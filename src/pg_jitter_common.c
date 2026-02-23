@@ -374,25 +374,27 @@ pg_jitter_fallback_step(ExprState *state,
 			FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
 			Datum		d;
 
+			/* force NULL result if strict fn and NULL input */
+			if (op->d.rowcompare_step.finfo->fn_strict &&
+				(fcinfo->args[0].isnull || fcinfo->args[1].isnull))
+			{
+				*op->resnull = true;
+				return op->d.rowcompare_step.jumpnull;
+			}
+
 			fcinfo->isnull = false;
 			d = op->d.rowcompare_step.fn_addr(fcinfo);
+			*op->resvalue = d;
 
 			if (fcinfo->isnull)
 			{
 				*op->resnull = true;
 				return op->d.rowcompare_step.jumpnull;
 			}
-			else
-			{
-				int32		cmpresult = DatumGetInt32(d);
+			*op->resnull = false;
 
-				if (cmpresult != 0)
-				{
-					*op->resvalue = Int32GetDatum(cmpresult);
-					*op->resnull = false;
-					return op->d.rowcompare_step.jumpdone;
-				}
-			}
+			if (DatumGetInt32(d) != 0)
+				return op->d.rowcompare_step.jumpdone;
 			break;
 		}
 		case EEOP_ROWCOMPARE_FINAL:
@@ -542,8 +544,7 @@ pg_jitter_fallback_step(ExprState *state,
 			ExecEvalJsonIsPredicate(state, op);
 			break;
 		case EEOP_JSONEXPR_PATH:
-			ExecEvalJsonExprPath(state, op, econtext);
-			break;
+			return ExecEvalJsonExprPath(state, op, econtext);
 		case EEOP_JSONEXPR_COERCION:
 			ExecEvalJsonCoercion(state, op, econtext);
 			break;

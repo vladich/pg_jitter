@@ -1523,6 +1523,36 @@ asmjit_compile_expr(ExprState *state)
 						cc.b(a64::CondCode::kEQ, step_labels[jdone]);
 					}
 				}
+				else if (opcode == EEOP_JSONEXPR_PATH)
+				{
+					/*
+					 * JSONEXPR_PATH always jumps (unconditional).
+					 * Compare return value against each possible target.
+					 */
+					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+					int targets[4];
+					int ntargets = 0;
+
+					targets[ntargets++] = jsestate->jump_end;
+					if (jsestate->jump_empty >= 0 &&
+						jsestate->jump_empty != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_empty;
+					if (jsestate->jump_error >= 0 &&
+						jsestate->jump_error != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_error;
+					if (jsestate->jump_eval_coercion >= 0 &&
+						jsestate->jump_eval_coercion != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_eval_coercion;
+
+					for (int t = 0; t < ntargets; t++)
+					{
+						if (targets[t] >= 0 && targets[t] < steps_len)
+						{
+							cc.cmp(ret_reg, targets[t]);
+							cc.b(a64::CondCode::kEQ, step_labels[targets[t]]);
+						}
+					}
+				}
 				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					cc.cmp(ret_reg, 0);

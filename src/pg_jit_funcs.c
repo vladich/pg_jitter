@@ -27,7 +27,7 @@
  * Error handlers — cold path, never inlined
  * ================================================================ */
 
-static pg_noinline void
+pg_noinline void
 jit_error_int2_overflow(void)
 {
 	ereport(ERROR,
@@ -35,7 +35,7 @@ jit_error_int2_overflow(void)
 			 errmsg("smallint out of range")));
 }
 
-static pg_noinline void
+pg_noinline void
 jit_error_int4_overflow(void)
 {
 	ereport(ERROR,
@@ -43,7 +43,7 @@ jit_error_int4_overflow(void)
 			 errmsg("integer out of range")));
 }
 
-static pg_noinline void
+pg_noinline void
 jit_error_int8_overflow(void)
 {
 	ereport(ERROR,
@@ -51,7 +51,7 @@ jit_error_int8_overflow(void)
 			 errmsg("bigint out of range")));
 }
 
-static pg_noinline void
+pg_noinline void
 jit_error_division_by_zero(void)
 {
 	ereport(ERROR,
@@ -59,7 +59,7 @@ jit_error_division_by_zero(void)
 			 errmsg("division by zero")));
 }
 
-static pg_noinline void
+pg_noinline void
 jit_error_float_overflow(void)
 {
 	ereport(ERROR,
@@ -67,7 +67,7 @@ jit_error_float_overflow(void)
 			 errmsg("value out of range: overflow")));
 }
 
-static pg_noinline void
+pg_noinline void
 jit_error_float_underflow(void)
 {
 	ereport(ERROR,
@@ -862,10 +862,14 @@ jit_int4_sum(int64 oldsum, int64 newval)
 #define T32 JIT_TYPE_32
 #define T64 JIT_TYPE_64
 
-/* Shorthand: E<nargs>(pg_fn, jit_fn, ret_type, arg_types...) */
-#define E0(pg, jf, rt)           { (PGFunction)(pg), (void*)(jf), 0, rt, {0} }
-#define E1(pg, jf, rt, a0)      { (PGFunction)(pg), (void*)(jf), 1, rt, {a0} }
-#define E2(pg, jf, rt, a0, a1)  { (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1} }
+/* Shorthand: E<nargs>(pg_fn, jit_fn, ret_type, arg_types...)
+ * The stringified jit_fn name is stored for precompiled blob lookup. */
+#define E0(pg, jf, rt)           { (PGFunction)(pg), (void*)(jf), 0, rt, {0}, 0, #jf }
+#define E1(pg, jf, rt, a0)      { (PGFunction)(pg), (void*)(jf), 1, rt, {a0}, 0, #jf }
+#define E2(pg, jf, rt, a0, a1)  { (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, 0, #jf }
+/* EI2: 2-arg entry with inline_op tag for sljit inlining */
+#define EI2(pg, jf, rt, a0, a1, iop) \
+	{ (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, iop, #jf }
 
 /* NULL means no native implementation yet — fall through to fcinfo path */
 #define DEFERRED NULL
@@ -873,18 +877,18 @@ jit_int4_sum(int64 oldsum, int64 newval)
 const JitDirectFn jit_direct_fns[] = {
 
 	/* ---- int4 arithmetic ---- */
-	E2(int4pl,   jit_int4pl,   T32, T32, T32),
-	E2(int4mi,   jit_int4mi,   T32, T32, T32),
-	E2(int4mul,  jit_int4mul,  T32, T32, T32),
-	E2(int4div,  jit_int4div,  T32, T32, T32),
-	E2(int4mod,  jit_int4mod,  T32, T32, T32),
+	EI2(int4pl,   jit_int4pl,   T32, T32, T32, JIT_INLINE_INT4_ADD),
+	EI2(int4mi,   jit_int4mi,   T32, T32, T32, JIT_INLINE_INT4_SUB),
+	EI2(int4mul,  jit_int4mul,  T32, T32, T32, JIT_INLINE_INT4_MUL),
+	EI2(int4div,  jit_int4div,  T32, T32, T32, JIT_INLINE_INT4_DIV),
+	EI2(int4mod,  jit_int4mod,  T32, T32, T32, JIT_INLINE_INT4_MOD),
 	E1(int4abs,  jit_int4abs,  T32, T32),
 	E1(int4inc,  jit_int4inc,  T32, T32),
 
 	/* ---- int8 arithmetic ---- */
-	E2(int8pl,   jit_int8pl,   T64, T64, T64),
-	E2(int8mi,   jit_int8mi,   T64, T64, T64),
-	E2(int8mul,  jit_int8mul,  T64, T64, T64),
+	EI2(int8pl,   jit_int8pl,   T64, T64, T64, JIT_INLINE_INT8_ADD),
+	EI2(int8mi,   jit_int8mi,   T64, T64, T64, JIT_INLINE_INT8_SUB),
+	EI2(int8mul,  jit_int8mul,  T64, T64, T64, JIT_INLINE_INT8_MUL),
 	E2(int8div,  jit_int8div,  T64, T64, T64),
 	E2(int8mod,  jit_int8mod,  T64, T64, T64),
 	E1(int8abs,  jit_int8abs,  T64, T64),
@@ -900,20 +904,20 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(int2abs,  jit_int2abs,  T32, T32),
 
 	/* ---- int4 comparison ---- */
-	E2(int4eq,  jit_int4eq,  T32, T32, T32),
-	E2(int4ne,  jit_int4ne,  T32, T32, T32),
-	E2(int4lt,  jit_int4lt,  T32, T32, T32),
-	E2(int4le,  jit_int4le,  T32, T32, T32),
-	E2(int4gt,  jit_int4gt,  T32, T32, T32),
-	E2(int4ge,  jit_int4ge,  T32, T32, T32),
+	EI2(int4eq,  jit_int4eq,  T32, T32, T32, JIT_INLINE_INT4_EQ),
+	EI2(int4ne,  jit_int4ne,  T32, T32, T32, JIT_INLINE_INT4_NE),
+	EI2(int4lt,  jit_int4lt,  T32, T32, T32, JIT_INLINE_INT4_LT),
+	EI2(int4le,  jit_int4le,  T32, T32, T32, JIT_INLINE_INT4_LE),
+	EI2(int4gt,  jit_int4gt,  T32, T32, T32, JIT_INLINE_INT4_GT),
+	EI2(int4ge,  jit_int4ge,  T32, T32, T32, JIT_INLINE_INT4_GE),
 
 	/* ---- int8 comparison ---- */
-	E2(int8eq,  jit_int8eq,  T32, T64, T64),
-	E2(int8ne,  jit_int8ne,  T32, T64, T64),
-	E2(int8lt,  jit_int8lt,  T32, T64, T64),
-	E2(int8le,  jit_int8le,  T32, T64, T64),
-	E2(int8gt,  jit_int8gt,  T32, T64, T64),
-	E2(int8ge,  jit_int8ge,  T32, T64, T64),
+	EI2(int8eq,  jit_int8eq,  T32, T64, T64, JIT_INLINE_INT8_EQ),
+	EI2(int8ne,  jit_int8ne,  T32, T64, T64, JIT_INLINE_INT8_NE),
+	EI2(int8lt,  jit_int8lt,  T32, T64, T64, JIT_INLINE_INT8_LT),
+	EI2(int8le,  jit_int8le,  T32, T64, T64, JIT_INLINE_INT8_LE),
+	EI2(int8gt,  jit_int8gt,  T32, T64, T64, JIT_INLINE_INT8_GT),
+	EI2(int8ge,  jit_int8ge,  T32, T64, T64, JIT_INLINE_INT8_GE),
 
 	/* ---- int2 comparison ---- */
 	E2(int2eq,  jit_int2eq,  T32, T32, T32),
@@ -1142,13 +1146,25 @@ const JitDirectFn jit_direct_fns[] = {
 	 * ================================================================ */
 
 	/* ---- interval comparison ---- */
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(interval_eq,  jit_interval_eq_precompiled,  T32, T64, T64),
+#else
 	E2(interval_eq, DEFERRED, T32, T64, T64),
+#endif
 	E2(interval_ne, DEFERRED, T32, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(interval_lt,  jit_interval_lt_precompiled,  T32, T64, T64),
+#else
 	E2(interval_lt, DEFERRED, T32, T64, T64),
+#endif
 	E2(interval_le, DEFERRED, T32, T64, T64),
 	E2(interval_gt, DEFERRED, T32, T64, T64),
 	E2(interval_ge, DEFERRED, T32, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(interval_cmp, jit_interval_cmp_precompiled, T32, T64, T64),
+#else
 	E2(interval_cmp, DEFERRED, T32, T64, T64),
+#endif
 	E2(interval_smaller, DEFERRED, T64, T64, T64),
 	E2(interval_larger,  DEFERRED, T64, T64, T64),
 	E1(interval_hash, DEFERRED, T32, T64),
@@ -1157,16 +1173,30 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(interval_um, DEFERRED, T64, T64),
 
 	/* ---- text/varchar comparison ---- */
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(texteq,  jit_texteq_precompiled,  T32, T64, T64),
+	E2(textne,  jit_textne_precompiled,  T32, T64, T64),
+	E2(text_lt, jit_text_lt_precompiled, T32, T64, T64),
+#else
 	E2(texteq,  DEFERRED, T32, T64, T64),
 	E2(textne,  DEFERRED, T32, T64, T64),
 	E2(text_lt, DEFERRED, T32, T64, T64),
+#endif
 	E2(text_le, DEFERRED, T32, T64, T64),
 	E2(text_gt, DEFERRED, T32, T64, T64),
 	E2(text_ge, DEFERRED, T32, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(bttextcmp, jit_bttextcmp_precompiled, T32, T64, T64),
+#else
 	E2(bttextcmp, DEFERRED, T32, T64, T64),
+#endif
 	E2(text_larger,  DEFERRED, T64, T64, T64),
 	E2(text_smaller, DEFERRED, T64, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E1(hashtext, jit_hashtext_precompiled, T32, T64),
+#else
 	E1(hashtext, DEFERRED, T32, T64),
+#endif
 	E2(text_pattern_lt, DEFERRED, T32, T64, T64),
 	E2(text_pattern_le, DEFERRED, T32, T64, T64),
 	E2(text_pattern_ge, DEFERRED, T32, T64, T64),
@@ -1181,6 +1211,15 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(textnename, DEFERRED, T32, T64, T64),
 
 	/* ---- numeric comparison + arithmetic ---- */
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(numeric_eq,  jit_numeric_eq_precompiled,  T32, T64, T64),
+	E2(numeric_ne,  jit_numeric_ne_precompiled,  T32, T64, T64),
+	E2(numeric_lt,  jit_numeric_lt_precompiled,  T32, T64, T64),
+	E2(numeric_le,  jit_numeric_le_precompiled,  T32, T64, T64),
+	E2(numeric_gt,  jit_numeric_gt_precompiled,  T32, T64, T64),
+	E2(numeric_ge,  jit_numeric_ge_precompiled,  T32, T64, T64),
+	E2(numeric_cmp, jit_numeric_cmp_precompiled, T32, T64, T64),
+#else
 	E2(numeric_eq,  DEFERRED, T32, T64, T64),
 	E2(numeric_ne,  DEFERRED, T32, T64, T64),
 	E2(numeric_lt,  DEFERRED, T32, T64, T64),
@@ -1188,12 +1227,20 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(numeric_gt,  DEFERRED, T32, T64, T64),
 	E2(numeric_ge,  DEFERRED, T32, T64, T64),
 	E2(numeric_cmp, DEFERRED, T32, T64, T64),
+#endif
 	E2(numeric_larger,  DEFERRED, T64, T64, T64),
 	E2(numeric_smaller, DEFERRED, T64, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E1(hash_numeric, jit_hash_numeric_precompiled, T32, T64),
+	E2(numeric_add, jit_numeric_add_precompiled, T64, T64, T64),
+	E2(numeric_sub, jit_numeric_sub_precompiled, T64, T64, T64),
+	E2(numeric_mul, jit_numeric_mul_precompiled, T64, T64, T64),
+#else
 	E1(hash_numeric, DEFERRED, T32, T64),
 	E2(numeric_add, DEFERRED, T64, T64, T64),
 	E2(numeric_sub, DEFERRED, T64, T64, T64),
 	E2(numeric_mul, DEFERRED, T64, T64, T64),
+#endif
 	E2(numeric_div, DEFERRED, T64, T64, T64),
 	E2(numeric_mod, DEFERRED, T64, T64, T64),
 	E1(numeric_abs,    DEFERRED, T64, T64),
@@ -1206,14 +1253,27 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(numeric_float8, DEFERRED, T64, T64),
 
 	/* ---- uuid comparison ---- */
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(uuid_eq,  jit_uuid_eq_precompiled,  T32, T64, T64),
+#else
 	E2(uuid_eq,  DEFERRED, T32, T64, T64),
+#endif
 	E2(uuid_ne,  DEFERRED, T32, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(uuid_lt,  jit_uuid_lt_precompiled,  T32, T64, T64),
+#else
 	E2(uuid_lt,  DEFERRED, T32, T64, T64),
+#endif
 	E2(uuid_le,  DEFERRED, T32, T64, T64),
 	E2(uuid_gt,  DEFERRED, T32, T64, T64),
 	E2(uuid_ge,  DEFERRED, T32, T64, T64),
+#ifdef PG_JITTER_HAVE_TIER2
+	E2(uuid_cmp, jit_uuid_cmp_precompiled, T32, T64, T64),
+	E1(uuid_hash, jit_uuid_hash_precompiled, T32, T64),
+#else
 	E2(uuid_cmp, DEFERRED, T32, T64, T64),
 	E1(uuid_hash, DEFERRED, T32, T64),
+#endif
 
 	/* ---- jsonb comparison + operators ---- */
 	E2(jsonb_eq, DEFERRED, T32, T64, T64),
@@ -1337,5 +1397,6 @@ jit_find_direct_fn(PGFunction pg_fn)
 #undef E0
 #undef E1
 #undef E2
+#undef EI2
 #undef DEFERRED
 #undef DEF_CMP

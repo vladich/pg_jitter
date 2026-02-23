@@ -2024,7 +2024,7 @@ mir_compile_expr(ExprState *state)
 							MIR_new_reg_op(ctx, r_tmp1),
 							MIR_new_uint_op(ctx, (uint64_t) op)));
 					MIR_append_insn(ctx, func_item,
-						MIR_new_call_insn(ctx, 5,
+						MIR_new_call_insn(ctx, 4,
 							MIR_new_ref_op(ctx, proto_agg_helper),
 							MIR_new_ref_op(ctx, step_direct_imports[opno]),
 							MIR_new_reg_op(ctx, r_state),
@@ -2114,6 +2114,39 @@ mir_compile_expr(ExprState *state)
 								MIR_new_label_op(ctx, step_labels[jdone]),
 								MIR_new_reg_op(ctx, r_tmp2),
 								MIR_new_int_op(ctx, jdone)));
+					}
+				}
+				else if (opcode == EEOP_JSONEXPR_PATH)
+				{
+					/*
+					 * JSONEXPR_PATH always jumps (unconditional).
+					 * Compare return value against each possible target.
+					 */
+					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+					int targets[4];
+					int ntargets = 0;
+
+					targets[ntargets++] = jsestate->jump_end;
+					if (jsestate->jump_empty >= 0 &&
+						jsestate->jump_empty != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_empty;
+					if (jsestate->jump_error >= 0 &&
+						jsestate->jump_error != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_error;
+					if (jsestate->jump_eval_coercion >= 0 &&
+						jsestate->jump_eval_coercion != jsestate->jump_end)
+						targets[ntargets++] = jsestate->jump_eval_coercion;
+
+					for (int t = 0; t < ntargets; t++)
+					{
+						if (targets[t] >= 0 && targets[t] < steps_len)
+						{
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_BEQ,
+									MIR_new_label_op(ctx, step_labels[targets[t]]),
+									MIR_new_reg_op(ctx, r_tmp2),
+									MIR_new_int_op(ctx, targets[t])));
+						}
 					}
 				}
 				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
