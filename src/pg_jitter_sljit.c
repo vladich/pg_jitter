@@ -27,6 +27,7 @@
 #include "utils/guc.h"
 #include "common/hashfn.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
 
 /*
  * Mirror of Int8TransTypeData from numeric.c (not exported in headers).
@@ -38,11 +39,10 @@ typedef struct
 	int64		sum;
 } JitInt8TransTypeData;
 
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+/* W^X and I-cache support for code patching (precompiled blobs) */
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <pthread.h>
 #include <libkern/OSCacheControl.h>  /* sys_icache_invalidate */
-#endif
 #endif
 
 PG_MODULE_MAGIC_EXT(
@@ -75,6 +75,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
+
 }
 
 /*
@@ -116,27 +117,41 @@ sljit_code_free(void *data)
  */
 
 /* Stack offsets for cached pointers */
-/* Offsets 0 and 8 are unused (formerly SOFF_RESVALUEP/RESNULLP,
- * now replaced by S0-relative addressing in emit_store/load helpers). */
 #define SOFF_RESULTSLOT   16
-#define SOFF_RESULTVALS   24
-#define SOFF_RESULTNULLS  32
-#define SOFF_AGG_OLDCTX   40	/* saved CurrentMemoryContext across fn_addr */
-#define SOFF_AGG_PERGROUP 48	/* runtime pergroup pointer (changes per tuple) */
-#define SOFF_AGG_FCINFO   56	/* fcinfo pointer, avoid reloading 64-bit IMM */
-#define SOFF_TEMP         64	/* temporary scratch across function calls */
+#define SOFF_AGG_OLDCTX   24	/* saved CurrentMemoryContext across fn_addr */
+#define SOFF_AGG_PERGROUP 32	/* runtime pergroup pointer (changes per tuple) */
+#define SOFF_AGG_FCINFO   40	/* fcinfo pointer, avoid reloading 64-bit IMM */
+#define SOFF_AGG_CURRMCTXP 48	/* &CurrentMemoryContext (was in S4, now stack) */
+#define SOFF_TEMP         56	/* temporary scratch across function calls */
 /* Cached source-slot tts_values/tts_isnull pointers (set by FETCHSOME) */
-#define SOFF_INNER_VALS   72
-#define SOFF_INNER_NULLS  80
-#define SOFF_OUTER_VALS   88
-#define SOFF_OUTER_NULLS  96
-#define SOFF_SCAN_VALS    104
-#define SOFF_SCAN_NULLS   112
-#define SOFF_OLD_VALS     120
-#define SOFF_OLD_NULLS    128
-#define SOFF_NEW_VALS     136
-#define SOFF_NEW_NULLS    144
-#define SOFF_TOTAL        152
+#define SOFF_INNER_VALS   64
+#define SOFF_INNER_NULLS  72
+#define SOFF_OUTER_VALS   80
+#define SOFF_OUTER_NULLS  88
+#define SOFF_SCAN_VALS    96
+#define SOFF_SCAN_NULLS   104
+#define SOFF_OLD_VALS     112
+#define SOFF_OLD_NULLS    120
+#define SOFF_NEW_VALS     128
+#define SOFF_NEW_NULLS    136
+#define SOFF_TOTAL        144
+
+/*
+ * Saved register assignments:
+ *   S0 = ExprState *state  (function argument)
+ *   S1 = ExprContext *econtext  (function argument)
+ *   S2 = bool *isNull  (function argument)
+ *   S3 = resultslot->tts_values  (loaded in prologue)
+ *   S4 = resultslot->tts_isnull  (loaded in prologue)
+ *   S5 = AggState *aggstate  (when has_agg) OR sreg_hash (when has_hash_next && !has_agg)
+ *
+ * Max 6 saved registers — safe on all sljit architectures
+ * (SLJIT_NUMBER_OF_SAVED_REGISTERS >= 6 everywhere, including x86-64).
+ * &CurrentMemoryContext is accessed only twice per AGG_TRANS (save + restore)
+ * so it moves to SOFF_AGG_CURRMCTXP on the stack.
+ */
+#define SREG_RESULTVALS  SLJIT_S3
+#define SREG_RESULTNULLS SLJIT_S4
 
 /*
  * Helper: emit code to load a slot pointer from econtext (in S1).
@@ -982,6 +997,14 @@ slot_cache_bit(ExprEvalOp opcode)
  * This saves 180-360 ARM64 instructions per compiled expression.
  */
 
+/* Load a per-expression pointer as an immediate. */
+#define EMIT_PTR(C, reg, value) \
+    sljit_emit_op1(C, SLJIT_MOV, reg, 0, SLJIT_IMM, (sljit_sw)(value))
+
+/* Indirect call helper. */
+#define EMIT_ICALL(C, type, arg_types, fn) \
+    sljit_emit_icall(C, type, arg_types, SLJIT_IMM, (sljit_sw)(fn))
+
 static inline void
 emit_store_resvalue(struct sljit_compiler *C, ExprState *state,
                     ExprEvalStep *op, int src_reg)
@@ -992,8 +1015,7 @@ emit_store_resvalue(struct sljit_compiler *C, ExprState *state,
                        src_reg, 0);
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw) op->resvalue);
+        EMIT_PTR(C, SLJIT_R1, op->resvalue);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
                        src_reg, 0);
     }
@@ -1009,8 +1031,7 @@ emit_store_resnull_false(struct sljit_compiler *C, ExprState *state,
                        SLJIT_IMM, 0);
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw) op->resnull);
+        EMIT_PTR(C, SLJIT_R1, op->resnull);
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1), 0,
                        SLJIT_IMM, 0);
     }
@@ -1026,8 +1047,7 @@ emit_store_resnull_true(struct sljit_compiler *C, ExprState *state,
                        SLJIT_IMM, 1);
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw) op->resnull);
+        EMIT_PTR(C, SLJIT_R1, op->resnull);
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1), 0,
                        SLJIT_IMM, 1);
     }
@@ -1043,8 +1063,7 @@ emit_store_resnull_reg(struct sljit_compiler *C, ExprState *state,
                        src_reg, 0);
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw) op->resnull);
+        EMIT_PTR(C, SLJIT_R1, op->resnull);
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1), 0,
                        src_reg, 0);
     }
@@ -1060,8 +1079,7 @@ emit_store_resvalue_imm(struct sljit_compiler *C, ExprState *state,
                        SLJIT_IMM, imm);
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw) op->resvalue);
+        EMIT_PTR(C, SLJIT_R1, op->resvalue);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
                        SLJIT_IMM, imm);
     }
@@ -1076,8 +1094,7 @@ emit_load_resvalue(struct sljit_compiler *C, ExprState *state,
                        SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resvalue));
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                       SLJIT_IMM, (sljit_sw) op->resvalue);
+        EMIT_PTR(C, dst_reg, op->resvalue);
         sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
                        SLJIT_MEM1(dst_reg), 0);
     }
@@ -1092,8 +1109,7 @@ emit_load_resnull(struct sljit_compiler *C, ExprState *state,
                        SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resnull));
     else
     {
-        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                       SLJIT_IMM, (sljit_sw) op->resnull);
+        EMIT_PTR(C, dst_reg, op->resnull);
         sljit_emit_op1(C, SLJIT_MOV_U8, dst_reg, 0,
                        SLJIT_MEM1(dst_reg), 0);
     }
@@ -1108,8 +1124,7 @@ emit_load_resvalue_addr(struct sljit_compiler *C, ExprState *state,
                        SLJIT_S0, 0,
                        SLJIT_IMM, offsetof(ExprState, resvalue));
     else
-        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                       SLJIT_IMM, (sljit_sw) op->resvalue);
+        EMIT_PTR(C, dst_reg, op->resvalue);
 }
 
 static inline void
@@ -1121,8 +1136,7 @@ emit_load_resnull_addr(struct sljit_compiler *C, ExprState *state,
                        SLJIT_S0, 0,
                        SLJIT_IMM, offsetof(ExprState, resnull));
     else
-        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                       SLJIT_IMM, (sljit_sw) op->resnull);
+        EMIT_PTR(C, dst_reg, op->resnull);
 }
 
 /*
@@ -1143,8 +1157,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_ADD32 | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int4_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			/* Sign-extend 32-bit result to 64-bit Datum */
 			sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
@@ -1154,8 +1167,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_SUB32 | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int4_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
 			return true;
@@ -1164,8 +1176,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_MUL32 | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int4_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
 			return true;
@@ -1177,8 +1188,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			/* Check divisor == 0 */
 			j_not_zero = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 										SLJIT_R1, 0, SLJIT_IMM, 0);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_division_by_zero);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
 			sljit_set_label(j_not_zero, sljit_emit_label(C));
 
 			/* Check INT32_MIN / -1 overflow */
@@ -1189,8 +1199,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 				struct sljit_jump *j_not_neg1;
 				j_not_neg1 = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											SLJIT_R1, 0, SLJIT_IMM, -1);
-				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-								 SLJIT_IMM, (sljit_sw) jit_error_int4_overflow);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
 				sljit_set_label(j_not_neg1, sljit_emit_label(C));
 			}
 			sljit_set_label(j_not_minmax, sljit_emit_label(C));
@@ -1207,8 +1216,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			/* Check divisor == 0 */
 			j_not_zero = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 										SLJIT_R1, 0, SLJIT_IMM, 0);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_division_by_zero);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
 			sljit_set_label(j_not_zero, sljit_emit_label(C));
 
 			/* Check INT32_MIN % -1 → return 0 */
@@ -1241,8 +1249,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_ADD | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int8_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			return true;
 
@@ -1250,8 +1257,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_SUB | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int8_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			return true;
 
@@ -1259,8 +1265,7 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op2(C, SLJIT_MUL | SLJIT_SET_OVERFLOW,
 						   SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
 			j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-							 SLJIT_IMM, (sljit_sw) jit_error_int8_overflow);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
 			sljit_set_label(j_ok, sljit_emit_label(C));
 			return true;
 
@@ -1596,10 +1601,15 @@ sljit_compile_expr(ExprState *state)
 
 	/*
 	 * Pre-scan: check if expression has aggregate transition steps.
-	 * Aggregates need S3/S4 saved registers for aggstate/CurrentMemoryContext.
-	 * HASHDATUM_NEXT32 uses one extra saved register for the rotated hash
-	 * (survives the function call without stack spill).
-	 * Deform is now compiled as separate functions (no S3/S4 conflict).
+	 * Aggregates need S5 for aggstate.
+	 * HASHDATUM_NEXT32 uses S5 for the rotated hash when no agg.
+	 * Deform is compiled as separate functions (no S3-S5 conflict).
+	 *
+	 * Register layout (see SREG_RESULTVALS/SREG_RESULTNULLS defines):
+	 *   S0-S2: state, econtext, isNull (always)
+	 *   S3-S4: resultvals, resultnulls (always, loaded in prologue)
+	 *   S5:    aggstate (when has_agg) OR sreg_hash (when has_hash_next)
+	 * Max 6 saved regs — SLJIT_NUMBER_OF_SAVED_REGISTERS >= 6 on all archs.
 	 */
 	int sreg_hash = 0;		/* saved register for rotated hash in NEXT32 */
 	bool use_sreg_hash = false;	/* true if sreg_hash is a register, not stack */
@@ -1621,22 +1631,23 @@ sljit_compile_expr(ExprState *state)
 		}
 
 		/*
-		 * Compute saved register count and assign sreg_hash.
-		 * Base: S0=state, S1=econtext, S2=isNull (3 regs).
-		 * Agg:  +S3=aggstate, +S4=&CurrentMemoryContext (5 regs).
-		 * Hash: +S3 for rotated hash when no agg (4 regs).
+		 * Compute saved register count.
+		 * Base: S0=state, S1=econtext, S2=isNull,
+		 *       S3=resultvals, S4=resultnulls (5 regs).
+		 * Agg:  +S5=aggstate (6 regs). &CurrentMemoryContext on stack.
+		 * Hash (no agg): +S5 for rotated hash (6 regs).
 		 *
-		 * Cap at 5 saved registers for x86-64 portability (only 5
-		 * callee-saved GPRs available when rbp is frame pointer).
-		 * When agg+hash coexist, fall back to SOFF_TEMP for hash.
+		 * Max 6 saved registers — the guaranteed minimum across all
+		 * sljit architectures (x86-64 non-Windows has exactly 6).
+		 * When agg+hash coexist, hash falls back to SOFF_TEMP.
 		 */
-		nsaved = 3;
+		nsaved = 5;
 		if (has_agg)
-			nsaved = 5;
+			nsaved = 6;
 		if (has_hash_next && !has_agg)
 		{
-			sreg_hash = SLJIT_S3;
-			nsaved = 4;
+			sreg_hash = SLJIT_S5;
+			nsaved = 6;
 			use_sreg_hash = true;
 		}
 
@@ -1649,10 +1660,13 @@ sljit_compile_expr(ExprState *state)
 
 		/*
 		 * Function prologue.
-		 * Saved regs: S0=state, S1=econtext, S2=isNull
-		 * For aggregate expressions: S3=aggstate, S4=&CurrentMemoryContext
-		 * For HASHDATUM_NEXT32: sreg_hash = rotated hash across call
+		 * Saved regs: S0=state, S1=econtext, S2=isNull,
+		 *             S3=resultvals, S4=resultnulls
+		 * For aggregate expressions: S5=aggstate
+		 * For HASHDATUM_NEXT32 (no agg): S5=rotated hash
 		 * 4 scratch regs (R0-R3).
+		 * EMIT_ICALL uses SOFF_TEMP stack slot + SLJIT_MEM1(SP) for
+		 * position-independent calls (no extra scratch register needed).
 		 */
 		sljit_emit_enter(C, 0,
 						 SLJIT_ARGS3(W, P, P, P),
@@ -1660,19 +1674,19 @@ sljit_compile_expr(ExprState *state)
 
 		if (has_agg)
 		{
-			/* S3 = state->parent (aggstate) */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_S3, 0,
+			/* S5 = state->parent (aggstate) */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_S5, 0,
 						   SLJIT_MEM1(SLJIT_S0),
 						   offsetof(ExprState, parent));
-			/* S4 = &CurrentMemoryContext */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_S4, 0,
+			/* &CurrentMemoryContext → stack (only used twice per AGG_TRANS) */
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_CURRMCTXP,
 						   SLJIT_IMM,
 						   (sljit_sw) &CurrentMemoryContext);
 		}
 	}
 
-	/* Cache resultslot and its values/nulls pointers (if resultslot exists) */
-	/* resultslot = state->resultslot */
+	/* Load resultslot values/nulls into saved registers S3/S4 */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 				   SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resultslot));
 	sljit_emit_op1(C, SLJIT_MOV,
@@ -1686,19 +1700,13 @@ sljit_compile_expr(ExprState *state)
 		skip_rs = sljit_emit_cmp(C, SLJIT_EQUAL,
 								 SLJIT_R0, 0, SLJIT_IMM, 0);
 
-		/* result_values = resultslot->tts_values */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+		/* S3 = resultslot->tts_values */
+		sljit_emit_op1(C, SLJIT_MOV, SREG_RESULTVALS, 0,
 					   SLJIT_MEM1(SLJIT_R0), offsetof(TupleTableSlot, tts_values));
-		sljit_emit_op1(C, SLJIT_MOV,
-					   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTVALS,
-					   SLJIT_R1, 0);
 
-		/* result_nulls = resultslot->tts_isnull */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+		/* S4 = resultslot->tts_isnull */
+		sljit_emit_op1(C, SLJIT_MOV, SREG_RESULTNULLS, 0,
 					   SLJIT_MEM1(SLJIT_R0), offsetof(TupleTableSlot, tts_isnull));
-		sljit_emit_op1(C, SLJIT_MOV,
-					   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTNULLS,
-					   SLJIT_R1, 0);
 
 		sljit_set_label(skip_rs, sljit_emit_label(C));
 	}
@@ -1800,15 +1808,12 @@ sljit_compile_expr(ExprState *state)
 					if (tmpl)
 					{
 						/* R0 still has slot pointer; call template(slot) */
-						sljit_emit_icall(C, SLJIT_CALL,
-										 SLJIT_ARGS1V(P),
-										 SLJIT_IMM,
-										 (sljit_sw) tmpl);
+						EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1V(P), tmpl);
 						deform_emitted = true;
 					}
 					else
 					{
-						/* Fall back to sljit runtime compilation */
+						/* Fall back to sljit runtime compilation. */
 						void *deform_fn = find_or_compile_deform(
 							ctx, deform_cache, &ndeform_cache,
 							op->d.fetch.known_desc,
@@ -1817,10 +1822,7 @@ sljit_compile_expr(ExprState *state)
 
 						if (deform_fn)
 						{
-							sljit_emit_icall(C, SLJIT_CALL,
-											 SLJIT_ARGS1V(P),
-											 SLJIT_IMM,
-											 (sljit_sw) deform_fn);
+							EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1V(P), deform_fn);
 							deform_emitted = true;
 						}
 					}
@@ -1832,10 +1834,7 @@ sljit_compile_expr(ExprState *state)
 					emit_load_econtext_slot(C, SLJIT_R0, opcode);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
 								   SLJIT_IMM, op->d.fetch.last_var);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS2V(P, 32),
-									 SLJIT_IMM,
-									 (sljit_sw) slot_getsomeattrs_int);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, 32), slot_getsomeattrs_int);
 				}
 
 				/* Skip label (both skip and deform paths converge here) */
@@ -1958,12 +1957,9 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_MEM1(SLJIT_R0),
 							   attnum * (sljit_sw) sizeof(Datum));
 
-				/* R3 = resultslot->tts_values (cached on stack) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-							   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTVALS);
-				/* result_values[resultnum] = R2 */
+				/* result_values[resultnum] = R2 (S3 = resultvals, in register) */
 				sljit_emit_op1(C, SLJIT_MOV,
-							   SLJIT_MEM1(SLJIT_R3),
+							   SLJIT_MEM1(SREG_RESULTVALS),
 							   resultnum * (sljit_sw) sizeof(Datum),
 							   SLJIT_R2, 0);
 
@@ -1985,12 +1981,9 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_MEM1(SLJIT_R0),
 							   attnum * (sljit_sw) sizeof(bool));
 
-				/* R3 = resultslot->tts_isnull (cached on stack) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-							   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTNULLS);
-				/* result_nulls[resultnum] = R2 */
+				/* result_nulls[resultnum] = R2 (S4 = resultnulls, in register) */
 				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM1(SLJIT_R3),
+							   SLJIT_MEM1(SREG_RESULTNULLS),
 							   resultnum * (sljit_sw) sizeof(bool),
 							   SLJIT_R2, 0);
 				break;
@@ -2024,10 +2017,7 @@ sljit_compile_expr(ExprState *state)
 											 SLJIT_IMM, 0);
 
 					/* R0 = MakeExpandedObjectReadOnlyInternal(R0) */
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, W),
-									 SLJIT_IMM,
-									 (sljit_sw) MakeExpandedObjectReadOnlyInternal);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, W), MakeExpandedObjectReadOnlyInternal);
 					/* Re-load R1 = 0 (not null, since we skipped for null) */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
 								   SLJIT_IMM, 0);
@@ -2035,19 +2025,15 @@ sljit_compile_expr(ExprState *state)
 					sljit_set_label(skip_ro, sljit_emit_label(C));
 				}
 
-				/* Store to resultslot->tts_isnull[resultnum] */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTNULLS);
+				/* Store to resultslot->tts_isnull[resultnum] (S4 = resultnulls) */
 				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM1(SLJIT_R2),
+							   SLJIT_MEM1(SREG_RESULTNULLS),
 							   resultnum * (sljit_sw) sizeof(bool),
 							   SLJIT_R1, 0);
 
-				/* Store to resultslot->tts_values[resultnum] */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_SP), SOFF_RESULTVALS);
+				/* Store to resultslot->tts_values[resultnum] (S3 = resultvals) */
 				sljit_emit_op1(C, SLJIT_MOV,
-							   SLJIT_MEM1(SLJIT_R2),
+							   SLJIT_MEM1(SREG_RESULTVALS),
 							   resultnum * (sljit_sw) sizeof(Datum),
 							   SLJIT_R0, 0);
 				break;
@@ -2103,8 +2089,7 @@ sljit_compile_expr(ExprState *state)
 					 * For nargs <= 4, OR-batch the isnull flags into R0
 					 * and emit a single branch.  Saves (nargs-1) branches.
 					 */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-								   SLJIT_IMM, (sljit_sw) fcinfo);
+					EMIT_PTR(C, SLJIT_R1, fcinfo);
 
 					if (nargs <= 4 && nargs > 1)
 					{
@@ -2206,8 +2191,7 @@ sljit_compile_expr(ExprState *state)
 							}
 							else
 							{
-								sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-											   SLJIT_IMM, (sljit_sw) fcinfo);
+								EMIT_PTR(C, SLJIT_R2, fcinfo);
 								base_reg = SLJIT_R2;
 							}
 							for (int i = 0; i < dfn->nargs && i < 4; i++)
@@ -2254,8 +2238,7 @@ sljit_compile_expr(ExprState *state)
 					int fcinfo_reg = r1_has_fcinfo ? SLJIT_R1 : SLJIT_R2;
 
 					if (!r1_has_fcinfo)
-						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-									   SLJIT_IMM, (sljit_sw) fcinfo);
+						EMIT_PTR(C, SLJIT_R2, fcinfo);
 					/* Load arg0 first, then arg1 (overwrites fcinfo_reg if R1) */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(fcinfo_reg), off0);
@@ -2291,8 +2274,7 @@ sljit_compile_expr(ExprState *state)
 						}
 						else
 						{
-							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-										   SLJIT_IMM, (sljit_sw) fcinfo);
+							EMIT_PTR(C, SLJIT_R2, fcinfo);
 							base_reg = SLJIT_R2;
 						}
 						for (int i = 0; i < dfn->nargs; i++)
@@ -2306,10 +2288,7 @@ sljit_compile_expr(ExprState *state)
 					}
 
 					/* Direct call with native arg types */
-					sljit_emit_icall(C, SLJIT_CALL,
-									 jit_sljit_call_type(dfn),
-									 SLJIT_IMM,
-									 (sljit_sw) dfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(dfn), dfn->jit_fn);
 
 					/* Store result to *op->resvalue */
 					emit_store_resvalue(C, state, op, SLJIT_R0);
@@ -2330,8 +2309,7 @@ sljit_compile_expr(ExprState *state)
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R1, 0);
 				else
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) fcinfo);
+					EMIT_PTR(C, SLJIT_R0, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV_U8,
 							   SLJIT_MEM1(SLJIT_R0),
 							   offsetof(FunctionCallInfoBaseData, isnull),
@@ -2339,17 +2317,13 @@ sljit_compile_expr(ExprState *state)
 
 				/* Call fn_addr(fcinfo) */
 				/* R0 still = fcinfo */
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) op->d.func.fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* *op->resvalue = R0 (return value) */
 				emit_store_resvalue(C, state, op, SLJIT_R0);
 
 				/* *op->resnull = fcinfo->isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R0, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0),
 							   offsetof(FunctionCallInfoBaseData, isnull));
@@ -2402,8 +2376,7 @@ sljit_compile_expr(ExprState *state)
 				if (opcode == EEOP_BOOL_AND_STEP_FIRST)
 				{
 					/* *anynull = false */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8,
 								   SLJIT_MEM1(SLJIT_R0), 0,
 								   SLJIT_IMM, 0);
@@ -2432,8 +2405,7 @@ sljit_compile_expr(ExprState *state)
 
 					/* Null handler: set *anynull = true */
 					sljit_set_label(j_null, sljit_emit_label(C));
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8,
 								   SLJIT_MEM1(SLJIT_R0), 0,
 								   SLJIT_IMM, 1);
@@ -2447,8 +2419,7 @@ sljit_compile_expr(ExprState *state)
 				{
 					struct sljit_jump *j_no_anynull;
 
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R0), 0);
 
@@ -2475,8 +2446,7 @@ sljit_compile_expr(ExprState *state)
 
 				if (opcode == EEOP_BOOL_OR_STEP_FIRST)
 				{
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8,
 								   SLJIT_MEM1(SLJIT_R0), 0,
 								   SLJIT_IMM, 0);
@@ -2503,8 +2473,7 @@ sljit_compile_expr(ExprState *state)
 
 					/* Null handler */
 					sljit_set_label(j_null, sljit_emit_label(C));
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8,
 								   SLJIT_MEM1(SLJIT_R0), 0,
 								   SLJIT_IMM, 1);
@@ -2516,8 +2485,7 @@ sljit_compile_expr(ExprState *state)
 				{
 					struct sljit_jump *j_no_anynull;
 
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) op->d.boolexpr.anynull);
+					EMIT_PTR(C, SLJIT_R0, op->d.boolexpr.anynull);
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R0), 0);
 
@@ -2705,8 +2673,7 @@ sljit_compile_expr(ExprState *state)
 				sljit_sw nd_size = (sljit_sw) sizeof(NullableDatum);
 
 				/* R1 = args base pointer */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) args);
+				EMIT_PTR(C, SLJIT_R1, args);
 
 				if (nargs <= 4 && nargs > 1)
 				{
@@ -2753,8 +2720,7 @@ sljit_compile_expr(ExprState *state)
 				int			jumpnull = op->d.agg_strict_input_check.jumpnull;
 
 				/* R1 = nulls base pointer */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) nulls);
+				EMIT_PTR(C, SLJIT_R1, nulls);
 
 				if (nargs <= 4 && nargs > 1)
 				{
@@ -2877,11 +2843,11 @@ sljit_compile_expr(ExprState *state)
 				 * Compute pergroup at runtime — all_pergroups[setoff]
 				 * changes per tuple for hash aggregation.
 				 *
-				 * S3 = aggstate, so load all_pergroups directly
-				 * from [S3 + offset] (1 LDR, no IMM load needed).
+				 * S5 = aggstate, so load all_pergroups directly
+				 * from [S5 + offset] (1 LDR, no IMM load needed).
 				 */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_MEM1(SLJIT_S3),
+							   SLJIT_MEM1(SLJIT_S5),
 							   offsetof(AggState, all_pergroups));
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0),
@@ -2919,15 +2885,10 @@ sljit_compile_expr(ExprState *state)
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 								   SLJIT_R0, 0);	/* R2 = pergroup */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_S3, 0);	/* R0 = aggstate */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-								   SLJIT_IMM, (sljit_sw) pertrans);
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-								   SLJIT_IMM, (sljit_sw) aggcontext);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS4V(P, P, P, P),
-									 SLJIT_IMM,
-									 (sljit_sw) ExecAggInitGroup);
+								   SLJIT_S5, 0);	/* R0 = aggstate */
+					EMIT_PTR(C, SLJIT_R1, pertrans);
+					EMIT_PTR(C, SLJIT_R3, aggcontext);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, P, P), ExecAggInitGroup);
 
 					/* Jump to end (skip transition body) */
 					j_to_end[n_to_end++] =
@@ -2988,10 +2949,7 @@ sljit_compile_expr(ExprState *state)
 						struct sljit_jump *j_ok;
 
 						j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-						sljit_emit_icall(C, SLJIT_CALL,
-										 SLJIT_ARGS0V(),
-										 SLJIT_IMM,
-										 (sljit_sw) jit_error_int8_overflow);
+						EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
 						sljit_set_label(j_ok, sljit_emit_label(C));
 					}
 					/* Store result */
@@ -3027,8 +2985,7 @@ sljit_compile_expr(ExprState *state)
 						sljit_sw isnull_off =
 							(sljit_sw) &fcinfo->args[1].isnull -
 							(sljit_sw) fcinfo;
-						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-									   SLJIT_IMM, (sljit_sw) fcinfo);
+						EMIT_PTR(C, SLJIT_R1, fcinfo);
 						sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 									   SLJIT_MEM1(SLJIT_R1), isnull_off);
 						struct sljit_jump *j_arg_null =
@@ -3120,8 +3077,7 @@ sljit_compile_expr(ExprState *state)
 						sljit_sw val_off =
 							(sljit_sw) &fcinfo->args[1].value -
 							(sljit_sw) fcinfo;
-						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-									   SLJIT_IMM, (sljit_sw) fcinfo);
+						EMIT_PTR(C, SLJIT_R2, fcinfo);
 						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 									   SLJIT_MEM1(SLJIT_R2), val_off);
 					}
@@ -3215,8 +3171,7 @@ sljit_compile_expr(ExprState *state)
 						sljit_sw val_off =
 							(sljit_sw) &fcinfo->args[1].value -
 							(sljit_sw) fcinfo;
-						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-									   SLJIT_IMM, (sljit_sw) fcinfo);
+						EMIT_PTR(C, SLJIT_R3, fcinfo);
 						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
 									   SLJIT_MEM1(SLJIT_R3), val_off);
 					}
@@ -3262,32 +3217,36 @@ sljit_compile_expr(ExprState *state)
 					 * MemoryContextSwitchTo, fcinfo marshaling,
 					 * fn_addr call, result store, context restore.
 					 */
+					EMIT_PTR(C, SLJIT_R0, aggcontext);
 					sljit_emit_op1(C, SLJIT_MOV,
-								   SLJIT_MEM1(SLJIT_S3),
+								   SLJIT_MEM1(SLJIT_S5),
 								   offsetof(AggState, curaggcontext),
-								   SLJIT_IMM, (sljit_sw) aggcontext);
+								   SLJIT_R0, 0);
 					sljit_emit_op1(C, SLJIT_MOV_S32,
-								   SLJIT_MEM1(SLJIT_S3),
+								   SLJIT_MEM1(SLJIT_S5),
 								   offsetof(AggState, current_set),
 								   SLJIT_IMM, setno);
+					EMIT_PTR(C, SLJIT_R0, pertrans);
 					sljit_emit_op1(C, SLJIT_MOV,
-								   SLJIT_MEM1(SLJIT_S3),
+								   SLJIT_MEM1(SLJIT_S5),
 								   offsetof(AggState, curpertrans),
-								   SLJIT_IMM, (sljit_sw) pertrans);
+								   SLJIT_R0, 0);
 
 					/* MemoryContextSwitchTo(tuple_mctx) */
+					/* R1 = &CurrentMemoryContext (from stack) */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_CURRMCTXP);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_S4), 0);
+								   SLJIT_MEM1(SLJIT_R1), 0);
 					sljit_emit_op1(C, SLJIT_MOV,
 								   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_OLDCTX,
 								   SLJIT_R0, 0);
 					sljit_emit_op1(C, SLJIT_MOV,
-								   SLJIT_MEM1(SLJIT_S4), 0,
+								   SLJIT_MEM1(SLJIT_R1), 0,
 								   SLJIT_IMM, (sljit_sw) tuple_mctx);
 
 					/* Setup fcinfo->args[0] from pergroup */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-								   SLJIT_IMM, (sljit_sw) fcinfo);
+					EMIT_PTR(C, SLJIT_R2, fcinfo);
 					sljit_emit_op1(C, SLJIT_MOV,
 								   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_FCINFO,
 								   SLJIT_R2, 0);
@@ -3317,9 +3276,7 @@ sljit_compile_expr(ExprState *state)
 					/* Call fn_addr(fcinfo) */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R2, 0);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, P),
-									 SLJIT_IMM, (sljit_sw) fn_addr);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fn_addr);
 
 					/* Store result back to pergroup */
 					if (!is_byref)
@@ -3350,23 +3307,21 @@ sljit_compile_expr(ExprState *state)
 						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 									   SLJIT_R0, 0);
 						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-									   SLJIT_S3, 0);
-						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-									   SLJIT_IMM, (sljit_sw) pertrans);
+									   SLJIT_S5, 0);
+						EMIT_PTR(C, SLJIT_R1, pertrans);
 						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
 									   SLJIT_MEM1(SLJIT_SP),
 									   SOFF_AGG_PERGROUP);
-						sljit_emit_icall(C, SLJIT_CALL,
-										 SLJIT_ARGS4V(P, P, W, P),
-										 SLJIT_IMM,
-										 (sljit_sw) pg_jitter_agg_byref_finish);
+						EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, W, P), pg_jitter_agg_byref_finish);
 					}
 
 					/* Restore memory context */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_OLDCTX);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_MEM1(SLJIT_SP), SOFF_AGG_CURRMCTXP);
 					sljit_emit_op1(C, SLJIT_MOV,
-								   SLJIT_MEM1(SLJIT_S4), 0,
+								   SLJIT_MEM1(SLJIT_R1), 0,
 								   SLJIT_R0, 0);
 				}
 
@@ -3395,14 +3350,10 @@ sljit_compile_expr(ExprState *state)
 				/* These are rare, use fallback */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3(W, P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) pg_jitter_fallback_step);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P), pg_jitter_fallback_step);
 
 				struct sljit_jump *j =
 					sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
@@ -3443,8 +3394,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_done;
 
 				/* R1 = fcinfo (kept alive for value load below) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R1, fcinfo);
 				/* R0 = fcinfo->args[0].isnull */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1),
@@ -3463,10 +3413,7 @@ sljit_compile_expr(ExprState *state)
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 jit_sljit_call_type(hdfn),
-									 SLJIT_IMM,
-									 (sljit_sw) hdfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
 				}
 				else
 				{
@@ -3477,10 +3424,7 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_IMM, 0);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R1, 0);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, P),
-									 SLJIT_IMM,
-									 (sljit_sw) op->d.hashdatum.fn_addr);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.hashdatum.fn_addr);
 				}
 
 				/* Jump past store_zero */
@@ -3520,8 +3464,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_isnull;
 
 				/* R1 = fcinfo (kept alive for value load) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R1, fcinfo);
 				/* R0 = fcinfo->args[0].isnull */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1),
@@ -3540,10 +3483,7 @@ sljit_compile_expr(ExprState *state)
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 jit_sljit_call_type(hdfn),
-									 SLJIT_IMM,
-									 (sljit_sw) hdfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
 				}
 				else
 				{
@@ -3553,10 +3493,7 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_IMM, 0);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R1, 0);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, P),
-									 SLJIT_IMM,
-									 (sljit_sw) op->d.hashdatum.fn_addr);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.hashdatum.fn_addr);
 				}
 
 				/* *op->resvalue = R0 */
@@ -3616,8 +3553,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_done;
 
 				/* Load existing hash from iresult->value as uint32 into R0 */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) iresult);
+				EMIT_PTR(C, SLJIT_R0, iresult);
 				sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0),
 							   offsetof(NullableDatum, value));
@@ -3641,8 +3577,7 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				/* R1 = fcinfo (kept alive for value load) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R1, fcinfo);
 				/* R0 = fcinfo->args[0].isnull */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1),
@@ -3661,10 +3596,7 @@ sljit_compile_expr(ExprState *state)
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 jit_sljit_call_type(hdfn),
-									 SLJIT_IMM,
-									 (sljit_sw) hdfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
 				}
 				else
 				{
@@ -3674,10 +3606,7 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_IMM, 0);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R1, 0);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, P),
-									 SLJIT_IMM,
-									 (sljit_sw) op->d.hashdatum.fn_addr);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.hashdatum.fn_addr);
 				}
 
 				/* XOR rotated hash with hash result (R0) */
@@ -3735,8 +3664,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_isnull;
 
 				/* R1 = fcinfo (kept alive for value load) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R1, fcinfo);
 				/* R0 = fcinfo->args[0].isnull */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1),
@@ -3748,8 +3676,7 @@ sljit_compile_expr(ExprState *state)
 										  SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Not null path: load existing hash, rotate, call, XOR */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) iresult);
+				EMIT_PTR(C, SLJIT_R0, iresult);
 				sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0),
 							   offsetof(NullableDatum, value));
@@ -3776,10 +3703,7 @@ sljit_compile_expr(ExprState *state)
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 jit_sljit_call_type(hdfn),
-									 SLJIT_IMM,
-									 (sljit_sw) hdfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
 				}
 				else
 				{
@@ -3789,10 +3713,7 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_IMM, 0);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R1, 0);
-					sljit_emit_icall(C, SLJIT_CALL,
-									 SLJIT_ARGS1(W, P),
-									 SLJIT_IMM,
-									 (sljit_sw) op->d.hashdatum.fn_addr);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.hashdatum.fn_addr);
 				}
 
 				/* XOR rotated hash with hash result (R0) */
@@ -3852,15 +3773,13 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_CASE_TESTVAL:
 			{
 				/* *op->resvalue = *op->d.casetest.value */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.casetest.value);
+				EMIT_PTR(C, SLJIT_R0, op->d.casetest.value);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0), 0);
 				emit_store_resvalue(C, state, op, SLJIT_R0);
 
 				/* *op->resnull = *op->d.casetest.isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.casetest.isnull);
+				EMIT_PTR(C, SLJIT_R0, op->d.casetest.isnull);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0), 0);
 				emit_store_resnull_reg(C, state, op, SLJIT_R0);
@@ -3891,15 +3810,13 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_DOMAIN_TESTVAL:
 			{
 				/* *op->resvalue = *op->d.casetest.value */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.casetest.value);
+				EMIT_PTR(C, SLJIT_R0, op->d.casetest.value);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0), 0);
 				emit_store_resvalue(C, state, op, SLJIT_R0);
 
 				/* *op->resnull = *op->d.casetest.isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.casetest.isnull);
+				EMIT_PTR(C, SLJIT_R0, op->d.casetest.isnull);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0), 0);
 				emit_store_resnull_reg(C, state, op, SLJIT_R0);
@@ -3957,17 +3874,13 @@ sljit_compile_expr(ExprState *state)
 				}
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
 				/* R3 = econtext->ecxt_*tuple (slot) */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
 							   SLJIT_MEM1(SLJIT_S1), slot_offset);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS4V(P, P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) ExecEvalSysVar);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, P, P), ExecEvalSysVar);
 				break;
 			}
 
@@ -3991,8 +3904,7 @@ sljit_compile_expr(ExprState *state)
 				/* Setup and call output function */
 				/* fcinfo_out->args[0].value = *op->resvalue */
 				emit_load_resvalue(C, state, op, SLJIT_R0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo_out);
+				EMIT_PTR(C, SLJIT_R1, fcinfo_out);
 				sljit_emit_op1(C, SLJIT_MOV,
 							   SLJIT_MEM1(SLJIT_R1),
 							   (sljit_sw) &fcinfo_out->args[0].value -
@@ -4012,15 +3924,11 @@ sljit_compile_expr(ExprState *state)
 				/* R0 = fcinfo_out->flinfo->fn_addr(fcinfo_out) */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) fcinfo_out->flinfo->fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fcinfo_out->flinfo->fn_addr);
 
 				/* R0 = cstring result; setup input function */
 				/* fcinfo_in->args[0].value = R0 (cstring as Datum) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo_in);
+				EMIT_PTR(C, SLJIT_R1, fcinfo_in);
 				sljit_emit_op1(C, SLJIT_MOV,
 							   SLJIT_MEM1(SLJIT_R1),
 							   (sljit_sw) &fcinfo_in->args[0].value -
@@ -4040,16 +3948,12 @@ sljit_compile_expr(ExprState *state)
 				/* R0 = fcinfo_in->flinfo->fn_addr(fcinfo_in) */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) fcinfo_in->flinfo->fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fcinfo_in->flinfo->fn_addr);
 
 				/* *op->resvalue = R0 */
 				emit_store_resvalue(C, state, op, SLJIT_R0);
 				/* *op->resnull = fcinfo_in->isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo_in);
+				EMIT_PTR(C, SLJIT_R2, fcinfo_in);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R2),
 							   offsetof(FunctionCallInfoBaseData, isnull));
@@ -4180,8 +4084,7 @@ sljit_compile_expr(ExprState *state)
 					sljit_sw null_off =
 						(sljit_sw) &fcinfo->args[0].isnull -
 						(sljit_sw) fcinfo;
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_IMM, (sljit_sw) fcinfo);
+					EMIT_PTR(C, SLJIT_R0, fcinfo);
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R0), null_off);
 					struct sljit_jump *j =
@@ -4194,23 +4097,18 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				/* fcinfo->isnull = false */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R0, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV_U8,
 							   SLJIT_MEM1(SLJIT_R0),
 							   offsetof(FunctionCallInfoBaseData, isnull),
 							   SLJIT_IMM, 0);
 				/* R0 = fn_addr(fcinfo) */
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) fcinfo->flinfo->fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fcinfo->flinfo->fn_addr);
 
 				/* *op->resvalue = R0 */
 				emit_store_resvalue(C, state, op, SLJIT_R0);
 				/* *op->resnull = fcinfo->isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R1, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1),
 							   offsetof(FunctionCallInfoBaseData, isnull));
@@ -4226,14 +4124,10 @@ sljit_compile_expr(ExprState *state)
 			{
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3V(P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) ExecEvalParamExec);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalParamExec);
 				break;
 			}
 
@@ -4241,14 +4135,10 @@ sljit_compile_expr(ExprState *state)
 			{
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3V(P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) ExecEvalParamExtern);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalParamExtern);
 				break;
 			}
 
@@ -4269,8 +4159,7 @@ sljit_compile_expr(ExprState *state)
 									 (sljit_sw) fcinfo;
 
 				/* R2 = fcinfo base */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R2, fcinfo);
 
 				/* R0 = args[0].isnull, R1 = args[1].isnull */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
@@ -4293,10 +4182,7 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_IMM, 0);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R2, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) op->d.func.fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* For DISTINCT: invert the equality result */
 				if (opcode == EEOP_DISTINCT)
@@ -4354,8 +4240,7 @@ sljit_compile_expr(ExprState *state)
 									(sljit_sw) fcinfo;
 
 				/* R2 = fcinfo base */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R2, fcinfo);
 
 				/* Check if arg0 is null */
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
@@ -4376,14 +4261,10 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_IMM, 0);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R2, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, P),
-								 SLJIT_IMM,
-								 (sljit_sw) op->d.func.fn_addr);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* If !fcinfo->isnull && result is true → return null */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R2, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
 							   SLJIT_MEM1(SLJIT_R2),
 							   offsetof(FunctionCallInfoBaseData, isnull));
@@ -4408,8 +4289,7 @@ sljit_compile_expr(ExprState *state)
 
 				/* return_a: *op->resvalue = args[0].value, *op->resnull = false */
 				sljit_set_label(j_b_null, sljit_emit_label(C));
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_PTR(C, SLJIT_R2, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R2), val0_off);
 				emit_store_resvalue(C, state, op, SLJIT_R0);
@@ -4531,8 +4411,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_null;
 
 				/* R0 = *op->d.make_readonly.isnull */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.make_readonly.isnull);
+				EMIT_PTR(C, SLJIT_R1, op->d.make_readonly.isnull);
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R1), 0);
 
@@ -4549,10 +4428,7 @@ sljit_compile_expr(ExprState *state)
 							   (sljit_sw) op->d.make_readonly.value);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R0), 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS1(W, W),
-								 SLJIT_IMM,
-								 (sljit_sw) MakeExpandedObjectReadOnlyInternal);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, W), MakeExpandedObjectReadOnlyInternal);
 
 				/* *op->resvalue = R0 */
 				emit_store_resvalue(C, state, op, SLJIT_R0);
@@ -4606,8 +4482,7 @@ sljit_compile_expr(ExprState *state)
 				WindowFuncExprState *wfunc = op->d.window_func.wfstate;
 
 				/* R2 = wfunc->wfuncno (read at runtime, could be int32) */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_IMM, (sljit_sw) wfunc);
+				EMIT_PTR(C, SLJIT_R2, wfunc);
 				sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R2, 0,
 							   SLJIT_MEM1(SLJIT_R2),
 							   offsetof(WindowFuncExprState, wfuncno));
@@ -4638,6 +4513,404 @@ sljit_compile_expr(ExprState *state)
 			}
 
 			/*
+			 * ---- HASHED_SCALARARRAYOP ----
+			 *
+			 * For constant byval IN lists: extract values at compile
+			 * time, sort them, emit an inline binary search tree.
+			 * ~5 comparisons for 20 elements vs 25+ instructions for
+			 * Bob Jenkins hash + probe.
+			 *
+			 * Falls back to C function for byref types or non-constant
+			 * arrays.
+			 */
+			case EEOP_HASHED_SCALARARRAYOP:
+			{
+				FunctionCallInfo fcinfo =
+					op->d.hashedscalararrayop.fcinfo_data;
+				bool inclause = op->d.hashedscalararrayop.inclause;
+				ScalarArrayOpExpr *saop =
+					op->d.hashedscalararrayop.saop;
+
+				/*
+				 * Detect byval type at compile time.
+				 */
+				const JitDirectFn *eq_dfn =
+					jit_find_direct_fn(
+						op->d.hashedscalararrayop.finfo->fn_addr);
+
+				/*
+				 * Try to extract constant array values at compile time
+				 * for inline binary search.
+				 */
+				Datum *sorted_vals = NULL;
+				int nvals = 0;
+				bool array_has_nulls = false;
+
+				if (eq_dfn && eq_dfn->jit_fn)
+				{
+					/*
+					 * Check if the array argument is a Const node.
+					 * saop->args = list of (scalar, array).
+					 */
+					Expr *arrayarg = (Expr *) lsecond(saop->args);
+
+					if (IsA(arrayarg, Const))
+					{
+						Const *arrayconst = (Const *) arrayarg;
+
+						if (!arrayconst->constisnull)
+						{
+							ArrayType *arr = DatumGetArrayTypeP(
+								arrayconst->constvalue);
+							int16 typlen;
+							bool typbyval;
+							char typalign;
+							int nitems;
+
+							nitems = ArrayGetNItems(ARR_NDIM(arr),
+													 ARR_DIMS(arr));
+							get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+												 &typlen, &typbyval,
+												 &typalign);
+
+							if (typbyval && nitems > 0 && nitems <= 64)
+							{
+								/*
+								 * Extract all values. Check for NULLs.
+								 */
+								bits8 *bitmap = ARR_NULLBITMAP(arr);
+								char *s = (char *) ARR_DATA_PTR(arr);
+								int bitmask = 1;
+
+								sorted_vals = (Datum *) palloc(
+									nitems * sizeof(Datum));
+								nvals = 0;
+
+								for (int k = 0; k < nitems; k++)
+								{
+									if (bitmap &&
+										(*bitmap & bitmask) == 0)
+									{
+										array_has_nulls = true;
+									}
+									else
+									{
+										Datum d = fetch_att(s, true,
+															typlen);
+										sorted_vals[nvals++] = d;
+										s = att_addlength_pointer(s,
+											typlen, s);
+										s = (char *) att_align_nominal(
+											s, typalign);
+									}
+
+									if (bitmap)
+									{
+										bitmask <<= 1;
+										if (bitmask == 0x100)
+										{
+											bitmap++;
+											bitmask = 1;
+										}
+									}
+								}
+
+								/*
+								 * Sort values for binary search.
+								 * Simple insertion sort — at most 64
+								 * elements at compile time.
+								 */
+								for (int a = 1; a < nvals; a++)
+								{
+									Datum tmp = sorted_vals[a];
+									int b = a - 1;
+									while (b >= 0 &&
+										   (int64) sorted_vals[b] >
+										   (int64) tmp)
+									{
+										sorted_vals[b + 1] =
+											sorted_vals[b];
+										b--;
+									}
+									sorted_vals[b + 1] = tmp;
+								}
+							}
+						}
+					}
+				}
+
+				if (sorted_vals && nvals > 0)
+				{
+					/*
+					 * ---- Binary search path ----
+					 *
+					 * Emit a balanced binary search tree as inline
+					 * CMP + conditional branch instructions.
+					 *
+					 * For 20 elements: ~5 levels = 5 CMP+branch pairs.
+					 * Total: ~10-15 instructions vs 30+ for hash probe.
+					 *
+					 * Strategy: recursive structure emitted iteratively
+					 * using a work stack. At each node, compare scalar
+					 * against the median value:
+					 *   - equal → found
+					 *   - less → go left subtree
+					 *   - greater → go right subtree
+					 *   - leaf with no match → not found
+					 */
+					struct sljit_jump *j_scalar_null;
+					struct sljit_jump *j_done_found;
+					struct sljit_jump *j_done_notfound;
+					struct sljit_jump *j_done_null;
+					struct sljit_label *lbl_found;
+					struct sljit_label *lbl_not_found;
+					struct sljit_label *lbl_null_result;
+					struct sljit_label *lbl_done;
+
+					sljit_sw off_arg0_value =
+						(sljit_sw) &fcinfo->args[0].value -
+						(sljit_sw) fcinfo;
+					sljit_sw off_arg0_isnull =
+						(sljit_sw) &fcinfo->args[0].isnull -
+						(sljit_sw) fcinfo;
+
+					/*
+					 * Step 1: Check scalar not NULL (strict function).
+					 * R0 = fcinfo
+					 */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_IMM, (sljit_sw) fcinfo);
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   off_arg0_isnull);
+					j_scalar_null = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+												   SLJIT_R1, 0,
+												   SLJIT_IMM, 0);
+
+					/*
+					 * Step 2: Load scalar value into R0.
+					 */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   off_arg0_value);
+
+					/*
+					 * Step 3: Emit binary search tree.
+					 *
+					 * We use a work stack to emit the tree iteratively.
+					 * Each work item is (lo, hi) range into sorted_vals.
+					 * For each range, pick median, emit CMP against it,
+					 * then recurse into left and right halves.
+					 *
+					 * R0 = scalar value (preserved across all compares)
+					 *
+					 * We collect jump targets for "found" and
+					 * "not found" to patch at the end.
+					 */
+					{
+						/* Max depth for 64 elements = 7 levels.
+						 * Work stack needs at most 2^7 = 128 entries,
+						 * but binary search never stacks more than
+						 * 2*depth entries. Use generous size. */
+						struct {
+							int lo, hi;
+							struct sljit_jump *entry_jump;
+						} work[128];
+						int work_top = 0;
+
+						/* Jumps that need to go to "found" label */
+						struct sljit_jump *found_jumps[64];
+						int n_found = 0;
+
+						/* Jumps that need to go to "not found" label */
+						struct sljit_jump *notfound_jumps[128];
+						int n_notfound = 0;
+
+						/* Push initial range */
+						work[work_top].lo = 0;
+						work[work_top].hi = nvals - 1;
+						work[work_top].entry_jump = NULL;
+						work_top++;
+
+						while (work_top > 0)
+						{
+							int lo, hi, mid;
+							struct sljit_jump *j_lt, *j_eq;
+							struct sljit_label *lbl_node;
+
+							work_top--;
+							lo = work[work_top].lo;
+							hi = work[work_top].hi;
+
+							/* Emit label for this node */
+							lbl_node = sljit_emit_label(C);
+							if (work[work_top].entry_jump)
+								sljit_set_label(
+									work[work_top].entry_jump,
+									lbl_node);
+
+							if (lo > hi)
+							{
+								/*
+								 * Empty range → not found.
+								 * Jump to not_found label.
+								 */
+								notfound_jumps[n_notfound++] =
+									sljit_emit_jump(C, SLJIT_JUMP);
+								continue;
+							}
+
+							if (lo == hi)
+							{
+								/*
+								 * Single element — just compare.
+								 */
+								j_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
+									SLJIT_R0, 0,
+									SLJIT_IMM,
+									(sljit_sw) sorted_vals[lo]);
+								found_jumps[n_found++] = j_eq;
+								/* Not equal → not found */
+								notfound_jumps[n_notfound++] =
+									sljit_emit_jump(C, SLJIT_JUMP);
+								continue;
+							}
+
+							/*
+							 * Pick median element.
+							 */
+							mid = lo + (hi - lo) / 2;
+
+							/*
+							 * CMP R0, sorted_vals[mid]
+							 * BEQ → found
+							 * BLT → left subtree [lo, mid-1]
+							 * fall-through → right subtree [mid+1, hi]
+							 */
+							j_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
+								SLJIT_R0, 0,
+								SLJIT_IMM,
+								(sljit_sw) sorted_vals[mid]);
+							found_jumps[n_found++] = j_eq;
+
+							j_lt = sljit_emit_cmp(C,
+								SLJIT_SIG_LESS,
+								SLJIT_R0, 0,
+								SLJIT_IMM,
+								(sljit_sw) sorted_vals[mid]);
+
+							/*
+							 * Push left subtree first (processed
+							 * last = emitted later = j_lt target),
+							 * then right subtree (processed next =
+							 * emitted immediately = fall-through).
+							 */
+							/* Left subtree [lo, mid-1]: j_lt target */
+							work[work_top].lo = lo;
+							work[work_top].hi = mid - 1;
+							work[work_top].entry_jump = j_lt;
+							work_top++;
+
+							/* Right subtree [mid+1, hi]: falls through */
+							work[work_top].lo = mid + 1;
+							work[work_top].hi = hi;
+							work[work_top].entry_jump = NULL;
+							work_top++;
+						}
+
+						/*
+						 * ---- Found path ----
+						 */
+						lbl_found = sljit_emit_label(C);
+						for (int k = 0; k < n_found; k++)
+							sljit_set_label(found_jumps[k], lbl_found);
+
+						if (inclause)
+							emit_store_resvalue_imm(C, state, op, 1);
+						else
+							emit_store_resvalue_imm(C, state, op, 0);
+						emit_store_resnull_false(C, state, op);
+						j_done_found =
+							sljit_emit_jump(C, SLJIT_JUMP);
+
+						/*
+						 * ---- Not found path ----
+						 */
+						lbl_not_found = sljit_emit_label(C);
+						for (int k = 0; k < n_notfound; k++)
+							sljit_set_label(notfound_jumps[k],
+											lbl_not_found);
+
+						if (array_has_nulls)
+						{
+							/*
+							 * Array had NULLs — result is NULL
+							 * (for strict equality, not finding a
+							 * match with NULLs present means
+							 * indeterminate).
+							 */
+							if (inclause)
+							{
+								emit_store_resvalue_imm(C, state, op, 0);
+								emit_store_resnull_true(C, state, op);
+							}
+							else
+							{
+								emit_store_resvalue_imm(C, state, op, 0);
+								emit_store_resnull_true(C, state, op);
+							}
+						}
+						else
+						{
+							if (inclause)
+								emit_store_resvalue_imm(C, state, op, 0);
+							else
+								emit_store_resvalue_imm(C, state, op, 1);
+							emit_store_resnull_false(C, state, op);
+						}
+						j_done_notfound =
+							sljit_emit_jump(C, SLJIT_JUMP);
+					}
+
+					/*
+					 * ---- Null scalar path ----
+					 */
+					lbl_null_result = sljit_emit_label(C);
+					sljit_set_label(j_scalar_null, lbl_null_result);
+
+					emit_store_resvalue_imm(C, state, op, 0);
+					emit_store_resnull_true(C, state, op);
+					j_done_null = sljit_emit_jump(C, SLJIT_JUMP);
+
+					/* ---- Done ---- */
+					lbl_done = sljit_emit_label(C);
+					sljit_set_label(j_done_found, lbl_done);
+					sljit_set_label(j_done_notfound, lbl_done);
+					sljit_set_label(j_done_null, lbl_done);
+
+					pfree(sorted_vals);
+				}
+				else
+				{
+					/*
+					 * Non-constant array or byref type — fall back to
+					 * C function call.
+					 */
+					if (sorted_vals)
+						pfree(sorted_vals);
+
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_S0, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_IMM, (sljit_sw) op);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_S1, 0);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalHashedScalarArrayOp);
+				}
+				break;
+			}
+
+			/*
 			 * ---- DIRECT-CALL OPCODES (Phase 1) ----
 			 * These opcodes have PG-exported functions with matching signatures.
 			 * Instead of going through fallback_step's 120-case switch, we call
@@ -4655,7 +4928,6 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_FIELDSTORE_DEFORM:
 			case EEOP_FIELDSTORE_FORM:
 			case EEOP_CONVERT_ROWTYPE:
-			case EEOP_HASHED_SCALARARRAYOP:
 			case EEOP_JSON_CONSTRUCTOR:
 			case EEOP_JSONEXPR_COERCION:
 			case EEOP_MERGE_SUPPORT_FUNC:
@@ -4688,8 +4960,6 @@ sljit_compile_expr(ExprState *state)
 						fn = ExecEvalFieldStoreForm; break;
 					case EEOP_CONVERT_ROWTYPE:
 						fn = ExecEvalConvertRowtype; break;
-					case EEOP_HASHED_SCALARARRAYOP:
-						fn = ExecEvalHashedScalarArrayOp; break;
 					case EEOP_JSON_CONSTRUCTOR:
 						fn = ExecEvalJsonConstructor; break;
 					case EEOP_JSONEXPR_COERCION:
@@ -4709,13 +4979,10 @@ sljit_compile_expr(ExprState *state)
 				}
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3V(P, P, P),
-								 SLJIT_IMM, (sljit_sw) fn);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), fn);
 				break;
 			}
 
@@ -4772,11 +5039,8 @@ sljit_compile_expr(ExprState *state)
 				}
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS2V(P, P),
-								 SLJIT_IMM, (sljit_sw) fn);
+				EMIT_PTR(C, SLJIT_R1, op);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), fn);
 				break;
 			}
 
@@ -4785,14 +5049,10 @@ sljit_compile_expr(ExprState *state)
 			{
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3V(P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) op->d.cparam.paramfunc);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), op->d.cparam.paramfunc);
 				break;
 			}
 
@@ -4807,14 +5067,10 @@ sljit_compile_expr(ExprState *state)
 				/* Call pg_jitter_fallback_step(state, op, econtext) -> int64 */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_S0, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-							   SLJIT_IMM, (sljit_sw) op);
+				EMIT_PTR(C, SLJIT_R1, op);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
 							   SLJIT_S1, 0);
-				sljit_emit_icall(C, SLJIT_CALL,
-								 SLJIT_ARGS3(W, P, P, P),
-								 SLJIT_IMM,
-								 (sljit_sw) pg_jitter_fallback_step);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P), pg_jitter_fallback_step);
 
 				/*
 				 * Check if this opcode could jump. We know the jump target
@@ -4998,6 +5254,7 @@ sljit_compile_expr(ExprState *state)
 
 	pfree(step_labels);
 	pfree(pending_jumps);
+
 
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter,

@@ -14,6 +14,7 @@
 #include "nodes/execnodes.h"
 #include "utils/expandeddatum.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
 
 #include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
@@ -366,6 +367,11 @@ mir_compile_expr(ExprState *state)
 	proto_agg_helper = MIR_new_proto(ctx, "p_aggh", 0, NULL,
 									  2, MIR_T_P, "s", MIR_T_P, "o");
 
+	/* Proto for 3-arg void calls: fn(state, op, econtext) -> void */
+	MIR_item_t proto_3arg_void;
+	proto_3arg_void = MIR_new_proto(ctx, "p_3v", 0, NULL,
+									3, MIR_T_P, "s", MIR_T_P, "o", MIR_T_P, "e");
+
 	/* Proto + imports for inline error handlers: void -> void (noreturn) */
 	MIR_item_t proto_err_void;
 	proto_err_void = MIR_new_proto(ctx, "p_err", 0, NULL, 0);
@@ -423,6 +429,13 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "fn_%d", i);
 				step_fn_imports[i] = MIR_new_import(ctx, name);
 			}
+		}
+		else if (opcode == EEOP_HASHED_SCALARARRAYOP)
+		{
+			/* Import for fallback ExecEvalHashedScalarArrayOp */
+			char name[32];
+			snprintf(name, sizeof(name), "saop_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
 		}
 		else if (opcode >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
 				 opcode <= EEOP_AGG_PLAIN_TRANS_BYREF)
@@ -2816,6 +2829,448 @@ mir_compile_expr(ExprState *state)
 			}
 
 			/*
+			 * ---- HASHED_SCALARARRAYOP (compile-time binary search) ----
+			 *
+			 * For constant byval IN lists: extract values at compile time,
+			 * sort them, and emit an inline binary search tree (~5 CMP+branch
+			 * levels for 20 elements).
+			 * For non-constant or byref types: fall back to C function call.
+			 */
+			case EEOP_HASHED_SCALARARRAYOP:
+			{
+				FunctionCallInfo fcinfo =
+					op->d.hashedscalararrayop.fcinfo_data;
+				bool inclause = op->d.hashedscalararrayop.inclause;
+				ScalarArrayOpExpr *saop =
+					op->d.hashedscalararrayop.saop;
+
+				/*
+				 * Detect byval type at compile time.
+				 */
+				const JitDirectFn *eq_dfn =
+					jit_find_direct_fn(
+						op->d.hashedscalararrayop.finfo->fn_addr);
+
+				/*
+				 * Try to extract constant array values at compile time
+				 * for inline binary search.
+				 */
+				Datum *sorted_vals = NULL;
+				int nvals = 0;
+				bool array_has_nulls = false;
+
+				if (eq_dfn && eq_dfn->jit_fn)
+				{
+					/*
+					 * Check if the array argument is a Const node.
+					 * saop->args = list of (scalar, array).
+					 */
+					Expr *arrayarg = (Expr *) lsecond(saop->args);
+
+					if (IsA(arrayarg, Const))
+					{
+						Const *arrayconst = (Const *) arrayarg;
+
+						if (!arrayconst->constisnull)
+						{
+							ArrayType *arr = DatumGetArrayTypeP(
+								arrayconst->constvalue);
+							int16 typlen;
+							bool typbyval;
+							char typalign;
+							int nitems;
+
+							nitems = ArrayGetNItems(ARR_NDIM(arr),
+													 ARR_DIMS(arr));
+							get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+												 &typlen, &typbyval,
+												 &typalign);
+
+							if (typbyval && nitems > 0 && nitems <= 64)
+							{
+								/*
+								 * Extract all values. Check for NULLs.
+								 */
+								bits8 *bitmap = ARR_NULLBITMAP(arr);
+								char *s = (char *) ARR_DATA_PTR(arr);
+								int bitmask = 1;
+
+								sorted_vals = (Datum *) palloc(
+									nitems * sizeof(Datum));
+								nvals = 0;
+
+								for (int k = 0; k < nitems; k++)
+								{
+									if (bitmap &&
+										(*bitmap & bitmask) == 0)
+									{
+										array_has_nulls = true;
+									}
+									else
+									{
+										Datum d = fetch_att(s, true,
+															typlen);
+										sorted_vals[nvals++] = d;
+										s = att_addlength_pointer(s,
+											typlen, s);
+										s = (char *) att_align_nominal(
+											s, typalign);
+									}
+
+									if (bitmap)
+									{
+										bitmask <<= 1;
+										if (bitmask == 0x100)
+										{
+											bitmap++;
+											bitmask = 1;
+										}
+									}
+								}
+
+								/*
+								 * Sort values for binary search.
+								 * Simple insertion sort -- at most 64
+								 * elements at compile time.
+								 */
+								for (int a = 1; a < nvals; a++)
+								{
+									Datum tmp = sorted_vals[a];
+									int b = a - 1;
+									while (b >= 0 &&
+										   (int64) sorted_vals[b] >
+										   (int64) tmp)
+									{
+										sorted_vals[b + 1] =
+											sorted_vals[b];
+										b--;
+									}
+									sorted_vals[b + 1] = tmp;
+								}
+							}
+						}
+					}
+				}
+
+				if (sorted_vals && nvals > 0)
+				{
+					/*
+					 * ---- Binary search path ----
+					 *
+					 * Emit a balanced binary search tree as inline
+					 * CMP + conditional branch instructions.
+					 *
+					 * For 20 elements: ~5 levels = 5 CMP+branch pairs.
+					 *
+					 * Strategy: iterative using a work stack. At each
+					 * node, compare scalar against the median value:
+					 *   - equal  -> found  (BEQ to lbl_found)
+					 *   - less   -> left subtree (BLTS to left label)
+					 *   - greater -> right subtree (fall-through)
+					 *   - leaf miss -> JMP to lbl_not_found
+					 */
+					MIR_insn_t lbl_found = MIR_new_label(ctx);
+					MIR_insn_t lbl_not_found = MIR_new_label(ctx);
+					MIR_insn_t lbl_null_result = MIR_new_label(ctx);
+					MIR_insn_t lbl_done = MIR_new_label(ctx);
+
+					int64_t off_arg0_value =
+						(int64_t)((char *)&fcinfo->args[0].value -
+								  (char *)fcinfo);
+					int64_t off_arg0_isnull =
+						(int64_t)((char *)&fcinfo->args[0].isnull -
+								  (char *)fcinfo);
+
+					MIR_reg_t r_scalar =
+						mir_new_reg(ctx, f, MIR_T_I64, "bscalar");
+
+					/*
+					 * Step 1: Check scalar not NULL (strict function).
+					 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								off_arg0_isnull, r_tmp1, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BNE,
+							MIR_new_label_op(ctx, lbl_null_result),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_int_op(ctx, 0)));
+
+					/*
+					 * Step 2: Load scalar value into r_scalar.
+					 * (r_tmp1 still = fcinfo)
+					 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_scalar),
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								off_arg0_value, r_tmp1, 0, 1)));
+
+					/*
+					 * Step 3: Emit binary search tree.
+					 *
+					 * Work stack approach: each item is a [lo,hi]
+					 * range. For each range pick median, emit:
+					 *   BEQ lbl_found  (if scalar == median)
+					 *   BLTS lbl_left  (if scalar < median)
+					 *   fall-through to right subtree
+					 *
+					 * Push left first (processed last = emitted
+					 * later = BLTS target), then right (processed
+					 * next = fall-through).
+					 *
+					 * Empty range: JMP lbl_not_found
+					 * Single element: BEQ lbl_found + JMP lbl_not_found
+					 */
+					{
+						struct {
+							int lo, hi;
+							MIR_insn_t entry_label;
+						} work[128];
+						int work_top = 0;
+
+						/* Push initial range */
+						work[work_top].lo = 0;
+						work[work_top].hi = nvals - 1;
+						work[work_top].entry_label = NULL;
+						work_top++;
+
+						while (work_top > 0)
+						{
+							int lo, hi, mid;
+							MIR_insn_t lbl_entry;
+							MIR_insn_t lbl_left;
+
+							work_top--;
+							lo = work[work_top].lo;
+							hi = work[work_top].hi;
+							lbl_entry = work[work_top].entry_label;
+
+							/* Place entry label for this node */
+							if (lbl_entry)
+								MIR_append_insn(ctx, func_item,
+									lbl_entry);
+
+							if (lo > hi)
+							{
+								/* Empty range -> not found */
+								MIR_append_insn(ctx, func_item,
+									MIR_new_insn(ctx, MIR_JMP,
+										MIR_new_label_op(ctx,
+											lbl_not_found)));
+								continue;
+							}
+
+							if (lo == hi)
+							{
+								/* Single element: BEQ + JMP */
+								MIR_append_insn(ctx, func_item,
+									MIR_new_insn(ctx, MIR_BEQ,
+										MIR_new_label_op(ctx,
+											lbl_found),
+										MIR_new_reg_op(ctx,
+											r_scalar),
+										MIR_new_int_op(ctx,
+											(int64_t)
+											sorted_vals[lo])));
+								MIR_append_insn(ctx, func_item,
+									MIR_new_insn(ctx, MIR_JMP,
+										MIR_new_label_op(ctx,
+											lbl_not_found)));
+								continue;
+							}
+
+							/* Pick median */
+							mid = lo + (hi - lo) / 2;
+
+							/*
+							 * BEQ lbl_found  (== median)
+							 * BLTS lbl_left  (< median)
+							 * fall-through   (> median -> right)
+							 */
+							lbl_left = MIR_new_label(ctx);
+
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_BEQ,
+									MIR_new_label_op(ctx,
+										lbl_found),
+									MIR_new_reg_op(ctx,
+										r_scalar),
+									MIR_new_int_op(ctx,
+										(int64_t)
+										sorted_vals[mid])));
+
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_BLTS,
+									MIR_new_label_op(ctx,
+										lbl_left),
+									MIR_new_reg_op(ctx,
+										r_scalar),
+									MIR_new_int_op(ctx,
+										(int64_t)
+										sorted_vals[mid])));
+
+							/*
+							 * Push left first (processed last),
+							 * then right (processed next =
+							 * fall-through).
+							 */
+							work[work_top].lo = lo;
+							work[work_top].hi = mid - 1;
+							work[work_top].entry_label = lbl_left;
+							work_top++;
+
+							work[work_top].lo = mid + 1;
+							work[work_top].hi = hi;
+							work[work_top].entry_label = NULL;
+							work_top++;
+						}
+					}
+
+					/* ---- Found ---- */
+					MIR_append_insn(ctx, func_item, lbl_found);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx,
+								(uint64_t) op->resvalue)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								0, r_tmp3, 0, 1),
+							MIR_new_int_op(ctx,
+								inclause ? 1 : 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx,
+								(uint64_t) op->resnull)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								0, r_tmp3, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, lbl_done)));
+
+					/* ---- Not found ---- */
+					MIR_append_insn(ctx, func_item, lbl_not_found);
+					if (array_has_nulls)
+					{
+						/*
+						 * Array had NULLs -- result is NULL
+						 * (indeterminate for strict equality).
+						 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp3),
+								MIR_new_uint_op(ctx,
+									(uint64_t) op->resvalue)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_mem_op(ctx, MIR_T_I64,
+									0, r_tmp3, 0, 1),
+								MIR_new_int_op(ctx, 0)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp3),
+								MIR_new_uint_op(ctx,
+									(uint64_t) op->resnull)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_mem_op(ctx, MIR_T_U8,
+									0, r_tmp3, 0, 1),
+								MIR_new_int_op(ctx, 1)));
+					}
+					else
+					{
+						/* Definitive not-found result */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp3),
+								MIR_new_uint_op(ctx,
+									(uint64_t) op->resvalue)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_mem_op(ctx, MIR_T_I64,
+									0, r_tmp3, 0, 1),
+								MIR_new_int_op(ctx,
+									inclause ? 0 : 1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp3),
+								MIR_new_uint_op(ctx,
+									(uint64_t) op->resnull)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_mem_op(ctx, MIR_T_U8,
+									0, r_tmp3, 0, 1),
+								MIR_new_int_op(ctx, 0)));
+					}
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, lbl_done)));
+
+					/* ---- Null scalar ---- */
+					MIR_append_insn(ctx, func_item, lbl_null_result);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx,
+								(uint64_t) op->resvalue)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								0, r_tmp3, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx,
+								(uint64_t) op->resnull)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								0, r_tmp3, 0, 1),
+							MIR_new_int_op(ctx, 1)));
+
+					/* ---- Done ---- */
+					MIR_append_insn(ctx, func_item, lbl_done);
+
+					pfree(sorted_vals);
+				}
+				else
+				{
+					/*
+					 * Non-constant array or byref type -- fall back
+					 * to C function call.
+					 */
+					if (sorted_vals)
+						pfree(sorted_vals);
+
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_call_insn(ctx, 5,
+							MIR_new_ref_op(ctx, proto_3arg_void),
+							MIR_new_ref_op(ctx, step_fn_imports[opno]),
+							MIR_new_reg_op(ctx, r_state),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_reg_op(ctx, r_econtext)));
+				}
+				break;
+			}
+
+			/*
 			 * ---- DEFAULT: fallback ----
 			 */
 			default:
@@ -2976,7 +3431,14 @@ mir_compile_expr(ExprState *state)
 			void *addr;
 			char name[32];
 
-			if (op == EEOP_HASHDATUM_FIRST ||
+			if (op == EEOP_HASHED_SCALARARRAYOP)
+			{
+				snprintf(name, sizeof(name), "saop_%d", i);
+				MIR_load_external(ctx, name,
+								  (void *) ExecEvalHashedScalarArrayOp);
+				continue;
+			}
+			else if (op == EEOP_HASHDATUM_FIRST ||
 				op == EEOP_HASHDATUM_FIRST_STRICT ||
 				op == EEOP_HASHDATUM_NEXT32 ||
 				op == EEOP_HASHDATUM_NEXT32_STRICT)

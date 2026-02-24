@@ -21,6 +21,7 @@ extern "C" {
 #include "pg_jit_deform_templates.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",
@@ -1987,6 +1988,362 @@ asmjit_compile_expr(ExprState *state)
 				}
 
 				cc.bind(end_label);
+				break;
+			}
+
+			/*
+			 * ---- HASHED_SCALARARRAYOP (binary search) ----
+			 *
+			 * For constant byval IN lists: extract values at compile
+			 * time, sort them, and emit an inline balanced binary
+			 * search tree (~5 CMP+branch levels for 20 elements).
+			 * For non-constant or byref types: C function fallback.
+			 */
+			case EEOP_HASHED_SCALARARRAYOP:
+			{
+				FunctionCallInfo fcinfo =
+					op->d.hashedscalararrayop.fcinfo_data;
+				bool inclause = op->d.hashedscalararrayop.inclause;
+				ScalarArrayOpExpr *saop =
+					op->d.hashedscalararrayop.saop;
+
+				const JitDirectFn *eq_dfn =
+					jit_find_direct_fn(
+						op->d.hashedscalararrayop.finfo->fn_addr);
+
+				/*
+				 * Try to extract constant array values at compile time
+				 * for inline binary search.
+				 */
+				Datum *sorted_vals = NULL;
+				int nvals = 0;
+				bool array_has_nulls = false;
+
+				if (eq_dfn && eq_dfn->jit_fn)
+				{
+					/*
+					 * Check if the array argument is a Const node.
+					 * saop->args = list of (scalar, array).
+					 */
+					Expr *arrayarg = (Expr *) lsecond(saop->args);
+
+					if (IsA(arrayarg, Const))
+					{
+						Const *arrayconst = (Const *) arrayarg;
+
+						if (!arrayconst->constisnull)
+						{
+							ArrayType *arr = DatumGetArrayTypeP(
+								arrayconst->constvalue);
+							int16 typlen;
+							bool typbyval;
+							char typalign;
+							int nitems;
+
+							nitems = ArrayGetNItems(ARR_NDIM(arr),
+													 ARR_DIMS(arr));
+							get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+												 &typlen, &typbyval,
+												 &typalign);
+
+							if (typbyval && nitems > 0 && nitems <= 64)
+							{
+								/*
+								 * Extract all values. Check for NULLs.
+								 */
+								bits8 *bitmap = ARR_NULLBITMAP(arr);
+								char *s = (char *) ARR_DATA_PTR(arr);
+								int bitmask = 1;
+
+								sorted_vals = (Datum *) palloc(
+									nitems * sizeof(Datum));
+								nvals = 0;
+
+								for (int k = 0; k < nitems; k++)
+								{
+									if (bitmap &&
+										(*bitmap & bitmask) == 0)
+									{
+										array_has_nulls = true;
+									}
+									else
+									{
+										Datum d = fetch_att(s, true,
+															typlen);
+										sorted_vals[nvals++] = d;
+										s = att_addlength_pointer(s,
+											typlen, s);
+										s = (char *) att_align_nominal(
+											s, typalign);
+									}
+
+									if (bitmap)
+									{
+										bitmask <<= 1;
+										if (bitmask == 0x100)
+										{
+											bitmap++;
+											bitmask = 1;
+										}
+									}
+								}
+
+								/*
+								 * Sort values for binary search.
+								 * Simple insertion sort — at most 64
+								 * elements at compile time.
+								 */
+								for (int a = 1; a < nvals; a++)
+								{
+									Datum vtmp = sorted_vals[a];
+									int b = a - 1;
+									while (b >= 0 &&
+										   (int64) sorted_vals[b] >
+										   (int64) vtmp)
+									{
+										sorted_vals[b + 1] =
+											sorted_vals[b];
+										b--;
+									}
+									sorted_vals[b + 1] = vtmp;
+								}
+							}
+						}
+					}
+				}
+
+				if (sorted_vals && nvals > 0)
+				{
+					/*
+					 * ---- Binary search path ----
+					 *
+					 * Emit a balanced binary search tree as inline
+					 * CMP + conditional branch instructions.
+					 *
+					 * For 20 elements: ~5 levels = 5 CMP+branch pairs.
+					 * Total: ~10-15 instructions vs 30+ for hash probe.
+					 *
+					 * Strategy: recursive structure emitted iteratively
+					 * using a work stack. At each node, compare scalar
+					 * against the median value:
+					 *   - equal -> found
+					 *   - less -> go left subtree
+					 *   - greater -> go right subtree (fall-through)
+					 *   - leaf with no match -> not found
+					 *
+					 * All BEQ branches target lbl_found directly.
+					 * All not-found leaves branch to lbl_not_found.
+					 * BLT branches target per-node labels that are
+					 * bound when the left subtree is emitted.
+					 */
+					Label lbl_found = cc.new_label();
+					Label lbl_not_found = cc.new_label();
+					Label lbl_null_result = cc.new_label();
+					Label lbl_done = cc.new_label();
+
+					int64_t off_arg0_value =
+						(int64_t)((char *)&fcinfo->args[0].value -
+								  (char *)fcinfo);
+					int64_t off_arg0_isnull =
+						(int64_t)((char *)&fcinfo->args[0].isnull -
+								  (char *)fcinfo);
+
+					/*
+					 * Step 1: Check scalar not NULL (strict function).
+					 */
+					a64::Gp fci_reg = cc.new_gpx("fci");
+					cc.mov(fci_reg, (uint64_t) fcinfo);
+					cc.ldrb(tmp2.w(), a64::ptr(fci_reg, off_arg0_isnull));
+					cc.cbnz(tmp2, lbl_null_result);
+
+					/*
+					 * Step 2: Load scalar value.
+					 */
+					a64::Gp scalar = cc.new_gpx("scalar");
+					cc.ldr(scalar, a64::ptr(fci_reg, off_arg0_value));
+
+					/*
+					 * Step 3: Emit binary search tree.
+					 *
+					 * Work stack (LIFO) for iterative tree emission.
+					 * Each item is (lo, hi, entry_label).
+					 * Right subtree is pushed last (processed first =
+					 * emitted as fall-through). Left subtree is pushed
+					 * first (processed later = BLT target).
+					 */
+					{
+						struct {
+							int lo, hi;
+							Label entry_label;
+							bool has_entry;
+						} work[128];
+						int work_top = 0;
+
+						/* Push initial range (no entry jump needed) */
+						work[work_top].lo = 0;
+						work[work_top].hi = nvals - 1;
+						work[work_top].has_entry = false;
+						work_top++;
+
+						while (work_top > 0)
+						{
+							int lo, hi, mid;
+
+							work_top--;
+							lo = work[work_top].lo;
+							hi = work[work_top].hi;
+
+							/*
+							 * Bind entry label if this node is a BLT
+							 * target from a parent node.
+							 */
+							if (work[work_top].has_entry)
+								cc.bind(work[work_top].entry_label);
+
+							if (lo > hi)
+							{
+								/* Empty range -> not found */
+								cc.b(lbl_not_found);
+								continue;
+							}
+
+							if (lo == hi)
+							{
+								/*
+								 * Single element — compare and branch.
+								 * Load constant into register for CMP.
+								 */
+								a64::Gp cval = cc.new_gpx();
+								cc.mov(cval,
+									(uint64_t) sorted_vals[lo]);
+								cc.cmp(scalar, cval);
+								cc.b(a64::CondCode::kEQ, lbl_found);
+								/* Not equal -> not found */
+								cc.b(lbl_not_found);
+								continue;
+							}
+
+							/*
+							 * Pick median element.
+							 */
+							mid = lo + (hi - lo) / 2;
+
+							/*
+							 * CMP scalar, sorted_vals[mid]
+							 * BEQ -> found
+							 * BLT -> left subtree [lo, mid-1]
+							 * fall-through -> right subtree [mid+1, hi]
+							 */
+							a64::Gp cval = cc.new_gpx();
+							cc.mov(cval,
+								(uint64_t) sorted_vals[mid]);
+							cc.cmp(scalar, cval);
+							cc.b(a64::CondCode::kEQ, lbl_found);
+
+							Label lbl_lt = cc.new_label();
+							cc.b(a64::CondCode::kLT, lbl_lt);
+
+							/*
+							 * Push left subtree first (processed
+							 * last = emitted later = BLT target),
+							 * then right subtree (processed next =
+							 * emitted immediately = fall-through).
+							 */
+							work[work_top].lo = lo;
+							work[work_top].hi = mid - 1;
+							work[work_top].entry_label = lbl_lt;
+							work[work_top].has_entry = true;
+							work_top++;
+
+							work[work_top].lo = mid + 1;
+							work[work_top].hi = hi;
+							work[work_top].has_entry = false;
+							work_top++;
+						}
+					}
+
+					/*
+					 * ---- Found path ----
+					 */
+					cc.bind(lbl_found);
+					{
+						cc.mov(tmp3, (uint64_t) op->resvalue);
+						cc.mov(tmp1,
+							(uint64_t)(int64_t)(inclause ? 1 : 0));
+						cc.str(tmp1, a64::ptr(tmp3));
+						cc.mov(tmp3, (uint64_t) op->resnull);
+						cc.mov(tmp1, 0);
+						cc.strb(tmp1.w(), a64::ptr(tmp3));
+						cc.b(lbl_done);
+					}
+
+					/*
+					 * ---- Not found path ----
+					 */
+					cc.bind(lbl_not_found);
+					{
+						if (array_has_nulls)
+						{
+							/*
+							 * Array had NULLs and value not found ->
+							 * result is NULL (indeterminate for strict
+							 * equality).
+							 */
+							cc.mov(tmp3, (uint64_t) op->resvalue);
+							cc.mov(tmp1, 0);
+							cc.str(tmp1, a64::ptr(tmp3));
+							cc.mov(tmp3, (uint64_t) op->resnull);
+							cc.mov(tmp1, 1);
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
+						else
+						{
+							cc.mov(tmp3, (uint64_t) op->resvalue);
+							cc.mov(tmp1,
+								(uint64_t)(int64_t)(inclause ? 0 : 1));
+							cc.str(tmp1, a64::ptr(tmp3));
+							cc.mov(tmp3, (uint64_t) op->resnull);
+							cc.mov(tmp1, 0);
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
+						cc.b(lbl_done);
+					}
+
+					/*
+					 * ---- Null scalar path ----
+					 */
+					cc.bind(lbl_null_result);
+					{
+						cc.mov(tmp3, (uint64_t) op->resvalue);
+						cc.mov(tmp1, 0);
+						cc.str(tmp1, a64::ptr(tmp3));
+						cc.mov(tmp3, (uint64_t) op->resnull);
+						cc.mov(tmp1, 1);
+						cc.strb(tmp1.w(), a64::ptr(tmp3));
+					}
+
+					/* ---- Done ---- */
+					cc.bind(lbl_done);
+
+					pfree(sorted_vals);
+				}
+				else
+				{
+					/* Non-constant or byref — C function fallback */
+					if (sorted_vals)
+						pfree(sorted_vals);
+
+					a64::Gp fn_reg = cc.new_gpx();
+					cc.mov(fn_reg, (uint64_t)(void *) ExecEvalHashedScalarArrayOp);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.mov(op_reg, (uint64_t) op);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+				}
 				break;
 			}
 

@@ -94,6 +94,17 @@ extern pg_noinline void jit_error_float_overflow(void);
 extern pg_noinline void jit_error_float_underflow(void);
 
 /*
+ * Hash function declarations — used by HASHED_SCALARARRAYOP native path
+ * to identify hash type at compile time via function pointer comparison.
+ */
+extern int32 jit_hashint2(int64 a);
+extern int32 jit_hashint4(int32 a);
+extern int64 jit_hashint8(int64 val);
+extern int32 jit_hashoid(int32 a);
+extern int32 jit_hashbool(int64 a);
+extern int32 jit_hashdate(int32 a);
+
+/*
  * Pre-compiled inline blob support.
  *
  * When PG_JITTER_HAVE_PRECOMPILED is defined, the sljit backend can emit
