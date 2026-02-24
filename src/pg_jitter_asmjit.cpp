@@ -22,6 +22,7 @@ extern "C" {
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
 #include "utils/lsyscache.h"
+#include "common/hashfn.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",
@@ -35,6 +36,9 @@ typedef struct
 	int64		count;
 	int64		sum;
 } JitInt8TransTypeData;
+
+/* MIR precompiled blob support (shared infrastructure) */
+#include "pg_jit_mir_blobs.h"
 }
 
 #include <asmjit/a64.h>
@@ -605,6 +609,11 @@ asmjit_compile_expr(ExprState *state)
 
 	if (expr_has_fast_path(state))
 		return false;
+
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+	/* Lazy-load MIR precompiled blobs on first compile */
+	mir_load_precompiled_blobs(NULL);
+#endif
 
 	ctx = pg_jitter_get_context(state);
 
@@ -1179,8 +1188,22 @@ asmjit_compile_expr(ExprState *state)
 					cc.mov(tmp1, 0);
 					cc.strb(tmp1.w(), a64::ptr(tmp2));
 				}
-				else if (dfn && dfn->jit_fn)
+				else if (dfn && (dfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+						|| (dfn->jit_fn_name &&
+							mir_find_precompiled_fn(dfn->jit_fn_name))
+#endif
+						))
 				{
+					/*
+					 * Direct native call — either from dfn->jit_fn or
+					 * MIR-precompiled function pointer.
+					 */
+					void *call_target = dfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!call_target)
+						call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
+#endif
 					/* Load fcinfo once, then load all args from offsets */
 					a64::Gp args[4];
 					a64::Gp fci_base = cc.new_gpx();
@@ -1195,7 +1218,7 @@ asmjit_compile_expr(ExprState *state)
 
 					/* Direct call */
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t) dfn->jit_fn);
+					cc.mov(fn_reg, (uint64_t) call_target);
 
 					InvokeNode *invoke;
 					switch (dfn->nargs) {
@@ -1493,7 +1516,11 @@ asmjit_compile_expr(ExprState *state)
 
 				/* Not null: call hash function (direct or fcinfo) */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
@@ -1501,7 +1528,14 @@ asmjit_compile_expr(ExprState *state)
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-					cc.mov(hfn_reg, (uint64_t) hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					cc.mov(hfn_reg, (uint64_t) hash_target);
+				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -1550,7 +1584,11 @@ asmjit_compile_expr(ExprState *state)
 
 				/* Not null: call hash function (direct or fcinfo) */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
@@ -1558,7 +1596,14 @@ asmjit_compile_expr(ExprState *state)
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-					cc.mov(hfn_reg, (uint64_t) hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					cc.mov(hfn_reg, (uint64_t) hash_target);
+				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -1624,7 +1669,11 @@ asmjit_compile_expr(ExprState *state)
 
 				/* Not null: call hash function (direct or fcinfo), XOR */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
@@ -1632,7 +1681,14 @@ asmjit_compile_expr(ExprState *state)
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-					cc.mov(hfn_reg, (uint64_t) hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					cc.mov(hfn_reg, (uint64_t) hash_target);
+				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -1689,7 +1745,11 @@ asmjit_compile_expr(ExprState *state)
 				/* Call hash function (direct or fcinfo), XOR */
 				{
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
@@ -1697,7 +1757,14 @@ asmjit_compile_expr(ExprState *state)
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-					cc.mov(hfn_reg, (uint64_t) hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					cc.mov(hfn_reg, (uint64_t) hash_target);
+				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());

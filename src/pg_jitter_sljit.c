@@ -45,6 +45,9 @@ typedef struct
 #include <libkern/OSCacheControl.h>  /* sys_icache_invalidate */
 #endif
 
+/* MIR precompiled blob support (shared infrastructure) */
+#include "pg_jit_mir_blobs.h"
+
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_sljit",
 );
@@ -2099,8 +2102,20 @@ emit_precompiled_inline(struct sljit_compiler *C,
 		/* B (unconditional branch): 0x14000000 | imm26 */
 		*ret_instr = 0x14000000 | (remaining & 0x3FFFFFF);
 	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	/*
+	 * x86_64: Patch ret (0xC3) → JMP forward past the error-handler
+	 * tail. x86_64 JMP near: 0xE9 + 32-bit displacement.
+	 * The displacement is relative to the end of the 5-byte JMP instruction.
+	 */
+	if (pi->ret_offset >= 0)
+	{
+		int remaining = pi->code_len - pi->ret_offset - 5;
+		buf[pi->ret_offset] = 0xE9;  /* JMP near */
+		int32_t disp = remaining;
+		memcpy(buf + pi->ret_offset + 1, &disp, 4);
+	}
 #else
-	/* x86_64 not yet supported for precompiled blobs */
 	return false;
 #endif
 
@@ -2112,11 +2127,21 @@ emit_precompiled_inline(struct sljit_compiler *C,
 	 */
 	blob_label = sljit_emit_label(C);
 
-	/* Emit the raw instruction bytes in 4-byte chunks (ARM64) */
+	/* Emit the raw instruction bytes */
 #if defined(__aarch64__) || defined(_M_ARM64)
 	for (int off = 0; off < pi->code_len; off += 4)
 	{
 		sljit_emit_op_custom(C, buf + off, 4);
+	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	/*
+	 * x86_64: Variable-length instructions. Emit individual bytes.
+	 * sljit_emit_op_custom() on x86 accepts 1..16 byte instructions.
+	 * We emit the entire blob as a sequence of single-byte emissions.
+	 */
+	for (int off = 0; off < pi->code_len; off++)
+	{
+		sljit_emit_op_custom(C, buf + off, 1);
 	}
 #endif
 
@@ -2168,6 +2193,23 @@ fixup_precompiled_relocs(void *code, sljit_uw code_size,
 			sljit_sw pc_rel = ((sljit_sw)target - (sljit_sw)instr) >> 2;
 			*instr = (*instr & ~0x3FFFFFF) | ((uint32_t)pc_rel & 0x3FFFFFF);
 		}
+		else if (relocs[i].type == RELOC_MOVZ_MOVK64)
+		{
+			/*
+			 * Patch MOVZ+3×MOVK sequence (4 instructions, 16 bytes).
+			 * Each instruction has a 16-bit immediate in bits [20:5].
+			 */
+			uint32_t *insn = (uint32_t *)(blob_addr + relocs[i].offset_in_blob);
+			uintptr_t addr = (uintptr_t)target;
+			insn[0] = (insn[0] & ~(0xFFFFU << 5))
+					| (((uint32_t)(addr & 0xFFFF)) << 5);
+			insn[1] = (insn[1] & ~(0xFFFFU << 5))
+					| (((uint32_t)((addr >> 16) & 0xFFFF)) << 5);
+			insn[2] = (insn[2] & ~(0xFFFFU << 5))
+					| (((uint32_t)((addr >> 32) & 0xFFFF)) << 5);
+			insn[3] = (insn[3] & ~(0xFFFFU << 5))
+					| (((uint32_t)((addr >> 48) & 0xFFFF)) << 5);
+		}
 #elif defined(__x86_64__) || defined(_M_X64)
 		if (relocs[i].type == RELOC_PC32)
 		{
@@ -2175,6 +2217,12 @@ fixup_precompiled_relocs(void *code, sljit_uw code_size,
 			/* x86 CALL E8: displacement is from end of 5-byte instruction */
 			int32_t *disp = (int32_t *)(instr_addr + 1);
 			*disp = (int32_t)((sljit_sw)target - (sljit_sw)(instr_addr + 5));
+		}
+		else if (relocs[i].type == RELOC_ABS64)
+		{
+			/* Patch 8-byte absolute address in const pool */
+			uintptr_t addr = (uintptr_t)target;
+			memcpy((uint8_t *)blob_addr + relocs[i].offset_in_blob, &addr, 8);
 		}
 #endif
 	}
@@ -2243,6 +2291,11 @@ sljit_compile_expr(ExprState *state)
 		return false;
 
 	/* JIT is active */
+
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+	/* Lazy-load MIR precompiled blobs on first compile */
+	mir_load_precompiled_blobs(NULL);
+#endif
 
 	ctx = pg_jitter_get_context(state);
 
@@ -3026,12 +3079,23 @@ sljit_compile_expr(ExprState *state)
 					/* Store *op->resvalue = R0, *op->resnull = false */
 					emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				}
-				else if (dfn && dfn->jit_fn)
+				else if (dfn && (dfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+						|| (dfn->jit_fn_name &&
+							mir_find_precompiled_fn(dfn->jit_fn_name))
+#endif
+						))
 				{
 					/*
 					 * TIER 1 — DIRECT CALL: native unwrapped function.
+					 * Uses dfn->jit_fn or MIR-precompiled function pointer.
 					 * If strict, R1 already holds fcinfo from null checks.
 					 */
+					void *call_target = dfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!call_target)
+						call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
+#endif
 					if (dfn->nargs > 0)
 					{
 						int base_reg;
@@ -3061,7 +3125,7 @@ sljit_compile_expr(ExprState *state)
 					}
 
 					/* Direct call with native arg types */
-					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(dfn), dfn->jit_fn);
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(dfn), call_target);
 
 					/* Store *op->resvalue = R0, *op->resnull = false */
 					emit_store_res_pair_false(C, state, op, SLJIT_R0);
@@ -4165,14 +4229,25 @@ sljit_compile_expr(ExprState *state)
 										  SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Not null path: call hash function (R1 still = fcinfo) */
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: load arg from fcinfo->args[0].value */
 					sljit_sw val_off =
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
+				}
 				}
 				else
 				{
@@ -4231,14 +4306,25 @@ sljit_compile_expr(ExprState *state)
 										  SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Not null path: call hash function (R1 still = fcinfo) */
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call */
 					sljit_sw val_off =
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
+				}
 				}
 				else
 				{
@@ -4334,14 +4420,25 @@ sljit_compile_expr(ExprState *state)
 										  SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Not null: call hash function (R1 still = fcinfo) */
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse R1 for arg load */
 					sljit_sw val_off =
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
+				}
 				}
 				else
 				{
@@ -4437,14 +4534,25 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				/* Call hash function (R1 still = fcinfo) */
-				if (hdfn && hdfn->jit_fn)
+				if (hdfn && (hdfn->jit_fn
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+#endif
+					))
 				{
 					/* Direct hash call: reuse R1 for arg load */
 					sljit_sw val_off =
 						(sljit_sw) &fcinfo->args[0].value - (sljit_sw) fcinfo;
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_R1), val_off);
-					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
+				{
+					void *hash_target = hdfn->jit_fn;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+					if (!hash_target)
+						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
+#endif
+					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
+				}
 				}
 				else
 				{

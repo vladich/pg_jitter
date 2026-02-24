@@ -17,6 +17,7 @@
 #include "utils/lsyscache.h"
 
 #include "utils/fmgrprotos.h"
+#include "common/hashfn.h"
 #include "pg_jitter_common.h"
 #include "pg_jit_funcs.h"
 
@@ -54,6 +55,12 @@ static MIR_context_t	mir_persistent_ctx = NULL;
 static int				mir_module_counter = 0;
 
 /*
+ * Pre-compiled MIR blob support — shared infrastructure from pg_jit_mir_blobs.h.
+ * Provides mir_find_precompiled_fn() and mir_load_precompiled_blobs().
+ */
+#include "pg_jit_mir_blobs.h"
+
+/*
  * Lazy-init the persistent MIR context.
  */
 static MIR_context_t
@@ -65,6 +72,9 @@ mir_ensure_ctx(void)
 		MIR_gen_init(mir_persistent_ctx);
 		MIR_gen_set_optimize_level(mir_persistent_ctx, 0);
 		mir_module_counter = 0;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+		mir_load_precompiled_blobs(mir_persistent_ctx);
+#endif
 	}
 	return mir_persistent_ctx;
 }
@@ -81,6 +91,9 @@ mir_destroy_ctx(void)
 		MIR_finish(mir_persistent_ctx);
 		mir_persistent_ctx = NULL;
 		mir_module_counter = 0;
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+		mir_destroy_blob_ctx();
+#endif
 	}
 }
 
@@ -403,6 +416,16 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "dfn_%d", i);
 				step_direct_imports[i] = MIR_new_import(ctx, name);
 			}
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+			else if (dfn && dfn->jit_fn_name &&
+					 mir_find_precompiled_fn(dfn->jit_fn_name))
+			{
+				/* Use MIR-precompiled function pointer */
+				char name[32];
+				snprintf(name, sizeof(name), "dfn_%d", i);
+				step_direct_imports[i] = MIR_new_import(ctx, name);
+			}
+#endif
 			else
 			{
 				char name[32];
@@ -423,6 +446,15 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "dhfn_%d", i);
 				step_direct_imports[i] = MIR_new_import(ctx, name);
 			}
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+			else if (dfn && dfn->jit_fn_name &&
+					 mir_find_precompiled_fn(dfn->jit_fn_name))
+			{
+				char name[32];
+				snprintf(name, sizeof(name), "dhfn_%d", i);
+				step_direct_imports[i] = MIR_new_import(ctx, name);
+			}
+#endif
 			else
 			{
 				char name[32];
@@ -1305,8 +1337,13 @@ mir_compile_expr(ExprState *state)
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx, 0)));
 				}
-				else if (dfn && dfn->jit_fn && step_direct_imports[opno])
+				else if (dfn && step_direct_imports[opno])
 				{
+					/*
+					 * Direct native call — either from dfn->jit_fn or
+					 * MIR-precompiled function pointer. Both have the
+					 * same calling convention (int32/int64 args → int64 ret).
+					 */
 					/* Load fcinfo once, then load all args from offsets */
 					MIR_reg_t r_args[4];
 					MIR_append_insn(ctx, func_item,
@@ -3463,6 +3500,14 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "dhfn_%d", i);
 				if (dfn && dfn->jit_fn)
 					MIR_load_external(ctx, name, dfn->jit_fn);
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+				else if (dfn && dfn->jit_fn_name)
+				{
+					void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
+					if (fn)
+						MIR_load_external(ctx, name, fn);
+				}
+#endif
 			}
 			else if (opc >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
 					 opc <= EEOP_AGG_PLAIN_TRANS_BYREF)
@@ -3494,6 +3539,14 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "dfn_%d", i);
 				if (dfn && dfn->jit_fn)
 					MIR_load_external(ctx, name, dfn->jit_fn);
+#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
+				else if (dfn && dfn->jit_fn_name)
+				{
+					void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
+					if (fn)
+						MIR_load_external(ctx, name, fn);
+				}
+#endif
 			}
 		}
 	}

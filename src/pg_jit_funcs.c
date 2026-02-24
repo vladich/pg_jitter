@@ -25,6 +25,7 @@
 #include "utils/float.h"       /* get_float8_nan */
 
 #include "pg_jit_funcs.h"
+#include "pg_jit_tier2_wrappers.h"
 
 /* ================================================================
  * Error handlers — cold path, never inlined
@@ -1256,9 +1257,9 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(textne,  jit_textne_precompiled,  T32, T64, T64),
 	E2(text_lt, jit_text_lt_precompiled, T32, T64, T64),
 #else
-	E2(texteq,  DEFERRED, T32, T64, T64),
-	E2(textne,  DEFERRED, T32, T64, T64),
-	E2(text_lt, DEFERRED, T32, T64, T64),
+	E2(texteq,  jit_texteq_wrapper,  T32, T64, T64),
+	E2(textne,  jit_textne_wrapper,  T32, T64, T64),
+	E2(text_lt, jit_text_lt_wrapper, T32, T64, T64),
 #endif
 	E2(text_le, DEFERRED, T32, T64, T64),
 	E2(text_gt, DEFERRED, T32, T64, T64),
@@ -1266,14 +1267,14 @@ const JitDirectFn jit_direct_fns[] = {
 #ifdef PG_JITTER_HAVE_TIER2
 	E2(bttextcmp, jit_bttextcmp_precompiled, T32, T64, T64),
 #else
-	E2(bttextcmp, DEFERRED, T32, T64, T64),
+	E2(bttextcmp, jit_bttextcmp_wrapper, T32, T64, T64),
 #endif
 	E2(text_larger,  DEFERRED, T64, T64, T64),
 	E2(text_smaller, DEFERRED, T64, T64, T64),
 #ifdef PG_JITTER_HAVE_TIER2
 	E1(hashtext, jit_hashtext_precompiled, T32, T64),
 #else
-	E1(hashtext, DEFERRED, T32, T64),
+	E1(hashtext, jit_hashtext_wrapper, T32, T64),
 #endif
 	E2(text_pattern_lt, DEFERRED, T32, T64, T64),
 	E2(text_pattern_le, DEFERRED, T32, T64, T64),
@@ -1298,13 +1299,13 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(numeric_ge,  jit_numeric_ge_precompiled,  T32, T64, T64),
 	E2(numeric_cmp, jit_numeric_cmp_precompiled, T32, T64, T64),
 #else
-	E2(numeric_eq,  DEFERRED, T32, T64, T64),
-	E2(numeric_ne,  DEFERRED, T32, T64, T64),
-	E2(numeric_lt,  DEFERRED, T32, T64, T64),
-	E2(numeric_le,  DEFERRED, T32, T64, T64),
-	E2(numeric_gt,  DEFERRED, T32, T64, T64),
-	E2(numeric_ge,  DEFERRED, T32, T64, T64),
-	E2(numeric_cmp, DEFERRED, T32, T64, T64),
+	E2(numeric_eq,  jit_numeric_eq_wrapper,  T32, T64, T64),
+	E2(numeric_ne,  jit_numeric_ne_wrapper,  T32, T64, T64),
+	E2(numeric_lt,  jit_numeric_lt_wrapper,  T32, T64, T64),
+	E2(numeric_le,  jit_numeric_le_wrapper,  T32, T64, T64),
+	E2(numeric_gt,  jit_numeric_gt_wrapper,  T32, T64, T64),
+	E2(numeric_ge,  jit_numeric_ge_wrapper,  T32, T64, T64),
+	E2(numeric_cmp, jit_numeric_cmp_wrapper, T32, T64, T64),
 #endif
 	E2(numeric_larger,  DEFERRED, T64, T64, T64),
 	E2(numeric_smaller, DEFERRED, T64, T64, T64),
@@ -1314,10 +1315,10 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(numeric_sub, jit_numeric_sub_precompiled, T64, T64, T64),
 	E2(numeric_mul, jit_numeric_mul_precompiled, T64, T64, T64),
 #else
-	E1(hash_numeric, DEFERRED, T32, T64),
-	E2(numeric_add, DEFERRED, T64, T64, T64),
-	E2(numeric_sub, DEFERRED, T64, T64, T64),
-	E2(numeric_mul, DEFERRED, T64, T64, T64),
+	E1(hash_numeric, jit_hash_numeric_wrapper, T32, T64),
+	E2(numeric_add, jit_numeric_add_wrapper, T64, T64, T64),
+	E2(numeric_sub, jit_numeric_sub_wrapper, T64, T64, T64),
+	E2(numeric_mul, jit_numeric_mul_wrapper, T64, T64, T64),
 #endif
 	E2(numeric_div, DEFERRED, T64, T64, T64),
 	E2(numeric_mod, DEFERRED, T64, T64, T64),
@@ -1334,13 +1335,13 @@ const JitDirectFn jit_direct_fns[] = {
 #ifdef PG_JITTER_HAVE_TIER2
 	E2(uuid_eq,  jit_uuid_eq_precompiled,  T32, T64, T64),
 #else
-	E2(uuid_eq,  DEFERRED, T32, T64, T64),
+	E2(uuid_eq,  jit_uuid_eq_wrapper,  T32, T64, T64),
 #endif
 	E2(uuid_ne,  DEFERRED, T32, T64, T64),
 #ifdef PG_JITTER_HAVE_TIER2
 	E2(uuid_lt,  jit_uuid_lt_precompiled,  T32, T64, T64),
 #else
-	E2(uuid_lt,  DEFERRED, T32, T64, T64),
+	E2(uuid_lt,  jit_uuid_lt_wrapper,  T32, T64, T64),
 #endif
 	E2(uuid_le,  DEFERRED, T32, T64, T64),
 	E2(uuid_gt,  DEFERRED, T32, T64, T64),
@@ -1349,8 +1350,8 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(uuid_cmp, jit_uuid_cmp_precompiled, T32, T64, T64),
 	E1(uuid_hash, jit_uuid_hash_precompiled, T32, T64),
 #else
-	E2(uuid_cmp, DEFERRED, T32, T64, T64),
-	E1(uuid_hash, DEFERRED, T32, T64),
+	E2(uuid_cmp, jit_uuid_cmp_wrapper, T32, T64, T64),
+	E1(uuid_hash, jit_uuid_hash_wrapper, T32, T64),
 #endif
 
 	/* ---- jsonb comparison + operators ---- */
