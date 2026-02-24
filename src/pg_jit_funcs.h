@@ -177,11 +177,7 @@ extern int64 jit_numeric_add_precompiled(int64 a, int64 b);
 extern int64 jit_numeric_sub_precompiled(int64 a, int64 b);
 extern int64 jit_numeric_mul_precompiled(int64 a, int64 b);
 extern int32 jit_hash_numeric_precompiled(int64 a);
-extern int32 jit_texteq_precompiled(int64 a, int64 b);
-extern int32 jit_textne_precompiled(int64 a, int64 b);
-extern int32 jit_text_lt_precompiled(int64 a, int64 b);
-extern int32 jit_bttextcmp_precompiled(int64 a, int64 b);
-extern int32 jit_hashtext_precompiled(int64 a);
+/* Text precompiled functions removed: require collation (PG_GET_COLLATION) */
 extern int32 jit_interval_eq_precompiled(int64 a, int64 b);
 extern int32 jit_interval_lt_precompiled(int64 a, int64 b);
 extern int32 jit_interval_cmp_precompiled(int64 a, int64 b);

@@ -35,12 +35,11 @@ extern int64 jit_numeric_mul_wrapper(int64 a, int64 b);
 /* ---- numeric hash (1) ---- */
 extern int32 jit_hash_numeric_wrapper(int64 a);
 
-/* ---- text comparison (5) ---- */
-extern int32 jit_texteq_wrapper(int64 a, int64 b);
-extern int32 jit_textne_wrapper(int64 a, int64 b);
-extern int32 jit_text_lt_wrapper(int64 a, int64 b);
-extern int32 jit_bttextcmp_wrapper(int64 a, int64 b);
-extern int32 jit_hashtext_wrapper(int64 a);
+/*
+ * Text comparison/hash wrappers removed: these functions require collation
+ * (PG_GET_COLLATION) which DirectFunctionCall cannot provide. Text ops must
+ * go through the fcinfo path with fncollation set by ExecInitFunc.
+ */
 
 /* ---- interval (3) ---- */
 extern int32 jit_interval_eq_wrapper(int64 a, int64 b);

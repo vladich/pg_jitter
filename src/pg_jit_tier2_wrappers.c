@@ -99,39 +99,11 @@ jit_hash_numeric_wrapper(int64 a)
 	return DatumGetInt32(DirectFunctionCall1(hash_numeric, (Datum) a));
 }
 
-/* ================================================================
- * text comparison (5 functions)
- * ================================================================ */
-
-int32
-jit_texteq_wrapper(int64 a, int64 b)
-{
-	return DatumGetInt32(DirectFunctionCall2(texteq, (Datum) a, (Datum) b));
-}
-
-int32
-jit_textne_wrapper(int64 a, int64 b)
-{
-	return DatumGetInt32(DirectFunctionCall2(textne, (Datum) a, (Datum) b));
-}
-
-int32
-jit_text_lt_wrapper(int64 a, int64 b)
-{
-	return DatumGetInt32(DirectFunctionCall2(text_lt, (Datum) a, (Datum) b));
-}
-
-int32
-jit_bttextcmp_wrapper(int64 a, int64 b)
-{
-	return DatumGetInt32(DirectFunctionCall2(bttextcmp, (Datum) a, (Datum) b));
-}
-
-int32
-jit_hashtext_wrapper(int64 a)
-{
-	return DatumGetInt32(DirectFunctionCall1(hashtext, (Datum) a));
-}
+/*
+ * Text comparison/hash wrappers removed: these functions require collation
+ * (PG_GET_COLLATION) which DirectFunctionCall cannot provide. Text ops must
+ * go through the fcinfo path with fncollation set by ExecInitFunc.
+ */
 
 /* ================================================================
  * interval comparison (3 functions)

@@ -40,12 +40,9 @@ TIER2_FUNCTIONS = [
     ('numeric_mul', 2, True, [True, True]),
     # numeric hash
     ('hash_numeric', 1, False, [True]),
-    # text comparison
-    ('texteq',  2, False, [True, True]),
-    ('textne',  2, False, [True, True]),
-    ('text_lt', 2, False, [True, True]),
-    ('bttextcmp', 2, False, [True, True]),
-    ('hashtext',  1, False, [True]),
+    # text comparison — REMOVED: these functions require collation
+    # (PG_GET_COLLATION) which our wrappers cannot provide. Text ops
+    # must go through the fcinfo path with fncollation set by ExecInitFunc.
     # interval
     ('interval_eq',  2, False, [True, True]),
     ('interval_lt',  2, False, [True, True]),

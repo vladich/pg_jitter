@@ -983,6 +983,18 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
     if (natts <= 0 || natts > desc->natts)
         return false;
 
+    /*
+     * Skip inline deform for MinimalTupleTableSlot. The inline deform
+     * emits its code directly in the expression function body, sharing
+     * the stack frame. For MinimalTuple slots (used by Sort, tuplesort),
+     * this causes data corruption when the expression also contains
+     * aggregate transition steps that reuse the same stack slots
+     * (SOFF_DEFORM_* overlap with SOFF_AGG_*). Fall back to compiled
+     * deform (separate function) or slot_getsomeattrs_int.
+     */
+    if (ops == &TTSOpsMinimalTuple)
+        return false;
+
     /* Determine slot-type-specific field offsets */
     if (ops == &TTSOpsHeapTuple || ops == &TTSOpsBufferHeapTuple)
     {
@@ -2425,7 +2437,6 @@ sljit_compile_expr(ExprState *state)
 
 		step_labels[opno] = sljit_emit_label(C);
 		opcode = ExecEvalStepOp(state, op);
-
 
 		/*
 		 * For each opcode, emit either: (a) inline native code for hot-path

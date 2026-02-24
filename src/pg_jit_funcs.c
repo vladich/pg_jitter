@@ -1252,30 +1252,21 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(interval_um, DEFERRED, T64, T64),
 
 	/* ---- text/varchar comparison ---- */
-#ifdef PG_JITTER_HAVE_TIER2
-	E2(texteq,  jit_texteq_precompiled,  T32, T64, T64),
-	E2(textne,  jit_textne_precompiled,  T32, T64, T64),
-	E2(text_lt, jit_text_lt_precompiled, T32, T64, T64),
-#else
-	E2(texteq,  jit_texteq_wrapper,  T32, T64, T64),
-	E2(textne,  jit_textne_wrapper,  T32, T64, T64),
-	E2(text_lt, jit_text_lt_wrapper, T32, T64, T64),
-#endif
+	/*
+	 * Text functions require collation (PG_GET_COLLATION).  DirectFunctionCall
+	 * passes InvalidOid for collation, so wrappers cannot be used.  These must
+	 * go through the fcinfo path which has fncollation set by ExecInitFunc.
+	 */
+	E2(texteq,  DEFERRED, T32, T64, T64),
+	E2(textne,  DEFERRED, T32, T64, T64),
+	E2(text_lt, DEFERRED, T32, T64, T64),
 	E2(text_le, DEFERRED, T32, T64, T64),
 	E2(text_gt, DEFERRED, T32, T64, T64),
 	E2(text_ge, DEFERRED, T32, T64, T64),
-#ifdef PG_JITTER_HAVE_TIER2
-	E2(bttextcmp, jit_bttextcmp_precompiled, T32, T64, T64),
-#else
-	E2(bttextcmp, jit_bttextcmp_wrapper, T32, T64, T64),
-#endif
+	E2(bttextcmp, DEFERRED, T32, T64, T64),
 	E2(text_larger,  DEFERRED, T64, T64, T64),
 	E2(text_smaller, DEFERRED, T64, T64, T64),
-#ifdef PG_JITTER_HAVE_TIER2
-	E1(hashtext, jit_hashtext_precompiled, T32, T64),
-#else
-	E1(hashtext, jit_hashtext_wrapper, T32, T64),
-#endif
+	E1(hashtext, DEFERRED, T32, T64),
 	E2(text_pattern_lt, DEFERRED, T32, T64, T64),
 	E2(text_pattern_le, DEFERRED, T32, T64, T64),
 	E2(text_pattern_ge, DEFERRED, T32, T64, T64),
