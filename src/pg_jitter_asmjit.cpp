@@ -11,21 +11,62 @@ extern "C" {
 #include "jit/jit.h"
 #include "executor/execExpr.h"
 #include "executor/tuptable.h"
+#include "executor/nodeAgg.h"
 #include "nodes/execnodes.h"
 #include "utils/expandeddatum.h"
+#include "utils/array.h"
+#include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
 #include "pg_jit_funcs.h"
+#include "pg_jit_deform_templates.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",
 );
+
+/*
+ * Mirror of Int8TransTypeData from numeric.c.
+ */
+typedef struct
+{
+	int64		count;
+	int64		sum;
+} JitInt8TransTypeData;
 }
 
 #include <asmjit/a64.h>
 
 using namespace asmjit;
+
+/*
+ * Try to match a tuple descriptor against pre-compiled deform templates.
+ * Returns a function pointer to a shared-text deform function, or NULL.
+ */
+static deform_template_fn
+asmjit_deform_match_template(TupleDesc desc, const TupleTableSlotOps *ops, int natts)
+{
+	int16	attlens[5];
+
+	if (natts < 1 || natts > 5)
+		return NULL;
+	if (ops == &TTSOpsVirtual)
+		return NULL;
+	for (int i = 0; i < natts; i++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
+		if (!att->attbyval)
+			return NULL;
+		if (att->attlen != 1 && att->attlen != 2 &&
+			att->attlen != 4 && att->attlen != 8)
+			return NULL;
+		if (att->attisdropped || att->atthasmissing)
+			return NULL;
+		attlens[i] = att->attlen;
+	}
+	return jit_deform_find_template(deform_signature(natts, attlens));
+}
 
 /* Per-expression compiled code handle */
 struct AsmjitCode {
@@ -677,18 +718,41 @@ asmjit_compile_expr(ExprState *state)
 				if (op->d.fetch.fixed && op->d.fetch.known_desc &&
 					(ctx->base.flags & PGJIT_DEFORM))
 				{
-					instr_time  deform_start, deform_end;
+					/*
+					 * Try pre-compiled template first (I-cache friendly:
+					 * same virtual address across all parallel workers).
+					 */
+					deform_template_fn tmpl = asmjit_deform_match_template(
+						op->d.fetch.known_desc,
+						op->d.fetch.kind,
+						op->d.fetch.last_var);
 
-					INSTR_TIME_SET_CURRENT(deform_start);
-					deform_emitted = asmjit_emit_deform_inline(cc,
-					                                            op->d.fetch.known_desc,
-					                                            op->d.fetch.kind,
-					                                            op->d.fetch.last_var,
-					                                            slot_reg,
-					                                            tmp1, tmp2, tmp3);
-					INSTR_TIME_SET_CURRENT(deform_end);
-					INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
-					                      deform_end, deform_start);
+					if (tmpl)
+					{
+						/* slot_reg already has the slot pointer; call tmpl(slot) */
+						a64::Gp tmpl_fn = cc.new_gpx();
+						cc.mov(tmpl_fn, (uint64_t)(void *) tmpl);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), tmpl_fn,
+								  FuncSignature::build<void, void *>());
+						inv->set_arg(0, slot_reg);
+						deform_emitted = true;
+					}
+					else
+					{
+						instr_time  deform_start, deform_end;
+
+						INSTR_TIME_SET_CURRENT(deform_start);
+						deform_emitted = asmjit_emit_deform_inline(cc,
+						                                            op->d.fetch.known_desc,
+						                                            op->d.fetch.kind,
+						                                            op->d.fetch.last_var,
+						                                            slot_reg,
+						                                            tmp1, tmp2, tmp3);
+						INSTR_TIME_SET_CURRENT(deform_end);
+						INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
+						                      deform_end, deform_start);
+					}
 				}
 
 				if (!deform_emitted)
@@ -826,25 +890,295 @@ asmjit_compile_expr(ExprState *state)
 					cc.mov(tmp2, 1);
 					cc.strb(tmp2.w(), a64::ptr(tmp1));
 
-					/* Check each arg for NULL */
-					for (int argno = 0; argno < nargs; argno++)
+					/*
+					 * Batched null check: OR all isnull flags together,
+					 * single branch at the end.  Reduces branch mispredicts
+					 * for multi-arg strict functions.
+					 */
+					cc.mov(tmp1, (uint64_t) fcinfo);
+					if (nargs > 1 && nargs <= 4)
 					{
-						int64_t null_off =
-							(int64_t)((char *)&fcinfo->args[argno].isnull - (char *)fcinfo);
-
-						cc.mov(tmp1, (uint64_t) fcinfo);
-						cc.ldrb(tmp2.w(), a64::ptr(tmp1, null_off));
+						int64_t null_off_0 =
+							(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+						cc.ldrb(tmp2.w(), a64::ptr(tmp1, null_off_0));
+						for (int argno = 1; argno < nargs; argno++)
+						{
+							int64_t null_off =
+								(int64_t)((char *)&fcinfo->args[argno].isnull - (char *)fcinfo);
+							a64::Gp t = cc.new_gpx();
+							cc.ldrb(t.w(), a64::ptr(tmp1, null_off));
+							cc.orr(tmp2, tmp2, t);
+						}
 						cc.cbnz(tmp2, done_label);
+					}
+					else
+					{
+						/* 1 arg or >4 args: per-arg check */
+						for (int argno = 0; argno < nargs; argno++)
+						{
+							int64_t null_off =
+								(int64_t)((char *)&fcinfo->args[argno].isnull - (char *)fcinfo);
+							cc.ldrb(tmp2.w(), a64::ptr(tmp1, null_off));
+							cc.cbnz(tmp2, done_label);
+						}
 					}
 				}
 
 				/*
 				 * Try direct native call - bypasses fcinfo entirely.
+				 * Dispatch order: inline → direct call → fcinfo fallback.
 				 */
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
-				if (dfn && dfn->jit_fn)
+				if (dfn && dfn->inline_op != JIT_INLINE_NONE)
+				{
+					/*
+					 * TIER 0 — INLINE: emit the operation as native ARM64
+					 * instructions, no function call at all.
+					 */
+					a64::Gp fci_base = cc.new_gpx();
+					a64::Gp a0 = cc.new_gpx(), a1 = cc.new_gpx();
+					cc.mov(fci_base, (uint64_t) fcinfo);
+					int64_t val_off_0 =
+						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+					int64_t val_off_1 =
+						(int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+					cc.ldr(a0, a64::ptr(fci_base, val_off_0));
+					cc.ldr(a1, a64::ptr(fci_base, val_off_1));
+
+					switch ((JitInlineOp) dfn->inline_op)
+					{
+					/* ---- int32 arithmetic (overflow-checked) ---- */
+					case JIT_INLINE_INT4_ADD:
+					{
+						Label ok = cc.new_label();
+						cc.adds(a0.w(), a0.w(), a1.w());
+						cc.b_vc(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						cc.sxtw(tmp1, a0.w());
+						break;
+					}
+					case JIT_INLINE_INT4_SUB:
+					{
+						Label ok = cc.new_label();
+						cc.subs(a0.w(), a0.w(), a1.w());
+						cc.b_vc(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						cc.sxtw(tmp1, a0.w());
+						break;
+					}
+					case JIT_INLINE_INT4_MUL:
+					{
+						Label ok = cc.new_label();
+						/* smull: 32×32→64, overflow if result != sign-extend(low32) */
+						cc.smull(tmp1, a0.w(), a1.w());
+						a64::Gp ext = cc.new_gpx();
+						cc.sxtw(ext, tmp1.w());
+						cc.cmp(tmp1, ext);
+						cc.b_eq(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						/* tmp1 already holds sign-extended result from smull */
+						break;
+					}
+					case JIT_INLINE_INT4_DIV:
+					{
+						Label not_zero = cc.new_label();
+						Label not_minmax = cc.new_label();
+						/* Check divisor == 0 */
+						cc.cmp(a1.w(), 0);
+						cc.b_ne(not_zero);
+						{
+							a64::Gp err_fn = cc.new_gpx();
+							cc.mov(err_fn, (uint64_t)(void *) jit_error_division_by_zero);
+							InvokeNode *inv;
+							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						}
+						cc.bind(not_zero);
+						/* Check INT32_MIN / -1 overflow */
+						{
+							a64::Gp minval = cc.new_gpx();
+							cc.mov(minval.w(), (int32_t) PG_INT32_MIN);
+							cc.cmp(a0.w(), minval.w());
+						}
+						cc.b_ne(not_minmax);
+						{
+							Label not_neg1 = cc.new_label();
+							cc.cmn(a1.w(), 1);  /* cmn w, 1 == cmp w, -1 */
+							cc.b_ne(not_neg1);
+							a64::Gp err_fn = cc.new_gpx();
+							cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+							InvokeNode *inv;
+							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+							cc.bind(not_neg1);
+						}
+						cc.bind(not_minmax);
+						cc.sdiv(a0.w(), a0.w(), a1.w());
+						cc.sxtw(tmp1, a0.w());
+						break;
+					}
+					case JIT_INLINE_INT4_MOD:
+					{
+						Label not_zero = cc.new_label();
+						Label not_minmax = cc.new_label();
+						Label zero_result = cc.new_label();
+						Label after = cc.new_label();
+						/* Check divisor == 0 */
+						cc.cmp(a1.w(), 0);
+						cc.b_ne(not_zero);
+						{
+							a64::Gp err_fn = cc.new_gpx();
+							cc.mov(err_fn, (uint64_t)(void *) jit_error_division_by_zero);
+							InvokeNode *inv;
+							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						}
+						cc.bind(not_zero);
+						/* Check INT32_MIN % -1 → 0 */
+						{
+							a64::Gp minval = cc.new_gpx();
+							cc.mov(minval.w(), (int32_t) PG_INT32_MIN);
+							cc.cmp(a0.w(), minval.w());
+						}
+						cc.b_ne(not_minmax);
+						cc.cmn(a1.w(), 1);
+						cc.b_eq(zero_result);
+						cc.bind(not_minmax);
+						{
+							a64::Gp q = cc.new_gpx();
+							cc.sdiv(q.w(), a0.w(), a1.w());
+							cc.msub(a0.w(), q.w(), a1.w(), a0.w());
+						}
+						cc.sxtw(tmp1, a0.w());
+						cc.b(after);
+						cc.bind(zero_result);
+						cc.mov(tmp1, 0);
+						cc.bind(after);
+						break;
+					}
+					/* ---- int64 arithmetic (overflow-checked) ---- */
+					case JIT_INLINE_INT8_ADD:
+					{
+						Label ok = cc.new_label();
+						cc.adds(a0, a0, a1);
+						cc.b_vc(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						cc.mov(tmp1, a0);
+						break;
+					}
+					case JIT_INLINE_INT8_SUB:
+					{
+						Label ok = cc.new_label();
+						cc.subs(a0, a0, a1);
+						cc.b_vc(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						cc.mov(tmp1, a0);
+						break;
+					}
+					case JIT_INLINE_INT8_MUL:
+					{
+						Label ok = cc.new_label();
+						/* Use smulh to check overflow */
+						a64::Gp hi = cc.new_gpx();
+						cc.smulh(hi, a0, a1);
+						cc.mul(a0, a0, a1);
+						/* Overflow if hi != (a0 >> 63) (arithmetic shift) */
+						a64::Gp sign = cc.new_gpx();
+						cc.asr(sign, a0, 63);
+						cc.cmp(hi, sign);
+						cc.b_eq(ok);
+						a64::Gp err_fn = cc.new_gpx();
+						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
+						cc.bind(ok);
+						cc.mov(tmp1, a0);
+						break;
+					}
+					/* ---- int32 comparison ---- */
+					case JIT_INLINE_INT4_EQ:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kEQ);
+						break;
+					case JIT_INLINE_INT4_NE:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kNE);
+						break;
+					case JIT_INLINE_INT4_LT:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kLT);
+						break;
+					case JIT_INLINE_INT4_LE:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kLE);
+						break;
+					case JIT_INLINE_INT4_GT:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kGT);
+						break;
+					case JIT_INLINE_INT4_GE:
+						cc.cmp(a0.w(), a1.w());
+						cc.cset(tmp1, a64::CondCode::kGE);
+						break;
+					/* ---- int64 comparison ---- */
+					case JIT_INLINE_INT8_EQ:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kEQ);
+						break;
+					case JIT_INLINE_INT8_NE:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kNE);
+						break;
+					case JIT_INLINE_INT8_LT:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kLT);
+						break;
+					case JIT_INLINE_INT8_LE:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kLE);
+						break;
+					case JIT_INLINE_INT8_GT:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kGT);
+						break;
+					case JIT_INLINE_INT8_GE:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kGE);
+						break;
+					default:
+						Assert(false); /* all inline ops handled above */
+						break;
+					}
+
+					/* Store *op->resvalue = tmp1 */
+					cc.mov(tmp2, (uint64_t) op->resvalue);
+					cc.str(tmp1, a64::ptr(tmp2));
+
+					/* *op->resnull = false */
+					cc.mov(tmp2, (uint64_t) op->resnull);
+					cc.mov(tmp1, 0);
+					cc.strb(tmp1.w(), a64::ptr(tmp2));
+				}
+				else if (dfn && dfn->jit_fn)
 				{
 					/* Load fcinfo once, then load all args from offsets */
 					a64::Gp args[4];
@@ -1278,10 +1612,8 @@ asmjit_compile_expr(ExprState *state)
 				cc.mov(tmp1, (uint64_t) &iresult->value);
 				cc.ldr(hash.w(), a64::ptr(tmp1));
 
-				/* Rotate left 1: (hash << 1) | (hash >> 31) */
-				cc.lsl(tmp2.w(), hash.w(), 1);
-				cc.lsr(tmp3.w(), hash.w(), 31);
-				cc.orr(hash.w(), tmp2.w(), tmp3.w());
+				/* Rotate left 1 = rotate right 31 */
+				cc.ror(hash.w(), hash.w(), 31);
 
 				/* Check if arg is null */
 				a64::Gp fci_reg = cc.new_gpx();
@@ -1350,10 +1682,8 @@ asmjit_compile_expr(ExprState *state)
 				cc.mov(tmp1, (uint64_t) &iresult->value);
 				cc.ldr(hash.w(), a64::ptr(tmp1));
 
-				/* Rotate left 1: (hash << 1) | (hash >> 31) */
-				cc.lsl(tmp2.w(), hash.w(), 1);
-				cc.lsr(tmp3.w(), hash.w(), 31);
-				cc.orr(hash.w(), tmp2.w(), tmp3.w());
+				/* Rotate left 1 = rotate right 31 */
+				cc.ror(hash.w(), hash.w(), 31);
 
 				/* Call hash function (direct or fcinfo), XOR */
 				{
@@ -1412,8 +1742,8 @@ asmjit_compile_expr(ExprState *state)
 
 			/*
 			 * ---- AGG_PLAIN_TRANS (all 6 variants) ----
-			 * Call the specific agg_trans helper directly instead of
-			 * going through fallback_step's switch dispatch.
+			 * Inline common aggregate transition functions to avoid
+			 * function call overhead on the per-group hot path.
 			 */
 			case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
 			case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
@@ -1422,34 +1752,241 @@ asmjit_compile_expr(ExprState *state)
 			case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
 			case EEOP_AGG_PLAIN_TRANS_BYREF:
 			{
-				void *helper_fn;
-				switch (opcode) {
-				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_init_strict_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_strict_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_init_strict_byref; break;
-				case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_strict_byref; break;
-				case EEOP_AGG_PLAIN_TRANS_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_byref; break;
-				default:
-					helper_fn = NULL; break; /* unreachable */
+				bool is_init = (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL ||
+								opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF);
+				bool is_strict = (opcode != EEOP_AGG_PLAIN_TRANS_BYVAL &&
+								  opcode != EEOP_AGG_PLAIN_TRANS_BYREF);
+				bool is_byref = (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
+								 opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF ||
+								 opcode == EEOP_AGG_PLAIN_TRANS_BYREF);
+
+				AggState *aggstate = castNode(AggState, state->parent);
+				AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
+				int setoff = op->d.agg_trans.setoff;
+				int transno = op->d.agg_trans.transno;
+				FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+				PGFunction fn_addr = fcinfo->flinfo->fn_addr;
+				ExprContext *aggcontext = op->d.agg_trans.aggcontext;
+
+				Label end_label = cc.new_label();
+
+				/* Compute pergroup at runtime: all_pergroups[setoff] + transno */
+				a64::Gp pergroup = cc.new_gpx();
+				{
+					a64::Gp aggst = cc.new_gpx();
+					cc.ldr(aggst, a64::ptr(v_state, offsetof(ExprState, parent)));
+					cc.ldr(pergroup, a64::ptr(aggst, offsetof(AggState, all_pergroups)));
+					cc.ldr(pergroup, a64::ptr(pergroup, setoff * (int64_t)sizeof(AggStatePerGroup)));
+					if (transno != 0)
+						cc.add(pergroup, pergroup, transno * (int64_t)sizeof(AggStatePerGroupData));
 				}
 
-				/* Emit: helper_fn(state, op) — 2 pointer args, void return */
-				a64::Gp afn_reg = cc.new_gpx();
-				cc.mov(afn_reg, (uint64_t) helper_fn);
-				a64::Gp aop_reg = cc.new_gpx();
-				cc.mov(aop_reg, (uint64_t) op);
-				InvokeNode *ainvoke;
-				cc.invoke(Out(ainvoke), afn_reg,
-						  FuncSignature::build<void, void *, void *>());
-				ainvoke->set_arg(0, v_state);
-				ainvoke->set_arg(1, aop_reg);
+				/* INIT check */
+				if (is_init)
+				{
+					Label no_init = cc.new_label();
+					cc.ldrb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, noTransValue)));
+					cc.cbz(tmp1, no_init);
+
+					/* Call ExecAggInitGroup(aggstate, pertrans, pergroup, aggcontext) */
+					{
+						a64::Gp aggst = cc.new_gpx();
+						cc.ldr(aggst, a64::ptr(v_state, offsetof(ExprState, parent)));
+						a64::Gp pt = cc.new_gpx();
+						cc.mov(pt, (uint64_t) pertrans);
+						a64::Gp ac = cc.new_gpx();
+						cc.mov(ac, (uint64_t) aggcontext);
+						a64::Gp fn = cc.new_gpx();
+						cc.mov(fn, (uint64_t)(void *) ExecAggInitGroup);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), fn, FuncSignature::build<void, void*, void*, void*, void*>());
+						inv->set_arg(0, aggst);
+						inv->set_arg(1, pt);
+						inv->set_arg(2, pergroup);
+						inv->set_arg(3, ac);
+					}
+					cc.b(end_label);
+					cc.bind(no_init);
+				}
+
+				/* STRICT check: skip if transValueIsNull */
+				if (is_strict)
+				{
+					cc.ldrb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+					cc.cbnz(tmp1, end_label);
+				}
+
+				/*
+				 * Transition function dispatch — inline hot aggs.
+				 */
+				if (!is_byref &&
+					(fn_addr == int8inc || fn_addr == int8inc_any))
+				{
+					/* COUNT: transValue += 1 (int64, overflow-checked) */
+					a64::Gp tv = cc.new_gpx();
+					cc.ldr(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					Label ok = cc.new_label();
+					cc.adds(tv, tv, 1);
+					cc.b_vc(ok);
+					{
+						a64::Gp fn = cc.new_gpx();
+						cc.mov(fn, (uint64_t)(void *) jit_error_int8_overflow);
+						InvokeNode *inv;
+						cc.invoke(Out(inv), fn, FuncSignature::build<void>());
+					}
+					cc.bind(ok);
+					cc.str(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					cc.mov(tmp1, 0);
+					cc.strb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+				}
+				else if (!is_byref && fn_addr == int4_sum)
+				{
+					/*
+					 * SUM(int4): transValue += (int64)arg1.
+					 * Non-strict — handles NULL arg1 and first-call inline.
+					 */
+					Label arg_not_null = cc.new_label();
+					Label trans_not_null = cc.new_label();
+					Label after_sum = cc.new_label();
+
+					/* Check arg1 isnull */
+					int64_t isnull1_off = (int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+					a64::Gp fci = cc.new_gpx();
+					cc.mov(fci, (uint64_t) fcinfo);
+					cc.ldrb(tmp1.w(), a64::ptr(fci, isnull1_off));
+					cc.cbz(tmp1, arg_not_null);
+					cc.b(end_label); /* arg is null, skip */
+
+					cc.bind(arg_not_null);
+					/* Load arg1 value, sign-extend int32 → int64 */
+					a64::Gp arg1 = cc.new_gpx();
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+					cc.ldr(arg1, a64::ptr(fci, val1_off));
+					cc.sxtw(arg1, arg1.w());
+
+					/* Check transValueIsNull */
+					cc.ldrb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+					cc.cbz(tmp1, trans_not_null);
+
+					/* First non-null: transValue = (int64)arg1 */
+					cc.str(arg1, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					cc.mov(tmp1, 0);
+					cc.strb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+					cc.b(after_sum);
+
+					/* Normal: transValue += (int64)arg1 */
+					cc.bind(trans_not_null);
+					{
+						a64::Gp tv = cc.new_gpx();
+						cc.ldr(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+						cc.add(tv, tv, arg1);
+						cc.str(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					}
+					cc.bind(after_sum);
+				}
+				else if (!is_byref &&
+						 (fn_addr == int4smaller || fn_addr == int4larger))
+				{
+					/* MIN/MAX(int4): compare and conditionally update */
+					bool is_min = (fn_addr == int4smaller);
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+
+					a64::Gp tv = cc.new_gpx(), nv = cc.new_gpx();
+					cc.ldr(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					a64::Gp fci = cc.new_gpx();
+					cc.mov(fci, (uint64_t) fcinfo);
+					cc.ldr(nv, a64::ptr(fci, val1_off));
+
+					/* Sign-extend both for correct signed comparison */
+					cc.sxtw(tv, tv.w());
+					cc.sxtw(nv, nv.w());
+
+					Label skip_update = cc.new_label();
+					cc.cmp(tv, nv);
+					if (is_min)
+						cc.b_le(skip_update);
+					else
+						cc.b_ge(skip_update);
+					cc.str(nv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					cc.bind(skip_update);
+					cc.mov(tmp1, 0);
+					cc.strb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+				}
+				else if (is_byref &&
+						 (fn_addr == int4_avg_accum || fn_addr == int2_avg_accum))
+				{
+					/*
+					 * AVG(int4/int2): in-place update of Int8TransTypeData
+					 * inside the array at transValue + ARR_OVERHEAD_NONULLS(1).
+					 */
+					#define INT8_TRANS_DATA_OFFSET_ASM 24
+					StaticAssertDecl(
+						ARR_OVERHEAD_NONULLS(1) == INT8_TRANS_DATA_OFFSET_ASM,
+						"Int8TransTypeData offset must be 24");
+
+					a64::Gp tv_ptr = cc.new_gpx();
+					cc.ldr(tv_ptr, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
+					cc.add(tv_ptr, tv_ptr, INT8_TRANS_DATA_OFFSET_ASM);
+
+					/* count++ */
+					a64::Gp cnt = cc.new_gpx();
+					cc.ldr(cnt, a64::ptr(tv_ptr, offsetof(JitInt8TransTypeData, count)));
+					cc.add(cnt, cnt, 1);
+					cc.str(cnt, a64::ptr(tv_ptr, offsetof(JitInt8TransTypeData, count)));
+
+					/* Load arg1, sign-extend */
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+					a64::Gp arg1 = cc.new_gpx();
+					a64::Gp fci = cc.new_gpx();
+					cc.mov(fci, (uint64_t) fcinfo);
+					cc.ldr(arg1, a64::ptr(fci, val1_off));
+					if (fn_addr == int4_avg_accum)
+						cc.sxtw(arg1, arg1.w());
+					else
+						cc.sxth(arg1, arg1.w());
+
+					/* sum += arg1 */
+					a64::Gp sum = cc.new_gpx();
+					cc.ldr(sum, a64::ptr(tv_ptr, offsetof(JitInt8TransTypeData, sum)));
+					cc.add(sum, sum, arg1);
+					cc.str(sum, a64::ptr(tv_ptr, offsetof(JitInt8TransTypeData, sum)));
+
+					cc.mov(tmp1, 0);
+					cc.strb(tmp1.w(), a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValueIsNull)));
+					#undef INT8_TRANS_DATA_OFFSET_ASM
+				}
+				else
+				{
+					/* Generic fallback: call helper function */
+					void *helper_fn;
+					switch (opcode) {
+					case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+						helper_fn = (void *) pg_jitter_agg_trans_init_strict_byval; break;
+					case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+						helper_fn = (void *) pg_jitter_agg_trans_strict_byval; break;
+					case EEOP_AGG_PLAIN_TRANS_BYVAL:
+						helper_fn = (void *) pg_jitter_agg_trans_byval; break;
+					case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+						helper_fn = (void *) pg_jitter_agg_trans_init_strict_byref; break;
+					case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+						helper_fn = (void *) pg_jitter_agg_trans_strict_byref; break;
+					case EEOP_AGG_PLAIN_TRANS_BYREF:
+						helper_fn = (void *) pg_jitter_agg_trans_byref; break;
+					default:
+						helper_fn = NULL; break;
+					}
+					a64::Gp afn_reg = cc.new_gpx();
+					cc.mov(afn_reg, (uint64_t) helper_fn);
+					a64::Gp aop_reg = cc.new_gpx();
+					cc.mov(aop_reg, (uint64_t) op);
+					InvokeNode *ainvoke;
+					cc.invoke(Out(ainvoke), afn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					ainvoke->set_arg(0, v_state);
+					ainvoke->set_arg(1, aop_reg);
+				}
+
+				cc.bind(end_label);
 				break;
 			}
 

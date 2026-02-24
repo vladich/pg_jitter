@@ -10,11 +10,23 @@
 #include "jit/jit.h"
 #include "executor/execExpr.h"
 #include "executor/tuptable.h"
+#include "executor/nodeAgg.h"
 #include "nodes/execnodes.h"
 #include "utils/expandeddatum.h"
+#include "utils/array.h"
 
+#include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
 #include "pg_jit_funcs.h"
+
+/*
+ * Mirror of Int8TransTypeData from numeric.c.
+ */
+typedef struct
+{
+	int64		count;
+	int64		sum;
+} MirInt8TransTypeData;
 #include "mir.h"
 #include "mir-gen.h"
 
@@ -83,12 +95,21 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 }
 
 /*
- * Error reset — tear down the persistent context so it's re-created clean.
+ * Error reset — intentionally a no-op.
+ *
+ * We must NOT destroy the persistent MIR context here because other
+ * transactions/portals (e.g. cursors surviving a ROLLBACK TO SAVEPOINT)
+ * may still hold evalfunc pointers into MIR-generated code.  Destroying
+ * the context would free those code buffers → SIGSEGV on next FETCH.
+ *
+ * Per-expression cleanup happens via mir_code_free() called from
+ * pg_jitter_release_context() through the ResourceOwner machinery.
+ * The persistent context's arena is reclaimed when the backend exits.
  */
 static void
 mir_reset_after_error(void)
 {
-	mir_destroy_ctx();
+	/* nothing to do */
 }
 
 /*
@@ -344,6 +365,13 @@ mir_compile_expr(ExprState *state)
 	MIR_item_t proto_agg_helper;
 	proto_agg_helper = MIR_new_proto(ctx, "p_aggh", 0, NULL,
 									  2, MIR_T_P, "s", MIR_T_P, "o");
+
+	/* Proto + imports for inline error handlers: void -> void (noreturn) */
+	MIR_item_t proto_err_void;
+	proto_err_void = MIR_new_proto(ctx, "p_err", 0, NULL, 0);
+	MIR_item_t import_err_int4_overflow = MIR_new_import(ctx, "err_i4ov");
+	MIR_item_t import_err_int8_overflow = MIR_new_import(ctx, "err_i8ov");
+	MIR_item_t import_err_div_by_zero = MIR_new_import(ctx, "err_divz");
 
 	/*
 	 * Per-step imports for V1 function addresses.
@@ -842,37 +870,429 @@ mir_compile_expr(ExprState *state)
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx, 1)));
 
-					/* Check each arg for NULL */
-					for (int argno = 0; argno < nargs; argno++)
+					/*
+					 * Batched null check: OR all isnull flags, single branch.
+					 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_fci),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					if (nargs > 1 && nargs <= 4)
 					{
-						int64_t null_off =
-							(int64_t)((char *)&fcinfo->args[argno].isnull -
-									  (char *)fcinfo);
-
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_MOV,
-								MIR_new_reg_op(ctx, r_fci),
-								MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+						int64_t null_off_0 =
+							(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_reg_op(ctx, r_tmp1),
-								MIR_new_mem_op(ctx, MIR_T_U8, null_off,
+								MIR_new_mem_op(ctx, MIR_T_U8, null_off_0,
 									r_fci, 0, 1)));
+						for (int argno = 1; argno < nargs; argno++)
+						{
+							int64_t null_off =
+								(int64_t)((char *)&fcinfo->args[argno].isnull -
+										  (char *)fcinfo);
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_MOV,
+									MIR_new_reg_op(ctx, r_tmp2),
+									MIR_new_mem_op(ctx, MIR_T_U8, null_off,
+										r_fci, 0, 1)));
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_OR,
+									MIR_new_reg_op(ctx, r_tmp1),
+									MIR_new_reg_op(ctx, r_tmp1),
+									MIR_new_reg_op(ctx, r_tmp2)));
+						}
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_BNE,
 								MIR_new_label_op(ctx, done_label),
 								MIR_new_reg_op(ctx, r_tmp1),
 								MIR_new_int_op(ctx, 0)));
 					}
+					else
+					{
+						for (int argno = 0; argno < nargs; argno++)
+						{
+							int64_t null_off =
+								(int64_t)((char *)&fcinfo->args[argno].isnull -
+										  (char *)fcinfo);
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_MOV,
+									MIR_new_reg_op(ctx, r_tmp1),
+									MIR_new_mem_op(ctx, MIR_T_U8, null_off,
+										r_fci, 0, 1)));
+							MIR_append_insn(ctx, func_item,
+								MIR_new_insn(ctx, MIR_BNE,
+									MIR_new_label_op(ctx, done_label),
+									MIR_new_reg_op(ctx, r_tmp1),
+									MIR_new_int_op(ctx, 0)));
+						}
+					}
 				}
 
 				/*
 				 * Try direct native call — bypasses fcinfo entirely.
+				 * Dispatch order: inline → direct call → fcinfo fallback.
 				 */
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
-				if (dfn && dfn->jit_fn && step_direct_imports[opno])
+				if (dfn && dfn->inline_op != JIT_INLINE_NONE)
+				{
+					/*
+					 * TIER 0 — INLINE: emit the operation as MIR
+					 * instructions, no function call at all.
+					 */
+					MIR_reg_t a0 = mir_new_reg(ctx, f, MIR_T_I64, "ia0");
+					MIR_reg_t a1 = mir_new_reg(ctx, f, MIR_T_I64, "ia1");
+					int64_t val_off_0 =
+						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+					int64_t val_off_1 =
+						(int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_fci),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, a0),
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off_0,
+								r_fci, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, a1),
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off_1,
+								r_fci, 0, 1)));
+
+					switch ((JitInlineOp) dfn->inline_op)
+					{
+					/* ---- int32 arithmetic (overflow-checked) ---- */
+					case JIT_INLINE_INT4_ADD:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_ADDOS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int4_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						/* Sign-extend 32→64 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, r_ret)));
+						break;
+					}
+					case JIT_INLINE_INT4_SUB:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_SUBOS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int4_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, r_ret)));
+						break;
+					}
+					case JIT_INLINE_INT4_MUL:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MULOS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int4_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, r_ret)));
+						break;
+					}
+					case JIT_INLINE_INT4_DIV:
+					{
+						MIR_insn_t not_zero = MIR_new_label(ctx);
+						MIR_insn_t not_minmax = MIR_new_label(ctx);
+						MIR_insn_t not_neg1 = MIR_new_label(ctx);
+						/* Check divisor == 0 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNES,
+								MIR_new_label_op(ctx, not_zero),
+								MIR_new_reg_op(ctx, a1),
+								MIR_new_int_op(ctx, 0)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_div_by_zero)));
+						MIR_append_insn(ctx, func_item, not_zero);
+						/* Check INT32_MIN / -1 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNES,
+								MIR_new_label_op(ctx, not_minmax),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_int_op(ctx, (int32_t) PG_INT32_MIN)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNES,
+								MIR_new_label_op(ctx, not_neg1),
+								MIR_new_reg_op(ctx, a1),
+								MIR_new_int_op(ctx, -1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int4_overflow)));
+						MIR_append_insn(ctx, func_item, not_neg1);
+						MIR_append_insn(ctx, func_item, not_minmax);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_DIVS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, r_ret)));
+						break;
+					}
+					case JIT_INLINE_INT4_MOD:
+					{
+						MIR_insn_t not_zero = MIR_new_label(ctx);
+						MIR_insn_t not_minmax = MIR_new_label(ctx);
+						MIR_insn_t zero_result = MIR_new_label(ctx);
+						MIR_insn_t after = MIR_new_label(ctx);
+						/* Check divisor == 0 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNES,
+								MIR_new_label_op(ctx, not_zero),
+								MIR_new_reg_op(ctx, a1),
+								MIR_new_int_op(ctx, 0)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_div_by_zero)));
+						MIR_append_insn(ctx, func_item, not_zero);
+						/* Check INT32_MIN % -1 → 0 */
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNES,
+								MIR_new_label_op(ctx, not_minmax),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_int_op(ctx, (int32_t) PG_INT32_MIN)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BEQS,
+								MIR_new_label_op(ctx, zero_result),
+								MIR_new_reg_op(ctx, a1),
+								MIR_new_int_op(ctx, -1)));
+						MIR_append_insn(ctx, func_item, not_minmax);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MODS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, r_ret)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_JMP,
+								MIR_new_label_op(ctx, after)));
+						MIR_append_insn(ctx, func_item, zero_result);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_int_op(ctx, 0)));
+						MIR_append_insn(ctx, func_item, after);
+						break;
+					}
+					/* ---- int64 arithmetic (overflow-checked) ---- */
+					case JIT_INLINE_INT8_ADD:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_ADDO,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int8_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						break;
+					}
+					case JIT_INLINE_INT8_SUB:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_SUBO,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int8_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						break;
+					}
+					case JIT_INLINE_INT8_MUL:
+					{
+						MIR_insn_t ok = MIR_new_label(ctx);
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MULO,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNO,
+								MIR_new_label_op(ctx, ok)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_call_insn(ctx, 2,
+								MIR_new_ref_op(ctx, proto_err_void),
+								MIR_new_ref_op(ctx, import_err_int8_overflow)));
+						MIR_append_insn(ctx, func_item, ok);
+						break;
+					}
+					/* ---- int32 comparison ---- */
+					case JIT_INLINE_INT4_EQ:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EQS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT4_NE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_NES,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT4_LT:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_LTS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT4_LE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_LES,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT4_GT:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_GTS,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT4_GE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_GES,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					/* ---- int64 comparison ---- */
+					case JIT_INLINE_INT8_EQ:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EQ,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT8_NE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_NE,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT8_LT:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_LT,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT8_LE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_LE,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT8_GT:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_GT,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					case JIT_INLINE_INT8_GE:
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_GE,
+								MIR_new_reg_op(ctx, r_ret),
+								MIR_new_reg_op(ctx, a0),
+								MIR_new_reg_op(ctx, a1)));
+						break;
+					default:
+						Assert(false);
+						break;
+					}
+
+					/* *op->resvalue = r_ret */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+							MIR_new_reg_op(ctx, r_ret)));
+
+					/* *op->resnull = false */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+				}
+				else if (dfn && dfn->jit_fn && step_direct_imports[opno])
 				{
 					/* Load fcinfo once, then load all args from offsets */
 					MIR_reg_t r_args[4];
@@ -941,11 +1361,19 @@ mir_compile_expr(ExprState *state)
 				{
 				/* Fallback: generic fcinfo path */
 
-				/* Call fn_addr(fcinfo) → result */
+				/* fcinfo->isnull = false (caller must clear before V1 call) */
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_fci),
 						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Call fn_addr(fcinfo) → result */
 				MIR_append_insn(ctx, func_item,
 					MIR_new_call_insn(ctx, 4,
 						MIR_new_ref_op(ctx, proto_v1func),
@@ -1998,27 +2426,379 @@ mir_compile_expr(ExprState *state)
 			case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
 			case EEOP_AGG_PLAIN_TRANS_BYREF:
 			{
-				void *helper_fn;
-				switch (opcode) {
-				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_init_strict_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_strict_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_BYVAL:
-					helper_fn = (void *) pg_jitter_agg_trans_byval; break;
-				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_init_strict_byref; break;
-				case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_strict_byref; break;
-				case EEOP_AGG_PLAIN_TRANS_BYREF:
-					helper_fn = (void *) pg_jitter_agg_trans_byref; break;
-				default:
-					helper_fn = NULL; break;
+				bool	is_init = (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL ||
+							   opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF);
+				bool	is_strict = (opcode != EEOP_AGG_PLAIN_TRANS_BYVAL &&
+							 opcode != EEOP_AGG_PLAIN_TRANS_BYREF);
+				bool	is_byref = (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
+							opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF ||
+							opcode == EEOP_AGG_PLAIN_TRANS_BYREF);
+
+				AggState   *aggstate = castNode(AggState, state->parent);
+				AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
+				int			setoff = op->d.agg_trans.setoff;
+				int			transno = op->d.agg_trans.transno;
+				FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+				PGFunction	fn_addr = fcinfo->flinfo->fn_addr;
+				ExprContext *aggcontext = op->d.agg_trans.aggcontext;
+
+				MIR_insn_t	end_label = MIR_new_label(ctx);
+				MIR_reg_t	r_pergroup = mir_new_reg(ctx, f, MIR_T_I64, "pg");
+				MIR_reg_t	r_aggst = mir_new_reg(ctx, f, MIR_T_I64, "agst");
+
+				/* Compute pergroup at runtime: aggstate->all_pergroups[setoff] + transno */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_aggst),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprState, parent),
+							r_state, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_pergroup),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(AggState, all_pergroups),
+							r_aggst, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_pergroup),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							setoff * (int64_t)sizeof(AggStatePerGroup),
+							r_pergroup, 0, 1)));
+				if (transno != 0)
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_ADD,
+							MIR_new_reg_op(ctx, r_pergroup),
+							MIR_new_reg_op(ctx, r_pergroup),
+							MIR_new_int_op(ctx,
+								transno * (int64_t)sizeof(AggStatePerGroupData))));
+
+				/* INIT check */
+				if (is_init)
+				{
+					MIR_insn_t no_init = MIR_new_label(ctx);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, noTransValue),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, no_init),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+					/* noTransValue=true: call helper(state, op) which handles
+					 * ExecAggInitGroup internally. */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_call_insn(ctx, 4,
+							MIR_new_ref_op(ctx, proto_agg_helper),
+							MIR_new_ref_op(ctx, step_direct_imports[opno]),
+							MIR_new_reg_op(ctx, r_state),
+							MIR_new_reg_op(ctx, r_tmp1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, end_label)));
+					MIR_append_insn(ctx, func_item, no_init);
 				}
 
-				/* Emit: helper_fn(state, op) — 2 pointer args, void return.
-				 * Import was pre-created in step_direct_imports[opno]. */
+				/* STRICT check: skip if transValueIsNull */
+				if (is_strict)
 				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BNE,
+							MIR_new_label_op(ctx, end_label),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+				}
+
+				/*
+				 * Transition function dispatch — inline hot aggs.
+				 */
+				if (!is_byref &&
+					(fn_addr == int8inc || fn_addr == int8inc_any))
+				{
+					/* COUNT: transValue += 1 (int64, overflow-checked) */
+					MIR_insn_t ok = MIR_new_label(ctx);
+					MIR_reg_t r_tv = mir_new_reg(ctx, f, MIR_T_I64, "tv");
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_ADDO,
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_int_op(ctx, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BNO,
+							MIR_new_label_op(ctx, ok)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_call_insn(ctx, 2,
+							MIR_new_ref_op(ctx, proto_err_void),
+							MIR_new_ref_op(ctx, import_err_int8_overflow)));
+					MIR_append_insn(ctx, func_item, ok);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1),
+							MIR_new_reg_op(ctx, r_tv)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+				}
+				else if (!is_byref && fn_addr == int4_sum)
+				{
+					/* SUM(int4): transValue += (int64)arg1 */
+					MIR_insn_t arg_not_null = MIR_new_label(ctx);
+					MIR_insn_t trans_not_null = MIR_new_label(ctx);
+					MIR_insn_t after_sum = MIR_new_label(ctx);
+					MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "sfci");
+					MIR_reg_t r_arg1 = mir_new_reg(ctx, f, MIR_T_I64, "arg1");
+					int64_t isnull1_off = (int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_fci),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					/* Check arg1 isnull */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_mem_op(ctx, MIR_T_U8, isnull1_off, r_fci, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, arg_not_null),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, end_label)));
+
+					MIR_append_insn(ctx, func_item, arg_not_null);
+					/* Load arg1, sign-extend int32→int64 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_arg1),
+							MIR_new_mem_op(ctx, MIR_T_I64, val1_off, r_fci, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_EXT32,
+							MIR_new_reg_op(ctx, r_arg1),
+							MIR_new_reg_op(ctx, r_arg1)));
+
+					/* Check transValueIsNull */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, trans_not_null),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+
+					/* First non-null: transValue = (int64)arg1 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1),
+							MIR_new_reg_op(ctx, r_arg1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, after_sum)));
+
+					/* Normal: transValue += (int64)arg1 */
+					MIR_append_insn(ctx, func_item, trans_not_null);
+					{
+						MIR_reg_t r_tv = mir_new_reg(ctx, f, MIR_T_I64, "tv");
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tv),
+								MIR_new_mem_op(ctx, MIR_T_I64,
+									offsetof(AggStatePerGroupData, transValue),
+									r_pergroup, 0, 1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_ADD,
+								MIR_new_reg_op(ctx, r_tv),
+								MIR_new_reg_op(ctx, r_tv),
+								MIR_new_reg_op(ctx, r_arg1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_mem_op(ctx, MIR_T_I64,
+									offsetof(AggStatePerGroupData, transValue),
+									r_pergroup, 0, 1),
+								MIR_new_reg_op(ctx, r_tv)));
+					}
+					MIR_append_insn(ctx, func_item, after_sum);
+				}
+				else if (!is_byref &&
+						 (fn_addr == int4smaller || fn_addr == int4larger))
+				{
+					/* MIN/MAX(int4) */
+					bool is_min = (fn_addr == int4smaller);
+					MIR_insn_t skip_update = MIR_new_label(ctx);
+					MIR_reg_t r_tv = mir_new_reg(ctx, f, MIR_T_I64, "tv");
+					MIR_reg_t r_nv = mir_new_reg(ctx, f, MIR_T_I64, "nv");
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_nv),
+							MIR_new_mem_op(ctx, MIR_T_I64, val1_off, r_tmp1, 0, 1)));
+					/* Sign-extend both */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_EXT32,
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_reg_op(ctx, r_tv)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_EXT32,
+							MIR_new_reg_op(ctx, r_nv),
+							MIR_new_reg_op(ctx, r_nv)));
+					/* MIN: skip if tv <= nv; MAX: skip if tv >= nv */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, is_min ? MIR_BLE : MIR_BGE,
+							MIR_new_label_op(ctx, skip_update),
+							MIR_new_reg_op(ctx, r_tv),
+							MIR_new_reg_op(ctx, r_nv)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1),
+							MIR_new_reg_op(ctx, r_nv)));
+					MIR_append_insn(ctx, func_item, skip_update);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+				}
+				else if (is_byref &&
+						 (fn_addr == int4_avg_accum || fn_addr == int2_avg_accum))
+				{
+					/* AVG(int4/int2): in-place update of {count, sum} */
+					#define MIR_INT8_TRANS_OFFSET 24
+					MIR_reg_t r_td = mir_new_reg(ctx, f, MIR_T_I64, "td");
+					MIR_reg_t r_cnt = mir_new_reg(ctx, f, MIR_T_I64, "cnt");
+					MIR_reg_t r_sum = mir_new_reg(ctx, f, MIR_T_I64, "sum");
+					MIR_reg_t r_a1 = mir_new_reg(ctx, f, MIR_T_I64, "a1v");
+					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+
+					/* r_td = transValue + 24 = pointer to Int8TransTypeData */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_td),
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								offsetof(AggStatePerGroupData, transValue),
+								r_pergroup, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_ADD,
+							MIR_new_reg_op(ctx, r_td),
+							MIR_new_reg_op(ctx, r_td),
+							MIR_new_int_op(ctx, MIR_INT8_TRANS_OFFSET)));
+
+					/* count++ */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_cnt),
+							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_td, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_ADD,
+							MIR_new_reg_op(ctx, r_cnt),
+							MIR_new_reg_op(ctx, r_cnt),
+							MIR_new_int_op(ctx, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_td, 0, 1),
+							MIR_new_reg_op(ctx, r_cnt)));
+
+					/* Load arg1, sign-extend */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_a1),
+							MIR_new_mem_op(ctx, MIR_T_I64, val1_off, r_tmp1, 0, 1)));
+					if (fn_addr == int4_avg_accum)
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT32,
+								MIR_new_reg_op(ctx, r_a1),
+								MIR_new_reg_op(ctx, r_a1)));
+					else
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_EXT16,
+								MIR_new_reg_op(ctx, r_a1),
+								MIR_new_reg_op(ctx, r_a1)));
+
+					/* sum += arg1 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_sum),
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								(int64_t) offsetof(MirInt8TransTypeData, sum),
+								r_td, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_ADD,
+							MIR_new_reg_op(ctx, r_sum),
+							MIR_new_reg_op(ctx, r_sum),
+							MIR_new_reg_op(ctx, r_a1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64,
+								(int64_t) offsetof(MirInt8TransTypeData, sum),
+								r_td, 0, 1),
+							MIR_new_reg_op(ctx, r_sum)));
+
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								offsetof(AggStatePerGroupData, transValueIsNull),
+								r_pergroup, 0, 1),
+							MIR_new_int_op(ctx, 0)));
+					#undef MIR_INT8_TRANS_OFFSET
+				}
+				else
+				{
+					/* Generic fallback: call helper function */
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_tmp1),
@@ -2030,6 +2810,8 @@ mir_compile_expr(ExprState *state)
 							MIR_new_reg_op(ctx, r_state),
 							MIR_new_reg_op(ctx, r_tmp1)));
 				}
+
+				MIR_append_insn(ctx, func_item, end_label);
 				break;
 			}
 
@@ -2181,6 +2963,10 @@ mir_compile_expr(ExprState *state)
 		MIR_load_external(ctx, "fallback_step", (void *) pg_jitter_fallback_step);
 		MIR_load_external(ctx, "getsomeattrs", (void *) slot_getsomeattrs_int);
 		MIR_load_external(ctx, "make_ro", (void *) MakeExpandedObjectReadOnlyInternal);
+		/* Inline error handlers */
+		MIR_load_external(ctx, "err_i4ov", (void *) jit_error_int4_overflow);
+		MIR_load_external(ctx, "err_i8ov", (void *) jit_error_int8_overflow);
+		MIR_load_external(ctx, "err_divz", (void *) jit_error_division_by_zero);
 
 	for (int i = 0; i < steps_len; i++)
 	{

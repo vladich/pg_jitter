@@ -23,6 +23,8 @@
 
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "access/parallel.h"
+#include "utils/guc.h"
 #include "common/hashfn.h"
 #include "utils/array.h"
 
@@ -47,6 +49,9 @@ PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_sljit",
 );
 
+/* GUC: allow disabling JIT in parallel workers to measure I-cache impact */
+static bool pg_jitter_parallel_jit = true;
+
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
 static void sljit_code_free(void *data);
@@ -60,6 +65,16 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = pg_jitter_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = sljit_compile_expr;
+
+	DefineCustomBoolVariable(
+		"pg_jitter.parallel_jit",
+		"Enable JIT expression compilation in parallel workers",
+		NULL,
+		&pg_jitter_parallel_jit,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
 }
 
 /*
@@ -1564,6 +1579,10 @@ sljit_compile_expr(ExprState *state)
 
 	/* Let PG's hand-optimized fast-path evalfuncs handle tiny expressions */
 	if (expr_has_fast_path(state))
+		return false;
+
+	/* Skip expression JIT in parallel workers if configured */
+	if (!pg_jitter_parallel_jit && IsParallelWorker())
 		return false;
 
 	/* JIT is active */

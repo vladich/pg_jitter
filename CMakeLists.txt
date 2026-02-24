@@ -239,7 +239,8 @@ set_target_properties(pg_jitter_sljit PROPERTIES
 target_link_options(pg_jitter_sljit PRIVATE -bundle -undefined dynamic_lookup)
 
 # ---------- pg_jitter_asmjit ----------
-add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp)
+add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
+            src/pg_jit_deform_templates.c)
 target_include_directories(pg_jitter_asmjit PRIVATE ${PG_INCLUDEDIR_SERVER} src)
 target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
 set_target_properties(pg_jitter_asmjit PROPERTIES
