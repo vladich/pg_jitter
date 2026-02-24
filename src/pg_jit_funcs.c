@@ -15,11 +15,14 @@
 
 #include "postgres.h"
 #include "common/int.h"
+#include "common/int128.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "utils/fmgrprotos.h"
-#include "utils/timestamp.h"   /* timestamp_cmp_internal */
+#include "utils/timestamp.h"   /* timestamp_cmp_internal, Interval */
 #include "utils/date.h"        /* DateADT, date constants */
+#include "datatype/timestamp.h" /* USECS_PER_DAY, INTERVAL_NOT_FINITE */
+#include "utils/float.h"       /* get_float8_nan */
 
 #include "pg_jit_funcs.h"
 
@@ -852,6 +855,93 @@ jit_int4_sum(int64 oldsum, int64 newval)
 /* int8_sum: accumulates int64 values into numeric — too complex, skip */
 
 /* ================================================================
+ * TIER 1: Interval comparison (8 functions)
+ * Interval = { TimeOffset time, int32 day, int32 month }
+ * Comparison uses INT128 arithmetic: span = time + days*USECS_PER_DAY
+ * where days = month*30 + day.
+ * ================================================================ */
+
+static inline int
+jit_interval_cmp_internal(int64 a_ptr, int64 b_ptr)
+{
+	const Interval *a = (const Interval *) a_ptr;
+	const Interval *b = (const Interval *) b_ptr;
+	INT128	span1, span2;
+	int64	days1, days2;
+
+	days1 = (int64) a->month * INT64CONST(30) + a->day;
+	span1 = int64_to_int128(a->time);
+	int128_add_int64_mul_int64(&span1, days1, USECS_PER_DAY);
+
+	days2 = (int64) b->month * INT64CONST(30) + b->day;
+	span2 = int64_to_int128(b->time);
+	int128_add_int64_mul_int64(&span2, days2, USECS_PER_DAY);
+
+	return int128_compare(span1, span2);
+}
+
+int32 jit_interval_eq(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) == 0) ? 1 : 0; }
+int32 jit_interval_ne(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) != 0) ? 1 : 0; }
+int32 jit_interval_lt(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) < 0) ? 1 : 0; }
+int32 jit_interval_le(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) <= 0) ? 1 : 0; }
+int32 jit_interval_gt(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) > 0) ? 1 : 0; }
+int32 jit_interval_ge(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) >= 0) ? 1 : 0; }
+int32 jit_interval_cmp(int64 a, int64 b) { return jit_interval_cmp_internal(a, b); }
+
+/* interval min/max: return the pointer to the smaller/larger interval */
+int64 jit_interval_smaller(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) <= 0) ? a : b; }
+int64 jit_interval_larger(int64 a, int64 b) { return (jit_interval_cmp_internal(a, b) >= 0) ? a : b; }
+
+/* interval_hash: compute INT128 span, take low 64 bits, hash as int8 */
+int32
+jit_interval_hash(int64 a_ptr)
+{
+	const Interval *a = (const Interval *) a_ptr;
+	INT128	span;
+	int64	days, span64;
+
+	days = (int64) a->month * INT64CONST(30) + a->day;
+	span = int64_to_int128(a->time);
+	int128_add_int64_mul_int64(&span, days, USECS_PER_DAY);
+	span64 = int128_to_int64(span);
+
+	return (int32) jit_hashint8(span64);
+}
+
+/* ================================================================
+ * TIER 1: hashfloat4 / hashfloat8 (2 functions)
+ * Must handle -0.0 → 0 hash and NaN normalization.
+ * ================================================================ */
+
+int32
+jit_hashfloat4(int64 datum)
+{
+	union { int32 i; float f; } u;
+	float8 key8;
+
+	u.i = (int32) datum;  /* float4 stored as int32 in Datum */
+	if (u.f == (float4) 0)
+		return 0;
+	key8 = (float8) u.f;
+	if (isnan(key8))
+		key8 = get_float8_nan();
+	return (int32) hash_any((unsigned char *) &key8, sizeof(key8));
+}
+
+int32
+jit_hashfloat8(int64 datum)
+{
+	union { int64 i; float8 f; } u;
+
+	u.i = datum;
+	if (u.f == (float8) 0)
+		return 0;
+	if (isnan(u.f))
+		u.f = get_float8_nan();
+	return (int32) hash_any((unsigned char *) &u.f, sizeof(u.f));
+}
+
+/* ================================================================
  * LOOKUP TABLE
  *
  * Maps PG function address → direct-call entry.
@@ -1146,28 +1236,16 @@ const JitDirectFn jit_direct_fns[] = {
 	 * ================================================================ */
 
 	/* ---- interval comparison ---- */
-#ifdef PG_JITTER_HAVE_TIER2
-	E2(interval_eq,  jit_interval_eq_precompiled,  T32, T64, T64),
-#else
-	E2(interval_eq, DEFERRED, T32, T64, T64),
-#endif
-	E2(interval_ne, DEFERRED, T32, T64, T64),
-#ifdef PG_JITTER_HAVE_TIER2
-	E2(interval_lt,  jit_interval_lt_precompiled,  T32, T64, T64),
-#else
-	E2(interval_lt, DEFERRED, T32, T64, T64),
-#endif
-	E2(interval_le, DEFERRED, T32, T64, T64),
-	E2(interval_gt, DEFERRED, T32, T64, T64),
-	E2(interval_ge, DEFERRED, T32, T64, T64),
-#ifdef PG_JITTER_HAVE_TIER2
-	E2(interval_cmp, jit_interval_cmp_precompiled, T32, T64, T64),
-#else
-	E2(interval_cmp, DEFERRED, T32, T64, T64),
-#endif
-	E2(interval_smaller, DEFERRED, T64, T64, T64),
-	E2(interval_larger,  DEFERRED, T64, T64, T64),
-	E1(interval_hash, DEFERRED, T32, T64),
+	E2(interval_eq,  jit_interval_eq,  T32, T64, T64),
+	E2(interval_ne,  jit_interval_ne,  T32, T64, T64),
+	E2(interval_lt,  jit_interval_lt,  T32, T64, T64),
+	E2(interval_le,  jit_interval_le,  T32, T64, T64),
+	E2(interval_gt,  jit_interval_gt,  T32, T64, T64),
+	E2(interval_ge,  jit_interval_ge,  T32, T64, T64),
+	E2(interval_cmp, jit_interval_cmp, T32, T64, T64),
+	E2(interval_smaller, jit_interval_smaller, T64, T64, T64),
+	E2(interval_larger,  jit_interval_larger,  T64, T64, T64),
+	E1(interval_hash, jit_interval_hash, T32, T64),
 	E2(interval_pl, DEFERRED, T64, T64, T64),
 	E2(interval_mi, DEFERRED, T64, T64, T64),
 	E1(interval_um, DEFERRED, T64, T64),
@@ -1341,8 +1419,8 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(hashinet, DEFERRED, T32, T64),
 
 	/* ---- float hash ---- */
-	E1(hashfloat4, DEFERRED, T32, T64),
-	E1(hashfloat8, DEFERRED, T32, T64),
+	E1(hashfloat4, jit_hashfloat4, T32, T64),
+	E1(hashfloat8, jit_hashfloat8, T32, T64),
 
 	/* ---- numeric aggregates ---- */
 	E2(numeric_accum,     DEFERRED, T64, T64, T64),

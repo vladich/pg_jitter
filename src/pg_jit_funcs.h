@@ -103,6 +103,23 @@ extern int64 jit_hashint8(int64 val);
 extern int32 jit_hashoid(int32 a);
 extern int32 jit_hashbool(int64 a);
 extern int32 jit_hashdate(int32 a);
+extern int32 jit_hashfloat4(int64 datum);
+extern int32 jit_hashfloat8(int64 datum);
+
+/*
+ * Interval comparison — native implementations using INT128.
+ * Args are Interval* passed as int64 (pointer).
+ */
+extern int32 jit_interval_eq(int64 a, int64 b);
+extern int32 jit_interval_ne(int64 a, int64 b);
+extern int32 jit_interval_lt(int64 a, int64 b);
+extern int32 jit_interval_le(int64 a, int64 b);
+extern int32 jit_interval_gt(int64 a, int64 b);
+extern int32 jit_interval_ge(int64 a, int64 b);
+extern int32 jit_interval_cmp(int64 a, int64 b);
+extern int64 jit_interval_smaller(int64 a, int64 b);
+extern int64 jit_interval_larger(int64 a, int64 b);
+extern int32 jit_interval_hash(int64 a);
 
 /*
  * Pre-compiled inline blob support.

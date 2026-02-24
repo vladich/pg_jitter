@@ -137,6 +137,17 @@ sljit_code_free(void *data)
 #define SOFF_TOTAL        144
 
 /*
+ * Inline deform temporaries — reuse AGG stack slots (no temporal overlap:
+ * AGG slots are used only during AGG_PLAIN_TRANS steps, deform temporaries
+ * are used only within the FETCHSOME handler).
+ */
+#define SOFF_DEFORM_OFF       SOFF_AGG_OLDCTX     /* 24: byte offset in tuple */
+#define SOFF_DEFORM_HASNULLS  SOFF_AGG_PERGROUP   /* 32: hasnulls flag */
+#define SOFF_DEFORM_MAXATT    SOFF_AGG_FCINFO     /* 40: maxatt from infomask2 */
+#define SOFF_DEFORM_TBITS     SOFF_AGG_CURRMCTXP  /* 48: t_bits pointer */
+#define SOFF_DEFORM_TUPDATA   SOFF_TEMP           /* 56: tupdata_base pointer */
+
+/*
  * Saved register assignments:
  *   S0 = ExprState *state  (function argument)
  *   S1 = ExprContext *econtext  (function argument)
@@ -919,6 +930,531 @@ find_or_compile_deform(PgJitterContext *ctx,
 }
 
 /*
+ * Emit deform code inline into the expression function body.
+ *
+ * Unlike sljit_compile_deform() which creates a separate function with its
+ * own prologue/epilogue, this emits deform code directly into the expression
+ * function's instruction stream. The benefit is zero call overhead and
+ * contiguous I-cache locality — matching asmjit's inline deform approach.
+ *
+ * Register usage (within deform code only):
+ *   R0-R3 = scratch (caller-saved, clobbered by icalls)
+ *   S0 = state, S1 = econtext (expression function's saved regs, read-only)
+ *   Stack slots SOFF_DEFORM_* for temporaries (reuse AGG slots)
+ *
+ * The slot's tts_values/tts_isnull pointers are written to the slot-cache
+ * stack area (vals_off / vals_off+8), so the caller can skip the
+ * post-FETCHSOME cache population.
+ *
+ * Returns true if deform code was emitted, false otherwise (caller should
+ * fall back to compiled deform or slot_getsomeattrs_int).
+ */
+static bool
+sljit_emit_deform_inline(struct sljit_compiler *C,
+                          TupleDesc desc,
+                          const TupleTableSlotOps *ops,
+                          int natts,
+                          ExprEvalOp fetch_opcode,
+                          sljit_sw vals_off)
+{
+    int     attnum;
+    int     known_alignment = 0;
+    bool    attguaranteedalign = true;
+    int     guaranteed_column_number = -1;
+    sljit_sw tuple_off;
+    sljit_sw slot_off;
+
+    /* Forward-jump arrays */
+    struct sljit_jump **nvalid_jumps;
+    struct sljit_jump **avail_jumps;
+    struct sljit_jump **null_jumps;
+    struct sljit_label **att_labels;
+    struct sljit_jump  *nvalid_default;
+
+    /* --- Guards --- */
+    if (ops == &TTSOpsVirtual)
+        return false;
+    if (ops != &TTSOpsHeapTuple && ops != &TTSOpsBufferHeapTuple &&
+        ops != &TTSOpsMinimalTuple)
+        return false;
+    if (natts <= 0 || natts > desc->natts)
+        return false;
+
+    /* Determine slot-type-specific field offsets */
+    if (ops == &TTSOpsHeapTuple || ops == &TTSOpsBufferHeapTuple)
+    {
+        tuple_off = offsetof(HeapTupleTableSlot, tuple);
+        slot_off = offsetof(HeapTupleTableSlot, off);
+    }
+    else
+    {
+        tuple_off = offsetof(MinimalTupleTableSlot, tuple);
+        slot_off = offsetof(MinimalTupleTableSlot, off);
+    }
+
+    /* --- Pre-scan: find guaranteed_column_number --- */
+    for (attnum = 0; attnum < natts; attnum++)
+    {
+        CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+
+        if (att->attnullability == ATTNULLABLE_VALID &&
+            !att->atthasmissing &&
+            !att->attisdropped)
+            guaranteed_column_number = attnum;
+    }
+
+    /* Allocate forward-jump tracking arrays */
+    nvalid_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
+    avail_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
+    null_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
+    att_labels = palloc0(sizeof(struct sljit_label *) * natts);
+
+    /*
+     * PROLOGUE: load slot fields into R0-R3 + stack.
+     * R0 = slot pointer (reloaded from econtext).
+     */
+    emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
+
+    /* [SP+vals_off] = slot->tts_values (also used post-deform by VAR steps) */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                   SLJIT_MEM1(SLJIT_R0),
+                   offsetof(TupleTableSlot, tts_values));
+    sljit_emit_op1(C, SLJIT_MOV,
+                   SLJIT_MEM1(SLJIT_SP), vals_off,
+                   SLJIT_R1, 0);
+
+    /* [SP+vals_off+8] = slot->tts_isnull */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                   SLJIT_MEM1(SLJIT_R0),
+                   offsetof(TupleTableSlot, tts_isnull));
+    sljit_emit_op1(C, SLJIT_MOV,
+                   SLJIT_MEM1(SLJIT_SP), vals_off + 8,
+                   SLJIT_R2, 0);
+
+    /* R1 = HeapTuple ptr from slot-type-specific offset */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                   SLJIT_MEM1(SLJIT_R0), tuple_off);
+
+    /* R1 = tuplep = heaptuple->t_data (HeapTupleHeader) */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                   SLJIT_MEM1(SLJIT_R1),
+                   offsetof(HeapTupleData, t_data));
+
+    /* t_infomask -> R2 (uint16) */
+    sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R2, 0,
+                   SLJIT_MEM1(SLJIT_R1),
+                   offsetof(HeapTupleHeaderData, t_infomask));
+    /* hasnulls = infomask & HEAP_HASNULL → stack */
+    sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
+                   SLJIT_R2, 0, SLJIT_IMM, HEAP_HASNULL);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_HASNULLS,
+                   SLJIT_R2, 0);
+
+    /* t_infomask2 -> maxatt = infomask2 & HEAP_NATTS_MASK → stack */
+    sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R2, 0,
+                   SLJIT_MEM1(SLJIT_R1),
+                   offsetof(HeapTupleHeaderData, t_infomask2));
+    sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
+                   SLJIT_R2, 0, SLJIT_IMM, HEAP_NATTS_MASK);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT,
+                   SLJIT_R2, 0);
+
+    /* t_bits → stack */
+    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+                   SLJIT_R1, 0,
+                   SLJIT_IMM, offsetof(HeapTupleHeaderData, t_bits));
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TBITS,
+                   SLJIT_R2, 0);
+
+    /* t_hoff -> R2 (zero-extended uint8) */
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+                   SLJIT_MEM1(SLJIT_R1),
+                   offsetof(HeapTupleHeaderData, t_hoff));
+
+    /* tupdata_base = (char *)tuplep + t_hoff → stack */
+    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                   SLJIT_R1, 0, SLJIT_R2, 0);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA,
+                   SLJIT_R1, 0);
+
+    /* Load saved offset from slot->off → stack */
+    emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
+    sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
+                   SLJIT_MEM1(SLJIT_R0), slot_off);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                   SLJIT_R0, 0);
+
+    /* ============================================================
+     * MISSING ATTRIBUTES CHECK
+     * ============================================================ */
+    if ((natts - 1) > guaranteed_column_number)
+    {
+        struct sljit_jump *skip_missing;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT);
+        skip_missing = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+                                      SLJIT_R0, 0,
+                                      SLJIT_IMM, natts);
+
+        /* call slot_getmissingattrs(slot, maxatt, natts) */
+        emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                       SLJIT_IMM, natts);
+        sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32),
+                         SLJIT_IMM, (sljit_sw) slot_getmissingattrs);
+
+        sljit_set_label(skip_missing, sljit_emit_label(C));
+    }
+
+    /* ============================================================
+     * NVALID DISPATCH: comparison chain
+     * ============================================================ */
+    {
+        /* Reload slot to read tts_nvalid */
+        emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
+        sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0,
+                       SLJIT_MEM1(SLJIT_R0),
+                       offsetof(TupleTableSlot, tts_nvalid));
+
+        for (attnum = 0; attnum < natts; attnum++)
+        {
+            nvalid_jumps[attnum] = sljit_emit_cmp(C, SLJIT_EQUAL,
+                                                  SLJIT_R0, 0,
+                                                  SLJIT_IMM, attnum);
+        }
+        /* Default: already deformed enough -> goto out */
+        nvalid_default = sljit_emit_jump(C, SLJIT_JUMP);
+    }
+
+    /* ============================================================
+     * PER-ATTRIBUTE CODE EMISSION (unrolled loop)
+     * ============================================================ */
+    for (attnum = 0; attnum < natts; attnum++)
+    {
+        CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+        int     alignto = att->attalignby;
+
+        /* ---- Emit attcheck label and wire up nvalid dispatch ---- */
+        att_labels[attnum] = sljit_emit_label(C);
+        sljit_set_label(nvalid_jumps[attnum], att_labels[attnum]);
+
+        /* Patch previous null-path forward jump if it targeted this label */
+        if (attnum > 0 && null_jumps[attnum - 1] != NULL)
+            sljit_set_label(null_jumps[attnum - 1], att_labels[attnum]);
+
+        /* If attnum == 0: reset offset to 0 */
+        if (attnum == 0)
+        {
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                           SLJIT_IMM, 0);
+        }
+
+        /* ---- Availability check ---- */
+        if (attnum > guaranteed_column_number)
+        {
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT);
+            /* if attnum >= maxatt -> goto out (patched later) */
+            avail_jumps[attnum] = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+                                                 SLJIT_IMM, attnum,
+                                                 SLJIT_R0, 0);
+        }
+
+        /* ---- Null check ---- */
+        if (att->attnullability != ATTNULLABLE_VALID)
+        {
+            struct sljit_jump *no_hasnulls;
+            struct sljit_jump *bit_is_set;
+
+            /* if (!hasnulls) skip to not-null path */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_HASNULLS);
+            no_hasnulls = sljit_emit_cmp(C, SLJIT_EQUAL,
+                                         SLJIT_R0, 0,
+                                         SLJIT_IMM, 0);
+
+            /* byte = t_bits[attnum >> 3]; test bit (1 << (attnum & 7)) */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TBITS);
+            sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_R0), attnum >> 3);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
+                           SLJIT_R0, 0,
+                           SLJIT_IMM, 1 << (attnum & 0x07));
+            /* if bit set -> column is NOT null, skip to alignment */
+            bit_is_set = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                                        SLJIT_R0, 0,
+                                        SLJIT_IMM, 0);
+
+            /* ---- Column IS NULL ---- */
+            /* tts_values[attnum] = 0 */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            sljit_emit_op1(C, SLJIT_MOV,
+                           SLJIT_MEM1(SLJIT_R0),
+                           attnum * (sljit_sw) sizeof(Datum),
+                           SLJIT_IMM, 0);
+            /* tts_isnull[attnum] = true */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+            sljit_emit_op1(C, SLJIT_MOV_U8,
+                           SLJIT_MEM1(SLJIT_R0), attnum,
+                           SLJIT_IMM, 1);
+
+            null_jumps[attnum] = sljit_emit_jump(C, SLJIT_JUMP);
+
+            /* ---- NOT NULL path continues here ---- */
+            {
+                struct sljit_label *notnull_label = sljit_emit_label(C);
+                sljit_set_label(no_hasnulls, notnull_label);
+                sljit_set_label(bit_is_set, notnull_label);
+            }
+
+            attguaranteedalign = false;
+        }
+
+        /* ---- Alignment ---- */
+        if (alignto > 1 &&
+            (known_alignment < 0 ||
+             known_alignment != TYPEALIGN(alignto, known_alignment)))
+        {
+            if (att->attlen == -1)
+            {
+                struct sljit_jump *is_short;
+
+                attguaranteedalign = false;
+
+                /* Peek first byte: if nonzero → short varlena, skip align */
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA);
+                sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+                               SLJIT_MEM2(SLJIT_R1, SLJIT_R0), 0);
+                is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                                          SLJIT_R1, 0,
+                                          SLJIT_IMM, 0);
+
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
+                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
+                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                               SLJIT_R0, 0);
+
+                sljit_set_label(is_short, sljit_emit_label(C));
+            }
+            else
+            {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
+                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
+                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                               SLJIT_R0, 0);
+            }
+
+            if (known_alignment >= 0)
+                known_alignment = TYPEALIGN(alignto, known_alignment);
+        }
+
+        if (attguaranteedalign)
+        {
+            Assert(known_alignment >= 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                           SLJIT_IMM, known_alignment);
+        }
+
+        /* ---- Value extraction ---- */
+        /* R0 = deform_off, R1 = tupdata_base + off (attdatap) */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA);
+        sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                       SLJIT_R1, 0, SLJIT_R0, 0);
+
+        /* tts_isnull[attnum] = false */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                       SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_R2), attnum,
+                       SLJIT_IMM, 0);
+
+        if (att->attbyval)
+        {
+            sljit_s32 mov_op;
+
+            switch (att->attlen)
+            {
+                case 1: mov_op = SLJIT_MOV_S8; break;
+                case 2: mov_op = SLJIT_MOV_S16; break;
+                case 4: mov_op = SLJIT_MOV_S32; break;
+                case 8: mov_op = SLJIT_MOV; break;
+                default:
+                    pfree(nvalid_jumps); pfree(avail_jumps);
+                    pfree(null_jumps); pfree(att_labels);
+                    return false;
+            }
+            /* R3 = *(mov_op *)(tupdata_base + off) */
+            sljit_emit_op1(C, mov_op, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_R1), 0);
+            /* tts_values[attnum] = R3 */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            sljit_emit_op1(C, SLJIT_MOV,
+                           SLJIT_MEM1(SLJIT_R2),
+                           attnum * (sljit_sw) sizeof(Datum),
+                           SLJIT_R3, 0);
+        }
+        else
+        {
+            /* tts_values[attnum] = pointer to data (R1 = attdatap) */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            sljit_emit_op1(C, SLJIT_MOV,
+                           SLJIT_MEM1(SLJIT_R2),
+                           attnum * (sljit_sw) sizeof(Datum),
+                           SLJIT_R1, 0);
+        }
+
+        /* ---- Compute alignment tracking for NEXT column ---- */
+        if (att->attlen < 0)
+        {
+            known_alignment = -1;
+            attguaranteedalign = false;
+        }
+        else if (att->attnullability == ATTNULLABLE_VALID &&
+                 attguaranteedalign && known_alignment >= 0)
+        {
+            Assert(att->attlen > 0);
+            known_alignment += att->attlen;
+        }
+        else if (att->attnullability == ATTNULLABLE_VALID &&
+                 (att->attlen % alignto) == 0)
+        {
+            Assert(att->attlen > 0);
+            known_alignment = alignto;
+            attguaranteedalign = false;
+        }
+        else
+        {
+            known_alignment = -1;
+            attguaranteedalign = false;
+        }
+
+        /* ---- Offset advance ---- */
+        if (att->attlen > 0)
+        {
+            if (attguaranteedalign)
+            {
+                Assert(known_alignment >= 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                               SLJIT_IMM, known_alignment);
+            }
+            else
+            {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                               SLJIT_R0, 0, SLJIT_IMM, att->attlen);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                               SLJIT_R0, 0);
+            }
+        }
+        else if (att->attlen == -1)
+        {
+            /* Varlena: off += varsize_any(attdatap) */
+            /* R1 still holds attdatap from value extraction */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+                             SLJIT_IMM, (sljit_sw) varsize_any);
+            /* After icall: R0 = varsize_any result. Reload deform_off from stack. */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                           SLJIT_R1, 0, SLJIT_R0, 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                           SLJIT_R1, 0);
+        }
+        else if (att->attlen == -2)
+        {
+            /* Cstring: off += strlen(attdatap) + 1 */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+                             SLJIT_IMM, (sljit_sw) strlen);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                           SLJIT_R0, 0, SLJIT_IMM, 1);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                           SLJIT_R1, 0, SLJIT_R0, 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                           SLJIT_R1, 0);
+        }
+    }
+
+    /* ============================================================
+     * EPILOGUE: patch jumps, store tts_nvalid, off, flags
+     * ============================================================ */
+    {
+        struct sljit_label *deform_out = sljit_emit_label(C);
+
+        /* Patch all forward jumps that target out */
+        sljit_set_label(nvalid_default, deform_out);
+        for (attnum = 0; attnum < natts; attnum++)
+        {
+            if (avail_jumps[attnum] != NULL)
+                sljit_set_label(avail_jumps[attnum], deform_out);
+        }
+        /* Null-path jump for last attribute */
+        if (null_jumps[natts - 1] != NULL)
+            sljit_set_label(null_jumps[natts - 1], deform_out);
+
+        /* Reload slot pointer */
+        emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
+
+        /* tts_nvalid = natts (int16 store) */
+        sljit_emit_op1(C, SLJIT_MOV_S16,
+                       SLJIT_MEM1(SLJIT_R0),
+                       offsetof(TupleTableSlot, tts_nvalid),
+                       SLJIT_IMM, natts);
+
+        /* slot->off = (uint32) off */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+        sljit_emit_op1(C, SLJIT_MOV_U32,
+                       SLJIT_MEM1(SLJIT_R0), slot_off,
+                       SLJIT_R1, 0);
+
+        /* tts_flags |= TTS_FLAG_SLOW */
+        sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_R0),
+                       offsetof(TupleTableSlot, tts_flags));
+        sljit_emit_op2(C, SLJIT_OR, SLJIT_R1, 0,
+                       SLJIT_R1, 0, SLJIT_IMM, TTS_FLAG_SLOW);
+        sljit_emit_op1(C, SLJIT_MOV_U16,
+                       SLJIT_MEM1(SLJIT_R0),
+                       offsetof(TupleTableSlot, tts_flags),
+                       SLJIT_R1, 0);
+    }
+
+    /* No return — we're inline in the expression function body */
+
+    pfree(nvalid_jumps);
+    pfree(avail_jumps);
+    pfree(null_jumps);
+    pfree(att_labels);
+
+    return true;
+}
+
+/*
  * Helper: get stack offset pair (vals, nulls) for a given opcode's slot type.
  * Returns the SOFF_*_VALS offset; caller adds 8 for SOFF_*_NULLS.
  * Returns -1 for unknown opcodes.
@@ -1005,6 +1541,23 @@ slot_cache_bit(ExprEvalOp opcode)
 #define EMIT_ICALL(C, type, arg_types, fn) \
     sljit_emit_icall(C, type, arg_types, SLJIT_IMM, (sljit_sw)(fn))
 
+/*
+ * Paired resvalue/resnull store helpers.
+ *
+ * When op->resvalue and op->resnull point into the same NullableDatum
+ * (i.e. resnull == resvalue + sizeof(Datum)), combined store helpers
+ * (emit_store_res_pair_*) emit both stores with a single EMIT_PTR,
+ * saving 4 ARM64 instructions per call.  For a 20-column SUM expression,
+ * this eliminates ~150 instructions from the hot loop.
+ *
+ * Individual helpers remain for cases where only one is stored, or
+ * where resvalue and resnull are stored at different control flow points.
+ */
+
+/* Is resnull adjacent to resvalue in the same NullableDatum? */
+#define RESNULL_IS_PAIRED(op) \
+    ((char *)(op)->resnull == (char *)(op)->resvalue + sizeof(Datum))
+
 static inline void
 emit_store_resvalue(struct sljit_compiler *C, ExprState *state,
                     ExprEvalStep *op, int src_reg)
@@ -1082,6 +1635,105 @@ emit_store_resvalue_imm(struct sljit_compiler *C, ExprState *state,
         EMIT_PTR(C, SLJIT_R1, op->resvalue);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
                        SLJIT_IMM, imm);
+    }
+}
+
+/*
+ * Combined store: resvalue + resnull = false, in one go.
+ * Saves 4 ARM64 instructions when resvalue/resnull are in the same
+ * NullableDatum (resnull at resvalue + 8) by reusing the EMIT_PTR base.
+ * R1 is clobbered.
+ */
+static inline void
+emit_store_res_pair_false(struct sljit_compiler *C, ExprState *state,
+                          ExprEvalStep *op, int value_reg)
+{
+    if (op->resvalue == &state->resvalue)
+    {
+        sljit_emit_op1(C, SLJIT_MOV,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resvalue),
+                       value_reg, 0);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resnull),
+                       SLJIT_IMM, 0);
+    }
+    else if (RESNULL_IS_PAIRED(op))
+    {
+        EMIT_PTR(C, SLJIT_R1, op->resvalue);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
+                       value_reg, 0);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_R1), (sljit_sw) sizeof(Datum),
+                       SLJIT_IMM, 0);
+    }
+    else
+    {
+        emit_store_resvalue(C, state, op, value_reg);
+        emit_store_resnull_false(C, state, op);
+    }
+}
+
+/*
+ * Combined store: resvalue (imm) + resnull = false.
+ */
+static inline void
+emit_store_res_pair_false_imm(struct sljit_compiler *C, ExprState *state,
+                              ExprEvalStep *op, sljit_sw imm)
+{
+    if (op->resvalue == &state->resvalue)
+    {
+        sljit_emit_op1(C, SLJIT_MOV,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resvalue),
+                       SLJIT_IMM, imm);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resnull),
+                       SLJIT_IMM, 0);
+    }
+    else if (RESNULL_IS_PAIRED(op))
+    {
+        EMIT_PTR(C, SLJIT_R1, op->resvalue);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
+                       SLJIT_IMM, imm);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_R1), (sljit_sw) sizeof(Datum),
+                       SLJIT_IMM, 0);
+    }
+    else
+    {
+        emit_store_resvalue_imm(C, state, op, imm);
+        emit_store_resnull_false(C, state, op);
+    }
+}
+
+/*
+ * Combined store: resvalue (imm) + resnull = true.
+ */
+static inline void
+emit_store_res_pair_true_imm(struct sljit_compiler *C, ExprState *state,
+                             ExprEvalStep *op, sljit_sw imm)
+{
+    if (op->resvalue == &state->resvalue)
+    {
+        sljit_emit_op1(C, SLJIT_MOV,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resvalue),
+                       SLJIT_IMM, imm);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, resnull),
+                       SLJIT_IMM, 1);
+    }
+    else if (RESNULL_IS_PAIRED(op))
+    {
+        EMIT_PTR(C, SLJIT_R1, op->resvalue);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
+                       SLJIT_IMM, imm);
+        sljit_emit_op1(C, SLJIT_MOV_U8,
+                       SLJIT_MEM1(SLJIT_R1), (sljit_sw) sizeof(Datum),
+                       SLJIT_IMM, 1);
+    }
+    else
+    {
+        emit_store_resvalue_imm(C, state, op, imm);
+        emit_store_resnull_true(C, state, op);
     }
 }
 
@@ -1813,17 +2465,43 @@ sljit_compile_expr(ExprState *state)
 					}
 					else
 					{
-						/* Fall back to sljit runtime compilation. */
-						void *deform_fn = find_or_compile_deform(
-							ctx, deform_cache, &ndeform_cache,
+						/*
+						 * Try inline deform (zero call overhead, contiguous
+						 * I-cache). Emits code directly into the expression
+						 * function body.
+						 */
+						instr_time  deform_start, deform_end;
+
+						INSTR_TIME_SET_CURRENT(deform_start);
+						deform_emitted = sljit_emit_deform_inline(
+							C,
 							op->d.fetch.known_desc,
 							op->d.fetch.kind,
-							op->d.fetch.last_var);
+							op->d.fetch.last_var,
+							opcode,
+							vals_off);
+						INSTR_TIME_SET_CURRENT(deform_end);
+						INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
+						                      deform_end, deform_start);
 
-						if (deform_fn)
+						if (!deform_emitted)
 						{
-							EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1V(P), deform_fn);
-							deform_emitted = true;
+							/*
+							 * Fall back to compiled deform (separate
+							 * function, called via BL).
+							 */
+							emit_load_econtext_slot(C, SLJIT_R0, opcode);
+							void *deform_fn = find_or_compile_deform(
+								ctx, deform_cache, &ndeform_cache,
+								op->d.fetch.known_desc,
+								op->d.fetch.kind,
+								op->d.fetch.last_var);
+
+							if (deform_fn)
+							{
+								EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1V(P), deform_fn);
+								deform_emitted = true;
+							}
 						}
 					}
 				}
@@ -1869,6 +2547,11 @@ sljit_compile_expr(ExprState *state)
 			 * ---- VAR ----
 			 * Load slot->tts_values[attnum] → *op->resvalue
 			 * Load slot->tts_isnull[attnum] → *op->resnull
+			 *
+			 * Optimization: when multiple consecutive VARs read from
+			 * the same slot, batch them to load tts_values/tts_isnull
+			 * once instead of per-VAR.  This saves 2*(N-1) memory
+			 * loads for N consecutive same-slot VARs.
 			 */
 			case EEOP_INNER_VAR:
 			case EEOP_OUTER_VAR:
@@ -1876,50 +2559,126 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_OLD_VAR:
 			case EEOP_NEW_VAR:
 			{
-				int			attnum = op->d.var.attnum;
 				sljit_sw	vals_off = slot_cache_offset(opcode);
 				bool		use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
 
-				if (use_cache)
+				/*
+				 * Look ahead: count consecutive VARs from the same slot.
+				 * We batch them to avoid reloading tts_values/tts_isnull.
+				 */
+				int			batch_end = opno;
+				while (batch_end + 1 < steps_len)
 				{
-					/* R0 = cached tts_values pointer */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_SP), vals_off);
+					ExprEvalStep *next_op = &steps[batch_end + 1];
+					ExprEvalOp    next_opc = ExecEvalStepOp(state, next_op);
+					if (next_opc != opcode)
+						break;
+					batch_end++;
 				}
-				else
-				{
-					/* No preceding FETCHSOME: load from slot */
-					emit_load_econtext_slot(C, SLJIT_R0, opcode);
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_R0),
-								   offsetof(TupleTableSlot, tts_values));
-				}
-				/* R2 = values[attnum] */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   attnum * (sljit_sw) sizeof(Datum));
-				/* *op->resvalue = R2 */
-				emit_store_resvalue(C, state, op, SLJIT_R2);
+				int batch_count = batch_end - opno + 1;
 
-				if (use_cache)
+				if (batch_count == 1 && RESNULL_IS_PAIRED(op) &&
+					op->resvalue != &state->resvalue)
 				{
-					/* R0 = cached tts_isnull pointer */
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+					/*
+					 * Single VAR with paired resvalue/resnull: load value and
+					 * isnull, store both using a single EMIT_PTR base.
+					 * Saves 4 ARM64 instructions vs separate EMIT_PTRs.
+					 */
+					int attnum = op->d.var.attnum;
+
+					/* Load value from tts_values[attnum] → R2 */
+					if (use_cache)
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_SP), vals_off);
+					else
+					{
+						emit_load_econtext_slot(C, SLJIT_R0, opcode);
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   offsetof(TupleTableSlot, tts_values));
+					}
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   attnum * (sljit_sw) sizeof(Datum));
+
+					/* R1 = resvalue base (shared for both stores) */
+					EMIT_PTR(C, SLJIT_R1, op->resvalue);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
+								   SLJIT_R2, 0);
+
+					/* Load isnull from tts_isnull[attnum] → R2 */
+					if (use_cache)
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+					else
+					{
+						emit_load_econtext_slot(C, SLJIT_R0, opcode);
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   offsetof(TupleTableSlot, tts_isnull));
+					}
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   attnum * (sljit_sw) sizeof(bool));
+
+					/* Store isnull via paired offset from R1 */
+					sljit_emit_op1(C, SLJIT_MOV_U8,
+								   SLJIT_MEM1(SLJIT_R1), (sljit_sw) sizeof(Datum),
+								   SLJIT_R2, 0);
 				}
 				else
 				{
-					emit_load_econtext_slot(C, SLJIT_R0, opcode);
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_R0),
-								   offsetof(TupleTableSlot, tts_isnull));
+					/* Multi-VAR batch or S0-relative: use phased approach */
+
+					/* Phase 1: load all values from tts_values */
+					if (use_cache)
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_SP), vals_off);
+					else
+					{
+						emit_load_econtext_slot(C, SLJIT_R0, opcode);
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   offsetof(TupleTableSlot, tts_values));
+					}
+					/* R0 = tts_values, stays live (emit_store uses R1) */
+					for (int bi = 0; bi < batch_count; bi++)
+					{
+						ExprEvalStep *cur = &steps[opno + bi];
+						int attnum = cur->d.var.attnum;
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   attnum * (sljit_sw) sizeof(Datum));
+						emit_store_resvalue(C, state, cur, SLJIT_R2);
+					}
+
+					/* Phase 2: load all isnulls from tts_isnull */
+					if (use_cache)
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+					else
+					{
+						emit_load_econtext_slot(C, SLJIT_R0, opcode);
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   offsetof(TupleTableSlot, tts_isnull));
+					}
+					for (int bi = 0; bi < batch_count; bi++)
+					{
+						ExprEvalStep *cur = &steps[opno + bi];
+						int attnum = cur->d.var.attnum;
+						sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+									   SLJIT_MEM1(SLJIT_R0),
+									   attnum * (sljit_sw) sizeof(bool));
+						emit_store_resnull_reg(C, state, cur, SLJIT_R2);
+					}
 				}
-				/* R2 = isnull[attnum] */
-				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   attnum * (sljit_sw) sizeof(bool));
-				/* *op->resnull = R2 */
-				emit_store_resnull_reg(C, state, op, SLJIT_R2);
+
+				/* Emit labels for skipped steps so jump targets work */
+				for (int bi = 1; bi < batch_count; bi++)
+					step_labels[opno + bi] = sljit_emit_label(C);
+				opno = batch_end;  /* advance past batch */
 				break;
 			}
 
@@ -1927,6 +2686,8 @@ sljit_compile_expr(ExprState *state)
 			 * ---- ASSIGN_*_VAR ----
 			 * Load source slot's values[attnum] → resultslot->tts_values[resultnum]
 			 * Load source slot's isnull[attnum] → resultslot->tts_isnull[resultnum]
+			 *
+			 * Batched like VAR above for consecutive same-slot assignments.
 			 */
 			case EEOP_ASSIGN_INNER_VAR:
 			case EEOP_ASSIGN_OUTER_VAR:
@@ -1934,17 +2695,25 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_ASSIGN_OLD_VAR:
 			case EEOP_ASSIGN_NEW_VAR:
 			{
-				int			attnum = op->d.assign_var.attnum;
-				int			resultnum = op->d.assign_var.resultnum;
 				sljit_sw	vals_off = slot_cache_offset(opcode);
 				bool		use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
 
-				if (use_cache)
+				/* Look ahead for consecutive same-slot ASSIGN_VARs */
+				int			batch_end = opno;
+				while (batch_end + 1 < steps_len)
 				{
-					/* R0 = cached source tts_values */
+					ExprEvalStep *next_op = &steps[batch_end + 1];
+					ExprEvalOp    next_opc = ExecEvalStepOp(state, next_op);
+					if (next_opc != opcode)
+						break;
+					batch_end++;
+				}
+				int batch_count = batch_end - opno + 1;
+
+				/* Phase 1: load all values from source tts_values */
+				if (use_cache)
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_SP), vals_off);
-				}
 				else
 				{
 					emit_load_econtext_slot(C, SLJIT_R0, opcode);
@@ -1952,23 +2721,25 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_MEM1(SLJIT_R0),
 								   offsetof(TupleTableSlot, tts_values));
 				}
-				/* R2 = values[attnum] */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   attnum * (sljit_sw) sizeof(Datum));
-
-				/* result_values[resultnum] = R2 (S3 = resultvals, in register) */
-				sljit_emit_op1(C, SLJIT_MOV,
-							   SLJIT_MEM1(SREG_RESULTVALS),
-							   resultnum * (sljit_sw) sizeof(Datum),
-							   SLJIT_R2, 0);
-
-				if (use_cache)
+				/* R0 = tts_values, stays live (STR to S3/S4 doesn't touch R0) */
+				for (int bi = 0; bi < batch_count; bi++)
 				{
-					/* R0 = cached source tts_isnull */
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.assign_var.attnum;
+					int resultnum = cur->d.assign_var.resultnum;
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   attnum * (sljit_sw) sizeof(Datum));
+					sljit_emit_op1(C, SLJIT_MOV,
+								   SLJIT_MEM1(SREG_RESULTVALS),
+								   resultnum * (sljit_sw) sizeof(Datum),
+								   SLJIT_R2, 0);
+				}
+
+				/* Phase 2: load all isnulls from source tts_isnull */
+				if (use_cache)
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_MEM1(SLJIT_SP), vals_off + 8);
-				}
 				else
 				{
 					emit_load_econtext_slot(C, SLJIT_R0, opcode);
@@ -1976,16 +2747,24 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_MEM1(SLJIT_R0),
 								   offsetof(TupleTableSlot, tts_isnull));
 				}
-				/* R2 = isnull[attnum] */
-				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   attnum * (sljit_sw) sizeof(bool));
+				for (int bi = 0; bi < batch_count; bi++)
+				{
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.assign_var.attnum;
+					int resultnum = cur->d.assign_var.resultnum;
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   attnum * (sljit_sw) sizeof(bool));
+					sljit_emit_op1(C, SLJIT_MOV_U8,
+								   SLJIT_MEM1(SREG_RESULTNULLS),
+								   resultnum * (sljit_sw) sizeof(bool),
+								   SLJIT_R2, 0);
+				}
 
-				/* result_nulls[resultnum] = R2 (S4 = resultnulls, in register) */
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM1(SREG_RESULTNULLS),
-							   resultnum * (sljit_sw) sizeof(bool),
-							   SLJIT_R2, 0);
+				/* Emit labels for skipped steps so jump targets work */
+				for (int bi = 1; bi < batch_count; bi++)
+					step_labels[opno + bi] = sljit_emit_label(C);
+				opno = batch_end;  /* advance past batch */
 				break;
 			}
 
@@ -2211,11 +2990,8 @@ sljit_compile_expr(ExprState *state)
 
 						if (used_precompiled)
 						{
-							/* Store *op->resvalue = R0 */
-							emit_store_resvalue(C, state, op, SLJIT_R0);
-
-							/* *op->resnull = false */
-							emit_store_resnull_false(C, state, op);
+							/* Store *op->resvalue = R0, *op->resnull = false */
+							emit_store_res_pair_false(C, state, op, SLJIT_R0);
 						}
 					}
 				}
@@ -2247,11 +3023,8 @@ sljit_compile_expr(ExprState *state)
 
 					emit_inline_funcexpr(C, (JitInlineOp) dfn->inline_op);
 
-					/* Store *op->resvalue = R0 */
-					emit_store_resvalue(C, state, op, SLJIT_R0);
-
-					/* *op->resnull = false */
-					emit_store_resnull_false(C, state, op);
+					/* Store *op->resvalue = R0, *op->resnull = false */
+					emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				}
 				else if (dfn && dfn->jit_fn)
 				{
@@ -2290,11 +3063,8 @@ sljit_compile_expr(ExprState *state)
 					/* Direct call with native arg types */
 					EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(dfn), dfn->jit_fn);
 
-					/* Store result to *op->resvalue */
-					emit_store_resvalue(C, state, op, SLJIT_R0);
-
-					/* *op->resnull = false */
-					emit_store_resnull_false(C, state, op);
+					/* Store *op->resvalue = R0, *op->resnull = false */
+					emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				}
 				else
 				{
@@ -2630,12 +3400,7 @@ sljit_compile_expr(ExprState *state)
 			{
 				/* resvalue = (resnull ? 1 : 0); resnull = false */
 				emit_load_resnull(C, state, op, SLJIT_R0);
-
-				/* Store as Datum (extend to 64-bit) */
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				break;
 			}
 
@@ -2646,10 +3411,7 @@ sljit_compile_expr(ExprState *state)
 				/* R0 = !R0: XOR with 1 */
 				sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
 							   SLJIT_R0, 0, SLJIT_IMM, 1);
-
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				break;
 			}
 
@@ -3374,10 +4136,7 @@ sljit_compile_expr(ExprState *state)
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_IMM,
 							   (sljit_sw) op->d.hashdatum_initvalue.init_value);
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* *op->resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				break;
 			}
 
@@ -3444,11 +4203,7 @@ sljit_compile_expr(ExprState *state)
 					sljit_set_label(j_done, lbl_result);
 				}
 
-				/* *op->resvalue = R0 */
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* *op->resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				break;
 			}
 
@@ -3496,11 +4251,7 @@ sljit_compile_expr(ExprState *state)
 					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.hashdatum.fn_addr);
 				}
 
-				/* *op->resvalue = R0 */
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* *op->resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 
 				/* Jump past null_path (fall through to next step) */
 				{
@@ -3513,14 +4264,8 @@ sljit_compile_expr(ExprState *state)
 					struct sljit_label *lbl_null = sljit_emit_label(C);
 					sljit_set_label(j_isnull, lbl_null);
 
-					/* Resolve the skip jump to land after null_path */
-					/* We'll use a label at the end */
-
-					/* *op->resnull = true */
-					emit_store_resnull_true(C, state, op);
-
-					/* *op->resvalue = 0 */
-					emit_store_resvalue_imm(C, state, op, 0);
+					/* *op->resnull = true, *op->resvalue = 0 */
+					emit_store_res_pair_true_imm(C, state, op, 0);
 
 					/* Jump to jumpdone */
 					struct sljit_jump *j_jumpdone =
@@ -3643,11 +4388,7 @@ sljit_compile_expr(ExprState *state)
 					sljit_set_label(j_done, lbl_store);
 				}
 
-				/* *op->resvalue = R0 (already zero-extended by 32-bit ops) */
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* *op->resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				break;
 			}
 
@@ -3729,10 +4470,7 @@ sljit_compile_expr(ExprState *state)
 					sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0,
 								   SLJIT_R1, 0, SLJIT_R0, 0);
 				}
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-
-				/* *op->resnull = false */
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 
 				/* Jump past null_path */
 				{
@@ -3745,11 +4483,8 @@ sljit_compile_expr(ExprState *state)
 					struct sljit_label *lbl_null = sljit_emit_label(C);
 					sljit_set_label(j_isnull, lbl_null);
 
-					/* *op->resnull = true */
-					emit_store_resnull_true(C, state, op);
-
-					/* *op->resvalue = 0 */
-					emit_store_resvalue_imm(C, state, op, 0);
+					/* *op->resnull = true, *op->resvalue = 0 */
+					emit_store_res_pair_true_imm(C, state, op, 0);
 
 					/* Jump to jumpdone */
 					struct sljit_jump *j_jumpdone =
@@ -4193,22 +4928,19 @@ sljit_compile_expr(ExprState *state)
 										SLJIT_EQUAL);
 				}
 				/* *op->resvalue = R0, *op->resnull = false */
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				j_done1 = sljit_emit_jump(C, SLJIT_JUMP);
 
 				/* one_null: nulls differ → DISTINCT=true, NOT_DISTINCT=false */
 				sljit_set_label(j_one_null, sljit_emit_label(C));
-				emit_store_resvalue_imm(C, state, op,
+				emit_store_res_pair_false_imm(C, state, op,
 							   (opcode == EEOP_DISTINCT) ? 1 : 0);
-				emit_store_resnull_false(C, state, op);
 				j_done2 = sljit_emit_jump(C, SLJIT_JUMP);
 
 				/* both_null: both nulls → DISTINCT=false, NOT_DISTINCT=true */
 				sljit_set_label(j_both_null, sljit_emit_label(C));
-				emit_store_resvalue_imm(C, state, op,
+				emit_store_res_pair_false_imm(C, state, op,
 							   (opcode == EEOP_DISTINCT) ? 0 : 1);
-				emit_store_resnull_false(C, state, op);
 
 				/* All paths converge */
 				{
@@ -4292,8 +5024,7 @@ sljit_compile_expr(ExprState *state)
 				EMIT_PTR(C, SLJIT_R2, fcinfo);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_R2), val0_off);
-				emit_store_resvalue(C, state, op, SLJIT_R0);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false(C, state, op, SLJIT_R0);
 				j_done2 = sljit_emit_jump(C, SLJIT_JUMP);
 
 				/* a_null: *op->resnull = true */
@@ -4324,8 +5055,7 @@ sljit_compile_expr(ExprState *state)
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Null path: *resvalue = false, *resnull = false */
-				emit_store_resvalue_imm(C, state, op, 0);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false_imm(C, state, op, 0);
 
 				sljit_set_label(j_not_null, sljit_emit_label(C));
 				break;
@@ -4341,8 +5071,7 @@ sljit_compile_expr(ExprState *state)
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Null path: *resvalue = true, *resnull = false */
-				emit_store_resvalue_imm(C, state, op, 1);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false_imm(C, state, op, 1);
 				j_done = sljit_emit_jump(C, SLJIT_JUMP);
 
 				/* Not null: *resvalue = !*resvalue */
@@ -4368,8 +5097,7 @@ sljit_compile_expr(ExprState *state)
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Null path: *resvalue = false, *resnull = false */
-				emit_store_resvalue_imm(C, state, op, 0);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false_imm(C, state, op, 0);
 				j_done = sljit_emit_jump(C, SLJIT_JUMP);
 
 				/* Not null: *resvalue = !*resvalue */
@@ -4395,8 +5123,7 @@ sljit_compile_expr(ExprState *state)
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
 				/* Null path: *resvalue = true, *resnull = false */
-				emit_store_resvalue_imm(C, state, op, 1);
-				emit_store_resnull_false(C, state, op);
+				emit_store_res_pair_false_imm(C, state, op, 1);
 
 				sljit_set_label(j_not_null, sljit_emit_label(C));
 				break;
