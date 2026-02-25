@@ -20,6 +20,16 @@ restart_pg() {
     sleep 1
 }
 
+ensure_pg_running() {
+    if ! "$PGBIN/pg_isready" -p "${PGPORT:-5432}" -q 2>/dev/null; then
+        echo " (server down, restarting)"
+        "$PGCTL" -D "$PG_DATA" stop -m immediate 2>/dev/null || true
+        sleep 1
+        "$PGCTL" -D "$PG_DATA" start -l "$LOGFILE" -w 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 get_exec_time() {
     local query="$1"
     local jit_on="$2"
@@ -154,6 +164,7 @@ for bi in "${!BACKENDS[@]}"; do
         jit_on="off"
     else
         echo "Switching to $bname..."
+        ensure_pg_running
         "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = '$backend';" 2>/dev/null
         restart_pg
         jit_on="on"
@@ -170,14 +181,31 @@ SELECT COUNT(*) FROM ultra_wide; SELECT COUNT(*) FROM jsonb_data;
 SELECT COUNT(*) FROM part_data;
 " > /dev/null 2>&1
 
+    crash_count=0
     for qi in $(seq 0 $((NQUERIES - 1))); do
+        if [ "$crash_count" -ge 3 ]; then
+            echo ""
+            echo "  Backend $bname crashed 3+ times, skipping remaining queries."
+            for rqi in $(seq "$qi" $((NQUERIES - 1))); do
+                echo "CRASH" >> "$TMPDIR/${bname}_${rqi}.txt"
+            done
+            break
+        fi
         query="${QUERIES[$qi]}"
+        ensure_pg_running
         # warmup
         get_exec_time "$query" "$jit_on" > /dev/null 2>&1
+        ensure_pg_running
         t1=$(get_exec_time "$query" "$jit_on")
         t2=$(get_exec_time "$query" "$jit_on")
         t3=$(get_exec_time "$query" "$jit_on")
-        m=$(median3 "$t1" "$t2" "$t3")
+        if [ -z "$t1" ] && [ -z "$t2" ] && [ -z "$t3" ]; then
+            m="CRASH"
+            crash_count=$((crash_count + 1))
+            ensure_pg_running
+        else
+            m=$(median3 "$t1" "$t2" "$t3")
+        fi
         echo "$m" >> "$TMPDIR/${bname}_${qi}.txt"
         printf "."
     done
@@ -223,6 +251,7 @@ echo "Results saved to: $OUTFILE"
 rm -rf "$TMPDIR"
 
 # Restore sljit as default
+ensure_pg_running
 "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';" 2>/dev/null
 restart_pg
 echo "Restored jit_provider = pg_jitter_sljit"

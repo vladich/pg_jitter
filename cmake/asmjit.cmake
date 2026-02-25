@@ -16,6 +16,7 @@ message(STATUS "asmjit source:      ${ASMJIT_DIR}")
 
 # ---------- AsmJIT (static library) ----------
 set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(${ASMJIT_DIR} ${CMAKE_BINARY_DIR}/asmjit)
 
 # ---------- Pre-compiled deform templates ----------

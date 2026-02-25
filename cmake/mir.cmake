@@ -14,6 +14,7 @@ message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
 message(STATUS "MIR source:         ${MIR_DIR}")
 
 # ---------- MIR (static library) ----------
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_library(mir_lib STATIC ${MIR_DIR}/mir.c ${MIR_DIR}/mir-gen.c)
 target_include_directories(mir_lib PUBLIC ${MIR_DIR})
 target_compile_options(mir_lib PRIVATE -std=gnu11 -w)

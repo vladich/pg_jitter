@@ -79,6 +79,7 @@ endif()
 # ==========================================================================
 # Third-party libraries
 # ==========================================================================
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------- sljit (static library from single source) ----------
 add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)

@@ -14,6 +14,7 @@ message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
 message(STATUS "sljit source:       ${SLJIT_DIR}")
 
 # ---------- sljit (static library) ----------
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
 target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
 target_compile_options(sljit PRIVATE -w)

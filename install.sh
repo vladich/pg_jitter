@@ -1,22 +1,33 @@
 #!/bin/bash
 # install.sh — Install pg_jitter backends and restart PostgreSQL (macOS / Linux)
 #
-# Usage: ./install.sh [--pg-config PATH] [sljit|asmjit|mir|all]
+# Usage: ./install.sh [--pg-config PATH] [--pgdata DIR] [sljit|asmjit|mir|all]
 #
 # pg_config resolution (first match wins):
 #   1. --pg-config PATH argument
 #   2. PG_CONFIG environment variable
 #   3. pg_config from PATH
+#
+# pgdata resolution (first match wins):
+#   1. --pgdata DIR argument
+#   2. PGDATA environment variable
+#   3. Query running PostgreSQL via psql
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Parse --pg-config if present
-if [ "${1:-}" = "--pg-config" ]; then
-    [ -z "${2:-}" ] && { echo "ERROR: --pg-config requires a path argument"; exit 1; }
-    PG_CONFIG="$2"
-    shift 2
-fi
+# Parse named arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pg-config)
+            [ -z "${2:-}" ] && { echo "ERROR: --pg-config requires a path argument"; exit 1; }
+            PG_CONFIG="$2"; shift 2 ;;
+        --pgdata)
+            [ -z "${2:-}" ] && { echo "ERROR: --pgdata requires a path argument"; exit 1; }
+            PGDATA="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
 
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 
@@ -28,8 +39,21 @@ fi
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PGCTL="$PGBIN/pg_ctl"
-PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
+
+# Resolve data directory
+if [ -n "${PGDATA:-}" ]; then
+    PG_DATA="$PGDATA"
+else
+    PG_DATA="$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || true)"
+fi
+
+if [ -z "$PG_DATA" ] || [ ! -d "$PG_DATA" ]; then
+    echo "WARNING: PostgreSQL data directory not found."
+    echo "  Set PGDATA or use --pgdata DIR, or ensure PostgreSQL is running."
+    echo "  Libraries will be installed but PostgreSQL will NOT be restarted."
+    NO_RESTART=1
+fi
 
 # Detect extension
 case "$(uname -s)" in
@@ -77,14 +101,25 @@ for b in "${BACKENDS[@]}"; do
 done
 
 # Restart PostgreSQL
-echo ""
-"$PGCTL" -D "$PG_DATA" restart -l /tmp/pg_jitter.log 2>&1
+if [ "${NO_RESTART:-}" = "1" ]; then
+    echo ""
+    echo "Skipping PostgreSQL restart (data directory unknown)."
+    echo "Restart PostgreSQL manually to load the new libraries."
+else
+    echo ""
+    if "$PGCTL" -D "$PG_DATA" status > /dev/null 2>&1; then
+        "$PGCTL" -D "$PG_DATA" restart -l /tmp/pg_jitter.log 2>&1
+    else
+        echo "PostgreSQL is not running. Starting..."
+        "$PGCTL" -D "$PG_DATA" start -l /tmp/pg_jitter.log 2>&1
+    fi
 
-# Show status
-PORT=$(sed -n '4p' "$PG_DATA/postmaster.pid" 2>/dev/null || echo 5432)
-PROVIDER=$("$PGBIN/psql" -p "$PORT" -d postgres -t -A \
-    -c "SHOW jit_provider;" 2>/dev/null || echo "unknown")
-echo ""
-echo "Active jit_provider: $PROVIDER"
-echo ""
-echo "To switch: psql -p $PORT -c \"ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';\""
+    # Show status
+    PORT=$(sed -n '4p' "$PG_DATA/postmaster.pid" 2>/dev/null || echo 5432)
+    PROVIDER=$("$PGBIN/psql" -p "$PORT" -d postgres -t -A \
+        -c "SHOW jit_provider;" 2>/dev/null || echo "unknown")
+    echo ""
+    echo "Active jit_provider: $PROVIDER"
+    echo ""
+    echo "To switch: psql -p $PORT -c \"ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';\""
+fi
