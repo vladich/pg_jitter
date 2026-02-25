@@ -131,6 +131,7 @@ slot_offset_for_opcode(ExprEvalOp opcode)
 		case EEOP_SCAN_VAR:
 		case EEOP_ASSIGN_SCAN_VAR:
 			return offsetof(ExprContext, ecxt_scantuple);
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_FETCHSOME:
 		case EEOP_OLD_VAR:
 		case EEOP_ASSIGN_OLD_VAR:
@@ -139,6 +140,7 @@ slot_offset_for_opcode(ExprEvalOp opcode)
 		case EEOP_NEW_VAR:
 		case EEOP_ASSIGN_NEW_VAR:
 			return offsetof(ExprContext, ecxt_newtuple);
+#endif
 		default:
 			return offsetof(ExprContext, ecxt_scantuple);
 	}
@@ -160,6 +162,7 @@ expr_has_fast_path(ExprState *state)
 
 	step0 = ExecEvalStepOp(state, &state->steps[0]);
 
+#ifdef HAVE_EEOP_HASHDATUM
 	if (nsteps == 5)
 	{
 		step1 = ExecEvalStepOp(state, &state->steps[1]);
@@ -172,11 +175,14 @@ expr_has_fast_path(ExprState *state)
 			step3 == EEOP_HASHDATUM_NEXT32)
 			return true;
 	}
-	else if (nsteps == 4)
+	else
+#endif
+	if (nsteps == 4)
 	{
 		step1 = ExecEvalStepOp(state, &state->steps[1]);
 		step2 = ExecEvalStepOp(state, &state->steps[2]);
 
+#ifdef HAVE_EEOP_HASHDATUM
 		if (step0 == EEOP_OUTER_FETCHSOME &&
 			step1 == EEOP_OUTER_VAR &&
 			step2 == EEOP_HASHDATUM_FIRST)
@@ -189,6 +195,7 @@ expr_has_fast_path(ExprState *state)
 			step1 == EEOP_OUTER_VAR &&
 			step2 == EEOP_HASHDATUM_FIRST_STRICT)
 			return true;
+#endif
 	}
 	else if (nsteps == 3)
 	{
@@ -209,15 +216,20 @@ expr_has_fast_path(ExprState *state)
 			return true;
 
 		if (step0 == EEOP_CASE_TESTVAL &&
-			(step1 == EEOP_FUNCEXPR_STRICT ||
-			 step1 == EEOP_FUNCEXPR_STRICT_1 ||
-			 step1 == EEOP_FUNCEXPR_STRICT_2))
+			(step1 == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			 || step1 == EEOP_FUNCEXPR_STRICT_1
+			 || step1 == EEOP_FUNCEXPR_STRICT_2
+#endif
+			))
 			return true;
 
+#ifdef HAVE_EEOP_HASHDATUM
 		if (step0 == EEOP_INNER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
 		if (step0 == EEOP_OUTER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
+#endif
 	}
 	else if (nsteps == 2)
 	{

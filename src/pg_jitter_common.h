@@ -5,6 +5,7 @@
 #define PG_JITTER_COMMON_H
 
 #include "postgres.h"
+#include "pg_jitter_compat.h"
 #include "jit/jit.h"
 #include "executor/execExpr.h"
 #include "executor/nodeAgg.h"

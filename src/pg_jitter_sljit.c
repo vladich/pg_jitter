@@ -194,6 +194,8 @@ emit_load_econtext_slot(struct sljit_compiler *C, sljit_s32 dst,
 		case EEOP_ASSIGN_SCAN_VAR:
 			offset = offsetof(ExprContext, ecxt_scantuple);
 			break;
+
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_FETCHSOME:
 		case EEOP_OLD_VAR:
 		case EEOP_ASSIGN_OLD_VAR:
@@ -204,6 +206,7 @@ emit_load_econtext_slot(struct sljit_compiler *C, sljit_s32 dst,
 		case EEOP_ASSIGN_NEW_VAR:
 			offset = offsetof(ExprContext, ecxt_newtuple);
 			break;
+#endif
 		default:
 			offset = offsetof(ExprContext, ecxt_scantuple);
 			break;
@@ -234,6 +237,8 @@ expr_has_fast_path(ExprState *state)
 
 	step0 = ExecEvalStepOp(state, &state->steps[0]);
 
+
+#ifdef HAVE_EEOP_HASHDATUM
 	if (nsteps == 5)
 	{
 		step1 = ExecEvalStepOp(state, &state->steps[1]);
@@ -266,7 +271,9 @@ expr_has_fast_path(ExprState *state)
 			step2 == EEOP_HASHDATUM_FIRST_STRICT)
 			return true;
 	}
-	else if (nsteps == 3)
+	else
+#endif /* HAVE_EEOP_HASHDATUM */
+	if (nsteps == 3)
 	{
 		step1 = ExecEvalStepOp(state, &state->steps[1]);
 
@@ -288,16 +295,21 @@ expr_has_fast_path(ExprState *state)
 
 		/* CASE_TESTVAL + FUNCEXPR_STRICT variants */
 		if (step0 == EEOP_CASE_TESTVAL &&
-			(step1 == EEOP_FUNCEXPR_STRICT ||
-			 step1 == EEOP_FUNCEXPR_STRICT_1 ||
-			 step1 == EEOP_FUNCEXPR_STRICT_2))
+			(step1 == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			 || step1 == EEOP_FUNCEXPR_STRICT_1
+			 || step1 == EEOP_FUNCEXPR_STRICT_2
+#endif
+			))
 			return true;
 
+#ifdef HAVE_EEOP_HASHDATUM
 		/* VAR + HASHDATUM_FIRST (virtual slot hash, no fetchsome) */
 		if (step0 == EEOP_INNER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
 		if (step0 == EEOP_OUTER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
+#endif
 	}
 	else if (nsteps == 2)
 	{
@@ -393,7 +405,7 @@ sljit_compile_deform(TupleDesc desc,
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
 
-        if (att->attnullability == ATTNULLABLE_VALID &&
+        if (JITTER_ATT_IS_NOTNULL(att) &&
             !att->atthasmissing &&
             !att->attisdropped)
             guaranteed_column_number = attnum;
@@ -524,7 +536,7 @@ sljit_compile_deform(TupleDesc desc,
     for (attnum = 0; attnum < natts; attnum++)
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-        int     alignto = att->attalignby;
+        int     alignto = JITTER_ATTALIGNBY(att);
 
         /* ---- Emit attcheck label and wire up nvalid dispatch ---- */
         att_labels[attnum] = sljit_emit_label(C);
@@ -553,7 +565,7 @@ sljit_compile_deform(TupleDesc desc,
         }
 
         /* ---- Null check ---- */
-        if (att->attnullability != ATTNULLABLE_VALID)
+        if (!JITTER_ATT_IS_NOTNULL(att))
         {
             struct sljit_jump *no_hasnulls;
             struct sljit_jump *bit_is_set;
@@ -701,13 +713,13 @@ sljit_compile_deform(TupleDesc desc,
             known_alignment = -1;
             attguaranteedalign = false;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  attguaranteedalign && known_alignment >= 0)
         {
             Assert(att->attlen > 0);
             known_alignment += att->attlen;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  (att->attlen % alignto) == 0)
         {
             Assert(att->attlen > 0);
@@ -912,7 +924,7 @@ find_or_compile_deform(PgJitterContext *ctx,
         INSTR_TIME_SET_CURRENT(deform_start);
         code = sljit_compile_deform(desc, ops, natts);
         INSTR_TIME_SET_CURRENT(deform_end);
-        INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
+        JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
                               deform_end, deform_start);
 
         if (code)
@@ -1012,7 +1024,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
 
-        if (att->attnullability == ATTNULLABLE_VALID &&
+        if (JITTER_ATT_IS_NOTNULL(att) &&
             !att->atthasmissing &&
             !att->attisdropped)
             guaranteed_column_number = attnum;
@@ -1150,7 +1162,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
     for (attnum = 0; attnum < natts; attnum++)
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-        int     alignto = att->attalignby;
+        int     alignto = JITTER_ATTALIGNBY(att);
 
         /* ---- Emit attcheck label and wire up nvalid dispatch ---- */
         att_labels[attnum] = sljit_emit_label(C);
@@ -1179,7 +1191,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         }
 
         /* ---- Null check ---- */
-        if (att->attnullability != ATTNULLABLE_VALID)
+        if (!JITTER_ATT_IS_NOTNULL(att))
         {
             struct sljit_jump *no_hasnulls;
             struct sljit_jump *bit_is_set;
@@ -1344,13 +1356,13 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
             known_alignment = -1;
             attguaranteedalign = false;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  attguaranteedalign && known_alignment >= 0)
         {
             Assert(att->attlen > 0);
             known_alignment += att->attlen;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  (att->attlen % alignto) == 0)
         {
             Assert(att->attlen > 0);
@@ -1491,6 +1503,8 @@ slot_cache_offset(ExprEvalOp opcode)
         case EEOP_SCAN_VAR:
         case EEOP_ASSIGN_SCAN_VAR:
             return SOFF_SCAN_VALS;
+
+#ifdef HAVE_EEOP_OLD_NEW
         case EEOP_OLD_FETCHSOME:
         case EEOP_OLD_VAR:
         case EEOP_ASSIGN_OLD_VAR:
@@ -1499,6 +1513,7 @@ slot_cache_offset(ExprEvalOp opcode)
         case EEOP_NEW_VAR:
         case EEOP_ASSIGN_NEW_VAR:
             return SOFF_NEW_VALS;
+#endif
         default:
             return -1;
     }
@@ -1525,6 +1540,7 @@ slot_cache_bit(ExprEvalOp opcode)
         case EEOP_SCAN_VAR:
         case EEOP_ASSIGN_SCAN_VAR:
             return 4;
+#ifdef HAVE_EEOP_OLD_NEW
         case EEOP_OLD_FETCHSOME:
         case EEOP_OLD_VAR:
         case EEOP_ASSIGN_OLD_VAR:
@@ -1533,6 +1549,7 @@ slot_cache_bit(ExprEvalOp opcode)
         case EEOP_NEW_VAR:
         case EEOP_ASSIGN_NEW_VAR:
             return 16;
+#endif
         default:
             return 0;
     }
@@ -2342,9 +2359,12 @@ sljit_compile_expr(ExprState *state)
 			if (op >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
 				op <= EEOP_AGG_PLAIN_TRANS_BYREF)
 				has_agg = true;
+
+#ifdef HAVE_EEOP_HASHDATUM
 			if (op == EEOP_HASHDATUM_NEXT32 ||
 				op == EEOP_HASHDATUM_NEXT32_STRICT)
 				has_hash_next = true;
+#endif
 		}
 
 		/*
@@ -2472,11 +2492,13 @@ sljit_compile_expr(ExprState *state)
 				break;
 			}
 
+#ifdef HAVE_EEOP_DONE_SPLIT
 			case EEOP_DONE_NO_RETURN:
 			{
 				sljit_emit_return(C, SLJIT_MOV, SLJIT_IMM, 0);
 				break;
 			}
+#endif
 
 			/* All hot-path opcodes below get native code */
 
@@ -2488,8 +2510,10 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_INNER_FETCHSOME:
 			case EEOP_OUTER_FETCHSOME:
 			case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_FETCHSOME:
 			case EEOP_NEW_FETCHSOME:
+#endif
 			{
 				struct sljit_jump *skip_j;
 				bool deform_emitted = false;
@@ -2545,7 +2569,7 @@ sljit_compile_expr(ExprState *state)
 							opcode,
 							vals_off);
 						INSTR_TIME_SET_CURRENT(deform_end);
-						INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
+						JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
 						                      deform_end, deform_start);
 
 						if (!deform_emitted)
@@ -2620,8 +2644,10 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_INNER_VAR:
 			case EEOP_OUTER_VAR:
 			case EEOP_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_VAR:
 			case EEOP_NEW_VAR:
+#endif
 			{
 				sljit_sw	vals_off = slot_cache_offset(opcode);
 				bool		use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
@@ -2756,8 +2782,10 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_ASSIGN_INNER_VAR:
 			case EEOP_ASSIGN_OUTER_VAR:
 			case EEOP_ASSIGN_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_ASSIGN_OLD_VAR:
 			case EEOP_ASSIGN_NEW_VAR:
+#endif
 			{
 				sljit_sw	vals_off = slot_cache_offset(opcode);
 				bool		use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
@@ -2906,8 +2934,10 @@ sljit_compile_expr(ExprState *state)
 			 */
 			case EEOP_FUNCEXPR:
 			case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
 			case EEOP_FUNCEXPR_STRICT_1:
 			case EEOP_FUNCEXPR_STRICT_2:
+#endif
 			{
 				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
 				int			nargs = op->d.func.nargs;
@@ -2915,9 +2945,12 @@ sljit_compile_expr(ExprState *state)
 				bool		r1_has_fcinfo = false;
 				int			null_check_start = npending;
 
-				if (opcode == EEOP_FUNCEXPR_STRICT ||
-					opcode == EEOP_FUNCEXPR_STRICT_1 ||
-					opcode == EEOP_FUNCEXPR_STRICT_2)
+				if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+					|| opcode == EEOP_FUNCEXPR_STRICT_1
+					|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+					)
 				{
 					/*
 					 * Check args for NULL. If any arg is null, jump to
@@ -3180,9 +3213,12 @@ sljit_compile_expr(ExprState *state)
 				} /* end direct-call dispatch block */
 
 				/* Fix up null-check jumps: emit null_path that sets resnull=true */
-				if (opcode == EEOP_FUNCEXPR_STRICT ||
-					opcode == EEOP_FUNCEXPR_STRICT_1 ||
-					opcode == EEOP_FUNCEXPR_STRICT_2)
+				if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+					|| opcode == EEOP_FUNCEXPR_STRICT_1
+					|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+					)
 				{
 					/* Jump over null_path from the normal (non-null) path */
 					struct sljit_jump *j_skip_null = sljit_emit_jump(C, SLJIT_JUMP);
@@ -3495,7 +3531,9 @@ sljit_compile_expr(ExprState *state)
 			 * Inline: load isnull bool, conditional jump. No function call.
 			 */
 			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
 			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
 			{
 				NullableDatum *args = op->d.agg_strict_input_check.args;
 				int			nargs = op->d.agg_strict_input_check.nargs;
@@ -4176,6 +4214,7 @@ sljit_compile_expr(ExprState *state)
 			 * ---- PRESORTED DISTINCT ----
 			 * Call extern function, branch on result.
 			 */
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 			case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 			case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
 			{
@@ -4200,11 +4239,13 @@ sljit_compile_expr(ExprState *state)
 				npending++;
 				break;
 			}
+#endif /* HAVE_EEOP_AGG_PRESORTED_DISTINCT */
 
 			/*
 			 * ---- HASHDATUM_SET_INITVAL ----
 			 * Store init_value → *op->resvalue, set *op->resnull = false.
 			 */
+#ifdef HAVE_EEOP_HASHDATUM
 			case EEOP_HASHDATUM_SET_INITVAL:
 			{
 				/* *op->resvalue = op->d.hashdatum_initvalue.init_value */
@@ -4619,6 +4660,7 @@ sljit_compile_expr(ExprState *state)
 				}
 				break;
 			}
+#endif /* HAVE_EEOP_HASHDATUM */
 
 			/*
 			 * ---- CASE_TESTVAL / CASE_TESTVAL_EXT ----
@@ -4640,6 +4682,8 @@ sljit_compile_expr(ExprState *state)
 				break;
 			}
 
+
+#ifdef HAVE_EEOP_TESTVAL_EXT
 			case EEOP_CASE_TESTVAL_EXT:
 			{
 				/* *op->resvalue = econtext->caseValue_datum */
@@ -4655,6 +4699,7 @@ sljit_compile_expr(ExprState *state)
 				emit_store_resnull_reg(C, state, op, SLJIT_R0);
 				break;
 			}
+#endif
 
 			/*
 			 * ---- DOMAIN_TESTVAL / DOMAIN_TESTVAL_EXT ----
@@ -4677,6 +4722,8 @@ sljit_compile_expr(ExprState *state)
 				break;
 			}
 
+
+#ifdef HAVE_EEOP_TESTVAL_EXT
 			case EEOP_DOMAIN_TESTVAL_EXT:
 			{
 				/* *op->resvalue = econtext->domainValue_datum */
@@ -4692,6 +4739,7 @@ sljit_compile_expr(ExprState *state)
 				emit_store_resnull_reg(C, state, op, SLJIT_R0);
 				break;
 			}
+#endif
 
 			/*
 			 * ---- SYSVAR ----
@@ -4701,8 +4749,10 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_INNER_SYSVAR:
 			case EEOP_OUTER_SYSVAR:
 			case EEOP_SCAN_SYSVAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_SYSVAR:
 			case EEOP_NEW_SYSVAR:
+#endif
 			{
 				sljit_sw slot_offset;
 
@@ -4717,12 +4767,15 @@ sljit_compile_expr(ExprState *state)
 					case EEOP_SCAN_SYSVAR:
 						slot_offset = offsetof(ExprContext, ecxt_scantuple);
 						break;
+
+#ifdef HAVE_EEOP_OLD_NEW
 					case EEOP_OLD_SYSVAR:
 						slot_offset = offsetof(ExprContext, ecxt_oldtuple);
 						break;
 					case EEOP_NEW_SYSVAR:
 						slot_offset = offsetof(ExprContext, ecxt_newtuple);
 						break;
+#endif
 					default:
 						pg_unreachable();
 				}
@@ -4888,6 +4941,7 @@ sljit_compile_expr(ExprState *state)
 			 * If state->flags & nullflag: set NULL result, jump to jumpdone.
 			 * Otherwise continue.
 			 */
+#ifdef HAVE_EEOP_RETURNINGEXPR
 			case EEOP_RETURNINGEXPR:
 			{
 				struct sljit_jump *j_continue;
@@ -4921,6 +4975,7 @@ sljit_compile_expr(ExprState *state)
 				sljit_set_label(j_continue, sljit_emit_label(C));
 				break;
 			}
+#endif /* HAVE_EEOP_RETURNINGEXPR */
 
 			/*
 			 * ---- AGG_STRICT_DESERIALIZE / AGG_DESERIALIZE ----
@@ -5371,6 +5426,7 @@ sljit_compile_expr(ExprState *state)
 			 */
 			case EEOP_HASHED_SCALARARRAYOP:
 			{
+#if PG_VERSION_NUM >= 150000
 				FunctionCallInfo fcinfo =
 					op->d.hashedscalararrayop.fcinfo_data;
 				bool inclause = op->d.hashedscalararrayop.inclause;
@@ -5753,6 +5809,17 @@ sljit_compile_expr(ExprState *state)
 								   SLJIT_S1, 0);
 					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalHashedScalarArrayOp);
 				}
+#else /* PG14: no inclause/saop — always use fallback */
+				{
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_S0, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_IMM, (sljit_sw) op);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_S1, 0);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalHashedScalarArrayOp);
+				}
+#endif /* PG_VERSION_NUM >= 150000 */
 				break;
 			}
 
@@ -5768,15 +5835,23 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_FUNCEXPR_STRICT_FUSAGE:
 			case EEOP_NULLTEST_ROWISNULL:
 			case EEOP_NULLTEST_ROWISNOTNULL:
+#ifdef HAVE_EEOP_PARAM_SET
 			case EEOP_PARAM_SET:
+#endif
 			case EEOP_ARRAYCOERCE:
 			case EEOP_FIELDSELECT:
 			case EEOP_FIELDSTORE_DEFORM:
 			case EEOP_FIELDSTORE_FORM:
 			case EEOP_CONVERT_ROWTYPE:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 			case EEOP_JSON_CONSTRUCTOR:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
 			case EEOP_JSONEXPR_COERCION:
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
 			case EEOP_MERGE_SUPPORT_FUNC:
+#endif
 			case EEOP_SUBPLAN:
 			case EEOP_WHOLEROW:
 			case EEOP_AGG_ORDERED_TRANS_DATUM:
@@ -5794,8 +5869,11 @@ sljit_compile_expr(ExprState *state)
 						fn = ExecEvalRowNull; break;
 					case EEOP_NULLTEST_ROWISNOTNULL:
 						fn = ExecEvalRowNotNull; break;
+
+#ifdef HAVE_EEOP_PARAM_SET
 					case EEOP_PARAM_SET:
 						fn = ExecEvalParamSet; break;
+#endif
 					case EEOP_ARRAYCOERCE:
 						fn = ExecEvalArrayCoerce; break;
 					case EEOP_FIELDSELECT:
@@ -5806,12 +5884,18 @@ sljit_compile_expr(ExprState *state)
 						fn = ExecEvalFieldStoreForm; break;
 					case EEOP_CONVERT_ROWTYPE:
 						fn = ExecEvalConvertRowtype; break;
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 					case EEOP_JSON_CONSTRUCTOR:
 						fn = ExecEvalJsonConstructor; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
 					case EEOP_JSONEXPR_COERCION:
 						fn = ExecEvalJsonCoercion; break;
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
 					case EEOP_MERGE_SUPPORT_FUNC:
 						fn = ExecEvalMergeSupportFunc; break;
+#endif
 					case EEOP_SUBPLAN:
 						fn = ExecEvalSubPlan; break;
 					case EEOP_WHOLEROW:
@@ -5833,7 +5917,9 @@ sljit_compile_expr(ExprState *state)
 			}
 
 			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
 			case EEOP_IOCOERCE_SAFE:
+#endif
 			case EEOP_SCALARARRAYOP:
 			case EEOP_SQLVALUEFUNCTION:
 			case EEOP_CURRENTOFEXPR:
@@ -5844,16 +5930,23 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_DOMAIN_NOTNULL:
 			case EEOP_DOMAIN_CHECK:
 			case EEOP_XMLEXPR:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 			case EEOP_IS_JSON:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
 			case EEOP_JSONEXPR_COERCION_FINISH:
+#endif
 			case EEOP_GROUPING_FUNC:
 			{
 				void *fn;
 
 				switch (opcode)
 				{
+
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
 					case EEOP_IOCOERCE_SAFE:
 						fn = ExecEvalCoerceViaIOSafe; break;
+#endif
 					case EEOP_SCALARARRAYOP:
 						fn = ExecEvalScalarArrayOp; break;
 					case EEOP_SQLVALUEFUNCTION:
@@ -5874,10 +5967,15 @@ sljit_compile_expr(ExprState *state)
 						fn = ExecEvalConstraintCheck; break;
 					case EEOP_XMLEXPR:
 						fn = ExecEvalXmlExpr; break;
+
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 					case EEOP_IS_JSON:
 						fn = ExecEvalJsonIsPredicate; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
 					case EEOP_JSONEXPR_COERCION_FINISH:
 						fn = ExecEvalJsonCoercionFinish; break;
+#endif
 					case EEOP_GROUPING_FUNC:
 						fn = ExecEvalGroupingFunc; break;
 					default:
@@ -5928,17 +6026,22 @@ sljit_compile_expr(ExprState *state)
 						fb_jump_target = op->d.agg_deserialize.jumpnull;
 						break;
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
 					case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
 						fb_jump_target = op->d.agg_strict_input_check.jumpnull;
 						break;
 					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
 						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
 						break;
+
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
 						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
 						break;
+#endif
 					/* HASHDATUM_FIRST_STRICT and NEXT32_STRICT are compiled natively */
 					case EEOP_ROWCOMPARE_STEP:
 						/*
@@ -5953,9 +6056,12 @@ sljit_compile_expr(ExprState *state)
 					case EEOP_SBSREF_SUBSCRIPTS:
 						fb_jump_target = op->d.sbsref_subscript.jumpdone;
 						break;
+
+#ifdef HAVE_EEOP_RETURNINGEXPR
 					case EEOP_RETURNINGEXPR:
 						fb_jump_target = op->d.returningexpr.jumpdone;
 						break;
+#endif
 					default:
 						break;
 				}
@@ -5991,6 +6097,8 @@ sljit_compile_expr(ExprState *state)
 						npending++;
 					}
 				}
+
+#ifdef HAVE_EEOP_JSONEXPR
 				else if (opcode == EEOP_JSONEXPR_PATH)
 				{
 					/*
@@ -6029,6 +6137,7 @@ sljit_compile_expr(ExprState *state)
 						}
 					}
 				}
+#endif /* HAVE_EEOP_JSONEXPR */
 				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					/* R0 >= 0 means jump to target step (signed compare!) */

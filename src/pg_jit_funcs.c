@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "pg_jitter_compat.h"
 #include "common/int.h"
 #include "common/int128.h"
 #include "common/hashfn.h"
@@ -1187,7 +1188,9 @@ const JitDirectFn jit_direct_fns[] = {
 
 	/* ---- timestamp/tz hash ---- */
 	E1(timestamp_hash,   jit_timestamp_hash,   T64, T64),
+#if PG_VERSION_NUM >= 180000
 	E1(timestamptz_hash, jit_timestamptz_hash, T64, T64),
+#endif
 
 	/* ---- date comparison ---- */
 	E2(date_eq, jit_date_eq, T32, T32, T32),
@@ -1217,8 +1220,10 @@ const JitDirectFn jit_direct_fns[] = {
 	E1(hashint4, jit_hashint4, T32, T32),
 	E1(hashint8, jit_hashint8, T64, T64),
 	E1(hashoid,  jit_hashoid,  T32, T32),
+#if PG_VERSION_NUM >= 180000
 	E1(hashbool, jit_hashbool, T32, T64),
 	E1(hashdate, jit_hashdate, T32, T32),
+#endif
 
 	/* ---- aggregate COUNT/SUM ---- */
 	E1(int8inc, jit_int8inc, T64, T64),
@@ -1374,8 +1379,10 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(byteagt, DEFERRED, T32, T64, T64),
 	E2(byteage, DEFERRED, T32, T64, T64),
 	E2(byteacmp, DEFERRED, T32, T64, T64),
+#if PG_VERSION_NUM >= 180000
 	E2(bytea_larger,  DEFERRED, T64, T64, T64),
 	E2(bytea_smaller, DEFERRED, T64, T64, T64),
+#endif
 
 	/* ---- bpchar comparison ---- */
 	E2(bpchareq,  DEFERRED, T32, T64, T64),

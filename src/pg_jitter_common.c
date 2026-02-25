@@ -13,13 +13,17 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/expandeddatum.h"
-#include "access/cmptype.h"
 #include "fmgr.h"
 
 
 /*
  * Resource owner support — follows llvmjit.c pattern.
+ *
+ * PG17+ uses the generic ResourceOwnerDesc API.
+ * PG14-16 use the JIT-specific ResourceOwnerEnlargeJIT/RememberJIT/ForgetJIT.
  */
+#if PG_VERSION_NUM >= 170000
+
 static void ResOwnerReleasePgJitterContext(Datum res);
 
 static const ResourceOwnerDesc pg_jitter_resowner_desc =
@@ -52,6 +56,24 @@ ResOwnerReleasePgJitterContext(Datum res)
 	jit_release_context(&context->base);
 }
 
+#else /* PG14-16: JIT-specific resource owner API */
+
+#include "utils/resowner_private.h"
+
+static inline void
+PgJitterRememberContext(ResourceOwner owner, PgJitterContext *handle)
+{
+	ResourceOwnerRememberJIT(owner, PointerGetDatum(handle));
+}
+
+static inline void
+PgJitterForgetContext(ResourceOwner owner, PgJitterContext *handle)
+{
+	ResourceOwnerForgetJIT(owner, PointerGetDatum(handle));
+}
+
+#endif /* PG_VERSION_NUM >= 170000 */
+
 /*
  * Get or create a PgJitterContext for the current query.
  * Follows the pattern in llvmjit.c:222-246.
@@ -67,11 +89,22 @@ pg_jitter_get_context(ExprState *state)
 	if (parent->state->es_jit)
 		return (PgJitterContext *) parent->state->es_jit;
 
+#if PG_VERSION_NUM >= 170000
 	ResourceOwnerEnlarge(CurrentResourceOwner);
+#else
+	ResourceOwnerEnlargeJIT(CurrentResourceOwner);
+#endif
 
 	ctx = (PgJitterContext *)
 		MemoryContextAllocZero(TopMemoryContext, sizeof(PgJitterContext));
 	ctx->base.flags = parent->state->es_jit_flags;
+#if PG_VERSION_NUM < 170000
+	/*
+	 * PG14-16: JitContext has a resowner field that PG's jit_release_context()
+	 * reads to call ResourceOwnerForgetJIT.  Must be set or release crashes.
+	 */
+	ctx->base.resowner = CurrentResourceOwner;
+#endif
 	ctx->compiled_list = NULL;
 	ctx->resowner = CurrentResourceOwner;
 
@@ -119,8 +152,16 @@ pg_jitter_release_context(JitContext *context)
 	}
 	ctx->compiled_list = NULL;
 
+	/*
+	 * On PG17+ we manage our own ResourceOwnerDesc, so we must call
+	 * ResourceOwnerForget ourselves.  On PG14-16, PG's jit_release_context()
+	 * calls ResourceOwnerForgetJIT() after our callback returns — doing it
+	 * here too would be a double-forget and corrupt the resource owner.
+	 */
+#if PG_VERSION_NUM >= 170000
 	if (ctx->resowner)
 		PgJitterForgetContext(ctx->resowner, ctx);
+#endif
 }
 
 /*
@@ -161,12 +202,14 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_SCAN_SYSVAR:
 			ExecEvalSysVar(state, op, econtext, econtext->ecxt_scantuple);
 			break;
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_SYSVAR:
 			ExecEvalSysVar(state, op, econtext, econtext->ecxt_oldtuple);
 			break;
 		case EEOP_NEW_SYSVAR:
 			ExecEvalSysVar(state, op, econtext, econtext->ecxt_newtuple);
 			break;
+#endif
 
 		/* Whole-row variable */
 		case EEOP_WHOLEROW:
@@ -233,19 +276,23 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_PARAM_CALLBACK:
 			op->d.cparam.paramfunc(state, op, econtext);
 			break;
+#ifdef HAVE_EEOP_PARAM_SET
 		case EEOP_PARAM_SET:
 			ExecEvalParamSet(state, op, econtext);
 			break;
+#endif
 
 		/* Case test values */
 		case EEOP_CASE_TESTVAL:
 			*op->resvalue = *op->d.casetest.value;
 			*op->resnull = *op->d.casetest.isnull;
 			break;
+#ifdef HAVE_EEOP_TESTVAL_EXT
 		case EEOP_CASE_TESTVAL_EXT:
 			*op->resvalue = econtext->caseValue_datum;
 			*op->resnull = econtext->caseValue_isNull;
 			break;
+#endif
 
 		/* Make expanded object read-only */
 		case EEOP_MAKE_READONLY:
@@ -277,9 +324,11 @@ pg_jitter_fallback_step(ExprState *state,
 			*op->resnull = fcinfo_in->isnull;
 			break;
 		}
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
 		case EEOP_IOCOERCE_SAFE:
 			ExecEvalCoerceViaIOSafe(state, op);
 			break;
+#endif
 
 		/* Distinct / not distinct / nullif */
 		case EEOP_DISTINCT:
@@ -348,6 +397,7 @@ pg_jitter_fallback_step(ExprState *state,
 			ExecEvalNextValueExpr(state, op);
 			break;
 
+#ifdef HAVE_EEOP_RETURNINGEXPR
 		case EEOP_RETURNINGEXPR:
 			if (state->flags & op->d.returningexpr.nullflag)
 			{
@@ -356,6 +406,7 @@ pg_jitter_fallback_step(ExprState *state,
 				return op->d.returningexpr.jumpdone;
 			}
 			break;
+#endif
 
 		/* Arrays and rows */
 		case EEOP_ARRAYEXPR:
@@ -453,10 +504,12 @@ pg_jitter_fallback_step(ExprState *state,
 			*op->resvalue = *op->d.casetest.value;
 			*op->resnull = *op->d.casetest.isnull;
 			break;
+#ifdef HAVE_EEOP_TESTVAL_EXT
 		case EEOP_DOMAIN_TESTVAL_EXT:
 			*op->resvalue = econtext->domainValue_datum;
 			*op->resnull = econtext->domainValue_isNull;
 			break;
+#endif
 		case EEOP_DOMAIN_NOTNULL:
 			ExecEvalConstraintNotNull(state, op);
 			break;
@@ -465,6 +518,7 @@ pg_jitter_fallback_step(ExprState *state,
 			break;
 
 		/* Hash datum */
+#ifdef HAVE_EEOP_HASHDATUM
 		case EEOP_HASHDATUM_SET_INITVAL:
 			*op->resvalue = op->d.hashdatum_initvalue.init_value;
 			*op->resnull = false;
@@ -517,6 +571,7 @@ pg_jitter_fallback_step(ExprState *state,
 			*op->resnull = false;
 			break;
 		}
+#endif /* HAVE_EEOP_HASHDATUM */
 
 		/* Type conversion */
 		case EEOP_CONVERT_ROWTYPE:
@@ -537,12 +592,15 @@ pg_jitter_fallback_step(ExprState *state,
 			break;
 
 		/* JSON */
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 		case EEOP_JSON_CONSTRUCTOR:
 			ExecEvalJsonConstructor(state, op, econtext);
 			break;
 		case EEOP_IS_JSON:
 			ExecEvalJsonIsPredicate(state, op);
 			break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
 		case EEOP_JSONEXPR_PATH:
 			return ExecEvalJsonExprPath(state, op, econtext);
 		case EEOP_JSONEXPR_COERCION:
@@ -551,6 +609,7 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_JSONEXPR_COERCION_FINISH:
 			ExecEvalJsonCoercionFinish(state, op);
 			break;
+#endif
 
 		/* Aggregate references */
 		case EEOP_AGGREF:
@@ -572,9 +631,11 @@ pg_jitter_fallback_step(ExprState *state,
 			*op->resnull = econtext->ecxt_aggnulls[wfunc->wfuncno];
 			break;
 		}
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
 		case EEOP_MERGE_SUPPORT_FUNC:
 			ExecEvalMergeSupportFunc(state, op, econtext);
 			break;
+#endif
 		case EEOP_SUBPLAN:
 			ExecEvalSubPlan(state, op, econtext);
 			break;
@@ -596,7 +657,9 @@ pg_jitter_fallback_step(ExprState *state,
 		}
 
 		case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
 		case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
 		{
 			NullableDatum *args = op->d.agg_strict_input_check.args;
 			int nargs = op->d.agg_strict_input_check.nargs;
@@ -832,6 +895,7 @@ pg_jitter_fallback_step(ExprState *state,
 			break;
 		}
 
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 		case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 		{
 			AggState *aggstate = castNode(AggState, state->parent);
@@ -851,6 +915,7 @@ pg_jitter_fallback_step(ExprState *state,
 				return op->d.agg_presorted_distinctcheck.jumpdistinct;
 			break;
 		}
+#endif
 
 		case EEOP_AGG_ORDERED_TRANS_DATUM:
 			ExecEvalAggOrderedTransDatum(state, op, econtext);
@@ -864,7 +929,9 @@ pg_jitter_fallback_step(ExprState *state,
 		 * but included here as safety net for debugging/fallback.
 		 */
 		case EEOP_DONE_RETURN:
+#ifdef HAVE_EEOP_DONE_SPLIT
 		case EEOP_DONE_NO_RETURN:
+#endif
 			/* Should not reach fallback — these are always native */
 			elog(ERROR, "pg_jitter: DONE opcode in fallback");
 			break;
@@ -872,8 +939,10 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_INNER_FETCHSOME:
 		case EEOP_OUTER_FETCHSOME:
 		case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_FETCHSOME:
 		case EEOP_NEW_FETCHSOME:
+#endif
 		{
 			TupleTableSlot *slot;
 
@@ -885,10 +954,12 @@ pg_jitter_fallback_step(ExprState *state,
 					slot = econtext->ecxt_outertuple; break;
 				case EEOP_SCAN_FETCHSOME:
 					slot = econtext->ecxt_scantuple; break;
+#ifdef HAVE_EEOP_OLD_NEW
 				case EEOP_OLD_FETCHSOME:
 					slot = econtext->ecxt_oldtuple; break;
 				case EEOP_NEW_FETCHSOME:
 					slot = econtext->ecxt_newtuple; break;
+#endif
 				default:
 					slot = econtext->ecxt_scantuple; break;
 			}
@@ -900,8 +971,10 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_INNER_VAR:
 		case EEOP_OUTER_VAR:
 		case EEOP_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_VAR:
 		case EEOP_NEW_VAR:
+#endif
 		{
 			TupleTableSlot *slot;
 			int attnum = op->d.var.attnum;
@@ -914,10 +987,12 @@ pg_jitter_fallback_step(ExprState *state,
 					slot = econtext->ecxt_outertuple; break;
 				case EEOP_SCAN_VAR:
 					slot = econtext->ecxt_scantuple; break;
+#ifdef HAVE_EEOP_OLD_NEW
 				case EEOP_OLD_VAR:
 					slot = econtext->ecxt_oldtuple; break;
 				case EEOP_NEW_VAR:
 					slot = econtext->ecxt_newtuple; break;
+#endif
 				default:
 					slot = econtext->ecxt_scantuple; break;
 			}
@@ -929,8 +1004,10 @@ pg_jitter_fallback_step(ExprState *state,
 		case EEOP_ASSIGN_INNER_VAR:
 		case EEOP_ASSIGN_OUTER_VAR:
 		case EEOP_ASSIGN_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_ASSIGN_OLD_VAR:
 		case EEOP_ASSIGN_NEW_VAR:
+#endif
 		{
 			TupleTableSlot *srcslot;
 			TupleTableSlot *resultslot = state->resultslot;
@@ -945,10 +1022,12 @@ pg_jitter_fallback_step(ExprState *state,
 					srcslot = econtext->ecxt_outertuple; break;
 				case EEOP_ASSIGN_SCAN_VAR:
 					srcslot = econtext->ecxt_scantuple; break;
+#ifdef HAVE_EEOP_OLD_NEW
 				case EEOP_ASSIGN_OLD_VAR:
 					srcslot = econtext->ecxt_oldtuple; break;
 				case EEOP_ASSIGN_NEW_VAR:
 					srcslot = econtext->ecxt_newtuple; break;
+#endif
 				default:
 					srcslot = econtext->ecxt_scantuple; break;
 			}
@@ -978,8 +1057,10 @@ pg_jitter_fallback_step(ExprState *state,
 
 		case EEOP_FUNCEXPR:
 		case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
 		case EEOP_FUNCEXPR_STRICT_1:
 		case EEOP_FUNCEXPR_STRICT_2:
+#endif
 		{
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
 			int nargs = op->d.func.nargs;
