@@ -3,12 +3,13 @@
 # Uses PREPARE/EXECUTE to show caching benefits on repeated execution
 set -e
 
-PG_INSTALL="$HOME/PgCypher/pg_install"
-PG_DATA="$HOME/PgCypher/pg_data"
-PGBIN="$PG_INSTALL/bin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PGBIN="$("$PG_CONFIG" --bindir)"
+PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 PGCTL="$PGBIN/pg_ctl"
 LOGFILE="$PG_DATA/logfile"
-OUTFILE="/Users/vladimir/PgCypher/pg_jitter/tests/bench_cache_$(date +%Y%m%d_%H%M%S).txt"
+OUTFILE="$SCRIPT_DIR/bench_cache_$(date +%Y%m%d_%H%M%S).txt"
 NRUNS=3
 
 restart_pg() {
@@ -21,7 +22,7 @@ restart_pg() {
 get_exec_time() {
     local query="$1"
     local cache_on="$2"
-    "$PGBIN/psql" -p 5433 -d regression -X -t -A -c "
+    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -t -A -c "
 SET jit = on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -48,7 +49,7 @@ restart_pg
 
 # Warmup buffer cache
 echo "Warming up buffer cache..."
-"$PGBIN/psql" -p 5433 -d regression -X -q -c "
+"$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "
 SET enable_mergejoin = off; SET enable_nestloop = off;
 SELECT SUM(val1) FROM bench_data;
 SELECT COUNT(*), SUM(l.val + r.val) FROM join_left l JOIN join_right r ON l.key1 = r.key1;

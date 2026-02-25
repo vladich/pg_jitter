@@ -12,14 +12,14 @@
 #   PG_CONFIG=/opt/pg18/bin/pg_config ./build.sh all    # custom PG install
 #
 # Dependency paths (override with -D flags):
-#   -DPG_CONFIG=...   Path to pg_config       (default: $PG_CONFIG or ~/PgCypher/pg_install/bin/pg_config)
+#   -DPG_CONFIG=...   Path to pg_config       (default: $PG_CONFIG or pg_config from PATH)
 #   -DSLJIT_DIR=...   Path to sljit source    (default: ../sljit relative to pg_jitter)
 #   -DASMJIT_DIR=...  Path to asmjit source   (default: ../asmjit relative to pg_jitter)
 #   -DMIR_DIR=...     Path to MIR source      (default: ../mir relative to pg_jitter)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PG_CONFIG="${PG_CONFIG:-$HOME/PgCypher/pg_install/bin/pg_config}"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 # Parse target (first arg if it matches a backend name)

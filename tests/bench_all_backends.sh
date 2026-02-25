@@ -3,12 +3,13 @@
 # Runs ALL queries per backend before switching (only 4 restarts total).
 set -e
 
-PG_INSTALL="$HOME/PgCypher/pg_install"
-PG_DATA="$HOME/PgCypher/pg_data"
-PGBIN="$PG_INSTALL/bin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PGBIN="$("$PG_CONFIG" --bindir)"
+PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 PGCTL="$PGBIN/pg_ctl"
 LOGFILE="$PG_DATA/logfile"
-OUTFILE="/Users/vladimir/PgCypher/pg_jitter/tests/bench_results_$(date +%Y%m%d_%H%M%S).txt"
+OUTFILE="$SCRIPT_DIR/bench_results_$(date +%Y%m%d_%H%M%S).txt"
 NRUNS=3
 TMPDIR=$(mktemp -d)
 
@@ -22,7 +23,7 @@ restart_pg() {
 get_exec_time() {
     local query="$1"
     local jit_on="$2"
-    "$PGBIN/psql" -p 5433 -d regression -X -t -A -c "
+    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -t -A -c "
 SET jit = $jit_on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -153,13 +154,13 @@ for bi in "${!BACKENDS[@]}"; do
         jit_on="off"
     else
         echo "Switching to $bname..."
-        "$PGBIN/psql" -p 5433 -d regression -X -q -c "ALTER SYSTEM SET jit_provider = '$backend';" 2>/dev/null
+        "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = '$backend';" 2>/dev/null
         restart_pg
         jit_on="on"
     fi
 
     # Warmup buffer cache
-    "$PGBIN/psql" -p 5433 -d regression -X -q -c "
+    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "
 SET max_parallel_workers_per_gather = 0;
 SELECT COUNT(*) FROM bench_data; SELECT COUNT(*) FROM join_left;
 SELECT COUNT(*) FROM join_right; SELECT COUNT(*) FROM date_data;
@@ -222,6 +223,6 @@ echo "Results saved to: $OUTFILE"
 rm -rf "$TMPDIR"
 
 # Restore sljit as default
-"$PGBIN/psql" -p 5433 -d regression -X -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';" 2>/dev/null
+"$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';" 2>/dev/null
 restart_pg
 echo "Restored jit_provider = pg_jitter_sljit"

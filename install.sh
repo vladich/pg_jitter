@@ -4,9 +4,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PG_CONFIG="${PG_CONFIG:-$HOME/PgCypher/pg_install/bin/pg_config}"
-PG_DATA="${PGDATA:-$HOME/PgCypher/pg_data}"
-PGCTL="$(dirname "$PG_CONFIG")/pg_ctl"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PGCTL="$("$PG_CONFIG" --bindir)/pg_ctl"
+PG_DATA="${PGDATA:-$("$("$PG_CONFIG" --bindir)/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 
 PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
 
@@ -27,19 +27,31 @@ esac
 echo "=== pg_jitter install ($TARGET) ==="
 echo "  Target: $PKGLIBDIR"
 
-# Check dylibs exist
+# Find and copy dylibs (support both flat and per-backend build layouts)
+find_dylib() {
+    local b="$1"
+    local lib="pg_jitter_$b.$EXT"
+    for dir in "$SCRIPT_DIR/build/$b" "$SCRIPT_DIR/build"; do
+        if [ -f "$dir/$lib" ]; then
+            echo "$dir/$lib"
+            return 0
+        fi
+    done
+    return 1
+}
+
 missing=0
 for b in "${BACKENDS[@]}"; do
-    if [ ! -f "$SCRIPT_DIR/build/$b/pg_jitter_$b.$EXT" ]; then
-        echo "ERROR: build/$b/pg_jitter_$b.$EXT not found — run ./build.sh $b first"
+    if ! find_dylib "$b" > /dev/null 2>&1; then
+        echo "ERROR: pg_jitter_$b.$EXT not found in build/ — run ./build.sh $b first"
         missing=1
     fi
 done
 [ "$missing" -eq 1 ] && exit 1
 
-# Copy
 for b in "${BACKENDS[@]}"; do
-    cp "$SCRIPT_DIR/build/$b/pg_jitter_$b.$EXT" "$PKGLIBDIR/"
+    src=$(find_dylib "$b")
+    cp "$src" "$PKGLIBDIR/"
     echo "  pg_jitter_$b.$EXT installed"
 done
 

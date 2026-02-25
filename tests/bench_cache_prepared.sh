@@ -3,12 +3,13 @@
 # Uses clock_timestamp() to measure wall time of N EXECUTE cycles
 set -e
 
-PG_INSTALL="$HOME/PgCypher/pg_install"
-PGBIN="$PG_INSTALL/bin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PGBIN="$("$PG_CONFIG" --bindir)"
+PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 PGCTL="$PGBIN/pg_ctl"
-PG_DATA="$HOME/PgCypher/pg_data"
 LOGFILE="$PG_DATA/logfile"
-OUTFILE="/Users/vladimir/PgCypher/pg_jitter/tests/bench_prepared_$(date +%Y%m%d_%H%M%S).txt"
+OUTFILE="$SCRIPT_DIR/bench_prepared_$(date +%Y%m%d_%H%M%S).txt"
 
 NEXEC=50
 
@@ -28,7 +29,7 @@ measure_prepared() {
     local n="$NEXEC"
 
     # Build a DO block that loops N times
-    "$PGBIN/psql" -p 5433 -d regression -X -t -A -c "
+    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -t -A -c "
 SET jit = on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -62,7 +63,7 @@ DEALLOCATE the_query;
 measure_single() {
     local query="$1"
     local cache_setting="$2"
-    "$PGBIN/psql" -p 5433 -d regression -X -t -A -c "
+    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -t -A -c "
 SET jit = on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -91,7 +92,7 @@ restart_pg
 
 # Warmup
 echo "Warming up..."
-"$PGBIN/psql" -p 5433 -d regression -X -q -c "
+"$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "
 SET enable_mergejoin = off; SET enable_nestloop = off; SET max_parallel_workers_per_gather = 0;
 SELECT SUM(val1) FROM bench_data;
 SELECT COUNT(*), SUM(l.val + r.val) FROM join_left l JOIN join_right r ON l.key1 = r.key1;
