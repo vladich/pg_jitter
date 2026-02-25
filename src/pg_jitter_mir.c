@@ -44,56 +44,84 @@ static void mir_reset_after_error(void);
 static int mir_name_counter = 0;
 
 /*
- * Persistent MIR context — shared across all expressions in the backend.
- *
- * MIR_init() and MIR_gen_init() are expensive (~0.7 ms each).  By keeping
- * the context alive we pay that cost once per backend instead of once per
- * expression (20× per query).  Generated code pointers remain valid as long
- * as the context lives.
- */
-static MIR_context_t	mir_persistent_ctx = NULL;
-static int				mir_module_counter = 0;
-
-/*
  * Pre-compiled MIR blob support — shared infrastructure from pg_jit_mir_blobs.h.
  * Provides mir_find_precompiled_fn() and mir_load_precompiled_blobs().
  */
 #include "pg_jit_mir_blobs.h"
 
 /*
- * Lazy-init the persistent MIR context.
+ * Per-query MIR state.
+ *
+ * Each PgJitterContext (= each query) gets its own MIR context.  When the
+ * JitContext is released (ResourceOwner cleanup), we destroy the MIR context,
+ * freeing all generated code and IR.  This prevents unbounded code memory
+ * growth in long-running backends.
+ *
+ * Cost: MIR_init() + MIR_gen_init() ≈ 1.4 ms, paid once per query (not per
+ * expression).  A query typically has 1–5 expressions sharing the same
+ * JitContext.
  */
-static MIR_context_t
-mir_ensure_ctx(void)
+typedef struct MirPerQueryState
 {
-	if (!mir_persistent_ctx)
+	MIR_context_t	ctx;
+	int				module_counter;
+} MirPerQueryState;
+
+/* Single-threaded PG: cache the current per-query state */
+static MirPerQueryState *mir_current_state = NULL;
+static PgJitterContext  *mir_current_jctx = NULL;
+
+/*
+ * Free the per-query MIR context when its JitContext is released.
+ */
+static void
+mir_ctx_free(void *data)
+{
+	MirPerQueryState *st = (MirPerQueryState *) data;
+
+	if (st)
 	{
-		mir_persistent_ctx = MIR_init();
-		MIR_gen_init(mir_persistent_ctx);
-		MIR_gen_set_optimize_level(mir_persistent_ctx, 0);
-		mir_module_counter = 0;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-		mir_load_precompiled_blobs(mir_persistent_ctx);
-#endif
+		if (mir_current_state == st)
+		{
+			mir_current_state = NULL;
+			mir_current_jctx = NULL;
+		}
+		MIR_gen_finish(st->ctx);
+		MIR_finish(st->ctx);
+		pfree(st);
 	}
-	return mir_persistent_ctx;
 }
 
 /*
- * Tear down the persistent MIR context (error reset / cleanup).
+ * Get or create a MIR context for the given JitContext.
  */
-static void
-mir_destroy_ctx(void)
+static MIR_context_t
+mir_get_or_create_ctx(PgJitterContext *jctx)
 {
-	if (mir_persistent_ctx)
+	if (mir_current_jctx == jctx)
+		return mir_current_state->ctx;
+
+	/* New JitContext — create fresh MIR context */
 	{
-		MIR_gen_finish(mir_persistent_ctx);
-		MIR_finish(mir_persistent_ctx);
-		mir_persistent_ctx = NULL;
-		mir_module_counter = 0;
+		MirPerQueryState *st = MemoryContextAllocZero(TopMemoryContext,
+													  sizeof(MirPerQueryState));
+		st->ctx = MIR_init();
+		MIR_gen_init(st->ctx);
+		MIR_gen_set_optimize_level(st->ctx, 0);
+		st->module_counter = 0;
+
+		/* Register for cleanup when this JitContext is released */
+		pg_jitter_register_compiled(jctx, mir_ctx_free, st);
+
+		mir_current_state = st;
+		mir_current_jctx = jctx;
+
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-		mir_destroy_blob_ctx();
+		/* Precompiled blobs use their own mmap'd memory, load once globally */
+		mir_load_precompiled_blobs(NULL);
 #endif
+
+		return st->ctx;
 	}
 }
 
@@ -111,30 +139,16 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 /*
  * Error reset — intentionally a no-op.
  *
- * We must NOT destroy the persistent MIR context here because other
- * transactions/portals (e.g. cursors surviving a ROLLBACK TO SAVEPOINT)
- * may still hold evalfunc pointers into MIR-generated code.  Destroying
- * the context would free those code buffers → SIGSEGV on next FETCH.
- *
- * Per-expression cleanup happens via mir_code_free() called from
+ * Per-query MIR contexts are freed via mir_ctx_free() called from
  * pg_jitter_release_context() through the ResourceOwner machinery.
- * The persistent context's arena is reclaimed when the backend exits.
+ * A cursor surviving a ROLLBACK TO SAVEPOINT keeps its ResourceOwner
+ * alive, so its JitContext (and MIR context) won't be freed until the
+ * cursor is closed.
  */
 static void
 mir_reset_after_error(void)
 {
 	/* nothing to do */
-}
-
-/*
- * Per-expression free — the generated code lives in the persistent context's
- * code buffer, so there's nothing to free except our tiny tracking struct.
- */
-static void
-mir_code_free(void *data)
-{
-	if (data)
-		pfree(data);
 }
 
 /*
@@ -329,11 +343,11 @@ mir_compile_expr(ExprState *state)
 
 	mir_name_counter = 0;
 
-	ctx = mir_ensure_ctx();
+	ctx = mir_get_or_create_ctx(jctx);
 	if (!ctx)
 		return false;
 
-	snprintf(modname, sizeof(modname), "m_%d", mir_module_counter++);
+	snprintf(modname, sizeof(modname), "m_%d", mir_current_state->module_counter++);
 	m = MIR_new_module(ctx, modname);
 
 	/*
@@ -3567,14 +3581,10 @@ mir_compile_expr(ExprState *state)
 	}
 
 	/*
-	 * Register a small tracking struct for cleanup accounting.
-	 * The generated code lives in the persistent MIR context's code buffer
-	 * and doesn't need individual freeing.
+	 * No per-expression registration needed — the per-query MIR context
+	 * (registered via mir_ctx_free in mir_get_or_create_ctx) handles cleanup
+	 * of all generated code when the JitContext is released.
 	 */
-	{
-		void *mc = MemoryContextAllocZero(TopMemoryContext, sizeof(void *));
-		pg_jitter_register_compiled(jctx, mir_code_free, mc);
-	}
 
 	pfree(step_labels);
 	pfree(step_fn_imports);
