@@ -2,25 +2,37 @@
 # build.sh — Build pg_jitter backends (macOS / Linux)
 #
 # Usage:
-#   ./build.sh [sljit|asmjit|mir|all] [cmake args...]
+#   ./build.sh [--pg-config PATH] [sljit|asmjit|mir|all] [cmake args...]
 #
 # Examples:
 #   ./build.sh                                          # build all 3
 #   ./build.sh sljit                                    # build sljit only
+#   ./build.sh --pg-config /opt/pg18/bin/pg_config all  # custom PG install
 #   ./build.sh sljit -DPG_JITTER_USE_LLVM=ON            # sljit with LLVM blobs
 #   ./build.sh mir -DMIR_DIR=/opt/mir                   # custom MIR path
-#   PG_CONFIG=/opt/pg18/bin/pg_config ./build.sh all    # custom PG install
+#
+# pg_config resolution (first match wins):
+#   1. --pg-config PATH argument
+#   2. PG_CONFIG environment variable
+#   3. pg_config from PATH
 #
 # Dependency paths (override with -D flags):
-#   -DPG_CONFIG=...   Path to pg_config       (default: $PG_CONFIG or pg_config from PATH)
 #   -DSLJIT_DIR=...   Path to sljit source    (default: ../sljit relative to pg_jitter)
 #   -DASMJIT_DIR=...  Path to asmjit source   (default: ../asmjit relative to pg_jitter)
 #   -DMIR_DIR=...     Path to MIR source      (default: ../mir relative to pg_jitter)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PG_CONFIG="${PG_CONFIG:-pg_config}"
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+
+# Parse --pg-config if present
+if [ "${1:-}" = "--pg-config" ]; then
+    [ -z "${2:-}" ] && { echo "ERROR: --pg-config requires a path argument"; exit 1; }
+    PG_CONFIG="$2"
+    shift 2
+fi
+
+PG_CONFIG="${PG_CONFIG:-pg_config}"
 
 # Parse target (first arg if it matches a backend name)
 TARGET="all"
@@ -32,9 +44,11 @@ if [ $# -gt 0 ]; then
     CMAKE_EXTRA_ARGS=("$@")
 fi
 
-if [ ! -x "$PG_CONFIG" ]; then
-    echo "ERROR: pg_config not found at $PG_CONFIG"
-    echo "  Set PG_CONFIG env var: PG_CONFIG=/path/to/pg_config ./build.sh"
+# Resolve pg_config to absolute path
+if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
+    echo "ERROR: pg_config not found: $PG_CONFIG"
+    echo "  Use: ./build.sh --pg-config /path/to/pg_config"
+    echo "   or: PG_CONFIG=/path/to/pg_config ./build.sh"
     exit 1
 fi
 

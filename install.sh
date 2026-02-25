@@ -1,13 +1,34 @@
 #!/bin/bash
 # install.sh — Install pg_jitter backends and restart PostgreSQL (macOS / Linux)
-# Usage: ./install.sh [sljit|asmjit|mir|all]
+#
+# Usage: ./install.sh [--pg-config PATH] [sljit|asmjit|mir|all]
+#
+# pg_config resolution (first match wins):
+#   1. --pg-config PATH argument
+#   2. PG_CONFIG environment variable
+#   3. pg_config from PATH
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PG_CONFIG="${PG_CONFIG:-pg_config}"
-PGCTL="$("$PG_CONFIG" --bindir)/pg_ctl"
-PG_DATA="${PGDATA:-$("$("$PG_CONFIG" --bindir)/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 
+# Parse --pg-config if present
+if [ "${1:-}" = "--pg-config" ]; then
+    [ -z "${2:-}" ] && { echo "ERROR: --pg-config requires a path argument"; exit 1; }
+    PG_CONFIG="$2"
+    shift 2
+fi
+
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+
+if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
+    echo "ERROR: pg_config not found: $PG_CONFIG"
+    echo "  Use: ./install.sh --pg-config /path/to/pg_config"
+    exit 1
+fi
+
+PGBIN="$("$PG_CONFIG" --bindir)"
+PGCTL="$PGBIN/pg_ctl"
+PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
 PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
 
 # Detect extension
@@ -21,7 +42,7 @@ TARGET="${1:-all}"
 case "$TARGET" in
     sljit|asmjit|mir) BACKENDS=("$TARGET") ;;
     all)              BACKENDS=(sljit asmjit mir) ;;
-    *)                echo "Usage: $0 [sljit|asmjit|mir|all]"; exit 1 ;;
+    *)                echo "Usage: $0 [--pg-config PATH] [sljit|asmjit|mir|all]"; exit 1 ;;
 esac
 
 echo "=== pg_jitter install ($TARGET) ==="
@@ -61,7 +82,7 @@ echo ""
 
 # Show status
 PORT=$(sed -n '4p' "$PG_DATA/postmaster.pid" 2>/dev/null || echo 5432)
-PROVIDER=$("$(dirname "$PG_CONFIG")/psql" -p "$PORT" -d postgres -t -A \
+PROVIDER=$("$PGBIN/psql" -p "$PORT" -d postgres -t -A \
     -c "SHOW jit_provider;" 2>/dev/null || echo "unknown")
 echo ""
 echo "Active jit_provider: $PROVIDER"
