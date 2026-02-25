@@ -171,6 +171,7 @@ mir_slot_offset(ExprEvalOp opcode)
 		case EEOP_SCAN_VAR:
 		case EEOP_ASSIGN_SCAN_VAR:
 			return offsetof(ExprContext, ecxt_scantuple);
+#ifdef HAVE_EEOP_OLD_NEW
 		case EEOP_OLD_FETCHSOME:
 		case EEOP_OLD_VAR:
 		case EEOP_ASSIGN_OLD_VAR:
@@ -179,6 +180,7 @@ mir_slot_offset(ExprEvalOp opcode)
 		case EEOP_NEW_VAR:
 		case EEOP_ASSIGN_NEW_VAR:
 			return offsetof(ExprContext, ecxt_newtuple);
+#endif
 		default:
 			return offsetof(ExprContext, ecxt_scantuple);
 	}
@@ -219,18 +221,21 @@ expr_has_fast_path(ExprState *state)
 		step2 = ExecEvalStepOp(state, &state->steps[2]);
 		step3 = ExecEvalStepOp(state, &state->steps[3]);
 
+#ifdef HAVE_EEOP_HASHDATUM
 		/* INNER_FETCHSOME + HASHDATUM_SET_INITVAL + INNER_VAR + HASHDATUM_NEXT32 + DONE */
 		if (step0 == EEOP_INNER_FETCHSOME &&
 			step1 == EEOP_HASHDATUM_SET_INITVAL &&
 			step2 == EEOP_INNER_VAR &&
 			step3 == EEOP_HASHDATUM_NEXT32)
 			return true;
+#endif
 	}
 	else if (nsteps == 4)
 	{
 		step1 = ExecEvalStepOp(state, &state->steps[1]);
 		step2 = ExecEvalStepOp(state, &state->steps[2]);
 
+#ifdef HAVE_EEOP_HASHDATUM
 		/* (INNER|OUTER)_FETCHSOME + (INNER|OUTER)_VAR + HASHDATUM_FIRST(_STRICT) + DONE */
 		if (step0 == EEOP_OUTER_FETCHSOME &&
 			step1 == EEOP_OUTER_VAR &&
@@ -244,6 +249,7 @@ expr_has_fast_path(ExprState *state)
 			step1 == EEOP_OUTER_VAR &&
 			step2 == EEOP_HASHDATUM_FIRST_STRICT)
 			return true;
+#endif
 	}
 	else if (nsteps == 3)
 	{
@@ -267,16 +273,21 @@ expr_has_fast_path(ExprState *state)
 
 		/* CASE_TESTVAL + FUNCEXPR_STRICT variants */
 		if (step0 == EEOP_CASE_TESTVAL &&
-			(step1 == EEOP_FUNCEXPR_STRICT ||
-			 step1 == EEOP_FUNCEXPR_STRICT_1 ||
-			 step1 == EEOP_FUNCEXPR_STRICT_2))
+			(step1 == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			 || step1 == EEOP_FUNCEXPR_STRICT_1
+			 || step1 == EEOP_FUNCEXPR_STRICT_2
+#endif
+			))
 			return true;
 
+#ifdef HAVE_EEOP_HASHDATUM
 		/* VAR + HASHDATUM_FIRST (virtual slot hash, no fetchsome) */
 		if (step0 == EEOP_INNER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
 		if (step0 == EEOP_OUTER_VAR && step1 == EEOP_HASHDATUM_FIRST)
 			return true;
+#endif
 	}
 	else if (nsteps == 2)
 	{
@@ -418,9 +429,12 @@ mir_compile_expr(ExprState *state)
 		ExprEvalOp opcode = ExecEvalStepOp(state, op);
 
 		if (opcode == EEOP_FUNCEXPR ||
-			opcode == EEOP_FUNCEXPR_STRICT ||
-			opcode == EEOP_FUNCEXPR_STRICT_1 ||
-			opcode == EEOP_FUNCEXPR_STRICT_2)
+			opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			|| opcode == EEOP_FUNCEXPR_STRICT_1
+			|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+			)
 		{
 			const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 			if (dfn && dfn->jit_fn)
@@ -447,6 +461,7 @@ mir_compile_expr(ExprState *state)
 				step_fn_imports[i] = MIR_new_import(ctx, name);
 			}
 		}
+#ifdef HAVE_EEOP_HASHDATUM
 		else if (opcode == EEOP_HASHDATUM_FIRST ||
 				 opcode == EEOP_HASHDATUM_FIRST_STRICT ||
 				 opcode == EEOP_HASHDATUM_NEXT32 ||
@@ -476,6 +491,7 @@ mir_compile_expr(ExprState *state)
 				step_fn_imports[i] = MIR_new_import(ctx, name);
 			}
 		}
+#endif /* HAVE_EEOP_HASHDATUM */
 		else if (opcode == EEOP_HASHED_SCALARARRAYOP)
 		{
 			/* Import for fallback ExecEvalHashedScalarArrayOp */
@@ -619,6 +635,7 @@ mir_compile_expr(ExprState *state)
 				break;
 			}
 
+#ifdef HAVE_EEOP_DONE_SPLIT
 			case EEOP_DONE_NO_RETURN:
 			{
 				MIR_append_insn(ctx, func_item,
@@ -626,6 +643,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_int_op(ctx, 0)));
 				break;
 			}
+#endif
 
 			/*
 			 * ---- FETCHSOME ----
@@ -633,8 +651,10 @@ mir_compile_expr(ExprState *state)
 			case EEOP_INNER_FETCHSOME:
 			case EEOP_OUTER_FETCHSOME:
 			case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_FETCHSOME:
 			case EEOP_NEW_FETCHSOME:
+#endif
 			{
 				MIR_insn_t	skip_label = MIR_new_label(ctx);
 				int64_t		soff = mir_slot_offset(opcode);
@@ -679,8 +699,10 @@ mir_compile_expr(ExprState *state)
 			case EEOP_INNER_VAR:
 			case EEOP_OUTER_VAR:
 			case EEOP_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_VAR:
 			case EEOP_NEW_VAR:
+#endif
 			{
 				int			attnum = op->d.var.attnum;
 				int64_t		soff = mir_slot_offset(opcode);
@@ -748,8 +770,10 @@ mir_compile_expr(ExprState *state)
 			case EEOP_ASSIGN_INNER_VAR:
 			case EEOP_ASSIGN_OUTER_VAR:
 			case EEOP_ASSIGN_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_ASSIGN_OLD_VAR:
 			case EEOP_ASSIGN_NEW_VAR:
+#endif
 			{
 				int			attnum = op->d.assign_var.attnum;
 				int			resultnum = op->d.assign_var.resultnum;
@@ -906,8 +930,10 @@ mir_compile_expr(ExprState *state)
 			 */
 			case EEOP_FUNCEXPR:
 			case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
 			case EEOP_FUNCEXPR_STRICT_1:
 			case EEOP_FUNCEXPR_STRICT_2:
+#endif
 			{
 				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
 				int			nargs = op->d.func.nargs;
@@ -915,9 +941,12 @@ mir_compile_expr(ExprState *state)
 				MIR_reg_t	r_ret = mir_new_reg(ctx, f, MIR_T_I64, "fret");
 				MIR_reg_t	r_fci = mir_new_reg(ctx, f, MIR_T_I64, "fci");
 
-				if (opcode == EEOP_FUNCEXPR_STRICT ||
-					opcode == EEOP_FUNCEXPR_STRICT_1 ||
-					opcode == EEOP_FUNCEXPR_STRICT_2)
+				if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+					|| opcode == EEOP_FUNCEXPR_STRICT_1
+					|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+					)
 				{
 					/* Set resnull = true */
 					MIR_append_insn(ctx, func_item,
@@ -1941,6 +1970,7 @@ mir_compile_expr(ExprState *state)
 				break;
 			}
 
+#ifdef HAVE_EEOP_HASHDATUM
 			/*
 			 * ---- HASHDATUM_SET_INITVAL ----
 			 */
@@ -2477,6 +2507,7 @@ mir_compile_expr(ExprState *state)
 				MIR_append_insn(ctx, func_item, after_null);
 				break;
 			}
+#endif /* HAVE_EEOP_HASHDATUM */
 
 			/*
 			 * ---- AGG_PLAIN_TRANS (all 6 variants) ----
@@ -2889,6 +2920,7 @@ mir_compile_expr(ExprState *state)
 			 */
 			case EEOP_HASHED_SCALARARRAYOP:
 			{
+#if PG_VERSION_NUM >= 150000
 				FunctionCallInfo fcinfo =
 					op->d.hashedscalararrayop.fcinfo_data;
 				bool inclause = op->d.hashedscalararrayop.inclause;
@@ -3318,6 +3350,21 @@ mir_compile_expr(ExprState *state)
 							MIR_new_reg_op(ctx, r_tmp1),
 							MIR_new_reg_op(ctx, r_econtext)));
 				}
+#else /* PG14: no inclause/saop -- always use fallback */
+				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_call_insn(ctx, 5,
+							MIR_new_ref_op(ctx, proto_3arg_void),
+							MIR_new_ref_op(ctx, step_fn_imports[opno]),
+							MIR_new_reg_op(ctx, r_state),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_reg_op(ctx, r_econtext)));
+				}
+#endif /* PG_VERSION_NUM >= 150000 */
 				break;
 			}
 
@@ -3349,30 +3396,38 @@ mir_compile_expr(ExprState *state)
 						fb_jump_target = op->d.agg_deserialize.jumpnull;
 						break;
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
 					case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
 						fb_jump_target = op->d.agg_strict_input_check.jumpnull;
 						break;
 					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
 						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
 						break;
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
 						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
 						break;
+#endif
+#ifdef HAVE_EEOP_HASHDATUM
 					case EEOP_HASHDATUM_FIRST_STRICT:
 					case EEOP_HASHDATUM_NEXT32_STRICT:
 						fb_jump_target = op->d.hashdatum.jumpdone;
 						break;
+#endif
 					case EEOP_ROWCOMPARE_STEP:
 						fb_jump_target = op->d.rowcompare_step.jumpdone;
 						break;
 					case EEOP_SBSREF_SUBSCRIPTS:
 						fb_jump_target = op->d.sbsref_subscript.jumpdone;
 						break;
+#ifdef HAVE_EEOP_RETURNINGEXPR
 					case EEOP_RETURNINGEXPR:
 						fb_jump_target = op->d.returningexpr.jumpdone;
 						break;
+#endif
 					default:
 						break;
 				}
@@ -3404,6 +3459,7 @@ mir_compile_expr(ExprState *state)
 								MIR_new_int_op(ctx, jdone)));
 					}
 				}
+#ifdef HAVE_EEOP_JSONEXPR
 				else if (opcode == EEOP_JSONEXPR_PATH)
 				{
 					/*
@@ -3437,6 +3493,7 @@ mir_compile_expr(ExprState *state)
 						}
 					}
 				}
+#endif /* HAVE_EEOP_JSONEXPR */
 				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					/* If r_tmp2 >= 0, jump to target */
@@ -3489,11 +3546,13 @@ mir_compile_expr(ExprState *state)
 								  (void *) ExecEvalHashedScalarArrayOp);
 				continue;
 			}
+#ifdef HAVE_EEOP_HASHDATUM
 			else if (op == EEOP_HASHDATUM_FIRST ||
 				op == EEOP_HASHDATUM_FIRST_STRICT ||
 				op == EEOP_HASHDATUM_NEXT32 ||
 				op == EEOP_HASHDATUM_NEXT32_STRICT)
 				addr = (void *) steps[i].d.hashdatum.fn_addr;
+#endif
 			else
 				addr = (void *) steps[i].d.func.fn_addr;
 
@@ -3505,6 +3564,7 @@ mir_compile_expr(ExprState *state)
 			ExprEvalOp opc = ExecEvalStepOp(state, &steps[i]);
 			char name[32];
 
+#ifdef HAVE_EEOP_HASHDATUM
 			if (opc == EEOP_HASHDATUM_FIRST ||
 				opc == EEOP_HASHDATUM_FIRST_STRICT ||
 				opc == EEOP_HASHDATUM_NEXT32 ||
@@ -3523,7 +3583,9 @@ mir_compile_expr(ExprState *state)
 				}
 #endif
 			}
-			else if (opc >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
+			else
+#endif /* HAVE_EEOP_HASHDATUM */
+			if (opc >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
 					 opc <= EEOP_AGG_PLAIN_TRANS_BYREF)
 			{
 				/* Resolve agg_trans helper address */

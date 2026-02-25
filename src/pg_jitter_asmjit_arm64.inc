@@ -55,7 +55,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
     for (attnum = 0; attnum < natts; attnum++)
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-        if (att->attnullability == ATTNULLABLE_VALID &&
+        if (JITTER_ATT_IS_NOTNULL(att) &&
             !att->atthasmissing &&
             !att->attisdropped)
             guaranteed_column_number = attnum;
@@ -163,7 +163,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
     for (attnum = 0; attnum < natts; attnum++)
     {
         CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-        int alignto = att->attalignby;
+        int alignto = JITTER_ATTALIGNBY(att);
 
         cc.bind(att_labels[attnum]);
 
@@ -179,7 +179,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         }
 
         /* ---- Null check ---- */
-        if (att->attnullability != ATTNULLABLE_VALID)
+        if (!JITTER_ATT_IS_NOTNULL(att))
         {
             Label notnull = cc.new_label();
 
@@ -291,13 +291,13 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
             known_alignment = -1;
             attguaranteedalign = false;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  attguaranteedalign && known_alignment >= 0)
         {
             Assert(att->attlen > 0);
             known_alignment += att->attlen;
         }
-        else if (att->attnullability == ATTNULLABLE_VALID &&
+        else if (JITTER_ATT_IS_NOTNULL(att) &&
                  (att->attlen % alignto) == 0)
         {
             Assert(att->attlen > 0);
@@ -458,18 +458,22 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
+#ifdef HAVE_EEOP_DONE_SPLIT
 			case EEOP_DONE_NO_RETURN:
 			{
 				cc.mov(tmp1, 0);
 				cc.ret(tmp1);
 				break;
 			}
+#endif
 
 			case EEOP_INNER_FETCHSOME:
 			case EEOP_OUTER_FETCHSOME:
 			case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_FETCHSOME:
 			case EEOP_NEW_FETCHSOME:
+#endif
 			{
 				Label skip = cc.new_label();
 				int64_t soff = slot_offset_for_opcode(opcode);
@@ -518,7 +522,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						                                            slot_reg,
 						                                            tmp1, tmp2, tmp3);
 						INSTR_TIME_SET_CURRENT(deform_end);
-						INSTR_TIME_ACCUM_DIFF(ctx->base.instr.deform_counter,
+						JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
 						                      deform_end, deform_start);
 					}
 				}
@@ -542,8 +546,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_INNER_VAR:
 			case EEOP_OUTER_VAR:
 			case EEOP_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_OLD_VAR:
 			case EEOP_NEW_VAR:
+#endif
 			{
 				int attnum = op->d.var.attnum;
 				int64_t soff = slot_offset_for_opcode(opcode);
@@ -569,8 +575,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_ASSIGN_INNER_VAR:
 			case EEOP_ASSIGN_OUTER_VAR:
 			case EEOP_ASSIGN_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
 			case EEOP_ASSIGN_OLD_VAR:
 			case EEOP_ASSIGN_NEW_VAR:
+#endif
 			{
 				int attnum = op->d.assign_var.attnum;
 				int resultnum = op->d.assign_var.resultnum;
@@ -642,16 +650,21 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			case EEOP_FUNCEXPR:
 			case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
 			case EEOP_FUNCEXPR_STRICT_1:
 			case EEOP_FUNCEXPR_STRICT_2:
+#endif
 			{
 				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
 				int nargs = op->d.func.nargs;
 				Label done_label = cc.new_label();
 
-				if (opcode == EEOP_FUNCEXPR_STRICT ||
-					opcode == EEOP_FUNCEXPR_STRICT_1 ||
-					opcode == EEOP_FUNCEXPR_STRICT_2)
+				if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+					|| opcode == EEOP_FUNCEXPR_STRICT_1
+					|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+					)
 				{
 					/* Set resnull = true (will be overwritten if func called) */
 					cc.mov(tmp1, (uint64_t) op->resnull);
@@ -1245,6 +1258,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
+#ifdef HAVE_EEOP_HASHDATUM
 			case EEOP_HASHDATUM_SET_INITVAL:
 			{
 				/* *op->resvalue = init_value */
@@ -1565,6 +1579,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.bind(done);
 				break;
 			}
+#endif /* HAVE_EEOP_HASHDATUM */
 
 			/*
 			 * ---- AGG_PLAIN_TRANS (all 6 variants) ----
@@ -1814,6 +1829,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			case EEOP_HASHED_SCALARARRAYOP:
 			{
+#if PG_VERSION_NUM >= 150000
 				FunctionCallInfo fcinfo =
 					op->d.hashedscalararrayop.fcinfo_data;
 				bool inclause = op->d.hashedscalararrayop.inclause;
@@ -2066,6 +2082,20 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					invoke->set_arg(1, op_reg);
 					invoke->set_arg(2, v_econtext);
 				}
+#else /* PG14: no inclause/saop -- always use fallback */
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					cc.mov(fn_reg, (uint64_t)(void *) ExecEvalHashedScalarArrayOp);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.mov(op_reg, (uint64_t) op);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+				}
+#endif /* PG_VERSION_NUM >= 150000 */
 				break;
 			}
 
@@ -2092,30 +2122,38 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						fb_jump_target = op->d.agg_deserialize.jumpnull;
 						break;
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
 					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
 					case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
 						fb_jump_target = op->d.agg_strict_input_check.jumpnull;
 						break;
 					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
 						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
 						break;
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
 						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
 						break;
+#endif
+#ifdef HAVE_EEOP_HASHDATUM
 					case EEOP_HASHDATUM_FIRST_STRICT:
 					case EEOP_HASHDATUM_NEXT32_STRICT:
 						fb_jump_target = op->d.hashdatum.jumpdone;
 						break;
+#endif
 					case EEOP_ROWCOMPARE_STEP:
 						fb_jump_target = op->d.rowcompare_step.jumpdone;
 						break;
 					case EEOP_SBSREF_SUBSCRIPTS:
 						fb_jump_target = op->d.sbsref_subscript.jumpdone;
 						break;
+#ifdef HAVE_EEOP_RETURNINGEXPR
 					case EEOP_RETURNINGEXPR:
 						fb_jump_target = op->d.returningexpr.jumpdone;
 						break;
+#endif
 					default:
 						break;
 				}
@@ -2135,6 +2173,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.b(a64::CondCode::kEQ, step_labels[jdone]);
 					}
 				}
+#ifdef HAVE_EEOP_JSONEXPR
 				else if (opcode == EEOP_JSONEXPR_PATH)
 				{
 					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
@@ -2161,6 +2200,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						}
 					}
 				}
+#endif
 				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					cc.cmp(ret_reg, 0);

@@ -19,6 +19,7 @@
  * returns it without re-registering.
  */
 #include "postgres.h"
+#include "pg_jitter_compat.h"
 #include "fmgr.h"
 #include "jit/jit.h"
 #include "miscadmin.h"
@@ -51,6 +52,8 @@ typedef struct MetaJitterContext
 /* ----------------------------------------------------------------
  * Resource owner support — the meta's own copy
  * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 170000
+
 static void MetaResOwnerRelease(Datum res);
 
 static const ResourceOwnerDesc meta_resowner_desc =
@@ -82,6 +85,24 @@ MetaResOwnerRelease(Datum res)
 	context->resowner = NULL;
 	jit_release_context(&context->base);
 }
+
+#else /* PG14-16: JIT-specific resource owner API */
+
+#include "utils/resowner_private.h"
+
+static inline void
+MetaRememberContext(ResourceOwner owner, MetaJitterContext *handle)
+{
+	ResourceOwnerRememberJIT(owner, PointerGetDatum(handle));
+}
+
+static inline void
+MetaForgetContext(ResourceOwner owner, MetaJitterContext *handle)
+{
+	ResourceOwnerForgetJIT(owner, PointerGetDatum(handle));
+}
+
+#endif /* PG_VERSION_NUM >= 170000 */
 
 /* ----------------------------------------------------------------
  * Backend enum and GUC options
@@ -197,11 +218,18 @@ meta_ensure_context(ExprState *state)
 	if (parent->state->es_jit)
 		return;		/* context already exists */
 
+#if PG_VERSION_NUM >= 170000
 	ResourceOwnerEnlarge(CurrentResourceOwner);
+#else
+	ResourceOwnerEnlargeJIT(CurrentResourceOwner);
+#endif
 
 	ctx = (MetaJitterContext *)
 		MemoryContextAllocZero(TopMemoryContext, sizeof(MetaJitterContext));
 	ctx->base.flags = parent->state->es_jit_flags;
+#if PG_VERSION_NUM < 170000
+	ctx->base.resowner = CurrentResourceOwner;
+#endif
 	ctx->compiled_list = NULL;
 	ctx->resowner = CurrentResourceOwner;
 
@@ -257,8 +285,16 @@ meta_release_context(JitContext *context)
 	}
 	ctx->compiled_list = NULL;
 
+	/*
+	 * On PG17+ we manage our own ResourceOwnerDesc, so we must call
+	 * ResourceOwnerForget ourselves.  On PG14-16, PG's jit_release_context()
+	 * calls ResourceOwnerForgetJIT() after our callback returns — doing it
+	 * here too would be a double-forget and corrupt the resource owner.
+	 */
+#if PG_VERSION_NUM >= 170000
 	if (ctx->resowner)
 		MetaForgetContext(ctx->resowner, ctx);
+#endif
 }
 
 static void
