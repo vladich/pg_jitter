@@ -1,4 +1,4 @@
-# pg_jitter
+![pg_jitter](pg_jitter4.jpg "pg_jitter").
 
 A lightweight JIT compilation provider for PostgreSQL that adds three alternative JIT backends - **[sljit](https://github.com/zherczeg/sljit)**, **[AsmJit](https://github.com/asmjit/asmjit)** and **[MIR](https://github.com/vnmakarov/mir)** - delivering faster compilation and competitive query execution across PostgreSQL 14–18.
 
