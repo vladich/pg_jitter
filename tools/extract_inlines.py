@@ -205,6 +205,8 @@ def generate_header(functions, arch):
     lines.append('#define RELOC_PC32       4  /* x86_64: RIP-relative 32-bit */')
     lines.append('#define RELOC_GOTPCREL   5  /* x86_64: GOT-relative */')
     lines.append('#define RELOC_GOT        6  /* ARM64: GOT */')
+    lines.append('#define RELOC_MOVZ_MOVK64 7 /* ARM64: MOVZ+3xMOVK 64-bit imm */')
+    lines.append('#define RELOC_ABS64      8  /* 8-byte absolute address */')
     lines.append('#define RELOC_UNKNOWN    0')
     lines.append('')
     lines.append('typedef struct PrecompiledReloc {')

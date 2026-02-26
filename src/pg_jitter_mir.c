@@ -16,6 +16,7 @@
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 
+#include "access/htup_details.h"
 #include "utils/fmgrprotos.h"
 #include "common/hashfn.h"
 #include "pg_jitter_common.h"
@@ -306,6 +307,556 @@ expr_has_fast_path(ExprState *state)
 }
 
 /*
+ * mir_emit_deform_inline — emit inline tuple deform code into the MIR
+ * expression function body.
+ *
+ * This replaces the slot_getsomeattrs_int() call with an unrolled
+ * per-column extraction loop, keeping all code in the same MIR function
+ * (contiguous I-cache, zero call overhead).
+ *
+ * Returns true if inline deform was emitted, false to fall back to the
+ * C function call.
+ */
+static bool
+mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
+					   MIR_func_t f,
+					   TupleDesc desc, const TupleTableSlotOps *ops,
+					   int natts, ExprEvalOp fetch_opcode,
+					   MIR_reg_t r_econtext, MIR_reg_t r_slot,
+					   MIR_item_t proto_varsize, MIR_item_t import_varsize,
+					   MIR_item_t proto_strlen, MIR_item_t import_strlen)
+{
+	int			attnum;
+	int			known_alignment = 0;
+	bool		attguaranteedalign = true;
+	int			guaranteed_column_number = -1;
+	int64_t		tuple_off, slot_off;
+
+	MIR_reg_t	r_tupdata, r_values, r_nulls, r_off;
+	MIR_reg_t	r_hasnulls, r_maxatt, r_tbits, r_dtmp;
+
+	MIR_insn_t *att_labels;
+	MIR_insn_t	deform_done;
+
+	/* --- Guards --- */
+	if (ops == &TTSOpsVirtual)
+		return false;
+	if (ops != &TTSOpsHeapTuple && ops != &TTSOpsBufferHeapTuple)
+		return false;
+	if (natts <= 0 || natts > desc->natts)
+		return false;
+
+	/* Determine slot-type-specific field offsets */
+	tuple_off = offsetof(HeapTupleTableSlot, tuple);
+	slot_off = offsetof(HeapTupleTableSlot, off);
+
+	/* --- Pre-scan: reject atthasmissing, find guaranteed_column_number --- */
+	for (attnum = 0; attnum < natts; attnum++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+
+		if (att->atthasmissing)
+			return false;
+
+		if (JITTER_ATT_IS_NOTNULL(att) && !att->attisdropped)
+			guaranteed_column_number = attnum;
+	}
+
+	/* --- Allocate MIR registers --- */
+	r_tupdata = mir_new_reg(ctx, f, MIR_T_I64, "df_td");
+	r_values  = mir_new_reg(ctx, f, MIR_T_I64, "df_vals");
+	r_nulls   = mir_new_reg(ctx, f, MIR_T_I64, "df_nuls");
+	r_off     = mir_new_reg(ctx, f, MIR_T_I64, "df_off");
+	r_hasnulls = mir_new_reg(ctx, f, MIR_T_I64, "df_hn");
+	r_maxatt  = mir_new_reg(ctx, f, MIR_T_I64, "df_mx");
+	r_tbits   = mir_new_reg(ctx, f, MIR_T_I64, "df_tb");
+	r_dtmp    = mir_new_reg(ctx, f, MIR_T_I64, "df_dt");
+
+	/* --- Labels --- */
+	att_labels = palloc0(sizeof(MIR_insn_t) * natts);
+	for (attnum = 0; attnum < natts; attnum++)
+		att_labels[attnum] = MIR_new_label(ctx);
+	deform_done = MIR_new_label(ctx);
+
+	/* ============================================================
+	 * PROLOGUE: load tuple header fields
+	 * ============================================================ */
+
+	/* r_values = slot->tts_values */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_values),
+			MIR_new_mem_op(ctx, MIR_T_P,
+				offsetof(TupleTableSlot, tts_values),
+				r_slot, 0, 1)));
+
+	/* r_nulls = slot->tts_isnull */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_nulls),
+			MIR_new_mem_op(ctx, MIR_T_P,
+				offsetof(TupleTableSlot, tts_isnull),
+				r_slot, 0, 1)));
+
+	/* r_dtmp = slot->tuple (HeapTuple pointer) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_mem_op(ctx, MIR_T_P, tuple_off,
+				r_slot, 0, 1)));
+
+	/* r_dtmp = tuple->t_data (HeapTupleHeader) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_mem_op(ctx, MIR_T_P,
+				offsetof(HeapTupleData, t_data),
+				r_dtmp, 0, 1)));
+
+	/* r_hasnulls = *(uint16)(r_dtmp + t_infomask) & HEAP_HASNULL */
+	{
+		MIR_reg_t r_infomask = mir_new_reg(ctx, f, MIR_T_I64, "df_im");
+
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, r_infomask),
+				MIR_new_mem_op(ctx, MIR_T_U16,
+					offsetof(HeapTupleHeaderData, t_infomask),
+					r_dtmp, 0, 1)));
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_AND,
+				MIR_new_reg_op(ctx, r_hasnulls),
+				MIR_new_reg_op(ctx, r_infomask),
+				MIR_new_int_op(ctx, HEAP_HASNULL)));
+	}
+
+	/* r_maxatt = *(uint16)(r_dtmp + t_infomask2) & HEAP_NATTS_MASK */
+	{
+		MIR_reg_t r_im2 = mir_new_reg(ctx, f, MIR_T_I64, "df_im2");
+
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, r_im2),
+				MIR_new_mem_op(ctx, MIR_T_U16,
+					offsetof(HeapTupleHeaderData, t_infomask2),
+					r_dtmp, 0, 1)));
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_AND,
+				MIR_new_reg_op(ctx, r_maxatt),
+				MIR_new_reg_op(ctx, r_im2),
+				MIR_new_int_op(ctx, HEAP_NATTS_MASK)));
+	}
+
+	/* r_tbits = r_dtmp + offsetof(HeapTupleHeaderData, t_bits) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_ADD,
+			MIR_new_reg_op(ctx, r_tbits),
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_int_op(ctx, offsetof(HeapTupleHeaderData, t_bits))));
+
+	/* r_tupdata = r_dtmp + *(uint8)(r_dtmp + t_hoff) */
+	{
+		MIR_reg_t r_hoff = mir_new_reg(ctx, f, MIR_T_I64, "df_ho");
+
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, r_hoff),
+				MIR_new_mem_op(ctx, MIR_T_U8,
+					offsetof(HeapTupleHeaderData, t_hoff),
+					r_dtmp, 0, 1)));
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_ADD,
+				MIR_new_reg_op(ctx, r_tupdata),
+				MIR_new_reg_op(ctx, r_dtmp),
+				MIR_new_reg_op(ctx, r_hoff)));
+	}
+
+	/* r_off = *(uint32)(r_slot + slot_off) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_off),
+			MIR_new_mem_op(ctx, MIR_T_U32, slot_off,
+				r_slot, 0, 1)));
+
+	/* ============================================================
+	 * NVALID DISPATCH: comparison chain
+	 * ============================================================ */
+	{
+		MIR_reg_t r_nvalid = mir_new_reg(ctx, f, MIR_T_I64, "df_nv");
+
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, r_nvalid),
+				MIR_new_mem_op(ctx, MIR_T_I16,
+					offsetof(TupleTableSlot, tts_nvalid),
+					r_slot, 0, 1)));
+
+		for (attnum = 0; attnum < natts; attnum++)
+		{
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_BEQ,
+					MIR_new_label_op(ctx, att_labels[attnum]),
+					MIR_new_reg_op(ctx, r_nvalid),
+					MIR_new_int_op(ctx, attnum)));
+		}
+		/* Default: already fully deformed → skip */
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_JMP,
+				MIR_new_label_op(ctx, deform_done)));
+	}
+
+	/* ============================================================
+	 * PER-ATTRIBUTE CODE EMISSION (unrolled)
+	 * ============================================================ */
+	for (attnum = 0; attnum < natts; attnum++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+		int		alignto = JITTER_ATTALIGNBY(att);
+		MIR_insn_t next_label = (attnum < natts - 1)
+								? att_labels[attnum + 1]
+								: deform_done;
+
+		/* ---- Emit label ---- */
+		MIR_append_insn(ctx, func_item, att_labels[attnum]);
+
+		/* If attnum == 0: reset offset to 0 */
+		if (attnum == 0)
+		{
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_int_op(ctx, 0)));
+		}
+
+		/* ---- Availability check ---- */
+		if (attnum > guaranteed_column_number)
+		{
+			/* if attnum >= maxatt → deform_done */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_BGE,
+					MIR_new_label_op(ctx, deform_done),
+					MIR_new_int_op(ctx, attnum),
+					MIR_new_reg_op(ctx, r_maxatt)));
+		}
+
+		/* ---- Null check ---- */
+		if (!JITTER_ATT_IS_NOTNULL(att))
+		{
+			MIR_insn_t notnull_label = MIR_new_label(ctx);
+
+			/* if (!hasnulls) skip to not-null path */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_BEQ,
+					MIR_new_label_op(ctx, notnull_label),
+					MIR_new_reg_op(ctx, r_hasnulls),
+					MIR_new_int_op(ctx, 0)));
+
+			/* byte = t_bits[attnum >> 3] */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_reg_op(ctx, r_dtmp),
+					MIR_new_mem_op(ctx, MIR_T_U8,
+						attnum >> 3,
+						r_tbits, 0, 1)));
+
+			/* test bit (1 << (attnum & 7)) */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_AND,
+					MIR_new_reg_op(ctx, r_dtmp),
+					MIR_new_reg_op(ctx, r_dtmp),
+					MIR_new_int_op(ctx, 1 << (attnum & 0x07))));
+
+			/* if bit set → not null */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_BNE,
+					MIR_new_label_op(ctx, notnull_label),
+					MIR_new_reg_op(ctx, r_dtmp),
+					MIR_new_int_op(ctx, 0)));
+
+			/* ---- Column IS NULL ---- */
+			/* tts_values[attnum] = 0 */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_mem_op(ctx, MIR_T_I64,
+						attnum * (int64_t) sizeof(Datum),
+						r_values, 0, 1),
+					MIR_new_int_op(ctx, 0)));
+
+			/* tts_isnull[attnum] = true */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_mem_op(ctx, MIR_T_U8,
+						attnum, r_nulls, 0, 1),
+					MIR_new_int_op(ctx, 1)));
+
+			/* jump to next attribute (or deform_done for last) */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_JMP,
+					MIR_new_label_op(ctx, next_label)));
+
+			/* ---- NOT NULL path ---- */
+			MIR_append_insn(ctx, func_item, notnull_label);
+
+			attguaranteedalign = false;
+		}
+
+		/* ---- Alignment ---- */
+		if (alignto > 1 &&
+			(known_alignment < 0 ||
+			 known_alignment != TYPEALIGN(alignto, known_alignment)))
+		{
+			if (att->attlen == -1)
+			{
+				MIR_insn_t is_short_label = MIR_new_label(ctx);
+
+				attguaranteedalign = false;
+
+				/* Peek first byte: if nonzero → short varlena, skip align */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_dtmp),
+						MIR_new_reg_op(ctx, r_tupdata),
+						MIR_new_reg_op(ctx, r_off)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_dtmp),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0,
+							r_dtmp, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, is_short_label),
+						MIR_new_reg_op(ctx, r_dtmp),
+						MIR_new_int_op(ctx, 0)));
+
+				/* TYPEALIGN: r_off = (r_off + alignto-1) & ~(alignto-1) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_int_op(ctx, alignto - 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_AND,
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_int_op(ctx, ~((int64_t)(alignto - 1)))));
+
+				MIR_append_insn(ctx, func_item, is_short_label);
+			}
+			else
+			{
+				/* TYPEALIGN: r_off = (r_off + alignto-1) & ~(alignto-1) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_int_op(ctx, alignto - 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_AND,
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_int_op(ctx, ~((int64_t)(alignto - 1)))));
+			}
+
+			if (known_alignment >= 0)
+				known_alignment = TYPEALIGN(alignto, known_alignment);
+		}
+
+		if (attguaranteedalign)
+		{
+			Assert(known_alignment >= 0);
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_int_op(ctx, known_alignment)));
+		}
+
+		/* ---- Value extraction ---- */
+		/* r_dtmp = tupdata + off (attdatap) */
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_ADD,
+				MIR_new_reg_op(ctx, r_dtmp),
+				MIR_new_reg_op(ctx, r_tupdata),
+				MIR_new_reg_op(ctx, r_off)));
+
+		/* tts_isnull[attnum] = false */
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_mem_op(ctx, MIR_T_U8,
+					attnum, r_nulls, 0, 1),
+				MIR_new_int_op(ctx, 0)));
+
+		if (att->attbyval)
+		{
+			MIR_type_t load_type;
+			MIR_reg_t  r_val = mir_new_reg(ctx, f, MIR_T_I64, "df_v");
+
+			switch (att->attlen)
+			{
+				case 1: load_type = MIR_T_I8; break;
+				case 2: load_type = MIR_T_I16; break;
+				case 4: load_type = MIR_T_I32; break;
+				case 8: load_type = MIR_T_I64; break;
+				default:
+					pfree(att_labels);
+					return false;
+			}
+
+			/* r_val = *(load_type *)(r_dtmp) — sign-extend to 64-bit */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_reg_op(ctx, r_val),
+					MIR_new_mem_op(ctx, load_type, 0,
+						r_dtmp, 0, 1)));
+
+			/* tts_values[attnum] = r_val */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_mem_op(ctx, MIR_T_I64,
+						attnum * (int64_t) sizeof(Datum),
+						r_values, 0, 1),
+					MIR_new_reg_op(ctx, r_val)));
+		}
+		else
+		{
+			/* byref: tts_values[attnum] = pointer to data (r_dtmp) */
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_MOV,
+					MIR_new_mem_op(ctx, MIR_T_I64,
+						attnum * (int64_t) sizeof(Datum),
+						r_values, 0, 1),
+					MIR_new_reg_op(ctx, r_dtmp)));
+		}
+
+		/* ---- Compute alignment tracking for NEXT column ---- */
+		if (att->attlen < 0)
+		{
+			known_alignment = -1;
+			attguaranteedalign = false;
+		}
+		else if (JITTER_ATT_IS_NOTNULL(att) &&
+				 attguaranteedalign && known_alignment >= 0)
+		{
+			Assert(att->attlen > 0);
+			known_alignment += att->attlen;
+		}
+		else if (JITTER_ATT_IS_NOTNULL(att) &&
+				 (att->attlen % alignto) == 0)
+		{
+			Assert(att->attlen > 0);
+			known_alignment = alignto;
+			attguaranteedalign = false;
+		}
+		else
+		{
+			known_alignment = -1;
+			attguaranteedalign = false;
+		}
+
+		/* ---- Offset advance ---- */
+		if (att->attlen > 0)
+		{
+			if (attguaranteedalign)
+			{
+				/* Will be set by constant at top of next column */
+			}
+			else
+			{
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_reg_op(ctx, r_off),
+						MIR_new_int_op(ctx, att->attlen)));
+			}
+		}
+		else if (att->attlen == -1)
+		{
+			/* Varlena: off += varsize_any(attdatap) */
+			MIR_reg_t r_vsize = mir_new_reg(ctx, f, MIR_T_I64, "df_vs");
+
+			MIR_append_insn(ctx, func_item,
+				MIR_new_call_insn(ctx, 4,
+					MIR_new_ref_op(ctx, proto_varsize),
+					MIR_new_ref_op(ctx, import_varsize),
+					MIR_new_reg_op(ctx, r_vsize),
+					MIR_new_reg_op(ctx, r_dtmp)));
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_ADD,
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_reg_op(ctx, r_vsize)));
+		}
+		else if (att->attlen == -2)
+		{
+			/* CString: off += strlen(attdatap) + 1 */
+			MIR_reg_t r_slen = mir_new_reg(ctx, f, MIR_T_I64, "df_sl");
+
+			MIR_append_insn(ctx, func_item,
+				MIR_new_call_insn(ctx, 4,
+					MIR_new_ref_op(ctx, proto_strlen),
+					MIR_new_ref_op(ctx, import_strlen),
+					MIR_new_reg_op(ctx, r_slen),
+					MIR_new_reg_op(ctx, r_dtmp)));
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_ADD,
+					MIR_new_reg_op(ctx, r_slen),
+					MIR_new_reg_op(ctx, r_slen),
+					MIR_new_int_op(ctx, 1)));
+			MIR_append_insn(ctx, func_item,
+				MIR_new_insn(ctx, MIR_ADD,
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_reg_op(ctx, r_off),
+					MIR_new_reg_op(ctx, r_slen)));
+		}
+	}
+
+	/* ============================================================
+	 * EPILOGUE: store tts_nvalid, off, flags
+	 * ============================================================ */
+	MIR_append_insn(ctx, func_item, deform_done);
+
+	/* tts_nvalid = natts (int16 store) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_mem_op(ctx, MIR_T_I16,
+				offsetof(TupleTableSlot, tts_nvalid),
+				r_slot, 0, 1),
+			MIR_new_int_op(ctx, natts)));
+
+	/* slot->off = (uint32) r_off */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_mem_op(ctx, MIR_T_U32, slot_off,
+				r_slot, 0, 1),
+			MIR_new_reg_op(ctx, r_off)));
+
+	/* tts_flags |= TTS_FLAG_SLOW */
+	{
+		MIR_reg_t r_flags = mir_new_reg(ctx, f, MIR_T_I64, "df_fl");
+
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, r_flags),
+				MIR_new_mem_op(ctx, MIR_T_U16,
+					offsetof(TupleTableSlot, tts_flags),
+					r_slot, 0, 1)));
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_OR,
+				MIR_new_reg_op(ctx, r_flags),
+				MIR_new_reg_op(ctx, r_flags),
+				MIR_new_int_op(ctx, TTS_FLAG_SLOW)));
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_mem_op(ctx, MIR_T_U16,
+					offsetof(TupleTableSlot, tts_flags),
+					r_slot, 0, 1),
+				MIR_new_reg_op(ctx, r_flags)));
+	}
+
+	pfree(att_labels);
+	return true;
+}
+
+/*
  * Compile an expression using MIR.
  *
  * Generated function signature:
@@ -416,6 +967,19 @@ mir_compile_expr(ExprState *state)
 	MIR_item_t import_err_int4_overflow = MIR_new_import(ctx, "err_i4ov");
 	MIR_item_t import_err_int8_overflow = MIR_new_import(ctx, "err_i8ov");
 	MIR_item_t import_err_div_by_zero = MIR_new_import(ctx, "err_divz");
+
+	/* Proto + imports for inline deform helpers */
+	MIR_item_t proto_deform_varsize, import_deform_varsize;
+	MIR_item_t proto_deform_strlen, import_deform_strlen;
+	{
+		MIR_type_t rt = MIR_T_I64;
+		proto_deform_varsize = MIR_new_proto(ctx, "p_varsize",
+			1, &rt, 1, MIR_T_P, "p");
+		import_deform_varsize = MIR_new_import(ctx, "varsize_any");
+		proto_deform_strlen = MIR_new_proto(ctx, "p_strlen",
+			1, &rt, 1, MIR_T_P, "s");
+		import_deform_strlen = MIR_new_import(ctx, "strlen");
+	}
 
 	/*
 	 * Per-step imports for V1 function addresses.
@@ -658,6 +1222,7 @@ mir_compile_expr(ExprState *state)
 			{
 				MIR_insn_t	skip_label = MIR_new_label(ctx);
 				int64_t		soff = mir_slot_offset(opcode);
+				bool		deform_emitted = false;
 
 				/* r_slot = econtext->ecxt_*tuple */
 				MIR_append_insn(ctx, func_item,
@@ -681,13 +1246,33 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_tmp1),
 						MIR_new_int_op(ctx, op->d.fetch.last_var)));
 
-				/* Call slot_getsomeattrs_int(slot, last_var) */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_call_insn(ctx, 4,
-						MIR_new_ref_op(ctx, proto_getsomeattrs),
-						MIR_new_ref_op(ctx, import_getsomeattrs),
-						MIR_new_reg_op(ctx, r_slot),
-						MIR_new_int_op(ctx, op->d.fetch.last_var)));
+				/* Try inline deform */
+				if (op->d.fetch.fixed && op->d.fetch.known_desc &&
+					(jctx->base.flags & PGJIT_DEFORM))
+				{
+					deform_emitted = mir_emit_deform_inline(
+						ctx, func_item, f,
+						op->d.fetch.known_desc,
+						op->d.fetch.kind,
+						op->d.fetch.last_var,
+						opcode,
+						r_econtext, r_slot,
+						proto_deform_varsize,
+						import_deform_varsize,
+						proto_deform_strlen,
+						import_deform_strlen);
+				}
+
+				if (!deform_emitted)
+				{
+					/* Fallback: call slot_getsomeattrs_int(slot, last_var) */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_call_insn(ctx, 4,
+							MIR_new_ref_op(ctx, proto_getsomeattrs),
+							MIR_new_ref_op(ctx, import_getsomeattrs),
+							MIR_new_reg_op(ctx, r_slot),
+							MIR_new_int_op(ctx, op->d.fetch.last_var)));
+				}
 
 				MIR_append_insn(ctx, func_item, skip_label);
 				break;
@@ -3530,6 +4115,9 @@ mir_compile_expr(ExprState *state)
 		MIR_load_external(ctx, "err_i4ov", (void *) jit_error_int4_overflow);
 		MIR_load_external(ctx, "err_i8ov", (void *) jit_error_int8_overflow);
 		MIR_load_external(ctx, "err_divz", (void *) jit_error_division_by_zero);
+		/* Inline deform helpers */
+		MIR_load_external(ctx, "varsize_any", (void *) varsize_any);
+		MIR_load_external(ctx, "strlen", (void *) strlen);
 
 	for (int i = 0; i < steps_len; i++)
 	{

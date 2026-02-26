@@ -151,9 +151,14 @@ sljit_code_free(void *data)
 #define SOFF_DEFORM_SAVE_S3   SOFF_AGG_OLDCTX     /* 24: saved S3 (resultvals) */
 #define SOFF_DEFORM_SAVE_S4   SOFF_AGG_PERGROUP   /* 32: saved S4 (resultnulls) */
 #define SOFF_DEFORM_SAVE_S5   SOFF_AGG_FCINFO     /* 40: saved S5 (aggstate/hash) */
-#define SOFF_DEFORM_HASNULLS  SOFF_AGG_CURRMCTXP  /* 48: hasnulls flag */
-#define SOFF_DEFORM_MAXATT    SOFF_TEMP           /* 56: maxatt from infomask2 */
 #define SOFF_DEFORM_TBITS     SOFF_RESULTSLOT     /* 16: t_bits pointer (resultslot not used during deform) */
+#define SOFF_DEFORM_MAXATT    SOFF_TEMP           /* 56: maxatt from infomask2 */
+/*
+ * SOFF_DEFORM_HASNULLS: stored at vals_off+8 (the slot-cache area for tts_isnull).
+ * During inline deform, tts_values lives in S4, so vals_off is unused.
+ * Note: NOT at SOFF_AGG_CURRMCTXP (48) — that holds &CurrentMemoryContext
+ * across the entire expression and must not be overwritten.
+ */
 
 /*
  * Saved register assignments:
@@ -1090,8 +1095,8 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
     /* hasnulls = infomask & HEAP_HASNULL → stack */
     sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
                    SLJIT_R2, 0, SLJIT_IMM, HEAP_HASNULL);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_HASNULLS,
-                   SLJIT_R2, 0);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off + 8,
+                   SLJIT_R2, 0);  /* hasnulls → vals_off+8 (slot cache unused during deform) */
 
     /* t_infomask2 -> maxatt = infomask2 & HEAP_NATTS_MASK → stack */
     sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R2, 0,
@@ -1215,7 +1220,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
 
             /* if (!hasnulls) skip to not-null path */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_HASNULLS);
+                           SLJIT_MEM1(SLJIT_SP), vals_off + 8);  /* hasnulls */
             no_hasnulls = sljit_emit_cmp(C, SLJIT_EQUAL,
                                          SLJIT_R0, 0,
                                          SLJIT_IMM, 0);
