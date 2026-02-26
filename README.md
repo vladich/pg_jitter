@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="800px" height="291px" src="pg_jitter5.jpeg">
+  <img width="800px" height="291px" src="img/pg_jitter5.jpeg">
 </p>
 
 A lightweight JIT compilation provider for PostgreSQL that adds three alternative JIT backends - **[sljit](https://github.com/zherczeg/sljit)**, **[AsmJit](https://github.com/asmjit/asmjit)** and **[MIR](https://github.com/vnmakarov/mir)** - delivering faster compilation and competitive query execution across PostgreSQL 14–18.
