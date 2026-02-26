@@ -108,7 +108,7 @@ mir_get_or_create_ctx(PgJitterContext *jctx)
 													  sizeof(MirPerQueryState));
 		st->ctx = MIR_init();
 		MIR_gen_init(st->ctx);
-		MIR_gen_set_optimize_level(st->ctx, 0);
+		MIR_gen_set_optimize_level(st->ctx, 1);
 		st->module_counter = 0;
 
 		/* Register for cleanup when this JitContext is released */
@@ -334,6 +334,7 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 
 	MIR_reg_t	r_tupdata, r_values, r_nulls, r_off;
 	MIR_reg_t	r_hasnulls, r_maxatt, r_tbits, r_dtmp;
+	MIR_reg_t	r_val, r_callret;
 
 	MIR_insn_t *att_labels;
 	MIR_insn_t	deform_done;
@@ -362,7 +363,7 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 			guaranteed_column_number = attnum;
 	}
 
-	/* --- Allocate MIR registers --- */
+	/* --- Allocate MIR registers (all upfront to minimize spill pressure) --- */
 	r_tupdata = mir_new_reg(ctx, f, MIR_T_I64, "df_td");
 	r_values  = mir_new_reg(ctx, f, MIR_T_I64, "df_vals");
 	r_nulls   = mir_new_reg(ctx, f, MIR_T_I64, "df_nuls");
@@ -371,6 +372,8 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 	r_maxatt  = mir_new_reg(ctx, f, MIR_T_I64, "df_mx");
 	r_tbits   = mir_new_reg(ctx, f, MIR_T_I64, "df_tb");
 	r_dtmp    = mir_new_reg(ctx, f, MIR_T_I64, "df_dt");
+	r_val     = mir_new_reg(ctx, f, MIR_T_I64, "df_v");
+	r_callret = mir_new_reg(ctx, f, MIR_T_I64, "df_cr");
 
 	/* --- Labels --- */
 	att_labels = palloc0(sizeof(MIR_insn_t) * natts);
@@ -414,38 +417,30 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 				r_dtmp, 0, 1)));
 
 	/* r_hasnulls = *(uint16)(r_dtmp + t_infomask) & HEAP_HASNULL */
-	{
-		MIR_reg_t r_infomask = mir_new_reg(ctx, f, MIR_T_I64, "df_im");
-
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_reg_op(ctx, r_infomask),
-				MIR_new_mem_op(ctx, MIR_T_U16,
-					offsetof(HeapTupleHeaderData, t_infomask),
-					r_dtmp, 0, 1)));
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_AND,
-				MIR_new_reg_op(ctx, r_hasnulls),
-				MIR_new_reg_op(ctx, r_infomask),
-				MIR_new_int_op(ctx, HEAP_HASNULL)));
-	}
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_hasnulls),
+			MIR_new_mem_op(ctx, MIR_T_U16,
+				offsetof(HeapTupleHeaderData, t_infomask),
+				r_dtmp, 0, 1)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_AND,
+			MIR_new_reg_op(ctx, r_hasnulls),
+			MIR_new_reg_op(ctx, r_hasnulls),
+			MIR_new_int_op(ctx, HEAP_HASNULL)));
 
 	/* r_maxatt = *(uint16)(r_dtmp + t_infomask2) & HEAP_NATTS_MASK */
-	{
-		MIR_reg_t r_im2 = mir_new_reg(ctx, f, MIR_T_I64, "df_im2");
-
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_reg_op(ctx, r_im2),
-				MIR_new_mem_op(ctx, MIR_T_U16,
-					offsetof(HeapTupleHeaderData, t_infomask2),
-					r_dtmp, 0, 1)));
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_AND,
-				MIR_new_reg_op(ctx, r_maxatt),
-				MIR_new_reg_op(ctx, r_im2),
-				MIR_new_int_op(ctx, HEAP_NATTS_MASK)));
-	}
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_maxatt),
+			MIR_new_mem_op(ctx, MIR_T_U16,
+				offsetof(HeapTupleHeaderData, t_infomask2),
+				r_dtmp, 0, 1)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_AND,
+			MIR_new_reg_op(ctx, r_maxatt),
+			MIR_new_reg_op(ctx, r_maxatt),
+			MIR_new_int_op(ctx, HEAP_NATTS_MASK)));
 
 	/* r_tbits = r_dtmp + offsetof(HeapTupleHeaderData, t_bits) */
 	MIR_append_insn(ctx, func_item,
@@ -455,21 +450,17 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 			MIR_new_int_op(ctx, offsetof(HeapTupleHeaderData, t_bits))));
 
 	/* r_tupdata = r_dtmp + *(uint8)(r_dtmp + t_hoff) */
-	{
-		MIR_reg_t r_hoff = mir_new_reg(ctx, f, MIR_T_I64, "df_ho");
-
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_reg_op(ctx, r_hoff),
-				MIR_new_mem_op(ctx, MIR_T_U8,
-					offsetof(HeapTupleHeaderData, t_hoff),
-					r_dtmp, 0, 1)));
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_ADD,
-				MIR_new_reg_op(ctx, r_tupdata),
-				MIR_new_reg_op(ctx, r_dtmp),
-				MIR_new_reg_op(ctx, r_hoff)));
-	}
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_tupdata),
+			MIR_new_mem_op(ctx, MIR_T_U8,
+				offsetof(HeapTupleHeaderData, t_hoff),
+				r_dtmp, 0, 1)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_ADD,
+			MIR_new_reg_op(ctx, r_tupdata),
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_reg_op(ctx, r_tupdata)));
 
 	/* r_off = *(uint32)(r_slot + slot_off) */
 	MIR_append_insn(ctx, func_item,
@@ -481,29 +472,26 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 	/* ============================================================
 	 * NVALID DISPATCH: comparison chain
 	 * ============================================================ */
+	/* r_dtmp = slot->tts_nvalid (reuse r_dtmp, no longer needed for header) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_mem_op(ctx, MIR_T_I16,
+				offsetof(TupleTableSlot, tts_nvalid),
+				r_slot, 0, 1)));
+
+	for (attnum = 0; attnum < natts; attnum++)
 	{
-		MIR_reg_t r_nvalid = mir_new_reg(ctx, f, MIR_T_I64, "df_nv");
-
 		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_reg_op(ctx, r_nvalid),
-				MIR_new_mem_op(ctx, MIR_T_I16,
-					offsetof(TupleTableSlot, tts_nvalid),
-					r_slot, 0, 1)));
-
-		for (attnum = 0; attnum < natts; attnum++)
-		{
-			MIR_append_insn(ctx, func_item,
-				MIR_new_insn(ctx, MIR_BEQ,
-					MIR_new_label_op(ctx, att_labels[attnum]),
-					MIR_new_reg_op(ctx, r_nvalid),
-					MIR_new_int_op(ctx, attnum)));
-		}
-		/* Default: already fully deformed → skip */
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_JMP,
-				MIR_new_label_op(ctx, deform_done)));
+			MIR_new_insn(ctx, MIR_BEQ,
+				MIR_new_label_op(ctx, att_labels[attnum]),
+				MIR_new_reg_op(ctx, r_dtmp),
+				MIR_new_int_op(ctx, attnum)));
 	}
+	/* Default: already fully deformed → skip */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_JMP,
+			MIR_new_label_op(ctx, deform_done)));
 
 	/* ============================================================
 	 * PER-ATTRIBUTE CODE EMISSION (unrolled)
@@ -688,7 +676,6 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 		if (att->attbyval)
 		{
 			MIR_type_t load_type;
-			MIR_reg_t  r_val = mir_new_reg(ctx, f, MIR_T_I64, "df_v");
 
 			switch (att->attlen)
 			{
@@ -771,41 +758,37 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 		else if (att->attlen == -1)
 		{
 			/* Varlena: off += varsize_any(attdatap) */
-			MIR_reg_t r_vsize = mir_new_reg(ctx, f, MIR_T_I64, "df_vs");
-
 			MIR_append_insn(ctx, func_item,
 				MIR_new_call_insn(ctx, 4,
 					MIR_new_ref_op(ctx, proto_varsize),
 					MIR_new_ref_op(ctx, import_varsize),
-					MIR_new_reg_op(ctx, r_vsize),
+					MIR_new_reg_op(ctx, r_callret),
 					MIR_new_reg_op(ctx, r_dtmp)));
 			MIR_append_insn(ctx, func_item,
 				MIR_new_insn(ctx, MIR_ADD,
 					MIR_new_reg_op(ctx, r_off),
 					MIR_new_reg_op(ctx, r_off),
-					MIR_new_reg_op(ctx, r_vsize)));
+					MIR_new_reg_op(ctx, r_callret)));
 		}
 		else if (att->attlen == -2)
 		{
 			/* CString: off += strlen(attdatap) + 1 */
-			MIR_reg_t r_slen = mir_new_reg(ctx, f, MIR_T_I64, "df_sl");
-
 			MIR_append_insn(ctx, func_item,
 				MIR_new_call_insn(ctx, 4,
 					MIR_new_ref_op(ctx, proto_strlen),
 					MIR_new_ref_op(ctx, import_strlen),
-					MIR_new_reg_op(ctx, r_slen),
+					MIR_new_reg_op(ctx, r_callret),
 					MIR_new_reg_op(ctx, r_dtmp)));
 			MIR_append_insn(ctx, func_item,
 				MIR_new_insn(ctx, MIR_ADD,
-					MIR_new_reg_op(ctx, r_slen),
-					MIR_new_reg_op(ctx, r_slen),
+					MIR_new_reg_op(ctx, r_callret),
+					MIR_new_reg_op(ctx, r_callret),
 					MIR_new_int_op(ctx, 1)));
 			MIR_append_insn(ctx, func_item,
 				MIR_new_insn(ctx, MIR_ADD,
 					MIR_new_reg_op(ctx, r_off),
 					MIR_new_reg_op(ctx, r_off),
-					MIR_new_reg_op(ctx, r_slen)));
+					MIR_new_reg_op(ctx, r_callret)));
 		}
 	}
 
@@ -830,27 +813,23 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 			MIR_new_reg_op(ctx, r_off)));
 
 	/* tts_flags |= TTS_FLAG_SLOW */
-	{
-		MIR_reg_t r_flags = mir_new_reg(ctx, f, MIR_T_I64, "df_fl");
-
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_reg_op(ctx, r_flags),
-				MIR_new_mem_op(ctx, MIR_T_U16,
-					offsetof(TupleTableSlot, tts_flags),
-					r_slot, 0, 1)));
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_OR,
-				MIR_new_reg_op(ctx, r_flags),
-				MIR_new_reg_op(ctx, r_flags),
-				MIR_new_int_op(ctx, TTS_FLAG_SLOW)));
-		MIR_append_insn(ctx, func_item,
-			MIR_new_insn(ctx, MIR_MOV,
-				MIR_new_mem_op(ctx, MIR_T_U16,
-					offsetof(TupleTableSlot, tts_flags),
-					r_slot, 0, 1),
-				MIR_new_reg_op(ctx, r_flags)));
-	}
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_mem_op(ctx, MIR_T_U16,
+				offsetof(TupleTableSlot, tts_flags),
+				r_slot, 0, 1)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_OR,
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_reg_op(ctx, r_dtmp),
+			MIR_new_int_op(ctx, TTS_FLAG_SLOW)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_mem_op(ctx, MIR_T_U16,
+				offsetof(TupleTableSlot, tts_flags),
+				r_slot, 0, 1),
+			MIR_new_reg_op(ctx, r_dtmp)));
 
 	pfree(att_labels);
 	return true;

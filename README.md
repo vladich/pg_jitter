@@ -39,6 +39,11 @@ It's recommended to set this parameter value to something from ~200 to low thous
 - **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
 - **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But, pg_jitter was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is in the plans, but if you had success (or issues) running it, please let me know at vladimir@churyukin.com. 
 
+## Stability
+
+Current source code can be considered beta-quality - it passes all standard Postgres regression tests, but lacks large-scale production verification (yet).
+Stay tuned.
+
 ## Quick Start
 
 ### Prerequisites
