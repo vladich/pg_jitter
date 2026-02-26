@@ -22,14 +22,13 @@ Typical compilation time:
 
 In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache.
 Therefore, on systems executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records.
-By default, `jit_above_cost` parameter is set to a very high cost (100'000). This makes sense for LLVM, but doesn't make sense for faster providers.
-It's recommended to set this parameter value to something from few hundreds to few thousands.
+By default, `jit_above_cost` parameter is set to a very high number (100'000). This makes sense for LLVM, but doesn't make sense for faster providers.
+It's recommended to set this parameter value to something from ~200 to low thousands.
 
-- pg_jitter backends are **always faster than LLVM**, if we count compilation speed (often 2–3x faster)
-- **sljit** is the most consistent: 5–25% faster than the interpreter across all workloads. this, and also its phenomenal compilation speed makes it the best choice for most scenarios.
+- **sljit** is the most consistent: 5–25% faster than the interpreter across all workloads. This, and also its phenomenal compilation speed, make it the best choice for most scenarios.
 - **AsmJIT** excels on wide-row/deform-heavy queries (up to 32% faster) thanks to specialized tuple deforming
 - **MIR** provides solid gains while being the most portable backend
-- **LLVM was supposed to be fast** due to clang optimization advantages, but in fact in most cases it's slower than all 3 supported backends, even not counting compilation performance differences. This is due to zero-cost inlining using compile-time pre-extracted code and manual instruction-level optimization.
+- **LLVM** was supposed to be fast at execution time, due to clang optimization advantages, but in fact, in most cases, it's slower than all 3 pg_jitter backends, even not counting compilation performance differences. This is due to zero-cost inlining using compile-time pre-extracted code and manual instruction-level optimization.
 
 ## Features
 
