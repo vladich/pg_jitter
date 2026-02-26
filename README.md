@@ -115,7 +115,7 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 ### Two-Tier Function Optimization
 
 - **Tier 1** (~350 functions): Pass-by-value operations (int, float, bool, date, timestamp, OID) compiled as direct native calls with inline overflow checking. No `FunctionCallInfo` overhead.
-- **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON`.
+- **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON` or c2mir-optimized when built with `-DPG_JITTER_USE_C2MIR=ON`.
 
 ### Three JIT Backends
 
