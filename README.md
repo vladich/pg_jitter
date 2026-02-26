@@ -49,11 +49,16 @@ It's recommended to set this parameter value to something from few hundreds to f
 - C11 and C++17 compilers
 - Backend libraries as sibling directories:
 
+```
 parent/
 ├── pg_jitter/
-├── sljit/        # [https://github.com/zherczeg/sljit](https://github.com/zherczeg/sljit)
-├── asmjit/       # https://github.com/asmjit/asmjit
-└── mir/          # [https://github.com/vnmakarov/mir](https://github.com/vnmakarov/mir)
+├── sljit/        
+├── asmjit/       
+└── mir/          
+```
+[SLJIT](https://github.com/zherczeg/sljit)
+[AsmJit](https://github.com/asmjit/asmjit)
+[MIT](https://github.com/vnmakarov/mir)
 
 ### Build
 
