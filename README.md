@@ -150,7 +150,6 @@ JIT-compiled code is tied to PostgreSQL's ResourceOwner system:
    - **sljit**: `sljit_free_code()` — releases mmap'd executable memory
    - **AsmJIT**: `JitRuntime::release()` — frees the code buffer
    - **MIR**: `MIR_gen_finish()` + `MIR_finish()` — tears down the entire MIR context
-4. Verified leak-free: RSS remains flat across 10,000 compile/release cycles for all backends
 
 ### Version Compatibility
 
