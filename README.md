@@ -20,10 +20,8 @@ Typical compilation time:
 - **MIR**: hundreds of microseconds to single milliseconds
 - **LLVM (Postgres default)**: tens to hundreds of milliseconds
 
-In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache.
-Therefore, on systems executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records.
-By default, `jit_above_cost` parameter is set to a very high number (100'000). This makes sense for LLVM, but doesn't make sense for faster providers.
-It's recommended to set this parameter value to something from ~200 to low thousands.
+In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache and effects of increased memory pressure (rapid allocations / deallocations related to code generation and JIT compilation). Therefore, on systems executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records. By default, `jit_above_cost` parameter is set to a very high number (100'000). This makes sense for LLVM, but doesn't make sense for faster providers.
+It's recommended to set this parameter value to something from ~200 to low thousands for pg_jitter (depending on what specific backend you use and your specific workloads).
 
 - **sljit** is the most consistent: 5–25% faster than the interpreter across all workloads. This, and also its phenomenal compilation speed, make it the best choice for most scenarios.
 - **AsmJIT** excels on wide-row/deform-heavy queries (up to 32% faster) thanks to specialized tuple deforming
@@ -39,7 +37,7 @@ It's recommended to set this parameter value to something from ~200 to low thous
 - **Two-tier function optimization** - 350+ hot-path PG functions compiled as direct native calls
 - **No LLVM dependency** - pure C/C++ with small, embeddable libraries
 - **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
-- **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But, pg_jitter was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is in plans, but if you had success (or issues) running it on other platforms, let me know. 
+- **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But, pg_jitter was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is in the plans, but if you had success (or issues) running it, please let me know at vladimir@churyukin.com. 
 
 ## Quick Start
 
@@ -117,7 +115,7 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 ### Two-Tier Function Optimization
 
 - **Tier 1** (~350 functions): Pass-by-value operations (int, float, bool, date, timestamp, OID) compiled as direct native calls with inline overflow checking. No `FunctionCallInfo` overhead.
-- **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON`.
+- **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON` or c2mir-optimized when built with `-DPG_JITTER_USE_C2MIR=ON`.
 
 ### Three JIT Backends
 
@@ -127,8 +125,8 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 | **IR level** | Low-level (register machine) | Low-level (native assembler) | Medium-level (typed ops) |
 | **Register allocation** | Manual | Virtual (automatic) | Automatic |
 | **Architectures** | arm64, x86_64, s390x, ppc, mips, riscv | arm64, x86_64 | arm64, x86_64, s390x, ppc, mips, riscv |
-| **Compilation speed** | Fastest | Fast | Fast (~1ms init/query) |
-| **Best for** | General workloads, lowest overhead | Wide rows, deform-heavy queries | Portability |
+| **Compilation speed** | Fastest (10s to low 100s of μs) | Fast (x3-x5) of sljit | Still fast (x15-x20 of sljit) |
+| **Best for** | General workloads, lowest overhead | Wide rows, deform-heavy queries | Portability and edge cases |
 | **Library size** | ~100 KB | ~300 KB | ~200 KB |
 
 ### Meta Provider
