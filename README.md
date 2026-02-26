@@ -6,8 +6,8 @@ A lightweight JIT compilation provider for PostgreSQL that adds three alternativ
 
 JIT compilation was introduced in Postgres 11 in 2018. It solves a problem of Postgres having to interpret expressions and use inefficient per-row loops in run-time in order to do internal data conversions (so-called tuple deforming).
 On expression-heavy workloads or just wide tables, it can give a significant performance boost for those operations. However, standard LLVM-based JIT is notoriously slow at compilation.
-When your compilation lasts tens to hundreds of milliseconds, it may be suitable only for very heavy queries, in some cases.
-On typical OLTP queries, LLVM's JIT overhead can exceed the execution time of the query itself.
+When it takes tens to hundreds of milliseconds, it may be suitable only for very heavy, OLAP-style queries, in some cases.
+For typical OLTP queries, LLVM's JIT overhead can easily exceed the execution time of the query itself.
 pg_jitter provides native code generation with microsecond-level compilation times instead of milliseconds, making JIT worthwhile for a much wider range of queries.
 
 ## Performance
