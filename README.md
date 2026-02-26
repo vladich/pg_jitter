@@ -38,7 +38,7 @@ It's recommended to set this parameter value to something from few hundreds to f
 - **No LLVM dependency** — pure C/C++ with small, embeddable libraries
 - **Precompiled function blobs** — optional build-time native code extraction for zero-cost inlining
 - **Leak-free** — verified stable RSS across 10,000 compile/release cycles
-- **Supported platforms** - 2 out of 3 providers can be used on all Postgres-supported platforms. AsmJit is ARM64 and x86 only.
+- **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But, pg_jitter was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is in plans, but if you had success (or issues) running it on other platforms, let me know. 
 
 ## Quick Start
 
