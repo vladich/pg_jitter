@@ -21,7 +21,7 @@ Typical compilation time:
 
 In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache.
 Therefore, on system executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records.
-Default `jit_above_cost` parameter is set to a very high cost (100'000). This makes sense for LLVM, but doesn't make sense for these providers.
+By default, `jit_above_cost` parameter is set to a very high cost (100'000). This makes sense for LLVM, but doesn't make sense for these providers.
 It's recommended to set this parameter value to something from few hundreds to few thousands.
 
 - pg_jitter backends are **always faster than LLVM**, if we count compilation speed (often 2–3x faster)
