@@ -143,12 +143,17 @@ sljit_code_free(void *data)
  * Inline deform temporaries — reuse AGG stack slots (no temporal overlap:
  * AGG slots are used only during AGG_PLAIN_TRANS steps, deform temporaries
  * are used only within the FETCHSOME handler).
+ *
+ * Register-optimized layout: S3=tupdata_base, S4=tts_values, S5=tts_isnull,
+ * R3=deform_off. Saved registers are spilled to stack during deform and
+ * restored in the epilogue.
  */
-#define SOFF_DEFORM_OFF       SOFF_AGG_OLDCTX     /* 24: byte offset in tuple */
-#define SOFF_DEFORM_HASNULLS  SOFF_AGG_PERGROUP   /* 32: hasnulls flag */
-#define SOFF_DEFORM_MAXATT    SOFF_AGG_FCINFO     /* 40: maxatt from infomask2 */
-#define SOFF_DEFORM_TBITS     SOFF_AGG_CURRMCTXP  /* 48: t_bits pointer */
-#define SOFF_DEFORM_TUPDATA   SOFF_TEMP           /* 56: tupdata_base pointer */
+#define SOFF_DEFORM_SAVE_S3   SOFF_AGG_OLDCTX     /* 24: saved S3 (resultvals) */
+#define SOFF_DEFORM_SAVE_S4   SOFF_AGG_PERGROUP   /* 32: saved S4 (resultnulls) */
+#define SOFF_DEFORM_SAVE_S5   SOFF_AGG_FCINFO     /* 40: saved S5 (aggstate/hash) */
+#define SOFF_DEFORM_HASNULLS  SOFF_AGG_CURRMCTXP  /* 48: hasnulls flag */
+#define SOFF_DEFORM_MAXATT    SOFF_TEMP           /* 56: maxatt from infomask2 */
+#define SOFF_DEFORM_TBITS     SOFF_RESULTSLOT     /* 16: t_bits pointer (resultslot not used during deform) */
 
 /*
  * Saved register assignments:
@@ -1037,26 +1042,37 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
     att_labels = palloc0(sizeof(struct sljit_label *) * natts);
 
     /*
-     * PROLOGUE: load slot fields into R0-R3 + stack.
-     * R0 = slot pointer (reloaded from econtext).
+     * PROLOGUE: load slot fields.  We temporarily repurpose S3-S5 for
+     * deform state to avoid per-column stack traffic.  The original
+     * S3/S4/S5 values (resultvals, resultnulls, aggstate/hash) are
+     * saved to stack and restored in the epilogue.
+     *
+     * Register allocation during inline deform:
+     *   S3 = tupdata_base   (was on stack)
+     *   S4 = tts_values     (was loaded from stack every column)
+     *   S5 = tts_isnull     (was loaded from stack every column)
+     *   R3 = deform_off     (was loaded/stored to stack every column)
+     *   R0-R2 = scratch
      */
+    /* Save S3, S4, S5 to stack (one-time cost) */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S3,
+                   SLJIT_S3, 0);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S4,
+                   SLJIT_S4, 0);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S5,
+                   SLJIT_S5, 0);
+
     emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
 
-    /* [SP+vals_off] = slot->tts_values (also used post-deform by VAR steps) */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+    /* S4 = slot->tts_values */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_S4, 0,
                    SLJIT_MEM1(SLJIT_R0),
                    offsetof(TupleTableSlot, tts_values));
-    sljit_emit_op1(C, SLJIT_MOV,
-                   SLJIT_MEM1(SLJIT_SP), vals_off,
-                   SLJIT_R1, 0);
 
-    /* [SP+vals_off+8] = slot->tts_isnull */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+    /* S5 = slot->tts_isnull */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_S5, 0,
                    SLJIT_MEM1(SLJIT_R0),
                    offsetof(TupleTableSlot, tts_isnull));
-    sljit_emit_op1(C, SLJIT_MOV,
-                   SLJIT_MEM1(SLJIT_SP), vals_off + 8,
-                   SLJIT_R2, 0);
 
     /* R1 = HeapTuple ptr from slot-type-specific offset */
     sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
@@ -1098,18 +1114,14 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                    SLJIT_MEM1(SLJIT_R1),
                    offsetof(HeapTupleHeaderData, t_hoff));
 
-    /* tupdata_base = (char *)tuplep + t_hoff → stack */
-    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+    /* S3 = tupdata_base = (char *)tuplep + t_hoff */
+    sljit_emit_op2(C, SLJIT_ADD, SLJIT_S3, 0,
                    SLJIT_R1, 0, SLJIT_R2, 0);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA,
-                   SLJIT_R1, 0);
 
-    /* Load saved offset from slot->off → stack */
+    /* R3 = deform_off (loaded from slot->off) */
     emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
-    sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
+    sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R3, 0,
                    SLJIT_MEM1(SLJIT_R0), slot_off);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                   SLJIT_R0, 0);
 
     /* ============================================================
      * MISSING ATTRIBUTES CHECK
@@ -1124,7 +1136,10 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                                       SLJIT_R0, 0,
                                       SLJIT_IMM, natts);
 
-        /* call slot_getmissingattrs(slot, maxatt, natts) */
+        /* call slot_getmissingattrs(slot, maxatt, natts)
+         * icall clobbers R0-R3, save R3 (deform_off) around it. */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
+                       SLJIT_R3, 0);
         emit_load_econtext_slot(C, SLJIT_R0, fetch_opcode);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
                        SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT);
@@ -1132,6 +1147,8 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                        SLJIT_IMM, natts);
         sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32),
                          SLJIT_IMM, (sljit_sw) slot_getmissingattrs);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                       SLJIT_MEM1(SLJIT_SP), vals_off);
 
         sljit_set_label(skip_missing, sljit_emit_label(C));
     }
@@ -1175,7 +1192,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         /* If attnum == 0: reset offset to 0 */
         if (attnum == 0)
         {
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                            SLJIT_IMM, 0);
         }
 
@@ -1218,17 +1235,13 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
 
             /* ---- Column IS NULL ---- */
             /* tts_values[attnum] = 0 */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_SP), vals_off);
             sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_R0),
+                           SLJIT_MEM1(SLJIT_S4),
                            attnum * (sljit_sw) sizeof(Datum),
                            SLJIT_IMM, 0);
             /* tts_isnull[attnum] = true */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_SP), vals_off + 8);
             sljit_emit_op1(C, SLJIT_MOV_U8,
-                           SLJIT_MEM1(SLJIT_R0), attnum,
+                           SLJIT_MEM1(SLJIT_S5), attnum,
                            SLJIT_IMM, 1);
 
             null_jumps[attnum] = sljit_emit_jump(C, SLJIT_JUMP);
@@ -1255,35 +1268,25 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                 attguaranteedalign = false;
 
                 /* Peek first byte: if nonzero → short varlena, skip align */
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA);
-                sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
-                               SLJIT_MEM2(SLJIT_R1, SLJIT_R0), 0);
+                sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+                               SLJIT_MEM2(SLJIT_S3, SLJIT_R3), 0);
                 is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-                                          SLJIT_R1, 0,
+                                          SLJIT_R0, 0,
                                           SLJIT_IMM, 0);
 
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
-                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                               SLJIT_R3, 0, SLJIT_IMM, alignto - 1);
+                sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+                               SLJIT_R3, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
 
                 sljit_set_label(is_short, sljit_emit_label(C));
             }
             else
             {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
-                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                               SLJIT_R3, 0, SLJIT_IMM, alignto - 1);
+                sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+                               SLJIT_R3, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
             }
 
             if (known_alignment >= 0)
@@ -1293,24 +1296,18 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         if (attguaranteedalign)
         {
             Assert(known_alignment >= 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                            SLJIT_IMM, known_alignment);
         }
 
         /* ---- Value extraction ---- */
-        /* R0 = deform_off, R1 = tupdata_base + off (attdatap) */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_TUPDATA);
+        /* R1 = tupdata_base + off (attdatap) */
         sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                       SLJIT_R1, 0, SLJIT_R0, 0);
+                       SLJIT_S3, 0, SLJIT_R3, 0);
 
         /* tts_isnull[attnum] = false */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-                       SLJIT_MEM1(SLJIT_SP), vals_off + 8);
         sljit_emit_op1(C, SLJIT_MOV_U8,
-                       SLJIT_MEM1(SLJIT_R2), attnum,
+                       SLJIT_MEM1(SLJIT_S5), attnum,
                        SLJIT_IMM, 0);
 
         if (att->attbyval)
@@ -1328,24 +1325,20 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                     pfree(null_jumps); pfree(att_labels);
                     return false;
             }
-            /* R3 = *(mov_op *)(tupdata_base + off) */
-            sljit_emit_op1(C, mov_op, SLJIT_R3, 0,
+            /* R0 = *(mov_op *)(tupdata_base + off) */
+            sljit_emit_op1(C, mov_op, SLJIT_R0, 0,
                            SLJIT_MEM1(SLJIT_R1), 0);
-            /* tts_values[attnum] = R3 */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            /* tts_values[attnum] = R0 */
             sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_R2),
+                           SLJIT_MEM1(SLJIT_S4),
                            attnum * (sljit_sw) sizeof(Datum),
-                           SLJIT_R3, 0);
+                           SLJIT_R0, 0);
         }
         else
         {
             /* tts_values[attnum] = pointer to data (R1 = attdatap) */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-                           SLJIT_MEM1(SLJIT_SP), vals_off);
             sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_R2),
+                           SLJIT_MEM1(SLJIT_S4),
                            attnum * (sljit_sw) sizeof(Datum),
                            SLJIT_R1, 0);
         }
@@ -1381,53 +1374,57 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
             if (attguaranteedalign)
             {
                 Assert(known_alignment >= 0);
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                                SLJIT_IMM, known_alignment);
             }
             else
             {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, att->attlen);
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                               SLJIT_R3, 0, SLJIT_IMM, att->attlen);
             }
         }
         else if (att->attlen == -1)
         {
-            /* Varlena: off += varsize_any(attdatap) */
-            /* R1 still holds attdatap from value extraction */
+            /*
+             * Varlena: off += varsize_any(attdatap).
+             * R1 still holds attdatap from value extraction.
+             * icall clobbers R0-R3, so save R3 (deform_off) to stack
+             * first. S3-S5 are callee-saved, so they survive the call.
+             */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
+                           SLJIT_R3, 0);  /* save R3 (vals_off is unused during deform) */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
             sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
                              SLJIT_IMM, (sljit_sw) varsize_any);
-            /* After icall: R0 = varsize_any result. Reload deform_off from stack. */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                           SLJIT_R1, 0, SLJIT_R0, 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                           SLJIT_R1, 0);
+            /* R0 = varsize_any result. Restore R3 and add. */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                           SLJIT_R3, 0, SLJIT_R0, 0);
         }
         else if (att->attlen == -2)
         {
-            /* Cstring: off += strlen(attdatap) + 1 */
+            /*
+             * Cstring: off += strlen(attdatap) + 1.
+             * Save R3 around icall.
+             */
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
+                           SLJIT_R3, 0);  /* save R3 (vals_off is unused during deform) */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
             sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
                              SLJIT_IMM, (sljit_sw) strlen);
             sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
                            SLJIT_R0, 0, SLJIT_IMM, 1);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                           SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
-            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                           SLJIT_R1, 0, SLJIT_R0, 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF,
-                           SLJIT_R1, 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_SP), vals_off);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                           SLJIT_R3, 0, SLJIT_R0, 0);
         }
     }
 
     /* ============================================================
-     * EPILOGUE: patch jumps, store tts_nvalid, off, flags
+     * EPILOGUE: patch jumps, store tts_nvalid, off, flags,
+     * write vals/nulls to slot cache, restore S3/S4/S5.
      * ============================================================ */
     {
         struct sljit_label *deform_out = sljit_emit_label(C);
@@ -1452,12 +1449,10 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                        offsetof(TupleTableSlot, tts_nvalid),
                        SLJIT_IMM, natts);
 
-        /* slot->off = (uint32) off */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_OFF);
+        /* slot->off = (uint32) deform_off (R3) */
         sljit_emit_op1(C, SLJIT_MOV_U32,
                        SLJIT_MEM1(SLJIT_R0), slot_off,
-                       SLJIT_R1, 0);
+                       SLJIT_R3, 0);
 
         /* tts_flags |= TTS_FLAG_SLOW */
         sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0,
@@ -1469,6 +1464,25 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                        SLJIT_MEM1(SLJIT_R0),
                        offsetof(TupleTableSlot, tts_flags),
                        SLJIT_R1, 0);
+
+        /*
+         * Write S4/S5 (tts_values/tts_isnull) to the slot cache area
+         * so post-deform VAR steps can find them.
+         */
+        sljit_emit_op1(C, SLJIT_MOV,
+                       SLJIT_MEM1(SLJIT_SP), vals_off,
+                       SLJIT_S4, 0);
+        sljit_emit_op1(C, SLJIT_MOV,
+                       SLJIT_MEM1(SLJIT_SP), vals_off + 8,
+                       SLJIT_S5, 0);
+
+        /* Restore S3, S4, S5 from saved slots */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_S3, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S3);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_S4, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S4);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_S5, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_SAVE_S5);
     }
 
     /* No return — we're inline in the expression function body */
@@ -2369,22 +2383,24 @@ sljit_compile_expr(ExprState *state)
 
 		/*
 		 * Compute saved register count.
-		 * Base: S0=state, S1=econtext, S2=isNull,
-		 *       S3=resultvals, S4=resultnulls (5 regs).
-		 * Agg:  +S5=aggstate (6 regs). &CurrentMemoryContext on stack.
-		 * Hash (no agg): +S5 for rotated hash (6 regs).
+		 * Always use 6 saved registers (S0-S5):
+		 *   S0=state, S1=econtext, S2=isNull,
+		 *   S3=resultvals, S4=resultnulls (always)
+		 *   S5=aggstate (agg) / sreg_hash (hash_next) / temp (deform)
+		 *
+		 * Inline deform temporarily repurposes S3-S5 for tupdata_base,
+		 * tts_values, tts_isnull (saving/restoring original values).
+		 * This requires S5 to be allocated even when there's no agg
+		 * or hash_next.
 		 *
 		 * Max 6 saved registers — the guaranteed minimum across all
 		 * sljit architectures (x86-64 non-Windows has exactly 6).
 		 * When agg+hash coexist, hash falls back to SOFF_TEMP.
 		 */
-		nsaved = 5;
-		if (has_agg)
-			nsaved = 6;
+		nsaved = 6;
 		if (has_hash_next && !has_agg)
 		{
 			sreg_hash = SLJIT_S5;
-			nsaved = 6;
 			use_sreg_hash = true;
 		}
 
