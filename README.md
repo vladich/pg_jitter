@@ -18,7 +18,7 @@ Typical compilation time:
 - **sljit**: tens to low hundreds of microseconds
 - **AsmJIT**: hundreds of microseconds
 - **MIR**: hundreds of microseconds to single milliseconds
-- **LVVM (Postgres default)**: tens to hundreds of milliseconds
+- **LLVM (Postgres default)**: tens to hundreds of milliseconds
 
 In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache.
 Therefore, on systems executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records.
