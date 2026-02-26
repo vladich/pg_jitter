@@ -52,9 +52,9 @@ It's recommended to set this parameter value to something from few hundreds to f
 ```
 parent/
 ├── pg_jitter/
-├── sljit/        # https://github.com/nicktehrany/sljit
+├── sljit/        # [https://github.com/zherczeg/sljit](https://github.com/zherczeg/sljit)
 ├── asmjit/       # https://github.com/asmjit/asmjit
-└── mir/          # https://github.com/nicktehrany/mir
+└── mir/          # [https://github.com/vnmakarov/mir](https://github.com/vnmakarov/mir)
 ```
 
 ### Build
