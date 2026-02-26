@@ -56,9 +56,7 @@ parent/
 ├── asmjit/       
 └── mir/          
 ```
-[SLJIT](https://github.com/zherczeg/sljit)
-[AsmJit](https://github.com/asmjit/asmjit)
-[MIT](https://github.com/vnmakarov/mir)
+[SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
 
 ### Build
 
