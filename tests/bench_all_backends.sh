@@ -1,39 +1,164 @@
 #!/bin/bash
-# bench_all_backends.sh — Comprehensive benchmark across all 5 JIT backends
-# Runs ALL queries per backend before switching (only 4 restarts total).
+# bench_all_backends.sh — Comprehensive benchmark across all JIT backends
+#
+# Uses the pg_jitter meta-provider for zero-restart backend switching.
+# Automatically creates benchmark tables if missing.
+#
+# Usage:
+#   ./tests/bench_all_backends.sh [--pg-config /path] [--port 5433] [--db postgres]
+#                                 [--runs 3] [--backends "interp sljit asmjit mir"]
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PG_CONFIG="${PG_CONFIG:-pg_config}"
-PGBIN="$("$PG_CONFIG" --bindir)"
-PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
-PGCTL="$PGBIN/pg_ctl"
-LOGFILE="$PG_DATA/logfile"
-OUTFILE="$SCRIPT_DIR/bench_results_$(date +%Y%m%d_%H%M%S).txt"
+PGPORT="${PGPORT:-5433}"
+PGDB="${PGDB:-postgres}"
 NRUNS=3
+REQUESTED_BACKENDS=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pg-config) PG_CONFIG="$2"; shift 2;;
+        --port)      PGPORT="$2";    shift 2;;
+        --db)        PGDB="$2";      shift 2;;
+        --runs)      NRUNS="$2";     shift 2;;
+        --backends)  REQUESTED_BACKENDS="$2"; shift 2;;
+        *) echo "Unknown option: $1"; exit 1;;
+    esac
+done
+
+PGBIN="$("$PG_CONFIG" --bindir)"
+PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+PGDATA="$("$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
+PGCTL="$PGBIN/pg_ctl"
+OUTFILE="$SCRIPT_DIR/bench_results_$(date +%Y%m%d_%H%M%S).txt"
 TMPDIR=$(mktemp -d)
 
-restart_pg() {
-    "$PGCTL" -D "$PG_DATA" stop -m fast 2>/dev/null || true
-    sleep 1
-    "$PGCTL" -D "$PG_DATA" start -l "$LOGFILE" -w 2>/dev/null
-    sleep 1
+trap 'rm -rf "$TMPDIR"' EXIT
+
+psql_cmd() {
+    "$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -X "$@"
 }
 
 ensure_pg_running() {
-    if ! "$PGBIN/pg_isready" -p "${PGPORT:-5432}" -q 2>/dev/null; then
+    if ! "$PGBIN/pg_isready" -p "$PGPORT" -q 2>/dev/null; then
         echo " (server down, restarting)"
-        "$PGCTL" -D "$PG_DATA" stop -m immediate 2>/dev/null || true
-        sleep 1
-        "$PGCTL" -D "$PG_DATA" start -l "$LOGFILE" -w 2>/dev/null || true
-        sleep 1
+        if [ -n "$PGDATA" ]; then
+            "$PGCTL" -D "$PGDATA" stop -m immediate 2>/dev/null || true
+            sleep 1
+            "$PGCTL" -D "$PGDATA" start -l "$PGDATA/logfile" -w 2>/dev/null || true
+            sleep 1
+        else
+            echo "ERROR: Cannot restart — PGDATA unknown" >&2
+            exit 1
+        fi
     fi
 }
 
+# ================================================================
+# Setup: create benchmark tables if missing
+# ================================================================
+echo "Checking benchmark tables..."
+
+TABLES_NEEDED=$(psql_cmd -t -A -c "
+SELECT string_agg(t, ',') FROM (VALUES
+    ('bench_data'),('join_left'),('join_right'),('date_data'),
+    ('text_data'),('numeric_data'),('jsonb_data'),('array_data'),
+    ('ultra_wide')
+) AS v(t)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = v.t AND n.nspname = 'public'
+      AND c.relkind IN ('r','p')
+);")
+
+if [ -n "$TABLES_NEEDED" ]; then
+    echo "Creating missing tables: $TABLES_NEEDED"
+    echo "Running bench_setup.sql..."
+    psql_cmd -q -f "$SCRIPT_DIR/bench_setup.sql" 2>&1 | grep -E "NOTICE|ERROR" || true
+    echo "Running bench_setup_extra.sql..."
+    psql_cmd -q -f "$SCRIPT_DIR/bench_setup_extra.sql" 2>&1 | grep -E "NOTICE|ERROR" || true
+    echo "Setup complete."
+else
+    echo "All tables present."
+fi
+
+# Ensure the SQL function exists
+psql_cmd -q -c "
+CREATE OR REPLACE FUNCTION pg_jitter_current_backend()
+RETURNS text AS 'pg_jitter', 'pg_jitter_current_backend'
+LANGUAGE C STABLE;
+" 2>/dev/null || true
+
+# ================================================================
+# Detect jit_provider and available backends
+# ================================================================
+JIT_PROVIDER=$(psql_cmd -t -A -c "SHOW jit_provider;" 2>/dev/null || echo "")
+META_MODE=0
+if [ "$JIT_PROVIDER" = "pg_jitter" ]; then
+    META_MODE=1
+    # Trigger provider init so GUC is available
+    psql_cmd -t -A -c "SET jit_above_cost = 0; SELECT 1;" >/dev/null 2>&1
+fi
+
+# Determine DLSUFFIX
+if [ -f "$PKGLIBDIR/pg_jitter_sljit.dylib" ]; then
+    DLSUFFIX=".dylib"
+else
+    DLSUFFIX=".so"
+fi
+
+# Build backend list
+ALL_BACKENDS=("interp")
+ALL_NAMES=("interp")
+
+for b in sljit asmjit mir; do
+    if [ -f "$PKGLIBDIR/pg_jitter_${b}${DLSUFFIX}" ]; then
+        ALL_BACKENDS+=("$b")
+        ALL_NAMES+=("$b")
+    fi
+done
+
+# Filter to requested backends if specified
+if [ -n "$REQUESTED_BACKENDS" ]; then
+    BACKENDS=()
+    NAMES=()
+    for rb in $REQUESTED_BACKENDS; do
+        for i in "${!ALL_NAMES[@]}"; do
+            if [ "${ALL_NAMES[$i]}" = "$rb" ]; then
+                BACKENDS+=("${ALL_BACKENDS[$i]}")
+                NAMES+=("${ALL_NAMES[$i]}")
+            fi
+        done
+    done
+else
+    BACKENDS=("${ALL_BACKENDS[@]}")
+    NAMES=("${ALL_NAMES[@]}")
+fi
+
+echo ""
+echo "Backends: ${NAMES[*]}"
+echo "Runs per query: $NRUNS"
+echo "Database: $PGDB (port $PGPORT)"
+echo "Meta-provider: $([ $META_MODE -eq 1 ] && echo 'yes (zero-restart switching)' || echo 'no (will use ALTER SYSTEM + restart)')"
+echo ""
+
+# ================================================================
+# Query execution helpers
+# ================================================================
 get_exec_time() {
     local query="$1"
     local jit_on="$2"
-    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -t -A -c "
+    local backend="$3"
+    local set_backend=""
+
+    if [ "$META_MODE" -eq 1 ] && [ "$backend" != "interp" ]; then
+        set_backend="SET pg_jitter.backend = '$backend';"
+    fi
+
+    psql_cmd -t -A -c "
 SET jit = $jit_on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -41,15 +166,22 @@ SET jit_optimize_above_cost = 0;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
 SET max_parallel_workers_per_gather = 0;
+$set_backend
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON) $query;
 " 2>/dev/null | grep "Execution Time" | sed 's/.*Execution Time: //' | sed 's/ ms//'
 }
 
-median3() {
-    echo -e "$1\n$2\n$3" | sort -g | sed -n '2p'
+median() {
+    # Read N values, sort, return middle
+    local vals=("$@")
+    local n=${#vals[@]}
+    local sorted=($(printf '%s\n' "${vals[@]}" | sort -g))
+    echo "${sorted[$((n / 2))]}"
 }
 
-# ---- Query definitions ----
+# ================================================================
+# Query definitions
+# ================================================================
 LABELS=()
 QUERIES=()
 SECTIONS=()
@@ -151,35 +283,42 @@ NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""
 
-# ---- Run all queries per backend ----
-BACKENDS=("interp" "llvmjit" "pg_jitter_sljit" "pg_jitter_asmjit" "pg_jitter_mir")
-BACKEND_NAMES=("interp" "llvm" "sljit" "asmjit" "mir")
+# ================================================================
+# Warmup buffer cache (once)
+# ================================================================
+echo "Warming up buffer cache..."
+psql_cmd -q -c "
+SET max_parallel_workers_per_gather = 0;
+SELECT COUNT(*) FROM bench_data; SELECT COUNT(*) FROM join_left;
+SELECT COUNT(*) FROM join_right; SELECT COUNT(*) FROM date_data;
+SELECT COUNT(*) FROM text_data; SELECT COUNT(*) FROM numeric_data;
+SELECT COUNT(*) FROM array_data; SELECT COUNT(*) FROM ultra_wide;
+SELECT COUNT(*) FROM jsonb_data; SELECT COUNT(*) FROM part_data;
+" > /dev/null 2>&1
+echo ""
 
+# ================================================================
+# Run all queries per backend
+# ================================================================
 for bi in "${!BACKENDS[@]}"; do
     backend="${BACKENDS[$bi]}"
-    bname="${BACKEND_NAMES[$bi]}"
+    bname="${NAMES[$bi]}"
 
     if [ "$backend" = "interp" ]; then
         echo "Running $bname (jit=off)..."
         jit_on="off"
+    elif [ "$META_MODE" -eq 1 ]; then
+        echo "Running $bname (SET pg_jitter.backend)..."
+        jit_on="on"
     else
-        echo "Switching to $bname..."
+        # Fallback: ALTER SYSTEM + restart (when not using meta-provider)
+        echo "Switching to $bname (ALTER SYSTEM + restart)..."
         ensure_pg_running
-        "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = '$backend';" 2>/dev/null
-        restart_pg
+        psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
+        "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
+        sleep 1
         jit_on="on"
     fi
-
-    # Warmup buffer cache
-    "$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "
-SET max_parallel_workers_per_gather = 0;
-SELECT COUNT(*) FROM bench_data; SELECT COUNT(*) FROM join_left;
-SELECT COUNT(*) FROM join_right; SELECT COUNT(*) FROM date_data;
-SELECT COUNT(*) FROM wide_data; SELECT COUNT(*) FROM text_data;
-SELECT COUNT(*) FROM numeric_data; SELECT COUNT(*) FROM array_data;
-SELECT COUNT(*) FROM ultra_wide; SELECT COUNT(*) FROM jsonb_data;
-SELECT COUNT(*) FROM part_data;
-" > /dev/null 2>&1
 
     crash_count=0
     for qi in $(seq 0 $((NQUERIES - 1))); do
@@ -191,21 +330,35 @@ SELECT COUNT(*) FROM part_data;
             done
             break
         fi
+
         query="${QUERIES[$qi]}"
         ensure_pg_running
-        # warmup
-        get_exec_time "$query" "$jit_on" > /dev/null 2>&1
+
+        # Warmup run
+        get_exec_time "$query" "$jit_on" "$backend" > /dev/null 2>&1
         ensure_pg_running
-        t1=$(get_exec_time "$query" "$jit_on")
-        t2=$(get_exec_time "$query" "$jit_on")
-        t3=$(get_exec_time "$query" "$jit_on")
-        if [ -z "$t1" ] && [ -z "$t2" ] && [ -z "$t3" ]; then
+
+        # Timed runs
+        times=()
+        for r in $(seq 1 "$NRUNS"); do
+            t=$(get_exec_time "$query" "$jit_on" "$backend")
+            times+=("$t")
+        done
+
+        # Check for crash (all empty)
+        all_empty=1
+        for t in "${times[@]}"; do
+            [ -n "$t" ] && all_empty=0
+        done
+
+        if [ "$all_empty" -eq 1 ]; then
             m="CRASH"
             crash_count=$((crash_count + 1))
             ensure_pg_running
         else
-            m=$(median3 "$t1" "$t2" "$t3")
+            m=$(median "${times[@]}")
         fi
+
         echo "$m" >> "$TMPDIR/${bname}_${qi}.txt"
         printf "."
     done
@@ -216,13 +369,24 @@ echo ""
 echo "Formatting results..."
 echo ""
 
-# ---- Format output ----
+# ================================================================
+# Format output table
+# ================================================================
 {
-    printf "%-30s%10s%10s%10s%10s%10s\n" "Query" "interp" "llvm" "sljit" "asmjit" "mir"
-    printf "%-30s%10s%10s%10s%10s%10s\n" "" "--------" "--------" "--------" "--------" "--------"
+    # Header
+    header_fmt="%-30s"
+    header_args=("Query")
+    sep_args=("")
+    for bname in "${NAMES[@]}"; do
+        header_fmt+="%10s"
+        header_args+=("$bname")
+        sep_args+=("--------")
+    done
+    printf "$header_fmt\n" "${header_args[@]}"
+    printf "$header_fmt\n" "${sep_args[@]}"
 
     for qi in $(seq 0 $((NQUERIES - 1))); do
-        # Check if this index starts a section
+        # Section headers
         for sec in "${SECTIONS[@]}"; do
             sec_idx="${sec%%:*}"
             sec_name="${sec#*:}"
@@ -233,25 +397,27 @@ echo ""
         done
 
         label="${LABELS[$qi]}"
-        v_interp=$(cat "$TMPDIR/interp_${qi}.txt" 2>/dev/null || echo "N/A")
-        v_llvm=$(cat "$TMPDIR/llvm_${qi}.txt" 2>/dev/null || echo "N/A")
-        v_sljit=$(cat "$TMPDIR/sljit_${qi}.txt" 2>/dev/null || echo "N/A")
-        v_asmjit=$(cat "$TMPDIR/asmjit_${qi}.txt" 2>/dev/null || echo "N/A")
-        v_mir=$(cat "$TMPDIR/mir_${qi}.txt" 2>/dev/null || echo "N/A")
-        printf "%-30s%10s%10s%10s%10s%10s\n" "$label" "$v_interp" "$v_llvm" "$v_sljit" "$v_asmjit" "$v_mir"
+        row_fmt="%-30s"
+        row_args=("$label")
+        for bname in "${NAMES[@]}"; do
+            v=$(cat "$TMPDIR/${bname}_${qi}.txt" 2>/dev/null || echo "N/A")
+            row_fmt+="%10s"
+            row_args+=("$v")
+        done
+        printf "$row_fmt\n" "${row_args[@]}"
     done
 
     echo ""
-    echo "All times in ms. Lower is better."
+    echo "All times in ms (median of $NRUNS). Lower is better."
 } | tee "$OUTFILE"
 
+echo ""
 echo "Results saved to: $OUTFILE"
 
-# Cleanup
-rm -rf "$TMPDIR"
-
-# Restore sljit as default
-ensure_pg_running
-"$PGBIN/psql" -p "${PGPORT:-5432}" -d regression -X -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_sljit';" 2>/dev/null
-restart_pg
-echo "Restored jit_provider = pg_jitter_sljit"
+# Restore default if we used ALTER SYSTEM
+if [ "$META_MODE" -eq 0 ] && [ -n "$PGDATA" ]; then
+    ensure_pg_running
+    psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
+    "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
+    echo "Restored jit_provider = pg_jitter"
+fi
