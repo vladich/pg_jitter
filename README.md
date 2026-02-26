@@ -1,13 +1,13 @@
 # pg_jitter
 
-A lightweight JIT compilation provider for PostgreSQL that adds three alternative JIT backends — **sljit**, **AsmJIT**, and **MIR** — delivering faster compilation and competitive query execution across PostgreSQL 14–18.
+A lightweight JIT compilation provider for PostgreSQL that adds three alternative JIT backends - **[sljit](https://github.com/zherczeg/sljit)**, **[AsmJit](https://github.com/asmjit/asmjit)** and **[MIR](https://github.com/vnmakarov/mir)** - delivering faster compilation and competitive query execution across PostgreSQL 14–18.
 
 ## Why?
 
-JIT compilation was introduced in Postgres 11 in 2018. It solves a problem of Postgres having to interpret expressions and use run-time metadata access in order to figure out internal data conversions (so-called tuple deforming).
+JIT compilation was introduced in Postgres 11 in 2018. It solves a problem of Postgres having to interpret expressions and use inefficient per-row loops in run-time in order to do internal data conversions (so-called tuple deforming).
 On expression-heavy workloads or just wide tables, it can give a significant performance boost for those operations. However, standard LLVM-based JIT is notoriously slow at compilation.
-When your compilation lasts tens to hundreds of milliseconds, it may be suitable only for very heavy queries, in some cases.
-On typical OLTP queries, LLVM's JIT overhead can exceed the execution time of the query itself.
+When it takes tens to hundreds of milliseconds, it may be suitable only for very heavy, OLAP-style queries, in some cases.
+For typical OLTP queries, LLVM's JIT overhead can easily exceed the execution time of the query itself.
 pg_jitter provides native code generation with microsecond-level compilation times instead of milliseconds, making JIT worthwhile for a much wider range of queries.
 
 ## Performance
@@ -30,15 +30,15 @@ It's recommended to set this parameter value to something from few hundreds to f
 
 ## Features
 
-- **Zero-config** — set `jit_provider` and go
+- **Zero-config** - set `jit_provider` and go
 - **Three independent backends** with different strengths
 - **Runtime backend switching** via `SET pg_jitter.backend = 'sljit'` (no restart)
 - **PostgreSQL 14–18** support from one codebase
-- **Two-tier function optimization** — 350+ hot-path PG functions compiled as direct native calls
-- **No LLVM dependency** — pure C/C++ with small, embeddable libraries
-- **Precompiled function blobs** — optional build-time native code extraction for zero-cost inlining
-- **Leak-free** — verified stable RSS across 10,000 compile/release cycles
-- **Supported platforms** - 2 out of 3 providers can be used on all Postgres-supported platforms. AsmJit is ARM64 and x86 only.
+- **Two-tier function optimization** - 350+ hot-path PG functions compiled as direct native calls
+- **No LLVM dependency** - pure C/C++ with small, embeddable libraries
+- **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
+- **Leak-free** - verified stable RSS across 10,000 compile/release cycles
+- **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But, pg_jitter was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is in plans, but if you had success (or issues) running it on other platforms, let me know. 
 
 ## Quick Start
 
@@ -52,10 +52,11 @@ It's recommended to set this parameter value to something from few hundreds to f
 ```
 parent/
 ├── pg_jitter/
-├── sljit/        # https://github.com/nicktehrany/sljit
-├── asmjit/       # https://github.com/asmjit/asmjit
-└── mir/          # https://github.com/nicktehrany/mir
+├── sljit/        
+├── asmjit/       
+└── mir/          
 ```
+[SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
 
 ### Build
 
@@ -124,8 +125,8 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 | **Language** | C | C++ | C |
 | **IR level** | Low-level (register machine) | Low-level (native assembler) | Medium-level (typed ops) |
 | **Register allocation** | Manual | Virtual (automatic) | Automatic |
-| **Architectures** | arm64, x86_64, s390x, ppc, mips, riscv | arm64, x86_64 | Portable (any POSIX) |
-| **Compilation speed** | Fastest | Fast | Fast (~1.4ms init/query) |
+| **Architectures** | arm64, x86_64, s390x, ppc, mips, riscv | arm64, x86_64 | arm64, x86_64, s390x, ppc, mips, riscv |
+| **Compilation speed** | Fastest | Fast | Fast (~1ms init/query) |
 | **Best for** | General workloads, lowest overhead | Wide rows, deform-heavy queries | Portability |
 | **Library size** | ~100 KB | ~300 KB | ~200 KB |
 
@@ -150,7 +151,6 @@ JIT-compiled code is tied to PostgreSQL's ResourceOwner system:
    - **sljit**: `sljit_free_code()` — releases mmap'd executable memory
    - **AsmJIT**: `JitRuntime::release()` — frees the code buffer
    - **MIR**: `MIR_gen_finish()` + `MIR_finish()` — tears down the entire MIR context
-4. Verified leak-free: RSS remains flat across 10,000 compile/release cycles for all backends
 
 ### Version Compatibility
 
