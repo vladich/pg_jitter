@@ -126,7 +126,7 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 | **Register allocation** | Manual | Virtual (automatic) | Automatic |
 | **Architectures** | arm64, x86_64, s390x, ppc, mips, riscv | arm64, x86_64 | arm64, x86_64, s390x, ppc, mips, riscv |
 | **Compilation speed** | Fastest | Fast (x3-x5) of sljit | Still fast (x15-x20 of sljit) |
-| **Best for** | General workloads, lowest overhead | Wide rows, deform-heavy queries | Portability |
+| **Best for** | General workloads, lowest overhead | Wide rows, deform-heavy queries | Portability and edge cases |
 | **Library size** | ~100 KB | ~300 KB | ~200 KB |
 
 ### Meta Provider
