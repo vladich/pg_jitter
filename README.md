@@ -61,6 +61,7 @@ parent/
 └── mir/          
 ```
 [SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
+For MIR, use the patched version from [MIR-patched](https://github.com/vladich/mir-patched) - it has a small change that tracks the size of the generated native code per function.
 
 ### Build
 
