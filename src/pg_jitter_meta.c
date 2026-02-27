@@ -29,11 +29,9 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "storage/dsm.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
-
-/* Forward declaration — must match pg_jitter_common.h */
-typedef struct PendingSharedCode PendingSharedCode;
 
 /* ----------------------------------------------------------------
  * PgJitterContext — must match the layout in pg_jitter_common.h
@@ -44,6 +42,18 @@ typedef struct MetaCompiledCode
 	void	(*free_fn)(void *data);
 	void   *data;
 } MetaCompiledCode;
+
+/*
+ * JitShareState — must match pg_jitter_common.h for layout compatibility.
+ * Duplicated here because meta.c doesn't include pg_jitter_common.h.
+ */
+typedef struct MetaJitShareState
+{
+	dsm_segment *dsm_seg;
+	void	   *sjc;			/* SharedJitCompiledCode * */
+	bool		initialized;
+	bool		is_leader;
+} MetaJitShareState;
 
 typedef struct MetaJitterContext
 {
@@ -58,7 +68,9 @@ typedef struct MetaJitterContext
 	 */
 	int					last_plan_node_id;
 	int					expr_ordinal;
-	PendingSharedCode  *pending_shared;
+
+	/* DSM-based shared code state — mirrors JitShareState */
+	MetaJitShareState	share_state;
 } MetaJitterContext;
 
 /* ----------------------------------------------------------------
@@ -145,6 +157,7 @@ static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 /* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
 static int meta_parallel_mode = 2;		/* PARALLEL_JIT_SHARED */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
+static char *meta_shared_dsm_guc = NULL;	/* DSM handle for parallel JIT sharing */
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
@@ -254,7 +267,7 @@ meta_ensure_context(ExprState *state)
 	ctx->resowner = CurrentResourceOwner;
 	ctx->last_plan_node_id = -1;
 	ctx->expr_ordinal = 0;
-	ctx->pending_shared = NULL;
+	memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
 
@@ -297,6 +310,19 @@ meta_release_context(JitContext *context)
 {
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
+
+	/* Clean up DSM shared code state */
+	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)
+	{
+		dsm_unpin_mapping(ctx->share_state.dsm_seg);
+		dsm_detach(ctx->share_state.dsm_seg);
+
+		if (ctx->share_state.is_leader)
+			SetConfigOption("pg_jitter._shared_dsm", "",
+							PGC_USERSET, PGC_S_SESSION);
+
+		memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
+	}
 
 	/* Free all compiled code — each node carries its own free_fn */
 	for (cc = ctx->compiled_list; cc != NULL; cc = next)
@@ -369,39 +395,6 @@ meta_detect_default(void)
 	return PG_JITTER_BACKEND_SLJIT;
 }
 
-static void
-meta_flush_shared_code(JitContext *jit_context, void *shared_jit_code)
-{
-	int		idx = pg_jitter_backend;
-
-	if (meta_load_backend(idx) && backends[idx].cb.flush_shared_code)
-	{
-		backends[idx].cb.flush_shared_code(jit_context, shared_jit_code);
-		return;
-	}
-
-	/* Fallback: try each backend */
-	for (idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
-	{
-		if (meta_load_backend(idx) && backends[idx].cb.flush_shared_code)
-		{
-			backends[idx].cb.flush_shared_code(jit_context, shared_jit_code);
-			return;
-		}
-	}
-}
-
-static Size
-meta_estimate_shared_code_size(JitContext *jit_context)
-{
-	int		idx = pg_jitter_backend;
-
-	if (meta_load_backend(idx) && backends[idx].cb.estimate_shared_code_size)
-		return backends[idx].cb.estimate_shared_code_size(jit_context);
-
-	return 0;
-}
-
 void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
@@ -410,8 +403,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = meta_reset_after_error;
 	cb->release_context = meta_release_context;
 	cb->compile_expr = meta_compile_expr;
-	cb->flush_shared_code = meta_flush_shared_code;
-	cb->estimate_shared_code_size = meta_estimate_shared_code_size;
 
 	boot_default = meta_detect_default();
 	pg_jitter_backend = boot_default;
@@ -469,6 +460,21 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 NULL,
 							 meta_backend_assign,
 							 NULL);
+
+	/*
+	 * Internal GUC for passing DSM handle from leader to workers.
+	 * Serialized via SerializeGUCState automatically.
+	 * Hidden from pg_settings and config files.
+	 */
+	DefineCustomStringVariable(
+		"pg_jitter._shared_dsm",
+		"Internal: DSM handle for parallel JIT code sharing.",
+		NULL,
+		&meta_shared_dsm_guc,
+		"",
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+		NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pg_jitter");
 }

@@ -307,8 +307,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = mir_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = mir_compile_expr;
-	cb->flush_shared_code = pg_jitter_flush_shared_code;
-	cb->estimate_shared_code_size = pg_jitter_estimate_shared_code_size;
 }
 
 /*
@@ -1140,6 +1138,9 @@ mir_compile_expr(ExprState *state)
 
 	/*
 	 * Compute expression identity for shared code.
+	 *
+	 * Leader: creates DSM on first compile, writes code directly.
+	 * Worker: attaches to DSM via GUC, looks up pre-compiled code.
 	 */
 	if (state->parent->state->es_jit_flags & PGJIT_EXPR)
 	{
@@ -1149,23 +1150,32 @@ mir_compile_expr(ExprState *state)
 		mir_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
 
 		elog(DEBUG1, "pg_jitter[mir]: compile_expr node=%d expr=%d is_worker=%d "
-			 "shared_code=%p shared_mode=%d",
+			 "shared_mode=%d share_init=%d",
 			 shared_node_id, shared_expr_idx, IsParallelWorker(),
-			 state->parent->state->es_jit_shared_code,
-			 mir_shared_code_mode);
+			 mir_shared_code_mode,
+			 jctx->share_state.initialized);
+
+		/* Leader: create DSM on first compile */
+		if (mir_shared_code_mode && !IsParallelWorker() &&
+			!jctx->share_state.initialized)
+			pg_jitter_init_shared_dsm(jctx);
 	}
 
 	/*
 	 * Parallel worker: try to use pre-compiled code from the leader.
 	 */
 	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
-		IsParallelWorker() && state->parent->state->es_jit_shared_code)
+		IsParallelWorker())
 	{
 		const void *code_bytes;
 		Size		code_size;
 		uint64		leader_dylib_ref;
 
-		if (pg_jitter_find_shared_code(state->parent->state->es_jit_shared_code,
+		if (!jctx->share_state.initialized)
+			pg_jitter_attach_shared_dsm(jctx);
+
+		if (jctx->share_state.sjc &&
+			pg_jitter_find_shared_code(jctx->share_state.sjc,
 									   shared_node_id, shared_expr_idx,
 									   &code_bytes, &code_size,
 									   &leader_dylib_ref))
@@ -4423,14 +4433,14 @@ mir_compile_expr(ExprState *state)
 		pg_jitter_install_expr(state, (ExprStateEvalFunc) code);
 
 		/*
-		 * Leader: record compiled machine code for later flushing to DSM.
+		 * Leader: store compiled machine code directly in DSM.
 		 * Use f->machine_code (actual code), not `code` (thunk).
 		 */
 		if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
 			!IsParallelWorker() &&
-			(state->parent->state->es_jit_flags & PGJIT_EXPR))
+			(state->parent->state->es_jit_flags & PGJIT_EXPR) &&
+			jctx->share_state.sjc)
 		{
-			PendingSharedCode *psc;
 			void   *mcode = f->machine_code;
 			Size	mcode_size = f->machine_code_len;
 
@@ -4439,16 +4449,10 @@ mir_compile_expr(ExprState *state)
 				 shared_node_id, shared_expr_idx,
 				 mcode_size, mcode, (void *) pg_jitter_fallback_step);
 
-			psc = (PendingSharedCode *)
-				MemoryContextAlloc(TopMemoryContext,
-								   sizeof(PendingSharedCode));
-			psc->node_id = shared_node_id;
-			psc->expr_idx = shared_expr_idx;
-			psc->code = mcode;
-			psc->code_size = mcode_size;
-			psc->dylib_ref_addr = (uint64)(uintptr_t) pg_jitter_fallback_step;
-			psc->next = jctx->pending_shared;
-			jctx->pending_shared = psc;
+			pg_jitter_store_shared_code(jctx->share_state.sjc,
+										mcode, mcode_size,
+										shared_node_id, shared_expr_idx,
+										(uint64)(uintptr_t) pg_jitter_fallback_step);
 		}
 	}
 

@@ -68,6 +68,9 @@ static const struct config_enum_entry parallel_jit_options[] = {
  */
 static bool sljit_shared_code_mode = false;
 
+/* GUC variable for _shared_dsm (needed when loaded standalone without meta) */
+static char *sljit_shared_dsm_guc = NULL;
+
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
 static void sljit_code_free(void *data);
@@ -81,8 +84,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = pg_jitter_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = sljit_compile_expr;
-	cb->flush_shared_code = pg_jitter_flush_shared_code;
-	cb->estimate_shared_code_size = pg_jitter_estimate_shared_code_size;
 
 	/*
 	 * Define GUCs only if not already registered (avoids conflict when
@@ -117,6 +118,19 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			parallel_jit_options,
 			PGC_USERSET,
 			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter._shared_dsm", true, false))
+	{
+		DefineCustomStringVariable(
+			"pg_jitter._shared_dsm",
+			"Internal: DSM handle for parallel JIT code sharing.",
+			NULL,
+			&sljit_shared_dsm_guc,
+			"",
+			PGC_USERSET,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
 			NULL, NULL, NULL);
 	}
 }
@@ -2482,50 +2496,44 @@ sljit_compile_expr(ExprState *state)
 	/*
 	 * Shared code for parallel queries: compute expression identity.
 	 *
-	 * Leader: always compute identity so we can record code for later
-	 * flushing to DSM (es_jit_shared_code isn't set yet during leader's
-	 * ExecInitNode, but will be set later in ExecInitParallelPlan).
-	 *
-	 * Worker: compute identity + try to find shared code in DSM.
+	 * Leader: creates DSM on first compile, writes code directly.
+	 * Worker: attaches to DSM via GUC, looks up pre-compiled code.
 	 */
 	if (state->parent->state->es_jit_flags & PGJIT_EXPR)
 	{
 		pg_jitter_get_expr_identity(ctx, state,
 									&shared_node_id, &shared_expr_idx);
 
-		/*
-		 * Enable shared code mode: forces EMIT_ICALL to use absolute
-		 * addressing (MOVZ+3×MOVK+BLR) instead of PC-relative BL.
-		 * Also prevents embedding per-process sljit code addresses
-		 * (like compiled deform functions) in the shared code.
-		 *
-		 * We enable this for ALL expressions when JIT is active, because
-		 * the leader doesn't know at compile time whether ExecInitParallelPlan
-		 * will be called later. The overhead is ~3 extra instructions per
-		 * call site — negligible.
-		 */
 		sljit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
 
 		elog(DEBUG1, "pg_jitter: compile_expr node=%d expr=%d is_worker=%d "
-			 "shared_code=%p shared_mode=%d",
+			 "shared_mode=%d share_init=%d",
 			 shared_node_id, shared_expr_idx, IsParallelWorker(),
-			 state->parent->state->es_jit_shared_code,
-			 sljit_shared_code_mode);
+			 sljit_shared_code_mode,
+			 ctx->share_state.initialized);
+
+		/* Leader: create DSM on first compile */
+		if (sljit_shared_code_mode && !IsParallelWorker() &&
+			!ctx->share_state.initialized)
+			pg_jitter_init_shared_dsm(ctx);
 	}
 
 	/*
 	 * Parallel worker: try to use pre-compiled code from the leader.
 	 * If found in DSM, copy to local executable memory and skip compilation.
-	 * Only active in 'shared' mode.
 	 */
 	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
-		IsParallelWorker() && state->parent->state->es_jit_shared_code)
+		IsParallelWorker())
 	{
 		const void *code_bytes;
 		Size		code_size;
 		uint64		leader_dylib_ref;
 
-		if (pg_jitter_find_shared_code(state->parent->state->es_jit_shared_code,
+		if (!ctx->share_state.initialized)
+			pg_jitter_attach_shared_dsm(ctx);
+
+		if (ctx->share_state.sjc &&
+			pg_jitter_find_shared_code(ctx->share_state.sjc,
 									   shared_node_id, shared_expr_idx,
 									   &code_bytes, &code_size,
 									   &leader_dylib_ref))
@@ -6473,17 +6481,14 @@ sljit_compile_expr(ExprState *state)
 #endif
 
 		/*
-		 * Leader: record compiled code for later flushing to DSM.
-		 * At this point es_jit_shared_code may not be set yet (leader
-		 * compiles during ExecInitNode, before ExecInitParallelPlan).
-		 * We save the code pointer and identity; pg_jitter_flush_shared_code()
-		 * copies the bytes to DSM later.
+		 * Leader: store compiled code directly in DSM.
+		 * The DSM was created during the first compile_expr call above.
 		 */
 		if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
 			!IsParallelWorker() &&
-			(state->parent->state->es_jit_flags & PGJIT_EXPR))
+			(state->parent->state->es_jit_flags & PGJIT_EXPR) &&
+			ctx->share_state.sjc)
 		{
-			PendingSharedCode *psc;
 			Size	gen_code_size = sljit_get_generated_code_size(C);
 
 			elog(DEBUG1, "pg_jitter: leader storing code "
@@ -6491,16 +6496,10 @@ sljit_compile_expr(ExprState *state)
 				 shared_node_id, shared_expr_idx,
 				 gen_code_size, code, (void *) pg_jitter_fallback_step);
 
-			psc = (PendingSharedCode *)
-				MemoryContextAlloc(TopMemoryContext,
-								   sizeof(PendingSharedCode));
-			psc->node_id = shared_node_id;
-			psc->expr_idx = shared_expr_idx;
-			psc->code = code;
-			psc->code_size = gen_code_size;
-			psc->dylib_ref_addr = (uint64)(uintptr_t) pg_jitter_fallback_step;
-			psc->next = ctx->pending_shared;
-			ctx->pending_shared = psc;
+			pg_jitter_store_shared_code(ctx->share_state.sjc,
+										code, gen_code_size,
+										shared_node_id, shared_expr_idx,
+										(uint64)(uintptr_t) pg_jitter_fallback_step);
 		}
 
 		/* Register for cleanup */

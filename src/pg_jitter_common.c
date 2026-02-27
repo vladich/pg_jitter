@@ -201,6 +201,9 @@ pg_jitter_release_context(JitContext *context)
 	PgJitterContext *ctx = (PgJitterContext *) context;
 	CompiledCode *cc, *next;
 
+	/* Clean up DSM shared code state before freeing compiled code */
+	pg_jitter_cleanup_shared_dsm(ctx);
+
 	for (cc = ctx->compiled_list; cc != NULL; cc = next)
 	{
 		next = cc->next;
@@ -1829,73 +1832,122 @@ pg_jitter_get_expr_identity(PgJitterContext *ctx, ExprState *state,
 	*expr_idx = ctx->expr_ordinal++;
 }
 
-/*
- * Estimate the total DSM space needed for pending shared code entries.
+/* ----------------------------------------------------------------
+ * DSM-based shared code management for parallel queries
  *
- * Called from ExecInitParallelPlan before DSM allocation so we can size
- * the shared JIT code area based on actual compiled code sizes.
+ * Leader creates a DSM segment during the first compile_expr call,
+ * initializes it, and stores the dsm_handle in a GUC string.
+ * PG serializes all GUCs (including extension-defined ones) to
+ * parallel workers via SerializeGUCState in InitializeParallelDSM.
+ * Workers read the GUC, attach to the DSM, and copy pre-compiled
+ * code instead of recompiling.
+ * ----------------------------------------------------------------
  */
-Size
-pg_jitter_estimate_shared_code_size(JitContext *jit_context)
+
+/*
+ * Leader: create DSM for shared JIT code and store handle in GUC.
+ */
+void
+pg_jitter_init_shared_dsm(PgJitterContext *ctx)
 {
-	PgJitterContext *ctx;
-	PendingSharedCode *psc;
-	Size	total = MAXALIGN(sizeof(SharedJitCompiledCode));
-	Size	cap = (Size) pg_jitter_get_shared_code_max_kb() * 1024;
+	Size		dsm_size;
+	char		buf[32];
 
-	if (!jit_context)
-		return 0;
+	if (ctx->share_state.initialized)
+		return;
 
-	ctx = (PgJitterContext *) jit_context;
+	dsm_size = (Size) pg_jitter_get_shared_code_max_kb() * 1024;
 
-	for (psc = ctx->pending_shared; psc != NULL; psc = psc->next)
-		total += MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) +
-						  psc->code_size);
+	ctx->share_state.dsm_seg = dsm_create(dsm_size, 0);
+	dsm_pin_mapping(ctx->share_state.dsm_seg);
 
-	/* Apply cap from pg_jitter.shared_code_max */
-	if (total > cap)
-		total = cap;
+	ctx->share_state.sjc = (SharedJitCompiledCode *)
+		dsm_segment_address(ctx->share_state.dsm_seg);
 
-	return total;
+	/* Initialize header */
+	pg_atomic_init_u32(&ctx->share_state.sjc->lock, 0);
+	ctx->share_state.sjc->num_entries = 0;
+	ctx->share_state.sjc->capacity = dsm_size;
+	ctx->share_state.sjc->used = MAXALIGN(sizeof(SharedJitCompiledCode));
+
+	/* Store handle in GUC for worker discovery */
+	snprintf(buf, sizeof(buf), "%u",
+			 dsm_segment_handle(ctx->share_state.dsm_seg));
+	SetConfigOption("pg_jitter._shared_dsm", buf,
+					PGC_USERSET, PGC_S_SESSION);
+
+	ctx->share_state.is_leader = true;
+	ctx->share_state.initialized = true;
+
+	elog(DEBUG1, "pg_jitter: leader created shared DSM handle=%s size=%zu",
+		 buf, dsm_size);
 }
 
 /*
- * Flush pending shared code entries to DSM.
- *
- * Called from ExecInitParallelPlan (or a hook there) after DSM is allocated.
- * Walks the pending_shared list, copies code bytes to DSM, then frees
- * the list nodes.
+ * Worker: read DSM handle from GUC and attach.
  */
 void
-pg_jitter_flush_shared_code(JitContext *jit_context, void *shared_jit_code)
+pg_jitter_attach_shared_dsm(PgJitterContext *ctx)
 {
-	PgJitterContext *ctx;
-	PendingSharedCode *psc, *next;
-	int			flushed = 0;
+	const char *val;
+	dsm_handle	handle;
 
-	if (!jit_context || !shared_jit_code)
+	if (ctx->share_state.initialized)
 		return;
 
-	ctx = (PgJitterContext *) jit_context;
-
-	elog(DEBUG1, "pg_jitter: flush_shared_code called, pending=%p",
-		 ctx->pending_shared);
-
-	for (psc = ctx->pending_shared; psc != NULL; psc = next)
+	val = GetConfigOption("pg_jitter._shared_dsm", true, false);
+	if (val == NULL || val[0] == '\0')
 	{
-		next = psc->next;
-
-		if (pg_jitter_store_shared_code(shared_jit_code,
-										psc->code, psc->code_size,
-										psc->node_id, psc->expr_idx,
-										psc->dylib_ref_addr))
-			flushed++;
-
-		pfree(psc);
+		elog(DEBUG1, "pg_jitter: worker found no shared DSM GUC");
+		return;
 	}
-	ctx->pending_shared = NULL;
 
-	if (flushed > 0)
-		elog(DEBUG1, "pg_jitter: leader flushed %d expressions to shared DSM",
-			 flushed);
+	handle = (dsm_handle) strtoul(val, NULL, 10);
+	if (handle == 0)
+	{
+		elog(DEBUG1, "pg_jitter: worker got invalid DSM handle from GUC");
+		return;
+	}
+
+	ctx->share_state.dsm_seg = dsm_attach(handle);
+	if (ctx->share_state.dsm_seg == NULL)
+	{
+		elog(DEBUG1, "pg_jitter: worker failed to attach DSM handle=%u", handle);
+		return;
+	}
+
+	dsm_pin_mapping(ctx->share_state.dsm_seg);
+
+	ctx->share_state.sjc = (SharedJitCompiledCode *)
+		dsm_segment_address(ctx->share_state.dsm_seg);
+	ctx->share_state.is_leader = false;
+	ctx->share_state.initialized = true;
+
+	elog(DEBUG1, "pg_jitter: worker attached to shared DSM handle=%u "
+		 "entries=%d used=%zu/%zu",
+		 handle, ctx->share_state.sjc->num_entries,
+		 ctx->share_state.sjc->used, ctx->share_state.sjc->capacity);
+}
+
+/*
+ * Cleanup: unpin mapping and detach from DSM.
+ * Leader also resets the GUC so stale handles aren't serialized.
+ */
+void
+pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx)
+{
+	if (!ctx->share_state.initialized)
+		return;
+
+	if (ctx->share_state.dsm_seg)
+	{
+		dsm_unpin_mapping(ctx->share_state.dsm_seg);
+		dsm_detach(ctx->share_state.dsm_seg);
+	}
+
+	if (ctx->share_state.is_leader)
+		SetConfigOption("pg_jitter._shared_dsm", "",
+						PGC_USERSET, PGC_S_SESSION);
+
+	memset(&ctx->share_state, 0, sizeof(JitShareState));
 }

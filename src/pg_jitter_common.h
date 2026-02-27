@@ -15,11 +15,11 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "access/parallel.h"
+#include "storage/dsm.h"
 
 /*
- * SharedJitCompiledCode / SharedJitCodeEntry — mirror of the structs in
- * execParallel.c.  We need them here because pg_jitter cannot #include
- * the PG executor's private typedefs.
+ * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
+ * compiled JIT code between leader and parallel workers via DSM.
  */
 typedef struct SharedJitCompiledCode
 {
@@ -48,18 +48,19 @@ typedef struct CompiledCode
 } CompiledCode;
 
 /*
- * Pending shared code entry — compiled by the leader before DSM is available.
- * Flushed to DSM after ExecInitParallelPlan allocates SharedJitCompiledCode.
+ * Process-local state for DSM-based JIT code sharing.
+ *
+ * Leader creates DSM via dsm_create(), stores handle in a GUC.
+ * Workers read the GUC, attach via dsm_attach().
+ * Both pin their mapping and explicitly unpin+detach in release_context.
  */
-typedef struct PendingSharedCode
+typedef struct JitShareState
 {
-	struct PendingSharedCode *next;
-	int			node_id;
-	int			expr_idx;
-	void	   *code;		/* pointer to sljit-generated code */
-	Size		code_size;
-	uint64		dylib_ref_addr;	/* leader's pg_jitter_fallback_step address */
-} PendingSharedCode;
+	dsm_segment *dsm_seg;
+	SharedJitCompiledCode *sjc;		/* mapped DSM address */
+	bool		initialized;
+	bool		is_leader;			/* true if we created the DSM */
+} JitShareState;
 
 /* Our JIT context — extends JitContext by embedding it as the first member */
 typedef struct PgJitterContext
@@ -72,8 +73,8 @@ typedef struct PgJitterContext
 	int			last_plan_node_id;	/* reset expr_ordinal when this changes */
 	int			expr_ordinal;		/* incremented per compile_expr call */
 
-	/* Pending shared code (leader only, flushed after DSM allocation) */
-	PendingSharedCode *pending_shared;
+	/* DSM-based shared code state for parallel queries */
+	JitShareState	share_state;
 } PgJitterContext;
 
 /* Get-or-create a PgJitterContext from the EState */
@@ -186,14 +187,16 @@ extern void pg_jitter_get_expr_identity(PgJitterContext *ctx,
 										int *node_id, int *expr_idx);
 
 /*
- * Flush pending shared code entries to DSM.
- * Called from ExecInitParallelPlan after DSM allocation, via a hook
- * or directly. The leader records compiled code during ExecInitNode
- * (before DSM exists), then flushes after DSM is allocated.
+ * DSM-based shared code management for parallel queries.
+ *
+ * Leader calls pg_jitter_init_shared_dsm() during first compile_expr to
+ * create the DSM and store its handle in a GUC.
+ * Workers call pg_jitter_attach_shared_dsm() to read the GUC and attach.
+ * Both call pg_jitter_cleanup_shared_dsm() during release_context.
  */
-extern void pg_jitter_flush_shared_code(JitContext *jit_context,
-										void *shared_jit_code);
-extern Size pg_jitter_estimate_shared_code_size(JitContext *jit_context);
+extern void pg_jitter_init_shared_dsm(PgJitterContext *ctx);
+extern void pg_jitter_attach_shared_dsm(PgJitterContext *ctx);
+extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 
 /* Parallel JIT mode enum — same values in all backends */
 #define PARALLEL_JIT_OFF        0
