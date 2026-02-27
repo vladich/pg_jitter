@@ -6,6 +6,39 @@
  */
 
 /*
+ * When true, emit 4-instruction MOVZ+3×MOVK sequences for all function
+ * pointer loads, making the code relocatable across ASLR address spaces.
+ * The relocation scanner in pg_jitter_common.c identifies these sequences
+ * and patches them when workers load shared code from DSM.
+ */
+static bool asmjit_shared_code_mode = false;
+
+/*
+ * Force a 4-instruction absolute-address load for relocatable code sharing.
+ * AsmJIT's cc.mov() may optimize to fewer instructions when upper bits are
+ * zero, but the relocation scanner needs exactly MOVZ+3×MOVK to identify
+ * and patch addresses.
+ */
+static void
+emit_relocatable_mov(a64::Compiler &cc, a64::Gp dst, uint64_t val)
+{
+	cc.movz(dst, Imm((val >>  0) & 0xFFFF), a64::lsl(0));
+	cc.movk(dst, Imm((val >> 16) & 0xFFFF), a64::lsl(16));
+	cc.movk(dst, Imm((val >> 32) & 0xFFFF), a64::lsl(32));
+	cc.movk(dst, Imm((val >> 48) & 0xFFFF), a64::lsl(48));
+}
+
+/* Load a function pointer into a register, using relocatable addressing
+ * when asmjit_shared_code_mode is active. */
+#define ASMJIT_MOV_FN(cc, dst, fn_ptr) \
+	do { \
+		if (asmjit_shared_code_mode) \
+			emit_relocatable_mov(cc, dst, (uint64_t)(fn_ptr)); \
+		else \
+			cc.mov(dst, (uint64_t)(fn_ptr)); \
+	} while (0)
+
+/*
  * Emit deform code inline into the AsmJIT Compiler.
  *
  * Uses virtual registers — the AsmJIT register allocator handles
@@ -133,7 +166,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         /* call slot_getmissingattrs(slot, maxatt, natts) */
         {
             a64::Gp fn_reg = cc.new_gpx();
-            cc.mov(fn_reg, (uint64_t)(void *) slot_getmissingattrs);
+            ASMJIT_MOV_FN(cc, fn_reg, (void *) slot_getmissingattrs);
             InvokeNode *invoke;
             cc.invoke(Out(invoke), fn_reg,
                       FuncSignature::build<void, void *, int, int>());
@@ -327,7 +360,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         {
             /* Varlena: off += varsize_any(attdatap) */
             a64::Gp fn_reg = cc.new_gpx();
-            cc.mov(fn_reg, (uint64_t)(void *) varsize_any);
+            ASMJIT_MOV_FN(cc, fn_reg, (void *) varsize_any);
             InvokeNode *invoke;
             cc.invoke(Out(invoke), fn_reg,
                       FuncSignature::build<int64_t, void *>());
@@ -339,7 +372,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         {
             /* Cstring: off += strlen(attdatap) + 1 */
             a64::Gp fn_reg = cc.new_gpx();
-            cc.mov(fn_reg, (uint64_t)(void *) strlen);
+            ASMJIT_MOV_FN(cc, fn_reg, (void *) strlen);
             InvokeNode *invoke;
             cc.invoke(Out(invoke), fn_reg,
                       FuncSignature::build<int64_t, void *>());
@@ -412,6 +445,19 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 	a64::Gp v_resultvals = cc.new_gpx("resultvals");
 	a64::Gp v_resultnulls = cc.new_gpx("resultnulls");
 
+	/*
+	 * Steps-relative addressing register.
+	 * Loaded once from state->steps in the prologue.  Used to compute
+	 * per-expression pointers (resvalue, resnull, fcinfo, etc.) at runtime
+	 * instead of embedding absolute 64-bit immediates.  This makes the
+	 * generated code position-independent (PIC) and shareable across
+	 * parallel workers via DSM.
+	 *
+	 * Cost: 2 instructions (LDR steps + LDR field) vs 2-4 instructions
+	 * (MOVZ+MOVK sequence) for absolute loads.
+	 */
+	a64::Gp v_steps = cc.new_gpx("steps");
+
 	/* Load cached pointers */
 	/* resvaluep = &state->resvalue */
 	cc.mov(v_resvaluep, v_state);
@@ -419,6 +465,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 	/* resnullp = &state->resnull */
 	cc.mov(v_resnullp, v_state);
 	cc.add(v_resnullp, v_resnullp, (int64_t) offsetof(ExprState, resnull));
+	/* v_steps = state->steps (for steps-relative addressing) */
+	cc.ldr(v_steps, a64::ptr(v_state, offsetof(ExprState, steps)));
 	/* resultslot = state->resultslot (may be NULL for non-projecting exprs) */
 	cc.ldr(slot_reg, a64::ptr(v_state, offsetof(ExprState, resultslot)));
 	{
@@ -430,6 +478,27 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 		cc.ldr(v_resultnulls, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
 		cc.bind(skip_rs);
 	}
+
+	/*
+	 * Steps-relative helper macros.
+	 *
+	 * STEP_OFFSET(opno, field): byte offset from steps base to field within
+	 *                           steps[opno].
+	 *
+	 * These helpers load pointers from the steps array at runtime (PIC)
+	 * instead of embedding absolute addresses.  Each load costs 1 LDR
+	 * instruction using v_steps as the base register.
+	 *
+	 * The ARM64 LDR with unscaled immediate supports offsets up to ±256,
+	 * while the scaled unsigned variant supports up to 32760 (for 8-byte).
+	 * sizeof(ExprEvalStep) is typically 64 or 128 bytes, so for reasonable
+	 * expression lengths the offset fits in a single instruction.  For very
+	 * large offsets (>32760), AsmJIT's Compiler automatically handles
+	 * materialization.
+	 */
+#define STEP_OFFSET(opno, field) \
+	((int64_t)(opno) * (int64_t)sizeof(ExprEvalStep) + \
+	 (int64_t)offsetof(ExprEvalStep, field))
 
 	/* Create labels for each step */
 	Label *step_labels = (Label *) palloc(sizeof(Label) * steps_len);
@@ -493,17 +562,23 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					/*
 					 * Try pre-compiled template first (I-cache friendly:
 					 * same virtual address across all parallel workers).
+					 *
+					 * Skip in shared mode: templates are in dylib .text,
+					 * workers have different ASLR base, and template
+					 * addresses fall outside the ±512KB relocation range.
 					 */
-					deform_template_fn tmpl = asmjit_deform_match_template(
-						op->d.fetch.known_desc,
-						op->d.fetch.kind,
-						op->d.fetch.last_var);
+					deform_template_fn tmpl = (!asmjit_shared_code_mode)
+						? asmjit_deform_match_template(
+							op->d.fetch.known_desc,
+							op->d.fetch.kind,
+							op->d.fetch.last_var)
+						: NULL;
 
 					if (tmpl)
 					{
 						/* slot_reg already has the slot pointer; call tmpl(slot) */
 						a64::Gp tmpl_fn = cc.new_gpx();
-						cc.mov(tmpl_fn, (uint64_t)(void *) tmpl);
+						ASMJIT_MOV_FN(cc, tmpl_fn, (void *) tmpl);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), tmpl_fn,
 								  FuncSignature::build<void, void *>());
@@ -531,7 +606,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					/* Fallback: call slot_getsomeattrs_int(slot, last_var) */
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) slot_getsomeattrs_int);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) slot_getsomeattrs_int);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());
@@ -559,16 +634,26 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				/* values_ptr = slot->tts_values; value = values_ptr[attnum] */
 				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
 				cc.ldr(tmp2, a64::ptr(tmp1, attnum * (int64_t) sizeof(Datum)));
-				/* *op->resvalue = value */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(tmp2, a64::ptr(tmp3));
+				/* *op->resvalue = value (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp2, a64::ptr(tmp3));
+				}
 
 				/* isnull_ptr = slot->tts_isnull; isnull = isnull_ptr[attnum] */
 				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
 				cc.ldrb(tmp2.w(), a64::ptr(tmp1, attnum * (int64_t) sizeof(bool)));
-				/* *op->resnull = isnull */
-				cc.mov(tmp3, (uint64_t) op->resnull);
-				cc.strb(tmp2.w(), a64::ptr(tmp3));
+				/* *op->resnull = isnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp2.w(), a64::ptr(tmp3));
+				}
 				break;
 			}
 
@@ -620,7 +705,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 					/* tmp1 = MakeExpandedObjectReadOnlyInternal(tmp1) */
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) MakeExpandedObjectReadOnlyInternal);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) MakeExpandedObjectReadOnlyInternal);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -637,14 +722,24 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			case EEOP_CONST:
 			{
-				/* *op->resvalue = constval.value */
+				/* *op->resvalue = constval.value (steps-relative) */
 				cc.mov(tmp1, (int64_t) op->d.constval.value);
-				cc.mov(tmp2, (uint64_t) op->resvalue);
-				cc.str(tmp1, a64::ptr(tmp2));
-				/* *op->resnull = constval.isnull */
-				cc.mov(tmp2, (uint64_t) op->resnull);
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp2));
+				}
+				/* *op->resnull = constval.isnull (steps-relative) */
 				cc.mov(tmp1, op->d.constval.isnull ? 1 : 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp2));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp2));
+				}
 				break;
 			}
 
@@ -666,17 +761,27 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #endif
 					)
 				{
-					/* Set resnull = true (will be overwritten if func called) */
-					cc.mov(tmp1, (uint64_t) op->resnull);
-					cc.mov(tmp2, 1);
-					cc.strb(tmp2.w(), a64::ptr(tmp1));
+					/* Set resnull = true (steps-relative) */
+					if (op->resnull == &state->resnull)
+					{
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					}
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(tmp1));
+					}
 
 					/*
 					 * Batched null check: OR all isnull flags together,
 					 * single branch at the end.  Reduces branch mispredicts
 					 * for multi-arg strict functions.
+					 *
+					 * Load fcinfo from steps-relative addressing.
 					 */
-					cc.mov(tmp1, (uint64_t) fcinfo);
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					if (nargs > 1 && nargs <= 4)
 					{
 						int64_t null_off_0 =
@@ -720,7 +825,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					 */
 					a64::Gp fci_base = cc.new_gpx();
 					a64::Gp a0 = cc.new_gpx(), a1 = cc.new_gpx();
-					cc.mov(fci_base, (uint64_t) fcinfo);
+					cc.ldr(fci_base, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					int64_t val_off_0 =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					int64_t val_off_1 =
@@ -737,7 +842,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.adds(a0.w(), a0.w(), a1.w());
 						cc.b_vc(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int4_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -750,7 +855,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.subs(a0.w(), a0.w(), a1.w());
 						cc.b_vc(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int4_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -767,7 +872,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.cmp(tmp1, ext);
 						cc.b_eq(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int4_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -783,7 +888,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.b_ne(not_zero);
 						{
 							a64::Gp err_fn = cc.new_gpx();
-							cc.mov(err_fn, (uint64_t)(void *) jit_error_division_by_zero);
+							ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_division_by_zero);
 							InvokeNode *inv;
 							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						}
@@ -800,7 +905,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							cc.cmn(a1.w(), 1);  /* cmn w, 1 == cmp w, -1 */
 							cc.b_ne(not_neg1);
 							a64::Gp err_fn = cc.new_gpx();
-							cc.mov(err_fn, (uint64_t)(void *) jit_error_int4_overflow);
+							ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int4_overflow);
 							InvokeNode *inv;
 							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 							cc.bind(not_neg1);
@@ -821,7 +926,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.b_ne(not_zero);
 						{
 							a64::Gp err_fn = cc.new_gpx();
-							cc.mov(err_fn, (uint64_t)(void *) jit_error_division_by_zero);
+							ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_division_by_zero);
 							InvokeNode *inv;
 							cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						}
@@ -855,7 +960,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.adds(a0, a0, a1);
 						cc.b_vc(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int8_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -868,7 +973,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.subs(a0, a0, a1);
 						cc.b_vc(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int8_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -888,7 +993,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.cmp(hi, sign);
 						cc.b_eq(ok);
 						a64::Gp err_fn = cc.new_gpx();
-						cc.mov(err_fn, (uint64_t)(void *) jit_error_int8_overflow);
+						ASMJIT_MOV_FN(cc, err_fn, (void *) jit_error_int8_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), err_fn, FuncSignature::build<void>());
 						cc.bind(ok);
@@ -950,18 +1055,29 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						break;
 					}
 
-					/* Store *op->resvalue = tmp1 */
-					cc.mov(tmp2, (uint64_t) op->resvalue);
-					cc.str(tmp1, a64::ptr(tmp2));
+					/* Store *op->resvalue = tmp1 (steps-relative) */
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp1, a64::ptr(tmp2));
+					}
 
-					/* *op->resnull = false */
-					cc.mov(tmp2, (uint64_t) op->resnull);
+					/* *op->resnull = false (steps-relative) */
 					cc.mov(tmp1, 0);
-					cc.strb(tmp1.w(), a64::ptr(tmp2));
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
 				}
 				else if (dfn && (dfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-						|| (dfn->jit_fn_name &&
+						|| (!asmjit_shared_code_mode &&
+							dfn->jit_fn_name &&
 							mir_find_precompiled_fn(dfn->jit_fn_name))
 #endif
 						))
@@ -969,16 +1085,20 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					/*
 					 * Direct native call — either from dfn->jit_fn or
 					 * MIR-precompiled function pointer.
+					 *
+					 * Skip MIR-precompiled in shared mode: blob addresses
+					 * are in separately mmap'd memory, outside the ±512KB
+					 * dylib relocation range.
 					 */
 					void *call_target = dfn->jit_fn;
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!call_target)
+					if (!call_target && !asmjit_shared_code_mode)
 						call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
 #endif
-					/* Load fcinfo once, then load all args from offsets */
+					/* Load fcinfo once (steps-relative), then load all args from offsets */
 					a64::Gp args[4];
 					a64::Gp fci_base = cc.new_gpx();
-					cc.mov(fci_base, (uint64_t) fcinfo);
+					cc.ldr(fci_base, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					for (int i = 0; i < dfn->nargs; i++)
 					{
 						args[i] = cc.new_gpx();
@@ -989,7 +1109,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 					/* Direct call */
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t) call_target);
+					ASMJIT_MOV_FN(cc, fn_reg, call_target);
 
 					InvokeNode *invoke;
 					switch (dfn->nargs) {
@@ -1018,41 +1138,66 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					}
 					invoke->set_ret(0, tmp1);
 
-					/* *op->resvalue = result */
-					cc.mov(tmp2, (uint64_t) op->resvalue);
-					cc.str(tmp1, a64::ptr(tmp2));
+					/* *op->resvalue = result (steps-relative) */
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp1, a64::ptr(tmp2));
+					}
 
-					/* *op->resnull = false */
-					cc.mov(tmp2, (uint64_t) op->resnull);
+					/* *op->resnull = false (steps-relative) */
 					cc.mov(tmp1, 0);
-					cc.strb(tmp1.w(), a64::ptr(tmp2));
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
 				}
 				else
 				{
-				/* Fallback: generic fcinfo path */
+				/* Fallback: generic fcinfo path (steps-relative) */
 				{
 					a64::Gp fci = cc.new_gpx();
-					cc.mov(fci, (uint64_t) fcinfo);
+					cc.ldr(fci, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(fci, offsetof(FunctionCallInfoBaseData, isnull)));
 				}
 				{
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) op->d.func.fn_addr);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
 					a64::Gp fcinfo_reg = cc.new_gpx();
-					cc.mov(fcinfo_reg, (uint64_t) fcinfo);
+					cc.ldr(fcinfo_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, void *>());
 					invoke->set_arg(0, fcinfo_reg);
 					invoke->set_ret(0, tmp1);
 				}
-				cc.mov(tmp2, (uint64_t) op->resvalue);
-				cc.str(tmp1, a64::ptr(tmp2));
-				cc.mov(tmp1, (uint64_t) fcinfo);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1, offsetof(FunctionCallInfoBaseData, isnull)));
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
+				/* *op->resvalue = result (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp2));
+				}
+				/* fcinfo->isnull → *op->resnull (steps-relative) */
+				{
+					a64::Gp fci2 = cc.new_gpx();
+					cc.ldr(fci2, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
+					cc.ldrb(tmp2.w(), a64::ptr(fci2, offsetof(FunctionCallInfoBaseData, isnull)));
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp2.w(), a64::ptr(tmp1));
+					}
+				}
 				} /* end else fallback */
 				} /* end direct-call dispatch */
 
@@ -1068,45 +1213,81 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				if (opcode == EEOP_BOOL_AND_STEP_FIRST)
 				{
-					cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
+					/* *anynull = false (steps-relative) */
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(tmp1));
 				}
 
-				/* Load resnull */
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				/* Load resnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, null_handler);
 
-				/* Not null: check false */
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.ldr(tmp2, a64::ptr(tmp1));
+				/* Not null: check false (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+				}
 				cc.cbz(tmp2, step_labels[op->d.boolexpr.jumpdone]);
 
 				cc.b(cont);
 
-				/* Null handler: set anynull */
+				/* Null handler: set anynull (steps-relative) */
 				cc.bind(null_handler);
-				cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
-				cc.mov(tmp2, 1);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
+				{
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
+					cc.mov(tmp2, 1);
+					cc.strb(tmp2.w(), a64::ptr(tmp1));
+				}
 
 				cc.bind(cont);
 
-				/* On last step: if anynull, set result to NULL */
+				/* On last step: if anynull, set result to NULL (steps-relative) */
 				if (opcode == EEOP_BOOL_AND_STEP_LAST)
 				{
 					Label no_anynull = cc.new_label();
-					cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
 					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
 					cc.cbz(tmp2, no_anynull);
 
-					cc.mov(tmp1, (uint64_t) op->resnull);
-					cc.mov(tmp2, 1);
-					cc.strb(tmp2.w(), a64::ptr(tmp1));
-					cc.mov(tmp1, (uint64_t) op->resvalue);
-					cc.mov(tmp2, 0);
-					cc.str(tmp2, a64::ptr(tmp1));
+					/* resnull = true, resvalue = 0 (steps-relative) */
+					if (op->resnull == &state->resnull)
+					{
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					}
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(tmp1));
+					}
+					if (op->resvalue == &state->resvalue)
+					{
+						cc.mov(tmp2, 0);
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					}
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.mov(tmp2, 0);
+						cc.str(tmp2, a64::ptr(tmp1));
+					}
 
 					cc.bind(no_anynull);
 				}
@@ -1122,41 +1303,77 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				if (opcode == EEOP_BOOL_OR_STEP_FIRST)
 				{
-					cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(tmp1));
 				}
 
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				/* Load resnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, null_handler);
 
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.ldr(tmp2, a64::ptr(tmp1));
+				/* Load resvalue (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, step_labels[op->d.boolexpr.jumpdone]);
 
 				cc.b(cont);
 
 				cc.bind(null_handler);
-				cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
-				cc.mov(tmp2, 1);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
+				{
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
+					cc.mov(tmp2, 1);
+					cc.strb(tmp2.w(), a64::ptr(tmp1));
+				}
 
 				cc.bind(cont);
 
 				if (opcode == EEOP_BOOL_OR_STEP_LAST)
 				{
 					Label no_anynull = cc.new_label();
-					cc.mov(tmp1, (uint64_t) op->d.boolexpr.anynull);
+					a64::Gp anp = cc.new_gpx();
+					cc.add(anp, v_steps, STEP_OFFSET(opno, d.boolexpr.anynull));
+					cc.ldr(tmp1, a64::ptr(anp));
 					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
 					cc.cbz(tmp2, no_anynull);
 
-					cc.mov(tmp1, (uint64_t) op->resnull);
-					cc.mov(tmp2, 1);
-					cc.strb(tmp2.w(), a64::ptr(tmp1));
-					cc.mov(tmp1, (uint64_t) op->resvalue);
-					cc.mov(tmp2, 0);
-					cc.str(tmp2, a64::ptr(tmp1));
+					if (op->resnull == &state->resnull)
+					{
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					}
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.mov(tmp2, 1);
+						cc.strb(tmp2.w(), a64::ptr(tmp1));
+					}
+					if (op->resvalue == &state->resvalue)
+					{
+						cc.mov(tmp2, 0);
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					}
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.mov(tmp2, 0);
+						cc.str(tmp2, a64::ptr(tmp1));
+					}
 
 					cc.bind(no_anynull);
 				}
@@ -1165,11 +1382,22 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			case EEOP_BOOL_NOT_STEP:
 			{
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.ldr(tmp2, a64::ptr(tmp1));
-				cc.cmp(tmp2, 0);
-				cc.cset(tmp2, a64::CondCode::kEQ);
-				cc.str(tmp2, a64::ptr(tmp1));
+				/* Load resvalue ptr (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+				{
+					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					cc.cmp(tmp2, 0);
+					cc.cset(tmp2, a64::CondCode::kEQ);
+					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				}
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+					cc.cmp(tmp2, 0);
+					cc.cset(tmp2, a64::CondCode::kEQ);
+					cc.str(tmp2, a64::ptr(tmp1));
+				}
 				break;
 			}
 
@@ -1178,23 +1406,45 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				Label qualfail = cc.new_label();
 				Label cont = cc.new_label();
 
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				/* Load resnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, qualfail);
 
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.ldr(tmp2, a64::ptr(tmp1));
+				/* Load resvalue (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+				}
 				cc.cbz(tmp2, qualfail);
 
 				cc.b(cont);
 
 				cc.bind(qualfail);
-				/* Set resvalue=0, resnull=false, jump to done */
-				cc.mov(tmp1, (uint64_t) op->resnull);
+				/* Set resvalue=0, resnull=false (steps-relative), jump to done */
 				cc.mov(tmp2, 0);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.str(tmp2, a64::ptr(tmp1));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp2.w(), a64::ptr(tmp1));
+				}
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp2, a64::ptr(tmp1));
+				}
 				cc.b(step_labels[op->d.qualexpr.jumpdone]);
 
 				cc.bind(cont);
@@ -1206,69 +1456,132 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 
 			case EEOP_JUMP_IF_NULL:
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, step_labels[op->d.jump.jumpdone]);
 				break;
 
 			case EEOP_JUMP_IF_NOT_NULL:
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbz(tmp2, step_labels[op->d.jump.jumpdone]);
 				break;
 
 			case EEOP_JUMP_IF_NOT_TRUE:
 			{
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				}
 				cc.cbnz(tmp2, step_labels[op->d.jump.jumpdone]);
 
-				cc.mov(tmp1, (uint64_t) op->resvalue);
-				cc.ldr(tmp2, a64::ptr(tmp1));
+				if (op->resvalue == &state->resvalue)
+					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+				}
 				cc.cbz(tmp2, step_labels[op->d.jump.jumpdone]);
 				break;
 			}
 
 			case EEOP_NULLTEST_ISNULL:
 			{
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
-				/* resvalue = (resnull == true) ? 1 : 0 */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				/* tmp2 already has the null flag as 0/1 */
-				cc.str(tmp2, a64::ptr(tmp3));
-				/* resnull = false */
-				cc.mov(tmp2, 0);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
+				/* Load resnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+				{
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					/* resvalue = (resnull == true) ? 1 : 0 */
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp2, a64::ptr(tmp3));
+					}
+					/* resnull = false */
+					cc.mov(tmp2, 0);
+					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				}
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp2, a64::ptr(tmp3));
+					cc.mov(tmp2, 0);
+					cc.strb(tmp2.w(), a64::ptr(tmp1));
+				}
 				break;
 			}
 
 			case EEOP_NULLTEST_ISNOTNULL:
 			{
-				cc.mov(tmp1, (uint64_t) op->resnull);
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
-				/* resvalue = (resnull == 0) ? 1 : 0 */
-				cc.cmp(tmp2, 0);
-				cc.cset(tmp2, a64::CondCode::kEQ);
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(tmp2, a64::ptr(tmp3));
-				/* resnull = false */
-				cc.mov(tmp2, 0);
-				cc.strb(tmp2.w(), a64::ptr(tmp1));
+				/* Load resnull (steps-relative) */
+				if (op->resnull == &state->resnull)
+				{
+					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					cc.cmp(tmp2, 0);
+					cc.cset(tmp2, a64::CondCode::kEQ);
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp2, a64::ptr(tmp3));
+					}
+					cc.mov(tmp2, 0);
+					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				}
+				else
+				{
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+					cc.cmp(tmp2, 0);
+					cc.cset(tmp2, a64::CondCode::kEQ);
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp2, a64::ptr(tmp3));
+					cc.mov(tmp2, 0);
+					cc.strb(tmp2.w(), a64::ptr(tmp1));
+				}
 				break;
 			}
 
 #ifdef HAVE_EEOP_HASHDATUM
 			case EEOP_HASHDATUM_SET_INITVAL:
 			{
-				/* *op->resvalue = init_value */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
+				/* *op->resvalue = init_value (steps-relative) */
 				cc.mov(tmp1, (int64_t) op->d.hashdatum_initvalue.init_value);
-				cc.str(tmp1, a64::ptr(tmp3));
-				/* *op->resnull = false */
-				cc.mov(tmp3, (uint64_t) op->resnull);
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp3));
+				}
+				/* *op->resnull = false (steps-relative) */
 				cc.mov(tmp1, 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				break;
 			}
 
@@ -1280,9 +1593,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				Label store_zero = cc.new_label();
 				Label store_result = cc.new_label();
 
-				/* Check if arg is null */
+				/* Check if arg is null (steps-relative fcinfo) */
 				a64::Gp fci_reg = cc.new_gpx();
-				cc.mov(fci_reg, (uint64_t) fcinfo);
+				cc.ldr(fci_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.hashdatum.fcinfo_data)));
 				cc.ldrb(tmp2.w(), a64::ptr(fci_reg, arg0_null_off));
 				cc.cbnz(tmp2, store_zero);
 
@@ -1290,11 +1603,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
 				if (hdfn && (hdfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+					|| (!asmjit_shared_code_mode &&
+						hdfn->jit_fn_name &&
+						mir_find_precompiled_fn(hdfn->jit_fn_name))
 #endif
 					))
 				{
-					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
@@ -1303,10 +1617,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					void *hash_target = hdfn->jit_fn;
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target)
+					if (!hash_target && !asmjit_shared_code_mode)
 						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
 #endif
-					cc.mov(hfn_reg, (uint64_t) hash_target);
+					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
 				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
@@ -1319,7 +1633,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(fci_reg, offsetof(FunctionCallInfoBaseData, isnull)));
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) op->d.hashdatum.fn_addr);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.hashdatum.fn_addr);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, void *>());
@@ -1332,11 +1646,22 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(tmp1, 0);
 
 				cc.bind(store_result);
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(tmp1, a64::ptr(tmp3));
-				cc.mov(tmp3, (uint64_t) op->resnull);
+				/* *op->resvalue = result (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				break;
 			}
 
@@ -1348,9 +1673,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				Label is_null = cc.new_label();
 				Label done = cc.new_label();
 
-				/* Check if arg is null */
+				/* Check if arg is null (steps-relative fcinfo) */
 				a64::Gp fci_reg = cc.new_gpx();
-				cc.mov(fci_reg, (uint64_t) fcinfo);
+				cc.ldr(fci_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.hashdatum.fcinfo_data)));
 				cc.ldrb(tmp2.w(), a64::ptr(fci_reg, arg0_null_off));
 				cc.cbnz(tmp2, is_null);
 
@@ -1358,11 +1683,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
 				if (hdfn && (hdfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+					|| (!asmjit_shared_code_mode &&
+						hdfn->jit_fn_name &&
+						mir_find_precompiled_fn(hdfn->jit_fn_name))
 #endif
 					))
 				{
-					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
@@ -1371,10 +1697,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					void *hash_target = hdfn->jit_fn;
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target)
+					if (!hash_target && !asmjit_shared_code_mode)
 						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
 #endif
-					cc.mov(hfn_reg, (uint64_t) hash_target);
+					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
 				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
@@ -1387,30 +1713,49 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(fci_reg, offsetof(FunctionCallInfoBaseData, isnull)));
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) op->d.hashdatum.fn_addr);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.hashdatum.fn_addr);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, void *>());
 					invoke->set_arg(0, fci_reg);
 					invoke->set_ret(0, tmp1);
 				}
-				/* *op->resvalue = result */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(tmp1, a64::ptr(tmp3));
-				/* *op->resnull = false */
-				cc.mov(tmp3, (uint64_t) op->resnull);
+				/* *op->resvalue = result (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				cc.b(done);
 
-				/* Null path: resnull=1, resvalue=0, jump to jumpdone */
+				/* Null path: resnull=1, resvalue=0 (steps-relative) */
 				cc.bind(is_null);
-				cc.mov(tmp3, (uint64_t) op->resnull);
 				cc.mov(tmp1, 1);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
-				cc.mov(tmp3, (uint64_t) op->resvalue);
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.str(tmp1, a64::ptr(tmp3));
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp3));
+				}
 				cc.b(step_labels[op->d.hashdatum.jumpdone]);
 
 				cc.bind(done);
@@ -1420,22 +1765,25 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_HASHDATUM_NEXT32:
 			{
 				FunctionCallInfo fcinfo = op->d.hashdatum.fcinfo_data;
-				NullableDatum *iresult = op->d.hashdatum.iresult;
 				int64_t arg0_null_off =
 					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
 				Label skip_hash = cc.new_label();
 
-				/* Load existing hash from iresult->value (32-bit) */
+				/* Load existing hash from iresult->value (steps-relative) */
 				a64::Gp hash = cc.new_gpx("hash");
-				cc.mov(tmp1, (uint64_t) &iresult->value);
-				cc.ldr(hash.w(), a64::ptr(tmp1));
+				{
+					a64::Gp ir = cc.new_gpx();
+					cc.add(ir, v_steps, STEP_OFFSET(opno, d.hashdatum.iresult));
+					cc.ldr(ir, a64::ptr(ir));  /* ir = iresult pointer */
+					cc.ldr(hash.w(), a64::ptr(ir, offsetof(NullableDatum, value)));
+				}
 
 				/* Rotate left 1 = rotate right 31 */
 				cc.ror(hash.w(), hash.w(), 31);
 
-				/* Check if arg is null */
+				/* Check if arg is null (steps-relative fcinfo) */
 				a64::Gp fci_reg = cc.new_gpx();
-				cc.mov(fci_reg, (uint64_t) fcinfo);
+				cc.ldr(fci_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.hashdatum.fcinfo_data)));
 				cc.ldrb(tmp2.w(), a64::ptr(fci_reg, arg0_null_off));
 				cc.cbnz(tmp2, skip_hash);
 
@@ -1443,11 +1791,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
 				if (hdfn && (hdfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+					|| (!asmjit_shared_code_mode &&
+						hdfn->jit_fn_name &&
+						mir_find_precompiled_fn(hdfn->jit_fn_name))
 #endif
 					))
 				{
-					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
@@ -1456,10 +1805,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					void *hash_target = hdfn->jit_fn;
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target)
+					if (!hash_target && !asmjit_shared_code_mode)
 						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
 #endif
-					cc.mov(hfn_reg, (uint64_t) hash_target);
+					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
 				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
@@ -1472,7 +1821,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(fci_reg, offsetof(FunctionCallInfoBaseData, isnull)));
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) op->d.hashdatum.fn_addr);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.hashdatum.fn_addr);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, void *>());
@@ -1482,34 +1831,47 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.eor(hash.w(), hash.w(), tmp1.w());
 
 				cc.bind(skip_hash);
-				/* Store result (upper 32 bits zero from .w() ops) */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(hash, a64::ptr(tmp3));
-				cc.mov(tmp3, (uint64_t) op->resnull);
+				/* Store result (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(hash, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(hash, a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				break;
 			}
 
 			case EEOP_HASHDATUM_NEXT32_STRICT:
 			{
 				FunctionCallInfo fcinfo = op->d.hashdatum.fcinfo_data;
-				NullableDatum *iresult = op->d.hashdatum.iresult;
 				int64_t arg0_null_off =
 					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
 				Label is_null = cc.new_label();
 				Label done = cc.new_label();
 
-				/* Check if arg is null first (strict) */
+				/* Check if arg is null first (steps-relative fcinfo) */
 				a64::Gp fci_reg = cc.new_gpx();
-				cc.mov(fci_reg, (uint64_t) fcinfo);
+				cc.ldr(fci_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.hashdatum.fcinfo_data)));
 				cc.ldrb(tmp2.w(), a64::ptr(fci_reg, arg0_null_off));
 				cc.cbnz(tmp2, is_null);
 
-				/* Load existing hash from iresult->value (32-bit) */
+				/* Load existing hash from iresult->value (steps-relative) */
 				a64::Gp hash = cc.new_gpx("hash");
-				cc.mov(tmp1, (uint64_t) &iresult->value);
-				cc.ldr(hash.w(), a64::ptr(tmp1));
+				{
+					a64::Gp ir = cc.new_gpx();
+					cc.add(ir, v_steps, STEP_OFFSET(opno, d.hashdatum.iresult));
+					cc.ldr(ir, a64::ptr(ir));
+					cc.ldr(hash.w(), a64::ptr(ir, offsetof(NullableDatum, value)));
+				}
 
 				/* Rotate left 1 = rotate right 31 */
 				cc.ror(hash.w(), hash.w(), 31);
@@ -1519,11 +1881,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
 				if (hdfn && (hdfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (hdfn->jit_fn_name && mir_find_precompiled_fn(hdfn->jit_fn_name))
+					|| (!asmjit_shared_code_mode &&
+						hdfn->jit_fn_name &&
+						mir_find_precompiled_fn(hdfn->jit_fn_name))
 #endif
 					))
 				{
-					/* Direct hash call: reuse fci_reg for arg load */
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
@@ -1532,10 +1895,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					void *hash_target = hdfn->jit_fn;
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target)
+					if (!hash_target && !asmjit_shared_code_mode)
 						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
 #endif
-					cc.mov(hfn_reg, (uint64_t) hash_target);
+					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
 				}
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
@@ -1548,7 +1911,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(tmp2, 0);
 					cc.strb(tmp2.w(), a64::ptr(fci_reg, offsetof(FunctionCallInfoBaseData, isnull)));
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) op->d.hashdatum.fn_addr);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.hashdatum.fn_addr);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<int64_t, void *>());
@@ -1558,22 +1921,42 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				}
 				cc.eor(hash.w(), hash.w(), tmp1.w());
 
-				/* Store result */
-				cc.mov(tmp3, (uint64_t) op->resvalue);
-				cc.str(hash, a64::ptr(tmp3));
-				cc.mov(tmp3, (uint64_t) op->resnull);
+				/* Store result (steps-relative) */
+				if (op->resvalue == &state->resvalue)
+					cc.str(hash, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(hash, a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				cc.b(done);
 
-				/* Null path: resnull=1, resvalue=0, jump to jumpdone */
+				/* Null path: resnull=1, resvalue=0 (steps-relative) */
 				cc.bind(is_null);
-				cc.mov(tmp3, (uint64_t) op->resnull);
 				cc.mov(tmp1, 1);
-				cc.strb(tmp1.w(), a64::ptr(tmp3));
-				cc.mov(tmp3, (uint64_t) op->resvalue);
+				if (op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp3));
+				}
 				cc.mov(tmp1, 0);
-				cc.str(tmp1, a64::ptr(tmp3));
+				if (op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp3));
+				}
 				cc.b(step_labels[op->d.hashdatum.jumpdone]);
 
 				cc.bind(done);
@@ -1632,11 +2015,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						a64::Gp aggst = cc.new_gpx();
 						cc.ldr(aggst, a64::ptr(v_state, offsetof(ExprState, parent)));
 						a64::Gp pt = cc.new_gpx();
-						cc.mov(pt, (uint64_t) pertrans);
+						cc.ldr(pt, a64::ptr(v_steps, STEP_OFFSET(opno, d.agg_trans.pertrans)));
 						a64::Gp ac = cc.new_gpx();
-						cc.mov(ac, (uint64_t) aggcontext);
+						cc.ldr(ac, a64::ptr(v_steps, STEP_OFFSET(opno, d.agg_trans.aggcontext)));
 						a64::Gp fn = cc.new_gpx();
-						cc.mov(fn, (uint64_t)(void *) ExecAggInitGroup);
+						ASMJIT_MOV_FN(cc, fn, (void *) ExecAggInitGroup);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), fn, FuncSignature::build<void, void*, void*, void*, void*>());
 						inv->set_arg(0, aggst);
@@ -1669,7 +2052,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.b_vc(ok);
 					{
 						a64::Gp fn = cc.new_gpx();
-						cc.mov(fn, (uint64_t)(void *) jit_error_int8_overflow);
+						ASMJIT_MOV_FN(cc, fn, (void *) jit_error_int8_overflow);
 						InvokeNode *inv;
 						cc.invoke(Out(inv), fn, FuncSignature::build<void>());
 					}
@@ -1687,10 +2070,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					Label trans_not_null = cc.new_label();
 					Label after_sum = cc.new_label();
 
-					/* Check arg1 isnull */
+					/* Load fcinfo from pertrans (steps-relative) */
 					int64_t isnull1_off = (int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
 					a64::Gp fci = cc.new_gpx();
-					cc.mov(fci, (uint64_t) fcinfo);
+					{
+						a64::Gp pt = cc.new_gpx();
+						cc.ldr(pt, a64::ptr(v_steps, STEP_OFFSET(opno, d.agg_trans.pertrans)));
+						cc.ldr(fci, a64::ptr(pt, offsetof(AggStatePerTransData, transfn_fcinfo)));
+					}
 					cc.ldrb(tmp1.w(), a64::ptr(fci, isnull1_off));
 					cc.cbz(tmp1, arg_not_null);
 					cc.b(end_label); /* arg is null, skip */
@@ -1732,7 +2119,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					a64::Gp tv = cc.new_gpx(), nv = cc.new_gpx();
 					cc.ldr(tv, a64::ptr(pergroup, offsetof(AggStatePerGroupData, transValue)));
 					a64::Gp fci = cc.new_gpx();
-					cc.mov(fci, (uint64_t) fcinfo);
+					{
+						a64::Gp pt = cc.new_gpx();
+						cc.ldr(pt, a64::ptr(v_steps, STEP_OFFSET(opno, d.agg_trans.pertrans)));
+						cc.ldr(fci, a64::ptr(pt, offsetof(AggStatePerTransData, transfn_fcinfo)));
+					}
 					cc.ldr(nv, a64::ptr(fci, val1_off));
 
 					/* Sign-extend both for correct signed comparison */
@@ -1771,11 +2162,15 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.add(cnt, cnt, 1);
 					cc.str(cnt, a64::ptr(tv_ptr, offsetof(JitInt8TransTypeData, count)));
 
-					/* Load arg1, sign-extend */
+					/* Load arg1, sign-extend (steps-relative fcinfo) */
 					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
 					a64::Gp arg1 = cc.new_gpx();
 					a64::Gp fci = cc.new_gpx();
-					cc.mov(fci, (uint64_t) fcinfo);
+					{
+						a64::Gp pt = cc.new_gpx();
+						cc.ldr(pt, a64::ptr(v_steps, STEP_OFFSET(opno, d.agg_trans.pertrans)));
+						cc.ldr(fci, a64::ptr(pt, offsetof(AggStatePerTransData, transfn_fcinfo)));
+					}
 					cc.ldr(arg1, a64::ptr(fci, val1_off));
 					if (fn_addr == int4_avg_accum)
 						cc.sxtw(arg1, arg1.w());
@@ -1813,9 +2208,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						helper_fn = NULL; break;
 					}
 					a64::Gp afn_reg = cc.new_gpx();
-					cc.mov(afn_reg, (uint64_t) helper_fn);
+					ASMJIT_MOV_FN(cc, afn_reg, helper_fn);
+					/* op = &steps[opno] (steps-relative) */
 					a64::Gp aop_reg = cc.new_gpx();
-					cc.mov(aop_reg, (uint64_t) op);
+					cc.add(aop_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
 					InvokeNode *ainvoke;
 					cc.invoke(Out(ainvoke), afn_reg,
 							  FuncSignature::build<void, void *, void *>());
@@ -1944,7 +2340,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								  (char *)fcinfo);
 
 					a64::Gp fci_reg = cc.new_gpx("fci");
-					cc.mov(fci_reg, (uint64_t) fcinfo);
+					cc.ldr(fci_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.hashedscalararrayop.fcinfo_data)));
 					cc.ldrb(tmp2.w(), a64::ptr(fci_reg, off_arg0_isnull));
 					cc.cbnz(tmp2, lbl_null_result);
 
@@ -2018,13 +2414,23 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 					cc.bind(lbl_found);
 					{
-						cc.mov(tmp3, (uint64_t) op->resvalue);
 						cc.mov(tmp1,
 							(uint64_t)(int64_t)(inclause ? 1 : 0));
-						cc.str(tmp1, a64::ptr(tmp3));
-						cc.mov(tmp3, (uint64_t) op->resnull);
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp1, a64::ptr(tmp3));
+						}
 						cc.mov(tmp1, 0);
-						cc.strb(tmp1.w(), a64::ptr(tmp3));
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
 						cc.b(lbl_done);
 					}
 
@@ -2032,34 +2438,64 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					{
 						if (array_has_nulls)
 						{
-							cc.mov(tmp3, (uint64_t) op->resvalue);
 							cc.mov(tmp1, 0);
-							cc.str(tmp1, a64::ptr(tmp3));
-							cc.mov(tmp3, (uint64_t) op->resnull);
+							if (op->resvalue == &state->resvalue)
+								cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+							else
+							{
+								cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+								cc.str(tmp1, a64::ptr(tmp3));
+							}
 							cc.mov(tmp1, 1);
-							cc.strb(tmp1.w(), a64::ptr(tmp3));
+							if (op->resnull == &state->resnull)
+								cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+							else
+							{
+								cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+								cc.strb(tmp1.w(), a64::ptr(tmp3));
+							}
 						}
 						else
 						{
-							cc.mov(tmp3, (uint64_t) op->resvalue);
 							cc.mov(tmp1,
 								(uint64_t)(int64_t)(inclause ? 0 : 1));
-							cc.str(tmp1, a64::ptr(tmp3));
-							cc.mov(tmp3, (uint64_t) op->resnull);
+							if (op->resvalue == &state->resvalue)
+								cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+							else
+							{
+								cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+								cc.str(tmp1, a64::ptr(tmp3));
+							}
 							cc.mov(tmp1, 0);
-							cc.strb(tmp1.w(), a64::ptr(tmp3));
+							if (op->resnull == &state->resnull)
+								cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+							else
+							{
+								cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+								cc.strb(tmp1.w(), a64::ptr(tmp3));
+							}
 						}
 						cc.b(lbl_done);
 					}
 
 					cc.bind(lbl_null_result);
 					{
-						cc.mov(tmp3, (uint64_t) op->resvalue);
 						cc.mov(tmp1, 0);
-						cc.str(tmp1, a64::ptr(tmp3));
-						cc.mov(tmp3, (uint64_t) op->resnull);
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp1, a64::ptr(tmp3));
+						}
 						cc.mov(tmp1, 1);
-						cc.strb(tmp1.w(), a64::ptr(tmp3));
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
 					}
 
 					cc.bind(lbl_done);
@@ -2072,9 +2508,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						pfree(sorted_vals);
 
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) ExecEvalHashedScalarArrayOp);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalHashedScalarArrayOp);
 					a64::Gp op_reg = cc.new_gpx();
-					cc.mov(op_reg, (uint64_t) op);
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, void *, void *>());
@@ -2085,9 +2521,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #else /* PG14: no inclause/saop -- always use fallback */
 				{
 					a64::Gp fn_reg = cc.new_gpx();
-					cc.mov(fn_reg, (uint64_t)(void *) ExecEvalHashedScalarArrayOp);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalHashedScalarArrayOp);
 					a64::Gp op_reg = cc.new_gpx();
-					cc.mov(op_reg, (uint64_t) op);
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, void *, void *>());
@@ -2101,11 +2537,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			default:
 			{
-				/* Fallback: call pg_jitter_fallback_step -> int */
+				/* Fallback: call pg_jitter_fallback_step -> int (steps-relative) */
 				a64::Gp fn_reg = cc.new_gpx();
-				cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_fallback_step);
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_fallback_step);
 				a64::Gp op_reg = cc.new_gpx();
-				cc.mov(op_reg, (uint64_t) op);
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
 				InvokeNode *invoke;
 				a64::Gp ret_reg = cc.new_gpx();
 				cc.invoke(Out(invoke), fn_reg,
@@ -2212,6 +2648,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 	}
 
 	cc.end_func();
+
+#undef STEP_OFFSET
 
 	Error err = cc.finalize();
 	if (err != kErrorOk)

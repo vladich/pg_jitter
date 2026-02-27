@@ -21,7 +21,9 @@ extern "C" {
 #include "pg_jit_deform_templates.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "access/parallel.h"
 #include "utils/lsyscache.h"
+#include "utils/guc.h"
 #include "common/hashfn.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -79,6 +81,14 @@ asmjit_deform_match_template(TupleDesc desc, const TupleTableSlotOps *ops, int n
 	return jit_deform_find_template(deform_signature(natts, attlens));
 }
 
+/* GUC enum options for pg_jitter.parallel_mode */
+static const struct config_enum_entry parallel_jit_options[] = {
+	{"off", PARALLEL_JIT_OFF, false},
+	{"per_worker", PARALLEL_JIT_PER_WORKER, false},
+	{"shared", PARALLEL_JIT_SHARED, false},
+	{NULL, 0, false}
+};
+
 /* Per-expression compiled code handle */
 struct AsmjitCode {
 	JitRuntime	rt;
@@ -109,6 +119,44 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = pg_jitter_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = asmjit_compile_expr;
+	cb->flush_shared_code = pg_jitter_flush_shared_code;
+	cb->estimate_shared_code_size = pg_jitter_estimate_shared_code_size;
+
+	/*
+	 * Define GUCs only if not already registered (avoids conflict when
+	 * loaded via the meta module after another backend already defined them).
+	 */
+	if (!GetConfigOption("pg_jitter.shared_code_max", true, false))
+	{
+		DefineCustomIntVariable(
+			"pg_jitter.shared_code_max",
+			"Maximum shared JIT code DSM size in KB.",
+			NULL,
+			&pg_jitter_shared_code_max_kb,
+			4096,		/* 4 MB default */
+			64,			/* 64 KB minimum */
+			1048576,	/* 1 GB maximum */
+			PGC_USERSET,
+			GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter.parallel_mode", true, false))
+	{
+		DefineCustomEnumVariable(
+			"pg_jitter.parallel_mode",
+			"Controls JIT behavior in parallel workers: "
+			"off (workers use interpreter), "
+			"per_worker (each worker compiles independently), "
+			"shared (leader shares compiled code via DSM)",
+			NULL,
+			&pg_jitter_parallel_mode,
+			PARALLEL_JIT_SHARED,
+			parallel_jit_options,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
 }
 
 /*
@@ -261,8 +309,14 @@ asmjit_compile_expr(ExprState *state)
 	ExprEvalStep   *steps;
 	int				steps_len;
 	instr_time		starttime, endtime;
+	int				shared_node_id = 0;
+	int				shared_expr_idx = 0;
 
 	if (!state->parent)
+		return false;
+
+	/* Skip JIT in parallel workers when mode is OFF */
+	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_OFF && IsParallelWorker())
 		return false;
 
 	if (expr_has_fast_path(state))
@@ -274,6 +328,88 @@ asmjit_compile_expr(ExprState *state)
 #endif
 
 	ctx = pg_jitter_get_context(state);
+
+	/*
+	 * Compute expression identity for shared code.
+	 *
+	 * Leader: always compute identity so we can record code for later
+	 * flushing to DSM (es_jit_shared_code isn't set yet during leader's
+	 * ExecInitNode, but will be set later in ExecInitParallelPlan).
+	 *
+	 * Worker: compute identity + try to find shared code in DSM.
+	 */
+	if (state->parent->state->es_jit_flags & PGJIT_EXPR)
+	{
+		pg_jitter_get_expr_identity(ctx, state,
+									&shared_node_id, &shared_expr_idx);
+
+		asmjit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
+
+		elog(DEBUG1, "pg_jitter[asmjit]: compile_expr node=%d expr=%d is_worker=%d "
+			 "shared_code=%p shared_mode=%d",
+			 shared_node_id, shared_expr_idx, IsParallelWorker(),
+			 state->parent->state->es_jit_shared_code,
+			 asmjit_shared_code_mode);
+	}
+
+	/*
+	 * Parallel worker: try to use pre-compiled code from the leader.
+	 * If found in DSM, copy to local executable memory and skip compilation.
+	 */
+	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
+		IsParallelWorker() && state->parent->state->es_jit_shared_code)
+	{
+		const void *code_bytes;
+		Size		code_size;
+		uint64		leader_dylib_ref;
+
+		if (pg_jitter_find_shared_code(state->parent->state->es_jit_shared_code,
+									   shared_node_id, shared_expr_idx,
+									   &code_bytes, &code_size,
+									   &leader_dylib_ref))
+		{
+			void   *handle;
+			void   *code_ptr;
+
+			handle = pg_jitter_copy_to_executable(code_bytes, code_size);
+			if (handle)
+			{
+				/* Relocate dylib addresses (ASLR differs between processes) */
+				uint64	worker_ref = (uint64)(uintptr_t) pg_jitter_fallback_step;
+				int		npatched;
+
+				npatched = pg_jitter_relocate_dylib_addrs(handle, code_size,
+														  leader_dylib_ref,
+														  worker_ref);
+
+				code_ptr = pg_jitter_exec_code_ptr(handle);
+
+				elog(DEBUG1, "pg_jitter[asmjit]: worker reused shared code "
+					 "node=%d expr=%d (%zu bytes, patched=%d)",
+					 shared_node_id, shared_expr_idx, code_size,
+					 npatched);
+
+				pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+				pg_jitter_install_expr(state,
+									  (ExprStateEvalFunc) code_ptr);
+
+				asmjit_shared_code_mode = false;
+
+				ctx->base.instr.created_functions++;
+				return true;
+			}
+
+			elog(WARNING, "pg_jitter[asmjit]: failed to allocate executable memory "
+				 "for shared code node=%d expr=%d, compiling locally",
+				 shared_node_id, shared_expr_idx);
+			/* Fall through to normal compilation */
+		}
+		else
+			elog(DEBUG1, "pg_jitter[asmjit]: worker did not find shared code "
+				 "node=%d expr=%d, compiling locally",
+				 shared_node_id, shared_expr_idx);
+		/* Fall through to normal compilation */
+	}
 
 	INSTR_TIME_SET_CURRENT(starttime);
 
@@ -288,6 +424,7 @@ asmjit_compile_expr(ExprState *state)
 	if (!asmjit_emit_all(code, state, ctx, steps, steps_len))
 	{
 		delete ac;
+		asmjit_shared_code_mode = false;
 		return false;
 	}
 
@@ -295,7 +432,37 @@ asmjit_compile_expr(ExprState *state)
 	if (err != kErrorOk)
 	{
 		delete ac;
+		asmjit_shared_code_mode = false;
 		return false;
+	}
+
+	/*
+	 * Leader: record compiled code for later flushing to DSM.
+	 * At this point es_jit_shared_code may not be set yet (leader
+	 * compiles during ExecInitNode, before ExecInitParallelPlan).
+	 */
+	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
+		!IsParallelWorker() &&
+		(state->parent->state->es_jit_flags & PGJIT_EXPR))
+	{
+		PendingSharedCode *psc;
+		Size	gen_code_size = code.code_size();
+
+		elog(DEBUG1, "pg_jitter[asmjit]: leader storing code "
+			 "node=%d expr=%d (%zu bytes) at %p fallback=%p",
+			 shared_node_id, shared_expr_idx,
+			 gen_code_size, ac->func, (void *) pg_jitter_fallback_step);
+
+		psc = (PendingSharedCode *)
+			MemoryContextAlloc(TopMemoryContext,
+							   sizeof(PendingSharedCode));
+		psc->node_id = shared_node_id;
+		psc->expr_idx = shared_expr_idx;
+		psc->code = ac->func;
+		psc->code_size = gen_code_size;
+		psc->dylib_ref_addr = (uint64)(uintptr_t) pg_jitter_fallback_step;
+		psc->next = ctx->pending_shared;
+		ctx->pending_shared = psc;
 	}
 
 	/* Register for cleanup */
@@ -303,6 +470,9 @@ asmjit_compile_expr(ExprState *state)
 
 	/* Set the eval function (with validation wrapper on first call) */
 	pg_jitter_install_expr(state, (ExprStateEvalFunc) ac->func);
+
+	/* Reset shared code mode for next compilation */
+	asmjit_shared_code_mode = false;
 
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter,

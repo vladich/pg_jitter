@@ -22,6 +22,11 @@
 #include "pg_jitter_common.h"
 #include "pg_jit_funcs.h"
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <pthread.h>
+#include <libkern/OSCacheControl.h>
+#endif
+
 /*
  * Mirror of Int8TransTypeData from numeric.c.
  */
@@ -43,6 +48,173 @@ static void mir_reset_after_error(void);
 
 /* Counter for unique register/proto names within a single expression */
 static int mir_name_counter = 0;
+
+/*
+ * When true, use steps-relative addressing for all step field accesses,
+ * making generated code position-independent and shareable via DSM.
+ */
+static bool mir_shared_code_mode = false;
+
+/*
+ * Sentinel address table for MIR shared code mode.
+ *
+ * MIR's code generator optimizes 64-bit immediate loads by skipping zero
+ * halfwords — e.g., an address 0x0000AAAA0000BBBB gets only 2 instructions
+ * (MOVZ+MOVK) instead of the full MOVZ+3×MOVK.  The relocation scanner
+ * requires exactly 4 instructions to detect and patch addresses.
+ *
+ * Fix: when mir_shared_code_mode is true, register external functions with
+ * sentinel addresses that have all 4 halfwords non-zero.  This forces MIR
+ * to emit 4-instruction sequences.  After MIR_gen(), we patch the sentinels
+ * back to real addresses in the leader's code.  Workers copy from DSM and
+ * only need ASLR delta relocation (which the scanner handles correctly since
+ * all sequences are 4 instructions).
+ */
+typedef struct
+{
+	void	   *real_addr;		/* actual function pointer */
+	uint64		sentinel;		/* all-nonzero-halfword fake address */
+} MirSentinelEntry;
+
+#define MIR_MAX_SENTINELS 128
+
+static MirSentinelEntry mir_sentinels[MIR_MAX_SENTINELS];
+static int mir_n_sentinels = 0;
+
+/*
+ * Generate a sentinel address with all 4 halfwords non-zero.
+ * Pattern: 0xCAFE_<idx>001_BABE_<idx>001 where idx varies.
+ */
+static uint64
+mir_alloc_sentinel(void *real_addr)
+{
+	int idx = mir_n_sentinels;
+	uint64 s;
+
+	Assert(idx < MIR_MAX_SENTINELS);
+
+	/*
+	 * Construct sentinel with all 4 halfwords non-zero.
+	 * Use idx+1 in low bits to make each one unique.
+	 */
+	s = 0xCAFE000000000000ULL
+		| ((uint64)((idx + 1) & 0xFFFF) << 32)
+		| 0x00000000BABE0000ULL
+		| ((uint64)((idx + 1) & 0xFFFF));
+
+	mir_sentinels[idx].real_addr = real_addr;
+	mir_sentinels[idx].sentinel = s;
+	mir_n_sentinels++;
+
+	return s;
+}
+
+/*
+ * Get the address to pass to MIR_load_external: sentinel in shared mode,
+ * real address otherwise.
+ */
+static void *
+mir_extern_addr(void *real_addr)
+{
+	if (!mir_shared_code_mode)
+		return real_addr;
+	return (void *)(uintptr_t) mir_alloc_sentinel(real_addr);
+}
+
+/*
+ * After MIR_gen(), scan the generated code and replace sentinel addresses
+ * with real addresses.  Only needed for the leader's code — workers get
+ * already-patched code from DSM.
+ *
+ * Uses the same MOVZ+3×MOVK scanning as pg_jitter_relocate_dylib_addrs,
+ * but matches against our sentinel table instead of a range check.
+ */
+static int
+mir_patch_sentinels(void *code, Size code_size)
+{
+#if defined(__aarch64__)
+	uint32_t   *insns = (uint32_t *) code;
+	int			ninsns = code_size / 4;
+	int			patched = 0;
+
+	for (int i = 0; i + 3 < ninsns; i++)
+	{
+		uint32_t w0 = insns[i];
+		uint32_t w1 = insns[i + 1];
+		uint32_t w2 = insns[i + 2];
+		uint32_t w3 = insns[i + 3];
+
+		/* Check MOVZ X?, #imm, LSL #0 */
+		if ((w0 & 0xFFE00000) != 0xD2800000)
+			continue;
+
+		int rd = w0 & 0x1F;
+
+		/* Check MOVK X?, #imm, LSL #16 with same Rd */
+		if ((w1 & 0xFFE0001F) != (0xF2A00000 | rd))
+			continue;
+
+		/* Check MOVK X?, #imm, LSL #32 with same Rd */
+		if ((w2 & 0xFFE0001F) != (0xF2C00000 | rd))
+			continue;
+
+		/* Check MOVK X?, #imm, LSL #48 with same Rd */
+		if ((w3 & 0xFFE0001F) != (0xF2E00000 | rd))
+			continue;
+
+		/* Reconstruct the 64-bit value */
+		uint64 val;
+		val  = (uint64)((w0 >> 5) & 0xFFFF);
+		val |= (uint64)((w1 >> 5) & 0xFFFF) << 16;
+		val |= (uint64)((w2 >> 5) & 0xFFFF) << 32;
+		val |= (uint64)((w3 >> 5) & 0xFFFF) << 48;
+
+		/* Check if it matches any sentinel */
+		for (int s = 0; s < mir_n_sentinels; s++)
+		{
+			if (val == mir_sentinels[s].sentinel)
+			{
+				uint64 real = (uint64)(uintptr_t) mir_sentinels[s].real_addr;
+
+				insns[i]     = (w0 & 0xFFE0001F) | (((real >>  0) & 0xFFFF) << 5);
+				insns[i + 1] = (w1 & 0xFFE0001F) | (((real >> 16) & 0xFFFF) << 5);
+				insns[i + 2] = (w2 & 0xFFE0001F) | (((real >> 32) & 0xFFFF) << 5);
+				insns[i + 3] = (w3 & 0xFFE0001F) | (((real >> 48) & 0xFFFF) << 5);
+
+				patched++;
+				i += 3;
+				break;
+			}
+		}
+	}
+
+	return patched;
+#else
+	/* x86_64: scan for 8-byte sentinel values in const pool */
+	int patched = 0;
+	uint8_t *bytes = (uint8_t *) code;
+
+	for (Size off = 0; off + 7 < code_size; off++)
+	{
+		uint64 val;
+		memcpy(&val, bytes + off, 8);
+
+		for (int s = 0; s < mir_n_sentinels; s++)
+		{
+			if (val == mir_sentinels[s].sentinel)
+			{
+				uint64 real = (uint64)(uintptr_t) mir_sentinels[s].real_addr;
+				memcpy(bytes + off, &real, 8);
+				patched++;
+				off += 7;
+				break;
+			}
+		}
+	}
+
+	return patched;
+#endif
+}
 
 /*
  * Pre-compiled MIR blob support — shared infrastructure from pg_jit_mir_blobs.h.
@@ -135,6 +307,8 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = mir_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = mir_compile_expr;
+	cb->flush_shared_code = pg_jitter_flush_shared_code;
+	cb->estimate_shared_code_size = pg_jitter_estimate_shared_code_size;
 }
 
 /*
@@ -836,6 +1010,87 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 }
 
 /*
+ * Helper: emit MIR instruction to load the address of a step field into
+ * a register.  In PIC mode (mir_shared_code_mode), computes the address
+ * at runtime from r_steps; otherwise embeds the absolute address.
+ *
+ * 'ptr' is the absolute address (e.g., op->resvalue).
+ * 'opno' is the step index, 'field' is the offsetof within ExprEvalStep.
+ */
+static void
+mir_emit_step_addr(MIR_context_t ctx, MIR_item_t func_item,
+				   MIR_reg_t dst, MIR_reg_t r_steps,
+				   int opno, int64_t field_offset,
+				   uint64_t abs_addr)
+{
+	if (mir_shared_code_mode)
+	{
+		int64_t	off = (int64_t) opno * (int64_t) sizeof(ExprEvalStep) + field_offset;
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_ADD,
+				MIR_new_reg_op(ctx, dst),
+				MIR_new_reg_op(ctx, r_steps),
+				MIR_new_int_op(ctx, off)));
+	}
+	else
+	{
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, dst),
+				MIR_new_uint_op(ctx, abs_addr)));
+	}
+}
+
+/*
+ * Helper: emit MIR instruction to load a pointer field from a step into
+ * a register.  In PIC mode, loads via r_steps + offset; otherwise embeds
+ * the absolute address and loads through it.
+ *
+ * Used for pointer-valued fields like op->d.func.fcinfo_data.
+ */
+static void
+mir_emit_step_load_ptr(MIR_context_t ctx, MIR_item_t func_item,
+					   MIR_reg_t dst, MIR_reg_t r_steps,
+					   int opno, int64_t field_offset,
+					   uint64_t abs_addr)
+{
+	if (mir_shared_code_mode)
+	{
+		int64_t	off = (int64_t) opno * (int64_t) sizeof(ExprEvalStep) + field_offset;
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, dst),
+				MIR_new_mem_op(ctx, MIR_T_P, off, r_steps, 0, 1)));
+	}
+	else
+	{
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_MOV,
+				MIR_new_reg_op(ctx, dst),
+				MIR_new_uint_op(ctx, abs_addr)));
+	}
+}
+
+/*
+ * Macros for common step-field address patterns.
+ * MIR_STEP_ADDR: load address of steps[opno].field into dst
+ * MIR_STEP_LOAD: load value of steps[opno].field (pointer-typed) into dst
+ */
+#define MIR_STEP_ADDR(dst, opno, field) \
+	mir_emit_step_addr(ctx, func_item, dst, r_steps, opno, \
+					   offsetof(ExprEvalStep, field), \
+					   (uint64_t)(op->field))
+
+#define MIR_STEP_ADDR_RAW(dst, opno, field_offset, abs_addr) \
+	mir_emit_step_addr(ctx, func_item, dst, r_steps, opno, \
+					   field_offset, abs_addr)
+
+#define MIR_STEP_LOAD(dst, opno, field) \
+	mir_emit_step_load_ptr(ctx, func_item, dst, r_steps, opno, \
+						   offsetof(ExprEvalStep, field), \
+						   (uint64_t)(op->field))
+
+/*
  * Compile an expression using MIR.
  *
  * Generated function signature:
@@ -853,11 +1108,11 @@ mir_compile_expr(ExprState *state)
 	int				steps_len;
 	instr_time		starttime, endtime;
 	char			modname[32];
-
 	MIR_reg_t		r_state, r_econtext, r_isnullp;
 	MIR_reg_t		r_resvaluep, r_resnullp;
 	MIR_reg_t		r_resultvals, r_resultnulls;
 	MIR_reg_t		r_tmp1, r_tmp2, r_tmp3, r_slot;
+	MIR_reg_t		r_steps;
 
 	MIR_insn_t	   *step_labels;
 
@@ -867,8 +1122,14 @@ mir_compile_expr(ExprState *state)
 	MIR_item_t		proto_v1func, import_v1func;	/* per-step, see below */
 	MIR_item_t		proto_makero, import_makero;
 	MIR_type_t		res_type;
+	int				shared_node_id = 0;
+	int				shared_expr_idx = 0;
 
 	if (!state->parent)
+		return false;
+
+	/* Skip JIT in parallel workers when mode is OFF */
+	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_OFF && IsParallelWorker())
 		return false;
 
 	/* Let PG's hand-optimized fast-path evalfuncs handle tiny expressions */
@@ -876,6 +1137,81 @@ mir_compile_expr(ExprState *state)
 		return false;
 
 	jctx = pg_jitter_get_context(state);
+
+	/*
+	 * Compute expression identity for shared code.
+	 */
+	if (state->parent->state->es_jit_flags & PGJIT_EXPR)
+	{
+		pg_jitter_get_expr_identity(jctx, state,
+									&shared_node_id, &shared_expr_idx);
+
+		mir_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
+
+		elog(DEBUG1, "pg_jitter[mir]: compile_expr node=%d expr=%d is_worker=%d "
+			 "shared_code=%p shared_mode=%d",
+			 shared_node_id, shared_expr_idx, IsParallelWorker(),
+			 state->parent->state->es_jit_shared_code,
+			 mir_shared_code_mode);
+	}
+
+	/*
+	 * Parallel worker: try to use pre-compiled code from the leader.
+	 */
+	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
+		IsParallelWorker() && state->parent->state->es_jit_shared_code)
+	{
+		const void *code_bytes;
+		Size		code_size;
+		uint64		leader_dylib_ref;
+
+		if (pg_jitter_find_shared_code(state->parent->state->es_jit_shared_code,
+									   shared_node_id, shared_expr_idx,
+									   &code_bytes, &code_size,
+									   &leader_dylib_ref))
+		{
+			void   *handle;
+			void   *code_ptr;
+
+			handle = pg_jitter_copy_to_executable(code_bytes, code_size);
+			if (handle)
+			{
+				uint64	worker_ref = (uint64)(uintptr_t) pg_jitter_fallback_step;
+				int		npatched;
+
+				npatched = pg_jitter_relocate_dylib_addrs(handle, code_size,
+														  leader_dylib_ref,
+														  worker_ref);
+
+				code_ptr = pg_jitter_exec_code_ptr(handle);
+
+				elog(DEBUG1, "pg_jitter[mir]: worker reused shared code "
+					 "node=%d expr=%d (%zu bytes, patched=%d) code_ptr=%p "
+					 "leader_ref=%lx worker_ref=%lx",
+					 shared_node_id, shared_expr_idx, code_size,
+					 npatched, code_ptr,
+					 (unsigned long) leader_dylib_ref,
+					 (unsigned long) worker_ref);
+
+				pg_jitter_register_compiled(jctx, pg_jitter_exec_free, handle);
+				pg_jitter_install_expr(state,
+									  (ExprStateEvalFunc) code_ptr);
+
+				mir_shared_code_mode = false;
+
+				jctx->base.instr.created_functions++;
+				return true;
+			}
+
+			elog(WARNING, "pg_jitter[mir]: failed to allocate executable memory "
+				 "for shared code node=%d expr=%d, compiling locally",
+				 shared_node_id, shared_expr_idx);
+		}
+		else
+			elog(DEBUG1, "pg_jitter[mir]: worker did not find shared code "
+				 "node=%d expr=%d, compiling locally",
+				 shared_node_id, shared_expr_idx);
+	}
 
 	INSTR_TIME_SET_CURRENT(starttime);
 
@@ -886,7 +1222,10 @@ mir_compile_expr(ExprState *state)
 
 	ctx = mir_get_or_create_ctx(jctx);
 	if (!ctx)
+	{
+		mir_shared_code_mode = false;
 		return false;
+	}
 
 	snprintf(modname, sizeof(modname), "m_%d", mir_current_state->module_counter++);
 	m = MIR_new_module(ctx, modname);
@@ -988,10 +1327,12 @@ mir_compile_expr(ExprState *state)
 				step_direct_imports[i] = MIR_new_import(ctx, name);
 			}
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-			else if (dfn && dfn->jit_fn_name &&
+			else if (!mir_shared_code_mode &&
+					 dfn && dfn->jit_fn_name &&
 					 mir_find_precompiled_fn(dfn->jit_fn_name))
 			{
-				/* Use MIR-precompiled function pointer */
+				/* Use MIR-precompiled function pointer (skip in shared mode:
+				 * blob addresses are in separate mmap, outside relocation range) */
 				char name[32];
 				snprintf(name, sizeof(name), "dfn_%d", i);
 				step_direct_imports[i] = MIR_new_import(ctx, name);
@@ -1019,7 +1360,8 @@ mir_compile_expr(ExprState *state)
 				step_direct_imports[i] = MIR_new_import(ctx, name);
 			}
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-			else if (dfn && dfn->jit_fn_name &&
+			else if (!mir_shared_code_mode &&
+					 dfn && dfn->jit_fn_name &&
 					 mir_find_precompiled_fn(dfn->jit_fn_name))
 			{
 				char name[32];
@@ -1074,10 +1416,19 @@ mir_compile_expr(ExprState *state)
 	r_tmp2 = mir_new_reg(ctx, f, MIR_T_I64, "t2");
 	r_tmp3 = mir_new_reg(ctx, f, MIR_T_I64, "t3");
 	r_slot = mir_new_reg(ctx, f, MIR_T_I64, "sl");
+	r_steps = mir_new_reg(ctx, f, MIR_T_I64, "stp");
 
 	/*
 	 * Prologue: cache frequently-used pointers.
 	 */
+
+	/* r_steps = state->steps (for steps-relative addressing in PIC mode) */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_steps),
+			MIR_new_mem_op(ctx, MIR_T_P,
+				offsetof(ExprState, steps),
+				r_state, 0, 1)));
 
 	/* r_resvaluep = &state->resvalue */
 	MIR_append_insn(ctx, func_item,
@@ -1293,10 +1644,7 @@ mir_compile_expr(ExprState *state)
 							attnum * (int64_t) sizeof(Datum),
 							r_tmp1, 0, 1)));
 				/* *op->resvalue = r_tmp2 */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -1317,10 +1665,7 @@ mir_compile_expr(ExprState *state)
 							attnum * (int64_t) sizeof(bool),
 							r_tmp1, 0, 1)));
 				/* *op->resnull = r_tmp2 */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -1468,20 +1813,14 @@ mir_compile_expr(ExprState *state)
 			case EEOP_CONST:
 			{
 				/* *op->resvalue = constval.value */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_int_op(ctx, (int64_t) op->d.constval.value)));
 
 				/* *op->resnull = constval.isnull */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -1513,10 +1852,7 @@ mir_compile_expr(ExprState *state)
 					)
 				{
 					/* Set resnull = true */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -1525,10 +1861,7 @@ mir_compile_expr(ExprState *state)
 					/*
 					 * Batched null check: OR all isnull flags, single branch.
 					 */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_fci),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
 					if (nargs > 1 && nargs <= 4)
 					{
 						int64_t null_off_0 =
@@ -1600,10 +1933,7 @@ mir_compile_expr(ExprState *state)
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					int64_t val_off_1 =
 						(int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_fci),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, a0),
@@ -1925,20 +2255,14 @@ mir_compile_expr(ExprState *state)
 					}
 
 					/* *op->resvalue = r_ret */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 							MIR_new_reg_op(ctx, r_ret)));
 
 					/* *op->resnull = false */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -1953,10 +2277,7 @@ mir_compile_expr(ExprState *state)
 					 */
 					/* Load fcinfo once, then load all args from offsets */
 					MIR_reg_t r_args[4];
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_fci),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
 					for (int i = 0; i < dfn->nargs; i++)
 					{
 						char aname[16];
@@ -1995,20 +2316,14 @@ mir_compile_expr(ExprState *state)
 					}
 
 					/* *op->resvalue = result */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 							MIR_new_reg_op(ctx, r_ret)));
 
 					/* *op->resnull = false */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2019,10 +2334,7 @@ mir_compile_expr(ExprState *state)
 				/* Fallback: generic fcinfo path */
 
 				/* fcinfo->isnull = false (caller must clear before V1 call) */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_fci),
-						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8,
@@ -2039,10 +2351,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_fci)));
 
 				/* *op->resvalue = result */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -2055,10 +2364,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_mem_op(ctx, MIR_T_U8,
 							offsetof(FunctionCallInfoBaseData, isnull),
 							r_fci, 0, 1)));
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2083,10 +2389,7 @@ mir_compile_expr(ExprState *state)
 				if (opcode == EEOP_BOOL_AND_STEP_FIRST)
 				{
 					/* *anynull = false */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+					MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2094,10 +2397,7 @@ mir_compile_expr(ExprState *state)
 				}
 
 				/* Load resnull */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2111,10 +2411,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_int_op(ctx, 0)));
 
 				/* Not null: check if false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2134,10 +2431,7 @@ mir_compile_expr(ExprState *state)
 
 				/* Null handler: set *anynull = true */
 				MIR_append_insn(ctx, func_item, null_handler);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+				MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2150,10 +2444,7 @@ mir_compile_expr(ExprState *state)
 				{
 					MIR_insn_t	no_anynull = MIR_new_label(ctx);
 
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+					MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_tmp1),
@@ -2165,18 +2456,12 @@ mir_compile_expr(ExprState *state)
 							MIR_new_int_op(ctx, 0)));
 
 					/* Set resnull = true, resvalue = 0 */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx, 1)));
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -2199,10 +2484,7 @@ mir_compile_expr(ExprState *state)
 
 				if (opcode == EEOP_BOOL_OR_STEP_FIRST)
 				{
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+					MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2210,10 +2492,7 @@ mir_compile_expr(ExprState *state)
 				}
 
 				/* Load resnull */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2226,10 +2505,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_int_op(ctx, 0)));
 
 				/* Not null: check if true */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2248,10 +2524,7 @@ mir_compile_expr(ExprState *state)
 
 				/* Null handler */
 				MIR_append_insn(ctx, func_item, null_handler);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+				MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2263,10 +2536,7 @@ mir_compile_expr(ExprState *state)
 				{
 					MIR_insn_t	no_anynull = MIR_new_label(ctx);
 
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->d.boolexpr.anynull)));
+					MIR_STEP_LOAD(r_tmp3, opno, d.boolexpr.anynull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_tmp1),
@@ -2277,18 +2547,12 @@ mir_compile_expr(ExprState *state)
 							MIR_new_reg_op(ctx, r_tmp1),
 							MIR_new_int_op(ctx, 0)));
 
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx, 1)));
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -2305,10 +2569,7 @@ mir_compile_expr(ExprState *state)
 			case EEOP_BOOL_NOT_STEP:
 			{
 				/* Load resvalue, negate, store back */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2335,10 +2596,7 @@ mir_compile_expr(ExprState *state)
 				MIR_insn_t	cont = MIR_new_label(ctx);
 
 				/* Check null */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2350,10 +2608,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_int_op(ctx, 0)));
 
 				/* Check false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2371,18 +2626,12 @@ mir_compile_expr(ExprState *state)
 
 				/* Qual fail: set resvalue=0, resnull=false, jump to done */
 				MIR_append_insn(ctx, func_item, qualfail);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 						MIR_new_int_op(ctx, 0)));
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -2405,10 +2654,7 @@ mir_compile_expr(ExprState *state)
 				break;
 
 			case EEOP_JUMP_IF_NULL:
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2421,10 +2667,7 @@ mir_compile_expr(ExprState *state)
 				break;
 
 			case EEOP_JUMP_IF_NOT_NULL:
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2439,10 +2682,7 @@ mir_compile_expr(ExprState *state)
 			case EEOP_JUMP_IF_NOT_TRUE:
 			{
 				/* Jump if null OR false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2454,10 +2694,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_tmp1),
 						MIR_new_int_op(ctx, 0)));
 				/* If false, jump */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2476,19 +2713,13 @@ mir_compile_expr(ExprState *state)
 			case EEOP_NULLTEST_ISNULL:
 			{
 				/* resvalue = resnull ? 1 : 0; resnull = false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
 				/* Store as Datum */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp2),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp2, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp2, 0, 1),
@@ -2503,10 +2734,7 @@ mir_compile_expr(ExprState *state)
 
 			case EEOP_NULLTEST_ISNOTNULL:
 			{
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_tmp1),
@@ -2518,10 +2746,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_tmp1),
 						MIR_new_int_op(ctx, 0)));
 				/* Store as Datum */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp2),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp2, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp2, 0, 1),
@@ -2541,20 +2766,14 @@ mir_compile_expr(ExprState *state)
 			case EEOP_HASHDATUM_SET_INITVAL:
 			{
 				/* *op->resvalue = op->d.hashdatum_initvalue.init_value */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_int_op(ctx, (int64_t) op->d.hashdatum_initvalue.init_value)));
 
 				/* *op->resnull = false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2576,10 +2795,7 @@ mir_compile_expr(ExprState *state)
 				MIR_reg_t	r_fci = mir_new_reg(ctx, f, MIR_T_I64, "hfci");
 
 				/* r_fci = fcinfo */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_fci),
-						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_STEP_LOAD(r_fci, opno, d.hashdatum.fcinfo_data);
 
 				/* r_tmp1 = fcinfo->args[0].isnull */
 				MIR_append_insn(ctx, func_item,
@@ -2649,19 +2865,13 @@ mir_compile_expr(ExprState *state)
 
 				/* store_result: *op->resvalue = r_tmp1, *op->resnull = false */
 				MIR_append_insn(ctx, func_item, store_result);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_reg_op(ctx, r_tmp1)));
 
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2683,10 +2893,7 @@ mir_compile_expr(ExprState *state)
 				MIR_reg_t	r_fci = mir_new_reg(ctx, f, MIR_T_I64, "hfci");
 
 				/* r_fci = fcinfo */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_fci),
-						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_STEP_LOAD(r_fci, opno, d.hashdatum.fcinfo_data);
 
 				/* r_tmp1 = fcinfo->args[0].isnull */
 				MIR_append_insn(ctx, func_item,
@@ -2739,20 +2946,14 @@ mir_compile_expr(ExprState *state)
 				}
 
 				/* *op->resvalue = r_ret */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_reg_op(ctx, r_ret)));
 
 				/* *op->resnull = false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2764,18 +2965,12 @@ mir_compile_expr(ExprState *state)
 
 				/* null_path: set resnull=1, resvalue=0, jump to jumpdone */
 				MIR_append_insn(ctx, func_item, null_path);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 						MIR_new_int_op(ctx, 1)));
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -2803,14 +2998,13 @@ mir_compile_expr(ExprState *state)
 				MIR_reg_t	r_hash = mir_new_reg(ctx, f, MIR_T_I64, "hash");
 
 				/* Load existing hash: r_hash = iresult->value (as U32) */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp1),
-						MIR_new_uint_op(ctx, (uint64_t) &iresult->value)));
+				MIR_STEP_LOAD(r_tmp1, opno, d.hashdatum.iresult);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_hash),
-						MIR_new_mem_op(ctx, MIR_T_U32, 0, r_tmp1, 0, 1)));
+						MIR_new_mem_op(ctx, MIR_T_U32,
+							offsetof(NullableDatum, value),
+							r_tmp1, 0, 1)));
 
 				/* Rotate left 1: r_hash = (r_hash << 1) | (r_hash >> 31) */
 				MIR_append_insn(ctx, func_item,
@@ -2830,10 +3024,7 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_tmp2)));
 
 				/* r_fci = fcinfo */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_fci),
-						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_STEP_LOAD(r_fci, opno, d.hashdatum.fcinfo_data);
 
 				/* r_tmp1 = fcinfo->args[0].isnull */
 				MIR_append_insn(ctx, func_item,
@@ -2896,20 +3087,14 @@ mir_compile_expr(ExprState *state)
 				MIR_append_insn(ctx, func_item, skip_hash);
 
 				/* *op->resvalue = r_hash (already zero-extended from 32-bit ops) */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_reg_op(ctx, r_hash)));
 
 				/* *op->resnull = false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -2933,10 +3118,7 @@ mir_compile_expr(ExprState *state)
 				MIR_reg_t	r_hash = mir_new_reg(ctx, f, MIR_T_I64, "hash");
 
 				/* r_fci = fcinfo */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_fci),
-						MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+				MIR_STEP_LOAD(r_fci, opno, d.hashdatum.fcinfo_data);
 
 				/* r_tmp1 = fcinfo->args[0].isnull */
 				MIR_append_insn(ctx, func_item,
@@ -2953,14 +3135,13 @@ mir_compile_expr(ExprState *state)
 						MIR_new_int_op(ctx, 0)));
 
 				/* Load existing hash: r_hash = iresult->value (as U32) */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp1),
-						MIR_new_uint_op(ctx, (uint64_t) &iresult->value)));
+				MIR_STEP_LOAD(r_tmp1, opno, d.hashdatum.iresult);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_reg_op(ctx, r_hash),
-						MIR_new_mem_op(ctx, MIR_T_U32, 0, r_tmp1, 0, 1)));
+						MIR_new_mem_op(ctx, MIR_T_U32,
+							offsetof(NullableDatum, value),
+							r_tmp1, 0, 1)));
 
 				/* Rotate left 1: r_hash = (r_hash << 1) | (r_hash >> 31) */
 				MIR_append_insn(ctx, func_item,
@@ -3023,20 +3204,14 @@ mir_compile_expr(ExprState *state)
 						MIR_new_reg_op(ctx, r_ret)));
 
 				/* *op->resvalue = r_hash */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
 						MIR_new_reg_op(ctx, r_hash)));
 
 				/* *op->resnull = false */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
@@ -3048,18 +3223,12 @@ mir_compile_expr(ExprState *state)
 
 				/* null_path: set resnull=1, resvalue=0, jump to jumpdone */
 				MIR_append_insn(ctx, func_item, null_path);
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resnull)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
 						MIR_new_int_op(ctx, 1)));
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp3),
-						MIR_new_uint_op(ctx, (uint64_t) op->resvalue)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_insn(ctx, MIR_MOV,
 						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
@@ -3149,10 +3318,7 @@ mir_compile_expr(ExprState *state)
 							MIR_new_int_op(ctx, 0)));
 					/* noTransValue=true: call helper(state, op) which handles
 					 * ExecAggInitGroup internally. */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
 							MIR_new_ref_op(ctx, proto_agg_helper),
@@ -3233,10 +3399,28 @@ mir_compile_expr(ExprState *state)
 					int64_t isnull1_off = (int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
 					int64_t val1_off = (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
 
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_fci),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					/* Load fcinfo = pertrans->transfn_fcinfo (runtime) */
+					if (mir_shared_code_mode)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_fci),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									(int64_t)opno * (int64_t)sizeof(ExprEvalStep) +
+									(int64_t)offsetof(ExprEvalStep, d.agg_trans.pertrans),
+									r_steps, 0, 1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_fci),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									offsetof(AggStatePerTransData, transfn_fcinfo),
+									r_fci, 0, 1)));
+					}
+					else
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_fci),
+								MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
 					/* Check arg1 isnull */
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
@@ -3332,10 +3516,28 @@ mir_compile_expr(ExprState *state)
 							MIR_new_mem_op(ctx, MIR_T_I64,
 								offsetof(AggStatePerGroupData, transValue),
 								r_pergroup, 0, 1)));
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					/* Load fcinfo = pertrans->transfn_fcinfo (runtime) */
+					if (mir_shared_code_mode)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									(int64_t)opno * (int64_t)sizeof(ExprEvalStep) +
+									(int64_t)offsetof(ExprEvalStep, d.agg_trans.pertrans),
+									r_steps, 0, 1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									offsetof(AggStatePerTransData, transfn_fcinfo),
+									r_tmp1, 0, 1)));
+					}
+					else
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_nv),
@@ -3409,10 +3611,28 @@ mir_compile_expr(ExprState *state)
 							MIR_new_reg_op(ctx, r_cnt)));
 
 					/* Load arg1, sign-extend */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					/* Load fcinfo = pertrans->transfn_fcinfo (runtime) */
+					if (mir_shared_code_mode)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									(int64_t)opno * (int64_t)sizeof(ExprEvalStep) +
+									(int64_t)offsetof(ExprEvalStep, d.agg_trans.pertrans),
+									r_steps, 0, 1)));
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_mem_op(ctx, MIR_T_P,
+									offsetof(AggStatePerTransData, transfn_fcinfo),
+									r_tmp1, 0, 1)));
+					}
+					else
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_MOV,
+								MIR_new_reg_op(ctx, r_tmp1),
+								MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_a1),
@@ -3458,10 +3678,7 @@ mir_compile_expr(ExprState *state)
 				else
 				{
 					/* Generic fallback: call helper function */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
 							MIR_new_ref_op(ctx, proto_agg_helper),
@@ -3634,10 +3851,7 @@ mir_compile_expr(ExprState *state)
 					/*
 					 * Step 1: Check scalar not NULL (strict function).
 					 */
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) fcinfo)));
+					MIR_STEP_LOAD(r_tmp1, opno, d.hashedscalararrayop.fcinfo_data);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_tmp2),
@@ -3782,22 +3996,14 @@ mir_compile_expr(ExprState *state)
 
 					/* ---- Found ---- */
 					MIR_append_insn(ctx, func_item, lbl_found);
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx,
-								(uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64,
 								0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx,
 								inclause ? 1 : 0)));
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx,
-								(uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8,
@@ -3815,21 +4021,13 @@ mir_compile_expr(ExprState *state)
 						 * Array had NULLs -- result is NULL
 						 * (indeterminate for strict equality).
 						 */
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_MOV,
-								MIR_new_reg_op(ctx, r_tmp3),
-								MIR_new_uint_op(ctx,
-									(uint64_t) op->resvalue)));
+						MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_mem_op(ctx, MIR_T_I64,
 									0, r_tmp3, 0, 1),
 								MIR_new_int_op(ctx, 0)));
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_MOV,
-								MIR_new_reg_op(ctx, r_tmp3),
-								MIR_new_uint_op(ctx,
-									(uint64_t) op->resnull)));
+						MIR_STEP_LOAD(r_tmp3, opno, resnull);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_mem_op(ctx, MIR_T_U8,
@@ -3839,22 +4037,14 @@ mir_compile_expr(ExprState *state)
 					else
 					{
 						/* Definitive not-found result */
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_MOV,
-								MIR_new_reg_op(ctx, r_tmp3),
-								MIR_new_uint_op(ctx,
-									(uint64_t) op->resvalue)));
+						MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_mem_op(ctx, MIR_T_I64,
 									0, r_tmp3, 0, 1),
 								MIR_new_int_op(ctx,
 									inclause ? 0 : 1)));
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_MOV,
-								MIR_new_reg_op(ctx, r_tmp3),
-								MIR_new_uint_op(ctx,
-									(uint64_t) op->resnull)));
+						MIR_STEP_LOAD(r_tmp3, opno, resnull);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_mem_op(ctx, MIR_T_U8,
@@ -3867,21 +4057,13 @@ mir_compile_expr(ExprState *state)
 
 					/* ---- Null scalar ---- */
 					MIR_append_insn(ctx, func_item, lbl_null_result);
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx,
-								(uint64_t) op->resvalue)));
+					MIR_STEP_LOAD(r_tmp3, opno, resvalue);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_I64,
 								0, r_tmp3, 0, 1),
 							MIR_new_int_op(ctx, 0)));
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp3),
-							MIR_new_uint_op(ctx,
-								(uint64_t) op->resnull)));
+					MIR_STEP_LOAD(r_tmp3, opno, resnull);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_mem_op(ctx, MIR_T_U8,
@@ -3902,10 +4084,7 @@ mir_compile_expr(ExprState *state)
 					if (sorted_vals)
 						pfree(sorted_vals);
 
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 5,
 							MIR_new_ref_op(ctx, proto_3arg_void),
@@ -3916,10 +4095,7 @@ mir_compile_expr(ExprState *state)
 				}
 #else /* PG14: no inclause/saop -- always use fallback */
 				{
-					MIR_append_insn(ctx, func_item,
-						MIR_new_insn(ctx, MIR_MOV,
-							MIR_new_reg_op(ctx, r_tmp1),
-							MIR_new_uint_op(ctx, (uint64_t) op)));
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 5,
 							MIR_new_ref_op(ctx, proto_3arg_void),
@@ -3940,10 +4116,7 @@ mir_compile_expr(ExprState *state)
 				int fb_jump_target = -1;
 
 				/* Call pg_jitter_fallback_step(state, op, econtext) -> int */
-				MIR_append_insn(ctx, func_item,
-					MIR_new_insn(ctx, MIR_MOV,
-						MIR_new_reg_op(ctx, r_tmp1),
-						MIR_new_uint_op(ctx, (uint64_t) op)));
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
 				MIR_append_insn(ctx, func_item,
 					MIR_new_call_insn(ctx, 6,
 						MIR_new_ref_op(ctx, proto_fallback),
@@ -4086,17 +4259,20 @@ mir_compile_expr(ExprState *state)
 
 		MIR_load_module(ctx, m);
 
-		/* Load external symbols */
-		MIR_load_external(ctx, "fallback_step", (void *) pg_jitter_fallback_step);
-		MIR_load_external(ctx, "getsomeattrs", (void *) slot_getsomeattrs_int);
-		MIR_load_external(ctx, "make_ro", (void *) MakeExpandedObjectReadOnlyInternal);
+		/* Reset sentinel table for this compilation */
+		mir_n_sentinels = 0;
+
+		/* Load external symbols (sentinels in shared mode) */
+		MIR_load_external(ctx, "fallback_step", mir_extern_addr((void *) pg_jitter_fallback_step));
+		MIR_load_external(ctx, "getsomeattrs", mir_extern_addr((void *) slot_getsomeattrs_int));
+		MIR_load_external(ctx, "make_ro", mir_extern_addr((void *) MakeExpandedObjectReadOnlyInternal));
 		/* Inline error handlers */
-		MIR_load_external(ctx, "err_i4ov", (void *) jit_error_int4_overflow);
-		MIR_load_external(ctx, "err_i8ov", (void *) jit_error_int8_overflow);
-		MIR_load_external(ctx, "err_divz", (void *) jit_error_division_by_zero);
+		MIR_load_external(ctx, "err_i4ov", mir_extern_addr((void *) jit_error_int4_overflow));
+		MIR_load_external(ctx, "err_i8ov", mir_extern_addr((void *) jit_error_int8_overflow));
+		MIR_load_external(ctx, "err_divz", mir_extern_addr((void *) jit_error_division_by_zero));
 		/* Inline deform helpers */
-		MIR_load_external(ctx, "varsize_any", (void *) varsize_any);
-		MIR_load_external(ctx, "strlen", (void *) strlen);
+		MIR_load_external(ctx, "varsize_any", mir_extern_addr((void *) varsize_any));
+		MIR_load_external(ctx, "strlen", mir_extern_addr((void *) strlen));
 
 	for (int i = 0; i < steps_len; i++)
 	{
@@ -4110,7 +4286,7 @@ mir_compile_expr(ExprState *state)
 			{
 				snprintf(name, sizeof(name), "saop_%d", i);
 				MIR_load_external(ctx, name,
-								  (void *) ExecEvalHashedScalarArrayOp);
+								  mir_extern_addr((void *) ExecEvalHashedScalarArrayOp));
 				continue;
 			}
 #ifdef HAVE_EEOP_HASHDATUM
@@ -4124,7 +4300,7 @@ mir_compile_expr(ExprState *state)
 				addr = (void *) steps[i].d.func.fn_addr;
 
 			snprintf(name, sizeof(name), "fn_%d", i);
-			MIR_load_external(ctx, name, addr);
+			MIR_load_external(ctx, name, mir_extern_addr(addr));
 		}
 		if (step_direct_imports[i])
 		{
@@ -4140,9 +4316,9 @@ mir_compile_expr(ExprState *state)
 				const JitDirectFn *dfn = jit_find_direct_fn(steps[i].d.hashdatum.fn_addr);
 				snprintf(name, sizeof(name), "dhfn_%d", i);
 				if (dfn && dfn->jit_fn)
-					MIR_load_external(ctx, name, dfn->jit_fn);
+					MIR_load_external(ctx, name, mir_extern_addr(dfn->jit_fn));
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-				else if (dfn && dfn->jit_fn_name)
+				else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name)
 				{
 					void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
 					if (fn)
@@ -4174,16 +4350,16 @@ mir_compile_expr(ExprState *state)
 				}
 				snprintf(name, sizeof(name), "ah_%d", i);
 				if (helper_fn)
-					MIR_load_external(ctx, name, helper_fn);
+					MIR_load_external(ctx, name, mir_extern_addr(helper_fn));
 			}
 			else
 			{
 				const JitDirectFn *dfn = jit_find_direct_fn(steps[i].d.func.fn_addr);
 				snprintf(name, sizeof(name), "dfn_%d", i);
 				if (dfn && dfn->jit_fn)
-					MIR_load_external(ctx, name, dfn->jit_fn);
+					MIR_load_external(ctx, name, mir_extern_addr(dfn->jit_fn));
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-				else if (dfn && dfn->jit_fn_name)
+				else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name)
 				{
 					void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
 					if (fn)
@@ -4202,11 +4378,78 @@ mir_compile_expr(ExprState *state)
 			pfree(step_labels);
 			pfree(step_fn_imports);
 			pfree(step_direct_imports);
+			mir_shared_code_mode = false;
 			return false;
+		}
+
+		/*
+		 * MIR_gen() returns a thunk address, not the actual machine code.
+		 * For local execution, the thunk works fine (it jumps to machine_code).
+		 * But for sharing via DSM, we need the actual machine_code pointer and
+		 * its length.
+		 */
+
+		/*
+		 * In shared code mode, MIR compiled with sentinel addresses.
+		 * Patch them to real addresses in the actual machine code, before
+		 * executing or storing.
+		 *
+		 * MIR uses MAP_JIT on macOS ARM64, so after MIR_gen() the code
+		 * memory is in execute mode.  Toggle W^X for patching.
+		 */
+		if (mir_shared_code_mode && mir_n_sentinels > 0)
+		{
+			void   *mcode = f->machine_code;
+			Size	mcode_size = f->machine_code_len;
+			int		npatched;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+			pthread_jit_write_protect_np(0);	/* write mode */
+#endif
+
+			npatched = mir_patch_sentinels(mcode, mcode_size);
+
+			elog(DEBUG1, "pg_jitter[mir]: patched %d/%d sentinel addresses "
+				 "in %zu bytes of machine code (thunk=%p, mcode=%p)",
+				 npatched, mir_n_sentinels, mcode_size, code, mcode);
+
+#if defined(__APPLE__) && defined(__aarch64__)
+			sys_icache_invalidate(mcode, mcode_size);
+			pthread_jit_write_protect_np(1);	/* exec mode */
+#endif
 		}
 
 		/* Set the eval function (with validation wrapper on first call) */
 		pg_jitter_install_expr(state, (ExprStateEvalFunc) code);
+
+		/*
+		 * Leader: record compiled machine code for later flushing to DSM.
+		 * Use f->machine_code (actual code), not `code` (thunk).
+		 */
+		if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
+			!IsParallelWorker() &&
+			(state->parent->state->es_jit_flags & PGJIT_EXPR))
+		{
+			PendingSharedCode *psc;
+			void   *mcode = f->machine_code;
+			Size	mcode_size = f->machine_code_len;
+
+			elog(DEBUG1, "pg_jitter[mir]: leader storing code "
+				 "node=%d expr=%d (%zu bytes) mcode=%p fallback=%p",
+				 shared_node_id, shared_expr_idx,
+				 mcode_size, mcode, (void *) pg_jitter_fallback_step);
+
+			psc = (PendingSharedCode *)
+				MemoryContextAlloc(TopMemoryContext,
+								   sizeof(PendingSharedCode));
+			psc->node_id = shared_node_id;
+			psc->expr_idx = shared_expr_idx;
+			psc->code = mcode;
+			psc->code_size = mcode_size;
+			psc->dylib_ref_addr = (uint64)(uintptr_t) pg_jitter_fallback_step;
+			psc->next = jctx->pending_shared;
+			jctx->pending_shared = psc;
+		}
 	}
 
 	/*
@@ -4218,6 +4461,9 @@ mir_compile_expr(ExprState *state)
 	pfree(step_labels);
 	pfree(step_fn_imports);
 	pfree(step_direct_imports);
+
+	/* Reset shared code mode for next compilation */
+	mir_shared_code_mode = false;
 
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_ACCUM_DIFF(jctx->base.instr.generation_counter,

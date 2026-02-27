@@ -14,6 +14,30 @@
 #include "access/tupdesc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "access/parallel.h"
+
+/*
+ * SharedJitCompiledCode / SharedJitCodeEntry — mirror of the structs in
+ * execParallel.c.  We need them here because pg_jitter cannot #include
+ * the PG executor's private typedefs.
+ */
+typedef struct SharedJitCompiledCode
+{
+	pg_atomic_uint32 lock;			/* simple spinlock for concurrent writes */
+	int			num_entries;
+	Size		capacity;			/* total allocated size */
+	Size		used;				/* bytes used so far (header + entries) */
+	/* SharedJitCodeEntry entries follow */
+} SharedJitCompiledCode;
+
+typedef struct SharedJitCodeEntry
+{
+	int			plan_node_id;
+	int			expr_index;			/* ordinal within plan node */
+	Size		code_size;
+	uint64		dylib_ref_addr;		/* leader's pg_jitter_fallback_step address */
+	char		code_bytes[FLEXIBLE_ARRAY_MEMBER];
+} SharedJitCodeEntry;
 
 /* Linked-list node tracking one compiled function's native code */
 typedef struct CompiledCode
@@ -23,12 +47,33 @@ typedef struct CompiledCode
 	void   *data;						/* backend-specific compiled code handle */
 } CompiledCode;
 
+/*
+ * Pending shared code entry — compiled by the leader before DSM is available.
+ * Flushed to DSM after ExecInitParallelPlan allocates SharedJitCompiledCode.
+ */
+typedef struct PendingSharedCode
+{
+	struct PendingSharedCode *next;
+	int			node_id;
+	int			expr_idx;
+	void	   *code;		/* pointer to sljit-generated code */
+	Size		code_size;
+	uint64		dylib_ref_addr;	/* leader's pg_jitter_fallback_step address */
+} PendingSharedCode;
+
 /* Our JIT context — extends JitContext by embedding it as the first member */
 typedef struct PgJitterContext
 {
 	JitContext		base;				/* must be first */
 	CompiledCode   *compiled_list;		/* linked list of compiled code */
 	ResourceOwner	resowner;
+
+	/* Expression identity tracking for shared code in parallel queries */
+	int			last_plan_node_id;	/* reset expr_ordinal when this changes */
+	int			expr_ordinal;		/* incremented per compile_expr call */
+
+	/* Pending shared code (leader only, flushed after DSM allocation) */
+	PendingSharedCode *pending_shared;
 } PgJitterContext;
 
 /* Get-or-create a PgJitterContext from the EState */
@@ -87,5 +132,87 @@ extern void pg_jitter_agg_byref_finish(AggState *aggstate,
  */
 extern void pg_jitter_install_expr(ExprState *state,
 								   ExprStateEvalFunc compiled_func);
+
+/*
+ * Shared JIT code helpers for parallel query.
+ * Leader stores compiled code bytes in DSM; workers copy them to local
+ * executable memory instead of recompiling.
+ */
+
+/* Store compiled code in DSM (leader only). Returns true on success. */
+extern bool pg_jitter_store_shared_code(void *shared, const void *code,
+										Size code_size, int node_id,
+										int expr_idx, uint64 dylib_ref_addr);
+
+/* Find compiled code in DSM (worker). Returns true if found. */
+extern bool pg_jitter_find_shared_code(void *shared, int node_id,
+									   int expr_idx,
+									   const void **code_bytes,
+									   Size *code_size,
+									   uint64 *dylib_ref_addr);
+
+/* Copy code bytes to local executable memory. */
+extern void *pg_jitter_copy_to_executable(const void *code_bytes,
+										  Size code_size);
+
+/* Free executable memory allocated by pg_jitter_copy_to_executable. */
+extern void pg_jitter_exec_free(void *ptr);
+
+/* Get the executable code pointer from a handle returned by pg_jitter_copy_to_executable. */
+extern void *pg_jitter_exec_code_ptr(void *handle);
+
+/*
+ * Relocate dylib function addresses in copied executable code.
+ *
+ * When JIT code is shared between leader and worker processes, any absolute
+ * addresses pointing into pg_jitter_sljit.dylib are WRONG in the worker
+ * because the dylib loads at a different ASLR base address.
+ *
+ * This function scans ARM64 MOVZ+3xMOVK sequences in the code, identifies
+ * addresses in the leader's dylib range, and patches them to the worker's
+ * addresses using the delta between leader_ref_addr and worker_ref_addr
+ * (both pg_jitter_fallback_step addresses).
+ *
+ * Must be called AFTER pg_jitter_copy_to_executable and BEFORE the code runs.
+ * The handle must point to a writable+executable MAP_JIT region.
+ */
+extern int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
+										   uint64 leader_ref_addr,
+										   uint64 worker_ref_addr);
+
+/* Get expression identity (plan_node_id, expr_ordinal) for the current expr. */
+extern void pg_jitter_get_expr_identity(PgJitterContext *ctx,
+										ExprState *state,
+										int *node_id, int *expr_idx);
+
+/*
+ * Flush pending shared code entries to DSM.
+ * Called from ExecInitParallelPlan after DSM allocation, via a hook
+ * or directly. The leader records compiled code during ExecInitNode
+ * (before DSM exists), then flushes after DSM is allocated.
+ */
+extern void pg_jitter_flush_shared_code(JitContext *jit_context,
+										void *shared_jit_code);
+extern Size pg_jitter_estimate_shared_code_size(JitContext *jit_context);
+
+/* Parallel JIT mode enum — same values in all backends */
+#define PARALLEL_JIT_OFF        0
+#define PARALLEL_JIT_PER_WORKER 1
+#define PARALLEL_JIT_SHARED     2
+
+/* GUC variables shared across backends (defined in pg_jitter_common.c) */
+extern int pg_jitter_parallel_mode;
+extern int pg_jitter_shared_code_max_kb;
+
+/*
+ * Read the current parallel mode from the GUC system.
+ *
+ * When a backend is loaded via the meta module, the GUC variable pointer
+ * belongs to whichever module defined the GUC first (the meta or the first
+ * backend loaded). This function reads the actual GUC value from PG's GUC
+ * system, which is always up-to-date regardless of which variable pointer
+ * was registered.
+ */
+extern int pg_jitter_get_parallel_mode(void);
 
 #endif /* PG_JITTER_COMMON_H */

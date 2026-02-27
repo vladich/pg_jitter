@@ -32,6 +32,9 @@
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
 
+/* Forward declaration — must match pg_jitter_common.h */
+typedef struct PendingSharedCode PendingSharedCode;
+
 /* ----------------------------------------------------------------
  * PgJitterContext — must match the layout in pg_jitter_common.h
  * ---------------------------------------------------------------- */
@@ -47,6 +50,15 @@ typedef struct MetaJitterContext
 	JitContext			base;			/* must be first */
 	MetaCompiledCode   *compiled_list;
 	ResourceOwner		resowner;
+
+	/*
+	 * Must mirror PgJitterContext layout for shared code support.
+	 * The sljit/asmjit/mir backends cast es_jit to PgJitterContext
+	 * and access these fields.
+	 */
+	int					last_plan_node_id;
+	int					expr_ordinal;
+	PendingSharedCode  *pending_shared;
 } MetaJitterContext;
 
 /* ----------------------------------------------------------------
@@ -129,6 +141,14 @@ static const char *backend_libnames[] = {
 };
 
 static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
+
+/* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
+static int meta_parallel_mode = 2;		/* PARALLEL_JIT_SHARED */
+static int meta_shared_code_max_kb = 4096;	/* 4 MB */
+
+#define PARALLEL_JIT_OFF        0
+#define PARALLEL_JIT_PER_WORKER 1
+#define PARALLEL_JIT_SHARED     2
 
 /* ----------------------------------------------------------------
  * Cached backend state
@@ -232,6 +252,9 @@ meta_ensure_context(ExprState *state)
 #endif
 	ctx->compiled_list = NULL;
 	ctx->resowner = CurrentResourceOwner;
+	ctx->last_plan_node_id = -1;
+	ctx->expr_ordinal = 0;
+	ctx->pending_shared = NULL;
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
 
@@ -346,6 +369,39 @@ meta_detect_default(void)
 	return PG_JITTER_BACKEND_SLJIT;
 }
 
+static void
+meta_flush_shared_code(JitContext *jit_context, void *shared_jit_code)
+{
+	int		idx = pg_jitter_backend;
+
+	if (meta_load_backend(idx) && backends[idx].cb.flush_shared_code)
+	{
+		backends[idx].cb.flush_shared_code(jit_context, shared_jit_code);
+		return;
+	}
+
+	/* Fallback: try each backend */
+	for (idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
+	{
+		if (meta_load_backend(idx) && backends[idx].cb.flush_shared_code)
+		{
+			backends[idx].cb.flush_shared_code(jit_context, shared_jit_code);
+			return;
+		}
+	}
+}
+
+static Size
+meta_estimate_shared_code_size(JitContext *jit_context)
+{
+	int		idx = pg_jitter_backend;
+
+	if (meta_load_backend(idx) && backends[idx].cb.estimate_shared_code_size)
+		return backends[idx].cb.estimate_shared_code_size(jit_context);
+
+	return 0;
+}
+
 void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
@@ -354,9 +410,53 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = meta_reset_after_error;
 	cb->release_context = meta_release_context;
 	cb->compile_expr = meta_compile_expr;
+	cb->flush_shared_code = meta_flush_shared_code;
+	cb->estimate_shared_code_size = meta_estimate_shared_code_size;
 
 	boot_default = meta_detect_default();
 	pg_jitter_backend = boot_default;
+
+	/*
+	 * Define parallel_mode and shared_code_max BEFORE pg_jitter.backend,
+	 * because the backend assign hook (meta_backend_assign) eagerly loads
+	 * the backend .dylib.  That backend's _PG_jit_provider_init will try
+	 * to define these same GUCs — the GetConfigOption guard skips the
+	 * define only if the GUC already exists.  So we must define them first.
+	 */
+	{
+		static const struct config_enum_entry parallel_jit_options[] = {
+			{"off", PARALLEL_JIT_OFF, false},
+			{"per_worker", PARALLEL_JIT_PER_WORKER, false},
+			{"shared", PARALLEL_JIT_SHARED, false},
+			{NULL, 0, false}
+		};
+
+		DefineCustomEnumVariable(
+			"pg_jitter.parallel_mode",
+			"Controls JIT behavior in parallel workers: "
+			"off (workers use interpreter), "
+			"per_worker (each worker compiles independently), "
+			"shared (leader shares compiled code via DSM)",
+			NULL,
+			&meta_parallel_mode,
+			PARALLEL_JIT_SHARED,
+			parallel_jit_options,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	DefineCustomIntVariable(
+		"pg_jitter.shared_code_max",
+		"Maximum shared JIT code DSM size in KB.",
+		NULL,
+		&meta_shared_code_max_kb,
+		4096,		/* 4 MB default */
+		64,			/* 64 KB minimum */
+		1048576,	/* 1 GB maximum */
+		PGC_USERSET,
+		GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("pg_jitter.backend",
 							 "Selects the active pg_jitter JIT backend.",
@@ -365,7 +465,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 boot_default,
 							 backend_options,
 							 PGC_USERSET,
-							 0,
+							 GUC_ALLOW_IN_PARALLEL,
 							 NULL,
 							 meta_backend_assign,
 							 NULL);

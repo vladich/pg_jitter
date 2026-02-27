@@ -13,7 +13,63 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/expandeddatum.h"
+#include "utils/guc.h"
 #include "fmgr.h"
+
+#include <stdlib.h>  /* for atoi */
+
+/* GUC: pg_jitter.parallel_mode — shared across backends */
+int pg_jitter_parallel_mode = 2;	/* PARALLEL_JIT_SHARED */
+
+/* GUC: pg_jitter.shared_code_max — cap in KB */
+int pg_jitter_shared_code_max_kb = 4096;	/* 4 MB default */
+
+/*
+ * Read the current pg_jitter.parallel_mode from PG's GUC system.
+ *
+ * This is needed because when backends are loaded via the meta module,
+ * the GUC variable pointer may belong to a different dylib's copy of
+ * pg_jitter_parallel_mode.  Reading from the GUC system ensures we
+ * always get the current value regardless of which module defined it.
+ */
+int
+pg_jitter_get_parallel_mode(void)
+{
+	const char *val = GetConfigOption("pg_jitter.parallel_mode", true, false);
+
+	if (val == NULL)
+		return pg_jitter_parallel_mode;		/* fallback to local default */
+
+	if (strcmp(val, "off") == 0)
+		return PARALLEL_JIT_OFF;
+	else if (strcmp(val, "per_worker") == 0)
+		return PARALLEL_JIT_PER_WORKER;
+	else if (strcmp(val, "shared") == 0)
+		return PARALLEL_JIT_SHARED;
+
+	return pg_jitter_parallel_mode;		/* unknown value, use local */
+}
+
+/*
+ * Read pg_jitter.shared_code_max from the GUC system (in KB).
+ */
+static int
+pg_jitter_get_shared_code_max_kb(void)
+{
+	const char *val = GetConfigOption("pg_jitter.shared_code_max", true, false);
+
+	if (val != NULL)
+		return atoi(val);
+
+	return pg_jitter_shared_code_max_kb;
+}
+
+#include <sys/mman.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <pthread.h>
+#include <libkern/OSCacheControl.h>
+#endif
+
 
 
 /*
@@ -107,6 +163,8 @@ pg_jitter_get_context(ExprState *state)
 #endif
 	ctx->compiled_list = NULL;
 	ctx->resowner = CurrentResourceOwner;
+	ctx->last_plan_node_id = -1;
+	ctx->expr_ordinal = 0;
 
 	PgJitterRememberContext(CurrentResourceOwner, ctx);
 
@@ -1417,4 +1475,427 @@ pg_jitter_install_expr(ExprState *state, ExprStateEvalFunc compiled_func)
 {
 	state->evalfunc = pg_jitter_run_compiled_expr;
 	state->evalfunc_private = (void *) compiled_func;
+}
+
+
+/* ----------------------------------------------------------------
+ * Shared JIT code helpers for parallel query
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Store compiled code bytes in DSM shared memory (leader only).
+ *
+ * Uses a simple spinlock (pg_atomic_uint32) to protect concurrent writes,
+ * though in practice only the leader stores code.
+ */
+bool
+pg_jitter_store_shared_code(void *shared, const void *code,
+							Size code_size, int node_id, int expr_idx,
+							uint64 dylib_ref_addr)
+{
+	SharedJitCompiledCode *sjc = (SharedJitCompiledCode *) shared;
+	SharedJitCodeEntry *entry;
+	Size		entry_size;
+
+	entry_size = MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + code_size);
+
+	/* Spinlock acquire */
+	while (pg_atomic_exchange_u32(&sjc->lock, 1) != 0)
+		pg_spin_delay();
+
+	/* Check if there's enough space */
+	if (sjc->used + entry_size > sjc->capacity)
+	{
+		elog(DEBUG1, "pg_jitter: DSM full: need %zu bytes, have %zu/%zu",
+			 entry_size, sjc->capacity - sjc->used, sjc->capacity);
+		pg_atomic_write_u32(&sjc->lock, 0);
+		return false;
+	}
+
+	entry = (SharedJitCodeEntry *) ((char *) sjc + sjc->used);
+	entry->plan_node_id = node_id;
+	entry->expr_index = expr_idx;
+	entry->code_size = code_size;
+	entry->dylib_ref_addr = dylib_ref_addr;
+	memcpy(entry->code_bytes, code, code_size);
+
+	sjc->used += entry_size;
+	sjc->num_entries++;
+
+	/* Release lock */
+	pg_atomic_write_u32(&sjc->lock, 0);
+
+	return true;
+}
+
+/*
+ * Find compiled code in DSM shared memory (worker).
+ *
+ * Scans all entries for a matching (plan_node_id, expr_index) pair.
+ * Returns true if found, with code_bytes and code_size set.
+ */
+bool
+pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
+						   const void **code_bytes, Size *code_size,
+						   uint64 *dylib_ref_addr)
+{
+	SharedJitCompiledCode *sjc = (SharedJitCompiledCode *) shared;
+	Size		offset;
+	int			i;
+
+	offset = MAXALIGN(sizeof(SharedJitCompiledCode));
+
+	for (i = 0; i < sjc->num_entries; i++)
+	{
+		SharedJitCodeEntry *entry = (SharedJitCodeEntry *) ((char *) sjc + offset);
+
+		if (entry->plan_node_id == node_id && entry->expr_index == expr_idx)
+		{
+			*code_bytes = entry->code_bytes;
+			*code_size = entry->code_size;
+			if (dylib_ref_addr)
+				*dylib_ref_addr = entry->dylib_ref_addr;
+			return true;
+		}
+
+		offset += MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) +
+						   entry->code_size);
+	}
+
+	return false;
+}
+
+/*
+ * ExecMemInfo: tracks mmap allocation for proper cleanup.
+ * Returned as an opaque handle by pg_jitter_copy_to_executable;
+ * callers must use pg_jitter_exec_code_ptr to get the executable address.
+ */
+typedef struct ExecMemInfo
+{
+	void   *code_ptr;	/* the executable memory (mmap'd) */
+	Size	alloc_size;
+} ExecMemInfo;
+
+/*
+ * Copy code bytes to local executable memory.
+ *
+ * On macOS ARM64, uses mmap(MAP_JIT) + pthread_jit_write_protect_np for W^X.
+ * On Linux, uses mmap + mprotect.
+ * Returns an ExecMemInfo handle (use pg_jitter_exec_code_ptr for code address).
+ */
+
+void *
+pg_jitter_copy_to_executable(const void *code_bytes, Size code_size)
+{
+	void		   *mem;
+	ExecMemInfo	   *info;
+	Size			alloc_size;
+
+	/*
+	 * Allocate a fresh MAP_JIT page for the shared code.
+	 * Each allocation gets its own mmap — avoids interference with sljit's
+	 * allocator state and ensures clean W^X transitions.
+	 */
+	alloc_size = (code_size + 4095) & ~((Size)4095);	/* page-align */
+
+#if defined(__APPLE__) && defined(__aarch64__)
+	mem = mmap(NULL, alloc_size,
+			   PROT_READ | PROT_WRITE | PROT_EXEC,
+			   MAP_PRIVATE | MAP_ANON | MAP_JIT,
+			   -1, 0);
+	if (mem == MAP_FAILED)
+		return NULL;
+
+	pthread_jit_write_protect_np(0);
+	memcpy(mem, code_bytes, code_size);
+	sys_icache_invalidate(mem, code_size);
+	pthread_jit_write_protect_np(1);
+
+	/* Verify: read back the code bytes and compare */
+	if (memcmp(mem, code_bytes, code_size) != 0)
+		elog(WARNING, "pg_jitter: VERIFY FAILED — code bytes don't match after copy!");
+	else
+		elog(DEBUG1, "pg_jitter: copy verified OK (%zu bytes)", code_size);
+#else
+	mem = mmap(NULL, alloc_size,
+			   PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANON,
+			   -1, 0);
+	if (mem == MAP_FAILED)
+		return NULL;
+
+	memcpy(mem, code_bytes, code_size);
+	if (mprotect(mem, alloc_size, PROT_READ | PROT_EXEC) != 0)
+	{
+		munmap(mem, alloc_size);
+		return NULL;
+	}
+#if defined(__aarch64__)
+	__builtin___clear_cache((char *) mem, (char *) mem + code_size);
+#endif
+#endif
+
+	info = (ExecMemInfo *)
+		MemoryContextAlloc(TopMemoryContext, sizeof(ExecMemInfo));
+	info->code_ptr = mem;
+	info->alloc_size = alloc_size;
+
+	return info;
+}
+
+/*
+ * Free executable memory allocated by pg_jitter_copy_to_executable.
+ */
+
+void
+pg_jitter_exec_free(void *ptr)
+{
+	ExecMemInfo *info = (ExecMemInfo *) ptr;
+
+	if (info)
+	{
+		munmap(info->code_ptr, info->alloc_size);
+		pfree(info);
+	}
+}
+
+void *
+pg_jitter_exec_code_ptr(void *handle)
+{
+	ExecMemInfo *info = (ExecMemInfo *) handle;
+	return info->code_ptr;
+}
+
+/*
+ * Relocate dylib function addresses in copied ARM64 executable code.
+ *
+ * Scans for MOVZ+3×MOVK sequences (the pattern sljit uses for 64-bit
+ * immediates when SLJIT_REWRITABLE_JUMP is set). For each sequence,
+ * reconstructs the embedded 64-bit address. If the address falls within
+ * a generous range around the leader's dylib reference address, it's
+ * assumed to be a dylib function pointer and is relocated by adding the
+ * delta between leader and worker addresses.
+ *
+ * Returns the number of addresses patched.
+ */
+int
+pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
+							   uint64 leader_ref_addr,
+							   uint64 worker_ref_addr)
+{
+#if defined(__aarch64__)
+	ExecMemInfo *info = (ExecMemInfo *) handle;
+	uint32_t   *insns;
+	int			ninsns;
+	int			patched = 0;
+	int64		delta;
+
+	if (!info || leader_ref_addr == worker_ref_addr)
+		return 0;
+
+	delta = (int64)(worker_ref_addr - leader_ref_addr);
+	insns = (uint32_t *) info->code_ptr;
+	ninsns = code_size / 4;
+
+	/*
+	 * Toggle to write mode for patching.
+	 * The page was set to exec mode by pg_jitter_copy_to_executable.
+	 */
+#if defined(__APPLE__)
+	pthread_jit_write_protect_np(0);
+#endif
+
+	/*
+	 * Scan for MOVZ+MOVK+MOVK+MOVK sequences targeting the same register.
+	 *
+	 * ARM64 encoding:
+	 *   MOVZ: 1 10 100101 hw(2) imm16(16) Rd(5)
+	 *   MOVK: 1 11 100101 hw(2) imm16(16) Rd(5)
+	 *
+	 * sljit emits them in order: hw=0, hw=1, hw=2, hw=3.
+	 * We look for MOVZ(hw=0) followed by 3 MOVK(hw=1,2,3) with same Rd.
+	 */
+	for (int i = 0; i + 3 < ninsns; i++)
+	{
+		uint32_t w0 = insns[i];
+		uint32_t w1 = insns[i + 1];
+		uint32_t w2 = insns[i + 2];
+		uint32_t w3 = insns[i + 3];
+
+		/* Check MOVZ X?, #imm, LSL #0 */
+		if ((w0 & 0xFFE00000) != 0xD2800000)
+			continue;
+
+		int rd = w0 & 0x1F;
+
+		/* Check MOVK X?, #imm, LSL #16 with same Rd */
+		if ((w1 & 0xFFE0001F) != (0xF2A00000 | rd))
+			continue;
+
+		/* Check MOVK X?, #imm, LSL #32 with same Rd */
+		if ((w2 & 0xFFE0001F) != (0xF2C00000 | rd))
+			continue;
+
+		/* Check MOVK X?, #imm, LSL #48 with same Rd */
+		if ((w3 & 0xFFE0001F) != (0xF2E00000 | rd))
+			continue;
+
+		/* Reconstruct the 64-bit address */
+		uint64	addr;
+		addr  = (uint64)((w0 >> 5) & 0xFFFF);
+		addr |= (uint64)((w1 >> 5) & 0xFFFF) << 16;
+		addr |= (uint64)((w2 >> 5) & 0xFFFF) << 32;
+		addr |= (uint64)((w3 >> 5) & 0xFFFF) << 48;
+
+		/*
+		 * Check if this address is within the dylib's address range.
+		 * The dylib is ~512KB, so any function should be within ±512KB
+		 * of the reference (pg_jitter_fallback_step).
+		 */
+		int64	offset_from_ref = (int64)(addr - leader_ref_addr);
+
+		elog(DEBUG1, "pg_jitter: relocate scan insn[%d] rd=x%d addr=%lx "
+			 "offset_from_ref=%ld",
+			 i, rd, (unsigned long) addr, (long) offset_from_ref);
+
+		if (offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000)
+		{
+			/* Relocate: add delta to get worker's address */
+			uint64 new_addr = addr + delta;
+
+			elog(DEBUG1, "pg_jitter: relocate PATCH insn[%d] rd=x%d "
+				 "old=%lx new=%lx delta=%ld",
+				 i, rd, (unsigned long) addr, (unsigned long) new_addr,
+				 (long) delta);
+
+			/* Patch the 4 instructions with new imm16 values */
+			insns[i]     = (w0 & 0xFFE0001F) | (((new_addr >>  0) & 0xFFFF) << 5);
+			insns[i + 1] = (w1 & 0xFFE0001F) | (((new_addr >> 16) & 0xFFFF) << 5);
+			insns[i + 2] = (w2 & 0xFFE0001F) | (((new_addr >> 32) & 0xFFFF) << 5);
+			insns[i + 3] = (w3 & 0xFFE0001F) | (((new_addr >> 48) & 0xFFFF) << 5);
+
+			patched++;
+			i += 3; /* skip the 3 MOVK instructions */
+		}
+	}
+
+	if (patched > 0)
+	{
+		/* Flush I-cache after patching */
+		sys_icache_invalidate(info->code_ptr, code_size);
+	}
+
+#if defined(__APPLE__)
+	/* Restore exec mode */
+	pthread_jit_write_protect_np(1);
+#endif
+
+	return patched;
+#else
+	/* TODO: x86_64 relocation (MOV imm64 sequences) */
+	return 0;
+#endif
+}
+
+/*
+ * Get expression identity for shared code matching.
+ *
+ * Uses (plan_node_id, expr_ordinal) as the key. plan_node_id is stable
+ * across leader/workers (from the plan). expr_ordinal is a counter
+ * incremented per compile_expr call within each PlanState — deterministic
+ * because ExecInitExpr processes expressions in the same order.
+ */
+void
+pg_jitter_get_expr_identity(PgJitterContext *ctx, ExprState *state,
+							int *node_id, int *expr_idx)
+{
+	/*
+	 * Use (plan_node_id, global_ordinal) as identity key.
+	 *
+	 * The ordinal is a globally incrementing counter across all compile_expr
+	 * calls within this JitContext. Both leader and worker traverse the plan
+	 * tree in the same deterministic order (ExecInitNode), so the global
+	 * counter matches between them.
+	 *
+	 * We do NOT reset expr_ordinal per plan_node_id because the same node can
+	 * be visited multiple times during ExecInitNode (e.g., in nested loops
+	 * where the inner Gather node's expressions are compiled, then outer
+	 * expressions referencing the same plan node are compiled later).
+	 * Resetting would produce duplicate (node_id, expr_idx) keys, causing
+	 * workers to load the wrong code → SIGSEGV.
+	 */
+	*node_id = state->parent->plan->plan_node_id;
+	*expr_idx = ctx->expr_ordinal++;
+}
+
+/*
+ * Estimate the total DSM space needed for pending shared code entries.
+ *
+ * Called from ExecInitParallelPlan before DSM allocation so we can size
+ * the shared JIT code area based on actual compiled code sizes.
+ */
+Size
+pg_jitter_estimate_shared_code_size(JitContext *jit_context)
+{
+	PgJitterContext *ctx;
+	PendingSharedCode *psc;
+	Size	total = MAXALIGN(sizeof(SharedJitCompiledCode));
+	Size	cap = (Size) pg_jitter_get_shared_code_max_kb() * 1024;
+
+	if (!jit_context)
+		return 0;
+
+	ctx = (PgJitterContext *) jit_context;
+
+	for (psc = ctx->pending_shared; psc != NULL; psc = psc->next)
+		total += MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) +
+						  psc->code_size);
+
+	/* Apply cap from pg_jitter.shared_code_max */
+	if (total > cap)
+		total = cap;
+
+	return total;
+}
+
+/*
+ * Flush pending shared code entries to DSM.
+ *
+ * Called from ExecInitParallelPlan (or a hook there) after DSM is allocated.
+ * Walks the pending_shared list, copies code bytes to DSM, then frees
+ * the list nodes.
+ */
+void
+pg_jitter_flush_shared_code(JitContext *jit_context, void *shared_jit_code)
+{
+	PgJitterContext *ctx;
+	PendingSharedCode *psc, *next;
+	int			flushed = 0;
+
+	if (!jit_context || !shared_jit_code)
+		return;
+
+	ctx = (PgJitterContext *) jit_context;
+
+	elog(DEBUG1, "pg_jitter: flush_shared_code called, pending=%p",
+		 ctx->pending_shared);
+
+	for (psc = ctx->pending_shared; psc != NULL; psc = next)
+	{
+		next = psc->next;
+
+		if (pg_jitter_store_shared_code(shared_jit_code,
+										psc->code, psc->code_size,
+										psc->node_id, psc->expr_idx,
+										psc->dylib_ref_addr))
+			flushed++;
+
+		pfree(psc);
+	}
+	ctx->pending_shared = NULL;
+
+	if (flushed > 0)
+		elog(DEBUG1, "pg_jitter: leader flushed %d expressions to shared DSM",
+			 flushed);
 }
