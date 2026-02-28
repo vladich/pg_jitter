@@ -27,6 +27,15 @@ typedef struct SharedJitCompiledCode
 	int			num_entries;
 	Size		capacity;			/* total allocated size */
 	Size		used;				/* bytes used so far (header + entries) */
+
+	/* Shared deform for parallel I-cache sharing */
+	uint64		deform_addr;		/* leader's mmap VA (0 = not set) */
+	Size		deform_page_size;	/* page-aligned allocation size */
+	Size		deform_code_size;	/* code bytes only */
+	Size		deform_desc_offset;	/* descriptor offset within page */
+	int			deform_natts;		/* columns */
+	/* deform page bytes stored at end of DSM, offset = capacity - deform_page_size */
+
 	/* SharedJitCodeEntry entries follow */
 } SharedJitCompiledCode;
 
@@ -217,5 +226,59 @@ extern int pg_jitter_shared_code_max_kb;
  * was registered.
  */
 extern int pg_jitter_get_parallel_mode(void);
+
+/*
+ * Loop-based deform for wide tables.
+ *
+ * Unrolled deform emits ~140 bytes per column. For wide tables (>100 cols),
+ * this exceeds L1I cache and makes JIT slower than the interpreter.
+ * pg_jitter_deform_threshold() returns the column count above which we
+ * switch from unrolled to a compact loop-based deform.
+ *
+ * Threshold = L1I_cache_size / DEFORM_BYTES_PER_COL / 2
+ */
+#define DEFORM_BYTES_PER_COL  140
+
+/* Per-column descriptor for loop-based deform */
+typedef struct DeformColDesc {
+	int16	attlen;		/* >0 fixed, -1 varlena, -2 cstring */
+	int8	attalign;	/* alignment in bytes (1, 2, 4, 8) */
+	int8	attbyval;	/* pass-by-value? */
+	int8	attnotnull;	/* guaranteed not null? */
+	int8	pad[3];		/* pad to 8 bytes */
+} DeformColDesc;
+
+extern int pg_jitter_deform_threshold(void);
+
+/*
+ * sljit-based deform compilation (shared across all backends via
+ * pg_jitter_deform_jit.c).  Produces standalone void fn(TupleTableSlot *)
+ * functions.  The dispatch function caches compiled deform functions and
+ * selects loop vs unrolled based on pg_jitter_deform_threshold().
+ */
+extern void *pg_jitter_compile_deform(TupleDesc desc,
+									  const TupleTableSlotOps *ops,
+									  int natts);
+struct sljit_generate_code_buffer;		/* forward declaration */
+extern void *pg_jitter_compile_deform_loop(TupleDesc desc,
+										   const TupleTableSlotOps *ops,
+										   int natts,
+										   DeformColDesc *target_descs,
+										   Size *code_size_out,
+										   struct sljit_generate_code_buffer *gen_buf);
+extern void pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot,
+											   int natts);
+
+/*
+ * Shared deform for parallel I-cache sharing.
+ * Leader compiles once and places code+descriptor at a fixed virtual address.
+ * Workers mmap at the same VA via MAP_FIXED_NOREPLACE (Linux) to share L1I.
+ */
+extern bool pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
+											TupleDesc desc,
+											const TupleTableSlotOps *ops,
+											int natts);
+extern bool pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc);
+extern void pg_jitter_reset_shared_deform(void);
 
 #endif /* PG_JITTER_COMMON_H */

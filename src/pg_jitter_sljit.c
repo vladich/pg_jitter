@@ -393,515 +393,32 @@ expr_has_fast_path(ExprState *state)
 }
 
 /*
- * Compile a separate deform function using sljit.
- *
- * Generates a standalone function: void deform_fn(TupleTableSlot *slot)
- * Called from the expression's FETCHSOME handler via sljit_emit_icall.
- *
- * Using a separate function avoids clobbering the expression function's
- * S3/S4 registers (used for aggstate/CurrentMemoryContext), eliminates
- * register pressure, and reduces I-cache footprint by separating deform
- * code from expression evaluation code.
- *
- * Register allocation (independent of expression function):
- *   S0 = slot pointer (input arg, survives calls)
- *   S1 = tts_values pointer (loaded once)
- *   S2 = tts_isnull pointer (loaded once)
- *   S3 = tupdata_base (char *, tuplep + t_hoff)
- *   S4 = t_bits (bits8 *)
- *   R0-R3 = scratch
- *
- * Returns compiled function pointer, or NULL if deform cannot be compiled.
- * Caller is responsible for registering the code for cleanup.
+ * Deform compilation functions (pg_jitter_compile_deform,
+ * pg_jitter_compile_deform_loop, pg_jitter_compiled_deform_dispatch) are in
+ * pg_jitter_deform_jit.c — shared across all backends.
  */
-
-/* Deform function stack layout (separate from expression function) */
-#define DOFF_DEFORM_OFF       0    /* current byte offset */
-#define DOFF_DEFORM_HASNULLS  8    /* hasnulls flag */
-#define DOFF_DEFORM_MAXATT    16   /* maxatt from tuple */
-#define DOFF_TOTAL            24
 
 typedef void (*deform_func_t)(TupleTableSlot *slot);
 
+/* Legacy wrappers for find_or_compile_deform (file-local cache) */
 static void *
 sljit_compile_deform(TupleDesc desc,
                      const TupleTableSlotOps *ops,
                      int natts)
 {
-    struct sljit_compiler *C;
-    int     attnum;
-    int     known_alignment = 0;
-    bool    attguaranteedalign = true;
-    int     guaranteed_column_number = -1;
-    sljit_sw tuple_off;
-    sljit_sw slot_off;
-    void   *code;
-
-    /* Forward-jump arrays */
-    struct sljit_jump **nvalid_jumps;
-    struct sljit_jump **avail_jumps;
-    struct sljit_jump **null_jumps;
-    struct sljit_label **att_labels;
-    struct sljit_jump  *nvalid_default;
-
-    /* --- Guards --- */
-    if (ops == &TTSOpsVirtual)
-        return NULL;
-    if (ops != &TTSOpsHeapTuple && ops != &TTSOpsBufferHeapTuple &&
-        ops != &TTSOpsMinimalTuple)
-        return NULL;
-    if (natts <= 0 || natts > desc->natts)
-        return NULL;
-
-    /* Determine slot-type-specific field offsets */
-    if (ops == &TTSOpsHeapTuple || ops == &TTSOpsBufferHeapTuple)
-    {
-        tuple_off = offsetof(HeapTupleTableSlot, tuple);
-        slot_off = offsetof(HeapTupleTableSlot, off);
-    }
-    else
-    {
-        tuple_off = offsetof(MinimalTupleTableSlot, tuple);
-        slot_off = offsetof(MinimalTupleTableSlot, off);
-    }
-
-    /* --- Pre-scan: find guaranteed_column_number --- */
-    for (attnum = 0; attnum < natts; attnum++)
-    {
-        CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-
-        if (JITTER_ATT_IS_NOTNULL(att) &&
-            !att->atthasmissing &&
-            !att->attisdropped)
-            guaranteed_column_number = attnum;
-    }
-
-    C = sljit_create_compiler(NULL);
-    if (!C)
-        return NULL;
-
-    /* Allocate forward-jump tracking arrays */
-    nvalid_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
-    avail_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
-    null_jumps = palloc0(sizeof(struct sljit_jump *) * natts);
-    att_labels = palloc0(sizeof(struct sljit_label *) * natts);
-
-    /*
-     * Function prologue: void deform_fn(TupleTableSlot *slot)
-     * S0 = slot (input arg)
-     * S1 = tts_values, S2 = tts_isnull (loaded at entry)
-     * S3 = tupdata_base, S4 = t_bits
-     * 4 scratch regs (R0-R3), 5 saved regs (S0-S4)
-     */
-    sljit_emit_enter(C, 0,
-                     SLJIT_ARGS1V(P),
-                     4, 5, DOFF_TOTAL);
-
-    /* S1 = slot->tts_values */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_S1, 0,
-                   SLJIT_MEM1(SLJIT_S0),
-                   offsetof(TupleTableSlot, tts_values));
-    /* S2 = slot->tts_isnull */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_S2, 0,
-                   SLJIT_MEM1(SLJIT_S0),
-                   offsetof(TupleTableSlot, tts_isnull));
-
-    /* R0 = HeapTuple ptr from slot-type-specific offset */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                   SLJIT_MEM1(SLJIT_S0), tuple_off);
-
-    /* R1 = tuplep = heaptuple->t_data (HeapTupleHeader) */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                   SLJIT_MEM1(SLJIT_R0),
-                   offsetof(HeapTupleData, t_data));
-
-    /* t_infomask -> R2 (uint16) */
-    sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R2, 0,
-                   SLJIT_MEM1(SLJIT_R1),
-                   offsetof(HeapTupleHeaderData, t_infomask));
-    /* hasnulls = infomask & HEAP_HASNULL */
-    sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
-                   SLJIT_R2, 0, SLJIT_IMM, HEAP_HASNULL);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_HASNULLS,
-                   SLJIT_R2, 0);
-
-    /* t_infomask2 -> maxatt = infomask2 & HEAP_NATTS_MASK */
-    sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R2, 0,
-                   SLJIT_MEM1(SLJIT_R1),
-                   offsetof(HeapTupleHeaderData, t_infomask2));
-    sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
-                   SLJIT_R2, 0, SLJIT_IMM, HEAP_NATTS_MASK);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_MAXATT,
-                   SLJIT_R2, 0);
-
-    /* S4 = &tuplep->t_bits[0] */
-    sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
-                   SLJIT_R1, 0,
-                   SLJIT_IMM, offsetof(HeapTupleHeaderData, t_bits));
-
-    /* t_hoff -> R2 (zero-extended uint8) */
-    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
-                   SLJIT_MEM1(SLJIT_R1),
-                   offsetof(HeapTupleHeaderData, t_hoff));
-
-    /* S3 = tupdata_base = (char *)tuplep + t_hoff */
-    sljit_emit_op2(C, SLJIT_ADD, SLJIT_S3, 0,
-                   SLJIT_R1, 0, SLJIT_R2, 0);
-
-    /* Load saved offset from slot->off -> [SP+DOFF_DEFORM_OFF] */
-    sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
-                   SLJIT_MEM1(SLJIT_S0), slot_off);
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                   SLJIT_R0, 0);
-
-    /* ============================================================
-     * MISSING ATTRIBUTES CHECK
-     * ============================================================ */
-    if ((natts - 1) > guaranteed_column_number)
-    {
-        struct sljit_jump *skip_missing;
-
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                       SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_MAXATT);
-        skip_missing = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-                                      SLJIT_R0, 0,
-                                      SLJIT_IMM, natts);
-
-        /* call slot_getmissingattrs(slot, maxatt_as_int, natts) */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_MAXATT);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-                       SLJIT_IMM, natts);
-        sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32),
-                         SLJIT_IMM, (sljit_sw) slot_getmissingattrs);
-
-        sljit_set_label(skip_missing, sljit_emit_label(C));
-    }
-
-    /* ============================================================
-     * NVALID DISPATCH: comparison chain
-     * ============================================================ */
-    sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0,
-                   SLJIT_MEM1(SLJIT_S0),
-                   offsetof(TupleTableSlot, tts_nvalid));
-
-    for (attnum = 0; attnum < natts; attnum++)
-    {
-        nvalid_jumps[attnum] = sljit_emit_cmp(C, SLJIT_EQUAL,
-                                              SLJIT_R0, 0,
-                                              SLJIT_IMM, attnum);
-    }
-    /* Default: already deformed enough -> goto out */
-    nvalid_default = sljit_emit_jump(C, SLJIT_JUMP);
-
-    /* ============================================================
-     * PER-ATTRIBUTE CODE EMISSION (unrolled loop)
-     * ============================================================ */
-    for (attnum = 0; attnum < natts; attnum++)
-    {
-        CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-        int     alignto = JITTER_ATTALIGNBY(att);
-
-        /* ---- Emit attcheck label and wire up nvalid dispatch ---- */
-        att_labels[attnum] = sljit_emit_label(C);
-        sljit_set_label(nvalid_jumps[attnum], att_labels[attnum]);
-
-        /* Patch previous null-path forward jump if it targeted this label */
-        if (attnum > 0 && null_jumps[attnum - 1] != NULL)
-            sljit_set_label(null_jumps[attnum - 1], att_labels[attnum]);
-
-        /* If attnum == 0: reset offset to 0 */
-        if (attnum == 0)
-        {
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                           SLJIT_IMM, 0);
-        }
-
-        /* ---- Availability check ---- */
-        if (attnum > guaranteed_column_number)
-        {
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_MAXATT);
-            /* if attnum >= maxatt -> goto out (patched later) */
-            avail_jumps[attnum] = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-                                                 SLJIT_IMM, attnum,
-                                                 SLJIT_R0, 0);
-        }
-
-        /* ---- Null check ---- */
-        if (!JITTER_ATT_IS_NOTNULL(att))
-        {
-            struct sljit_jump *no_hasnulls;
-            struct sljit_jump *bit_is_set;
-
-            /* if (!hasnulls) skip to not-null path */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_HASNULLS);
-            no_hasnulls = sljit_emit_cmp(C, SLJIT_EQUAL,
-                                         SLJIT_R0, 0,
-                                         SLJIT_IMM, 0);
-
-            /* byte = t_bits[attnum >> 3]; test bit (1 << (attnum & 7)) */
-            sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
-                           SLJIT_MEM1(SLJIT_S4), attnum >> 3);
-            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
-                           SLJIT_R0, 0,
-                           SLJIT_IMM, 1 << (attnum & 0x07));
-            /* if bit set -> column is NOT null, skip to alignment */
-            bit_is_set = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-                                        SLJIT_R0, 0,
-                                        SLJIT_IMM, 0);
-
-            /* ---- Column IS NULL ---- */
-            /* tts_values[attnum] = 0 */
-            sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_S1),
-                           attnum * (sljit_sw) sizeof(Datum),
-                           SLJIT_IMM, 0);
-            /* tts_isnull[attnum] = true */
-            sljit_emit_op1(C, SLJIT_MOV_U8,
-                           SLJIT_MEM1(SLJIT_S2), attnum,
-                           SLJIT_IMM, 1);
-
-            null_jumps[attnum] = sljit_emit_jump(C, SLJIT_JUMP);
-
-            /* ---- NOT NULL path continues here ---- */
-            {
-                struct sljit_label *notnull_label = sljit_emit_label(C);
-                sljit_set_label(no_hasnulls, notnull_label);
-                sljit_set_label(bit_is_set, notnull_label);
-            }
-
-            attguaranteedalign = false;
-        }
-
-        /* ---- Alignment ---- */
-        if (alignto > 1 &&
-            (known_alignment < 0 ||
-             known_alignment != TYPEALIGN(alignto, known_alignment)))
-        {
-            if (att->attlen == -1)
-            {
-                struct sljit_jump *is_short;
-
-                attguaranteedalign = false;
-
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-                sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
-                               SLJIT_MEM2(SLJIT_S3, SLJIT_R0), 0);
-                is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-                                          SLJIT_R1, 0,
-                                          SLJIT_IMM, 0);
-
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
-                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
-
-                sljit_set_label(is_short, sljit_emit_label(C));
-            }
-            else
-            {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, alignto - 1);
-                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, ~((sljit_sw)(alignto - 1)));
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
-            }
-
-            if (known_alignment >= 0)
-                known_alignment = TYPEALIGN(alignto, known_alignment);
-        }
-
-        if (attguaranteedalign)
-        {
-            Assert(known_alignment >= 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                           SLJIT_IMM, known_alignment);
-        }
-
-        /* ---- Value extraction ---- */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                       SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-        sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                       SLJIT_S3, 0, SLJIT_R0, 0);
-
-        /* tts_isnull[attnum] = false */
-        sljit_emit_op1(C, SLJIT_MOV_U8,
-                       SLJIT_MEM1(SLJIT_S2), attnum,
-                       SLJIT_IMM, 0);
-
-        if (att->attbyval)
-        {
-            sljit_s32 mov_op;
-
-            switch (att->attlen)
-            {
-                case 1: mov_op = SLJIT_MOV_S8; break;
-                case 2: mov_op = SLJIT_MOV_S16; break;
-                case 4: mov_op = SLJIT_MOV_S32; break;
-                case 8: mov_op = SLJIT_MOV; break;
-                default:
-                    sljit_free_compiler(C);
-                    pfree(nvalid_jumps); pfree(avail_jumps);
-                    pfree(null_jumps); pfree(att_labels);
-                    return NULL;
-            }
-            /* R3 = *(mov_op *)(tupdata_base + off) */
-            sljit_emit_op1(C, mov_op, SLJIT_R3, 0,
-                           SLJIT_MEM1(SLJIT_R1), 0);
-            /* tts_values[attnum] = R3 */
-            sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_S1),
-                           attnum * (sljit_sw) sizeof(Datum),
-                           SLJIT_R3, 0);
-        }
-        else
-        {
-            /* tts_values[attnum] = pointer to data */
-            sljit_emit_op1(C, SLJIT_MOV,
-                           SLJIT_MEM1(SLJIT_S1),
-                           attnum * (sljit_sw) sizeof(Datum),
-                           SLJIT_R1, 0);
-        }
-
-        /* ---- Compute alignment tracking for NEXT column ---- */
-        if (att->attlen < 0)
-        {
-            known_alignment = -1;
-            attguaranteedalign = false;
-        }
-        else if (JITTER_ATT_IS_NOTNULL(att) &&
-                 attguaranteedalign && known_alignment >= 0)
-        {
-            Assert(att->attlen > 0);
-            known_alignment += att->attlen;
-        }
-        else if (JITTER_ATT_IS_NOTNULL(att) &&
-                 (att->attlen % alignto) == 0)
-        {
-            Assert(att->attlen > 0);
-            known_alignment = alignto;
-            attguaranteedalign = false;
-        }
-        else
-        {
-            known_alignment = -1;
-            attguaranteedalign = false;
-        }
-
-        /* ---- Offset advance ---- */
-        if (att->attlen > 0)
-        {
-            if (attguaranteedalign)
-            {
-                Assert(known_alignment >= 0);
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                               SLJIT_IMM, known_alignment);
-            }
-            else
-            {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                               SLJIT_R0, 0, SLJIT_IMM, att->attlen);
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                               SLJIT_R0, 0);
-            }
-        }
-        else if (att->attlen == -1)
-        {
-            /* Varlena: off += varsize_any(attdatap) */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
-            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
-                             SLJIT_IMM, (sljit_sw) varsize_any);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                           SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                           SLJIT_R1, 0, SLJIT_R0, 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                           SLJIT_R1, 0);
-        }
-        else if (att->attlen == -2)
-        {
-            /* Cstring: off += strlen(attdatap) + 1 */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
-            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
-                             SLJIT_IMM, (sljit_sw) strlen);
-            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-                           SLJIT_R0, 0, SLJIT_IMM, 1);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                           SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                           SLJIT_R1, 0, SLJIT_R0, 0);
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF,
-                           SLJIT_R1, 0);
-        }
-    }
-
-    /* ============================================================
-     * EPILOGUE: patch jumps, store tts_nvalid, off, flags, return
-     * ============================================================ */
-    {
-        struct sljit_label *deform_out = sljit_emit_label(C);
-
-        /* Patch all forward jumps that target out */
-        sljit_set_label(nvalid_default, deform_out);
-        for (attnum = 0; attnum < natts; attnum++)
-        {
-            if (avail_jumps[attnum] != NULL)
-                sljit_set_label(avail_jumps[attnum], deform_out);
-        }
-        /* Null-path jump for last attribute */
-        if (null_jumps[natts - 1] != NULL)
-            sljit_set_label(null_jumps[natts - 1], deform_out);
-
-        /* tts_nvalid = natts (int16 store) */
-        sljit_emit_op1(C, SLJIT_MOV_S16,
-                       SLJIT_MEM1(SLJIT_S0),
-                       offsetof(TupleTableSlot, tts_nvalid),
-                       SLJIT_IMM, natts);
-
-        /* slot->off = (uint32) off */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_MEM1(SLJIT_SP), DOFF_DEFORM_OFF);
-        sljit_emit_op1(C, SLJIT_MOV_U32,
-                       SLJIT_MEM1(SLJIT_S0), slot_off,
-                       SLJIT_R1, 0);
-
-        /* tts_flags |= TTS_FLAG_SLOW */
-        sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0,
-                       SLJIT_MEM1(SLJIT_S0),
-                       offsetof(TupleTableSlot, tts_flags));
-        sljit_emit_op2(C, SLJIT_OR, SLJIT_R1, 0,
-                       SLJIT_R1, 0, SLJIT_IMM, TTS_FLAG_SLOW);
-        sljit_emit_op1(C, SLJIT_MOV_U16,
-                       SLJIT_MEM1(SLJIT_S0),
-                       offsetof(TupleTableSlot, tts_flags),
-                       SLJIT_R1, 0);
-    }
-
-    /* Return void */
-    sljit_emit_return_void(C);
-
-    /* Generate native code */
-    code = sljit_generate_code(C, 0, NULL);
-    sljit_free_compiler(C);
-
-    pfree(nvalid_jumps);
-    pfree(avail_jumps);
-    pfree(null_jumps);
-    pfree(att_labels);
-
-    return code;
+    return pg_jitter_compile_deform(desc, ops, natts);
 }
+
+/* (old sljit_compile_deform body removed — now in pg_jitter_deform_jit.c) */
+
+static void *
+sljit_compile_deform_loop(TupleDesc desc,
+                          const TupleTableSlotOps *ops,
+                          int natts)
+{
+    return pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
+}
+
 
 /*
  * Try to match a pre-compiled deform template for the given tuple descriptor.
@@ -987,7 +504,10 @@ find_or_compile_deform(PgJitterContext *ctx,
         void       *code;
 
         INSTR_TIME_SET_CURRENT(deform_start);
-        code = sljit_compile_deform(desc, ops, natts);
+        if (natts > pg_jitter_deform_threshold())
+            code = sljit_compile_deform_loop(desc, ops, natts);
+        else
+            code = sljit_compile_deform(desc, ops, natts);
         INSTR_TIME_SET_CURRENT(deform_end);
         JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
                               deform_end, deform_start);
@@ -1008,6 +528,42 @@ find_or_compile_deform(PgJitterContext *ctx,
         return code;
     }
 }
+
+/*
+ * pg_jitter_compiled_deform_dispatch is now in pg_jitter_deform_jit.c
+ * (shared across all backends).
+ */
+
+/*
+ * Indirect call helper.
+ *
+ * When generating code that will be shared via DSM (sljit_shared_code_mode),
+ * we need absolute addressing so that the relocation scanner can find and
+ * patch embedded function pointers.
+ *
+ * Without SLJIT_REWRITABLE_JUMP, sljit may optimize calls to relative form:
+ *   - ARM64: PC-relative BL (26-bit offset)
+ *   - x86_64: relative CALL (E8 + 32-bit offset)
+ * Both break when code is memcpy'd to a different address in a parallel worker.
+ *
+ * With SLJIT_REWRITABLE_JUMP, sljit always emits absolute addressing:
+ *   - ARM64: MOVZ+3×MOVK+BLR
+ *   - x86_64: MOVABS r, imm64 + CALL r
+ * The relocation scanner can then find and patch the embedded addresses.
+ *
+ * Note: SLJIT_REWRITABLE_JUMP is only valid on sljit_emit_call/sljit_emit_jump,
+ * NOT on sljit_emit_icall — hence the sljit_emit_call + sljit_set_target pattern.
+ */
+#define EMIT_ICALL(C, type, arg_types, fn) \
+    do { \
+        if (sljit_shared_code_mode) { \
+            struct sljit_jump *_j = sljit_emit_call(C, \
+                (type) | SLJIT_REWRITABLE_JUMP, arg_types); \
+            sljit_set_target(_j, (sljit_uw)(fn)); \
+        } else { \
+            sljit_emit_icall(C, type, arg_types, SLJIT_IMM, (sljit_sw)(fn)); \
+        } \
+    } while (0)
 
 /*
  * Emit deform code inline into the expression function body.
@@ -1059,6 +615,10 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         ops != &TTSOpsMinimalTuple)
         return false;
     if (natts <= 0 || natts > desc->natts)
+        return false;
+
+    /* Wide tables: skip inline deform, fall through to compiled loop deform */
+    if (natts > pg_jitter_deform_threshold())
         return false;
 
     /*
@@ -1206,9 +766,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
                        SLJIT_MEM1(SLJIT_SP), SOFF_DEFORM_MAXATT);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
                        SLJIT_IMM, natts);
-        sljit_emit_icall(C, SLJIT_CALL | (sljit_shared_code_mode ? SLJIT_REWRITABLE_JUMP : 0),
-                         SLJIT_ARGS3V(P, 32, 32),
-                         SLJIT_IMM, (sljit_sw) slot_getmissingattrs);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), slot_getmissingattrs);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                        SLJIT_MEM1(SLJIT_SP), vals_off);
 
@@ -1456,9 +1014,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
                            SLJIT_R3, 0);  /* save R3 (vals_off is unused during deform) */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
-            sljit_emit_icall(C, SLJIT_CALL | (sljit_shared_code_mode ? SLJIT_REWRITABLE_JUMP : 0),
-                             SLJIT_ARGS1(W, P),
-                             SLJIT_IMM, (sljit_sw) varsize_any);
+            EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), varsize_any);
             /* R0 = varsize_any result. Restore R3 and add. */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                            SLJIT_MEM1(SLJIT_SP), vals_off);
@@ -1474,9 +1030,7 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
                            SLJIT_R3, 0);  /* save R3 (vals_off is unused during deform) */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
-            sljit_emit_icall(C, SLJIT_CALL | (sljit_shared_code_mode ? SLJIT_REWRITABLE_JUMP : 0),
-                             SLJIT_ARGS1(W, P),
-                             SLJIT_IMM, (sljit_sw) strlen);
+            EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), strlen);
             sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
                            SLJIT_R0, 0, SLJIT_IMM, 1);
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
@@ -1700,19 +1254,6 @@ emit_load_step_field_addr(struct sljit_compiler *C, int opno,
                    SLJIT_IMM,
                    opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
 }
-
-/*
- * Indirect call helper.
- *
- * When generating code that will be shared via DSM (sljit_shared_code_mode),
- * we force SLJIT_REWRITABLE_JUMP so sljit emits MOVZ+3×MOVK+BLR
- * (absolute addressing) instead of potentially converting to a PC-relative
- * BL instruction.  PC-relative BL breaks when code is memcpy'd to a
- * different address in a parallel worker.
- */
-#define EMIT_ICALL(C, type, arg_types, fn) \
-    sljit_emit_icall(C, (type) | (sljit_shared_code_mode ? SLJIT_REWRITABLE_JUMP : 0), \
-                     arg_types, SLJIT_IMM, (sljit_sw)(fn))
 
 /*
  * Paired resvalue/resnull store helpers.
@@ -2198,7 +1739,11 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
  * 3. Patch the `ret` instruction to a forward branch (skip error path)
  * 4. After sljit_generate_code(), fix up BL/CALL relocations
  */
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#if defined(PG_JITTER_HAVE_PRECOMPILED) || defined(PG_JITTER_HAVE_MIR_PRECOMPILED)
+#define PG_JITTER_HAVE_INLINE_BLOBS
+#endif
+
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 
 /* Maximum pending relocations across all precompiled blobs in one expression */
 #define MAX_PRECOMPILED_RELOCS 256
@@ -2421,7 +1966,7 @@ fixup_precompiled_relocs(void *code, sljit_uw code_size,
 #endif
 }
 
-#endif /* PG_JITTER_HAVE_PRECOMPILED */
+#endif /* PG_JITTER_HAVE_INLINE_BLOBS */
 
 static bool
 sljit_compile_expr(ExprState *state)
@@ -2454,7 +1999,7 @@ sljit_compile_expr(ExprState *state)
 	}			   *pending_jumps;
 	int				npending = 0;
 
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 	/* Pending relocations for pre-compiled inline blobs */
 	PendingReloc	precompiled_relocs[MAX_PRECOMPILED_RELOCS];
 	int				n_precompiled_relocs = 0;
@@ -2504,7 +2049,8 @@ sljit_compile_expr(ExprState *state)
 		pg_jitter_get_expr_identity(ctx, state,
 									&shared_node_id, &shared_expr_idx);
 
-		sljit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
+		sljit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED)
+								&& state->parent->state->es_plannedstmt->parallelModeNeeded;
 
 		elog(DEBUG1, "pg_jitter: compile_expr node=%d expr=%d is_worker=%d "
 			 "shared_mode=%d share_init=%d",
@@ -2531,6 +2077,10 @@ sljit_compile_expr(ExprState *state)
 
 		if (!ctx->share_state.initialized)
 			pg_jitter_attach_shared_dsm(ctx);
+
+		/* Try to attach shared deform (same VA as leader for L1I sharing) */
+		if (ctx->share_state.sjc)
+			pg_jitter_attach_shared_deform(ctx->share_state.sjc);
 
 		if (ctx->share_state.sjc &&
 			pg_jitter_find_shared_code(ctx->share_state.sjc,
@@ -2862,6 +2412,39 @@ sljit_compile_expr(ExprState *state)
 							}
 						}
 					}
+				}
+
+				if (!deform_emitted && sljit_shared_code_mode)
+				{
+					/*
+					 * Leader: try to compile shared deform for wide tables.
+					 * Places code+descriptor at a fixed VA that workers will
+					 * mmap at the same address for L1I cache sharing.
+					 */
+					if (!IsParallelWorker() &&
+						op->d.fetch.known_desc &&
+						op->d.fetch.last_var > pg_jitter_deform_threshold() &&
+						ctx->share_state.sjc)
+					{
+						pg_jitter_compile_shared_deform(
+							ctx->share_state.sjc,
+							op->d.fetch.known_desc,
+							op->d.fetch.kind,
+							op->d.fetch.last_var);
+					}
+
+					/*
+					 * Shared mode: call the dylib-resident dispatch function
+					 * which JIT-compiles the deform per-process and caches it.
+					 * Being a dylib function, its address is properly relocated.
+					 * The dispatch function checks shared_deform_fn first.
+					 */
+					emit_load_econtext_slot(C, SLJIT_R0, opcode);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_IMM, op->d.fetch.last_var);
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, 32),
+							   pg_jitter_compiled_deform_dispatch);
+					deform_emitted = true;
 				}
 
 				if (!deform_emitted)
@@ -3298,13 +2881,13 @@ sljit_compile_expr(ExprState *state)
 				 */
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 				bool used_precompiled = false;
 #endif
 
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 				/*
-				 * PRECOMPILED PATH: try to emit clang-optimized native code
+				 * PRECOMPILED PATH: try to emit optimized native code
 				 * for ANY Tier 1 function that has a precompiled blob.
 				 * Covers all 192+ functions (int, float, bool, date, ts, oid,
 				 * hash, aggregates) — not just the 20 with inline_op tags.
@@ -3313,10 +2896,14 @@ sljit_compile_expr(ExprState *state)
 				 * hash_bytes_uint32) — those 5 hash functions fall through
 				 * to the direct-call path.
 				 */
-				if (dfn && dfn->jit_fn && dfn->jit_fn_name)
+				if (dfn && dfn->jit_fn_name)
 				{
-					const PrecompiledInline *pi =
-						jit_find_precompiled(dfn->jit_fn_name);
+					const PrecompiledInline *pi;
+#ifdef PG_JITTER_HAVE_PRECOMPILED
+					pi = jit_find_precompiled(dfn->jit_fn_name);
+#elif defined(PG_JITTER_HAVE_MIR_PRECOMPILED)
+					pi = mir_find_precompiled_blob(dfn->jit_fn_name);
+#endif
 
 					/*
 					 * Only inline blobs that:
@@ -3365,7 +2952,7 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				if (!used_precompiled) {
-#endif /* PG_JITTER_HAVE_PRECOMPILED */
+#endif /* PG_JITTER_HAVE_INLINE_BLOBS */
 				if (dfn && dfn->inline_op != JIT_INLINE_NONE)
 				{
 					/*
@@ -3478,7 +3065,7 @@ sljit_compile_expr(ExprState *state)
 							   offsetof(FunctionCallInfoBaseData, isnull));
 				emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
 				} /* end V1 fallback */
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 				} /* end if (!used_precompiled) */
 #endif
 				} /* end direct-call dispatch block */
@@ -4504,19 +4091,26 @@ sljit_compile_expr(ExprState *state)
 			{
 				int jumpdistinct = op->d.agg_presorted_distinctcheck.jumpdistinct;
 				void *fn = (opcode == EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
-					? (void *) pg_jitter_fallback_step
-					: (void *) pg_jitter_fallback_step;
+					? (void *) ExecEvalPreOrderedDistinctSingle
+					: (void *) ExecEvalPreOrderedDistinctMulti;
 
-				/* These are rare, use fallback */
+				/*
+				 * Direct call: fn(aggstate, pertrans) -> bool.
+				 * If returns false (not distinct), jump to jumpdistinct.
+				 * R0 = aggstate (from parent), R1 = pertrans.
+				 */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_S0, 0);
-				emit_load_step_addr(C, opno, SLJIT_R1);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_S1, 0);
-				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P), pg_jitter_fallback_step);
+							   SLJIT_MEM1(SLJIT_S0),
+							   offsetof(ExprState, parent));
+				emit_load_step_field(C, opno,
+					offsetof(ExprEvalStep,
+							 d.agg_presorted_distinctcheck.pertrans),
+					SLJIT_R1);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(W, P, P), fn);
 
+				/* If result == 0 (not distinct), jump */
 				struct sljit_jump *j =
-					sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+					sljit_emit_cmp(C, SLJIT_EQUAL,
 								   SLJIT_R0, 0, SLJIT_IMM, 0);
 				pending_jumps[npending].jump = j;
 				pending_jumps[npending].target = jumpdistinct;
@@ -6282,6 +5876,198 @@ sljit_compile_expr(ExprState *state)
 			}
 
 			/*
+			 * ---- ROWCOMPARE_STEP ----
+			 * Call comparison fn via fcinfo; jump to jumpnull on NULL
+			 * result, jumpdone on non-zero result.
+			 */
+			case EEOP_ROWCOMPARE_STEP:
+			{
+				FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
+				int jnull = op->d.rowcompare_step.jumpnull;
+				int jdone = op->d.rowcompare_step.jumpdone;
+
+				/*
+				 * If fn_strict and either arg is null → set resnull=true,
+				 * jump to jumpnull.
+				 */
+				if (op->d.rowcompare_step.finfo->fn_strict)
+				{
+					/* R0 = fcinfo->args[0].isnull */
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+						SLJIT_MEM0(),
+						(sljit_sw) &fcinfo->args[0].isnull);
+					/* R1 = fcinfo->args[1].isnull */
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+						SLJIT_MEM0(),
+						(sljit_sw) &fcinfo->args[1].isnull);
+					sljit_emit_op2(C, SLJIT_OR, SLJIT_R0, 0,
+								   SLJIT_R0, 0, SLJIT_R1, 0);
+
+					struct sljit_jump *j_not_null =
+						sljit_emit_cmp(C, SLJIT_EQUAL,
+									   SLJIT_R0, 0, SLJIT_IMM, 0);
+
+					/* Null path: *resnull = true, jump to jumpnull */
+					emit_store_resnull_true(C, state, opno, op);
+					{
+						struct sljit_jump *j =
+							sljit_emit_jump(C, SLJIT_JUMP);
+						pending_jumps[npending].jump = j;
+						pending_jumps[npending].target = jnull;
+						npending++;
+					}
+
+					sljit_set_label(j_not_null, sljit_emit_label(C));
+				}
+
+				/* fcinfo->isnull = false */
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+					SLJIT_MEM0(),
+					(sljit_sw) &fcinfo->isnull,
+					SLJIT_IMM, 0);
+
+				/* R0 = fn_addr(fcinfo) */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_IMM, (sljit_sw) fcinfo);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+						   op->d.rowcompare_step.fn_addr);
+
+				/* *op->resvalue = R0 */
+				emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+
+				/* If fcinfo->isnull, set resnull=true and jump to jumpnull */
+				{
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+						SLJIT_MEM0(),
+						(sljit_sw) &fcinfo->isnull);
+					struct sljit_jump *j_not_null2 =
+						sljit_emit_cmp(C, SLJIT_EQUAL,
+									   SLJIT_R1, 0, SLJIT_IMM, 0);
+
+					emit_store_resnull_true(C, state, opno, op);
+					{
+						struct sljit_jump *j =
+							sljit_emit_jump(C, SLJIT_JUMP);
+						pending_jumps[npending].jump = j;
+						pending_jumps[npending].target = jnull;
+						npending++;
+					}
+
+					sljit_set_label(j_not_null2, sljit_emit_label(C));
+				}
+
+				/* *resnull = false */
+				emit_store_resnull_false(C, state, opno, op);
+
+				/* If DatumGetInt32(d) != 0, jump to jumpdone */
+				{
+					struct sljit_jump *j =
+						sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+									   SLJIT_R0, 0, SLJIT_IMM, 0);
+					pending_jumps[npending].jump = j;
+					pending_jumps[npending].target = jdone;
+					npending++;
+				}
+				break;
+			}
+
+			/*
+			 * ---- SBSREF_SUBSCRIPTS ----
+			 * Call subscriptfunc(state, op, econtext) -> bool.
+			 * If false (null subscript), jump to jumpdone.
+			 */
+			case EEOP_SBSREF_SUBSCRIPTS:
+			{
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_S0, 0);
+				emit_load_step_addr(C, opno, SLJIT_R1);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+							   SLJIT_S1, 0);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P),
+						   op->d.sbsref_subscript.subscriptfunc);
+
+				/* If R0 == 0 (false), jump to jumpdone */
+				{
+					int jumpdone = op->d.sbsref_subscript.jumpdone;
+					struct sljit_jump *j =
+						sljit_emit_cmp(C, SLJIT_EQUAL,
+									   SLJIT_R0, 0, SLJIT_IMM, 0);
+					pending_jumps[npending].jump = j;
+					pending_jumps[npending].target = jumpdone;
+					npending++;
+				}
+				break;
+			}
+
+			/*
+			 * ---- SBSREF_OLD / SBSREF_ASSIGN / SBSREF_FETCH ----
+			 * Call subscriptfunc(state, op, econtext) -> void.
+			 */
+			case EEOP_SBSREF_OLD:
+			case EEOP_SBSREF_ASSIGN:
+			case EEOP_SBSREF_FETCH:
+			{
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_S0, 0);
+				emit_load_step_addr(C, opno, SLJIT_R1);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+							   SLJIT_S1, 0);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P),
+						   op->d.sbsref.subscriptfunc);
+				break;
+			}
+
+#ifdef HAVE_EEOP_JSONEXPR
+			/*
+			 * ---- JSONEXPR_PATH ----
+			 * Call ExecEvalJsonExprPath(state, op, econtext) -> int.
+			 * Return value is the step number to jump to.
+			 */
+			case EEOP_JSONEXPR_PATH:
+			{
+				JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+				int targets[4];
+				int ntargets = 0;
+
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_S0, 0);
+				emit_load_step_addr(C, opno, SLJIT_R1);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+							   SLJIT_S1, 0);
+				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P),
+						   ExecEvalJsonExprPath);
+
+				/* Collect unique valid targets */
+				targets[ntargets++] = jsestate->jump_end;
+				if (jsestate->jump_empty >= 0 &&
+					jsestate->jump_empty != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_empty;
+				if (jsestate->jump_error >= 0 &&
+					jsestate->jump_error != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_error;
+				if (jsestate->jump_eval_coercion >= 0 &&
+					jsestate->jump_eval_coercion != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_eval_coercion;
+
+				/* Compare R0 against each possible target */
+				for (int t = 0; t < ntargets; t++)
+				{
+					if (targets[t] >= 0 && targets[t] < steps_len)
+					{
+						struct sljit_jump *j =
+							sljit_emit_cmp(C, SLJIT_EQUAL,
+										   SLJIT_R0, 0,
+										   SLJIT_IMM, targets[t]);
+						pending_jumps[npending].jump = j;
+						pending_jumps[npending].target = targets[t];
+						npending++;
+					}
+				}
+				break;
+			}
+#endif /* HAVE_EEOP_JSONEXPR */
+
+			/*
 			 * ---- DEFAULT: fallback to C function ----
 			 * Handles all remaining opcodes via pg_jitter_fallback_step.
 			 */
@@ -6316,28 +6102,12 @@ sljit_compile_expr(ExprState *state)
 					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
 						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
 						break;
-
 #ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
 					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
 						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
 						break;
 #endif
-					/* HASHDATUM_FIRST_STRICT and NEXT32_STRICT are compiled natively */
-					case EEOP_ROWCOMPARE_STEP:
-						/*
-						 * ROWCOMPARE can jump to jumpnull or jumpdone.
-						 * Both are returned by fallback as the step number.
-						 * We use jumpdone here; jumpnull is also valid
-						 * since fallback returns whichever applies.
-						 */
-						fb_jump_target = op->d.rowcompare_step.jumpdone;
-						break;
-					/* EEOP_IOCOERCE_SAFE has no jump */
-					case EEOP_SBSREF_SUBSCRIPTS:
-						fb_jump_target = op->d.sbsref_subscript.jumpdone;
-						break;
-
 #ifdef HAVE_EEOP_RETURNINGEXPR
 					case EEOP_RETURNINGEXPR:
 						fb_jump_target = op->d.returningexpr.jumpdone;
@@ -6347,79 +6117,7 @@ sljit_compile_expr(ExprState *state)
 						break;
 				}
 
-				if (opcode == EEOP_ROWCOMPARE_STEP)
-				{
-					/*
-					 * ROWCOMPARE_STEP has two jump targets:
-					 * jumpnull and jumpdone.  Fallback returns the
-					 * actual step number, so check against each.
-					 */
-					int jnull = op->d.rowcompare_step.jumpnull;
-					int jdone = op->d.rowcompare_step.jumpdone;
-
-					if (jnull >= 0 && jnull < steps_len)
-					{
-						struct sljit_jump *j =
-							sljit_emit_cmp(C, SLJIT_EQUAL,
-										   SLJIT_R0, 0,
-										   SLJIT_IMM, jnull);
-						pending_jumps[npending].jump = j;
-						pending_jumps[npending].target = jnull;
-						npending++;
-					}
-					if (jdone >= 0 && jdone < steps_len)
-					{
-						struct sljit_jump *j =
-							sljit_emit_cmp(C, SLJIT_EQUAL,
-										   SLJIT_R0, 0,
-										   SLJIT_IMM, jdone);
-						pending_jumps[npending].jump = j;
-						pending_jumps[npending].target = jdone;
-						npending++;
-					}
-				}
-
-#ifdef HAVE_EEOP_JSONEXPR
-				else if (opcode == EEOP_JSONEXPR_PATH)
-				{
-					/*
-					 * JSONEXPR_PATH always jumps (unconditional).
-					 * Return value is one of: jump_empty, jump_error,
-					 * jump_eval_coercion, or jump_end.
-					 * Compare R0 against each possible target.
-					 */
-					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-					int targets[4];
-					int ntargets = 0;
-
-					/* Collect unique valid targets */
-					targets[ntargets++] = jsestate->jump_end;
-					if (jsestate->jump_empty >= 0 &&
-						jsestate->jump_empty != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_empty;
-					if (jsestate->jump_error >= 0 &&
-						jsestate->jump_error != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_error;
-					if (jsestate->jump_eval_coercion >= 0 &&
-						jsestate->jump_eval_coercion != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_eval_coercion;
-
-					for (int t = 0; t < ntargets; t++)
-					{
-						if (targets[t] >= 0 && targets[t] < steps_len)
-						{
-							struct sljit_jump *j =
-								sljit_emit_cmp(C, SLJIT_EQUAL,
-											   SLJIT_R0, 0,
-											   SLJIT_IMM, targets[t]);
-							pending_jumps[npending].jump = j;
-							pending_jumps[npending].target = targets[t];
-							npending++;
-						}
-					}
-				}
-#endif /* HAVE_EEOP_JSONEXPR */
-				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
+				if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					/* R0 >= 0 means jump to target step (signed compare!) */
 					struct sljit_jump *j =
@@ -6469,7 +6167,7 @@ sljit_compile_expr(ExprState *state)
 		INSTR_TIME_ACCUM_DIFF(ctx->base.instr.emission_counter,
 							  emit_end, emit_start);
 
-#ifdef PG_JITTER_HAVE_PRECOMPILED
+#ifdef PG_JITTER_HAVE_INLINE_BLOBS
 		/* Patch BL/CALL relocations in pre-compiled blobs.
 		 * Uses sljit label addresses for reliable blob positioning,
 		 * with W^X toggling on macOS ARM64. */

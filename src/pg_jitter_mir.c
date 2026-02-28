@@ -25,6 +25,9 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <pthread.h>
 #include <libkern/OSCacheControl.h>
+#elif defined(__x86_64__) || defined(_M_X64)
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 /*
@@ -517,6 +520,9 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 	if (ops != &TTSOpsHeapTuple && ops != &TTSOpsBufferHeapTuple)
 		return false;
 	if (natts <= 0 || natts > desc->natts)
+		return false;
+	/* Wide tables: fall back to slot_getsomeattrs_int */
+	if (natts > pg_jitter_deform_threshold())
 		return false;
 
 	/* Determine slot-type-specific field offsets */
@@ -1117,6 +1123,7 @@ mir_compile_expr(ExprState *state)
 	/* Prototypes and imports for function calls */
 	MIR_item_t		proto_fallback, import_fallback;
 	MIR_item_t		proto_getsomeattrs, import_getsomeattrs;
+	MIR_item_t		import_deform_dispatch;
 	MIR_item_t		proto_v1func, import_v1func;	/* per-step, see below */
 	MIR_item_t		proto_makero, import_makero;
 	MIR_type_t		res_type;
@@ -1147,7 +1154,18 @@ mir_compile_expr(ExprState *state)
 		pg_jitter_get_expr_identity(jctx, state,
 									&shared_node_id, &shared_expr_idx);
 
-		mir_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
+		mir_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED)
+							&& state->parent->state->es_plannedstmt->parallelModeNeeded;
+
+#if defined(__x86_64__) || defined(_M_X64)
+		/*
+		 * x86_64: MIR's code patterns aren't reliably handled by the
+		 * relocation scanner yet (it expects MOVABS but MIR may use
+		 * RIP-relative addressing). Disable shared code mode so
+		 * workers compile locally instead of reusing leader code.
+		 */
+		mir_shared_code_mode = false;
+#endif
 
 		elog(DEBUG1, "pg_jitter[mir]: compile_expr node=%d expr=%d is_worker=%d "
 			 "shared_mode=%d share_init=%d",
@@ -1259,6 +1277,9 @@ mir_compile_expr(ExprState *state)
 										2, MIR_T_P, "sl", MIR_T_I32, "n");
 	import_getsomeattrs = MIR_new_import(ctx, "getsomeattrs");
 
+	/* Import for deform dispatch (same proto as getsomeattrs: void(P, I32)) */
+	import_deform_dispatch = MIR_new_import(ctx, "deform_dispatch");
+
 	/* Proto for V1 function: fn(FunctionCallInfo) -> Datum */
 	res_type = MIR_T_I64;
 	proto_v1func = MIR_new_proto(ctx, "p_v1func",
@@ -1284,10 +1305,28 @@ mir_compile_expr(ExprState *state)
 	proto_agg_helper = MIR_new_proto(ctx, "p_aggh", 0, NULL,
 									  2, MIR_T_P, "s", MIR_T_P, "o");
 
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+	/* Proto + imports for presorted distinct: fn(AggState*, AggStatePerTrans) -> bool */
+	MIR_item_t proto_presorted_distinct;
+	MIR_item_t import_presorted_single, import_presorted_multi;
+	{
+		MIR_type_t rt = MIR_T_I64;
+		proto_presorted_distinct = MIR_new_proto(ctx, "p_pdist", 1, &rt,
+												  2, MIR_T_P, "a", MIR_T_P, "p");
+	}
+	import_presorted_single = MIR_new_import(ctx, "pdist_single");
+	import_presorted_multi = MIR_new_import(ctx, "pdist_multi");
+#endif
+
 	/* Proto for 3-arg void calls: fn(state, op, econtext) -> void */
 	MIR_item_t proto_3arg_void;
 	proto_3arg_void = MIR_new_proto(ctx, "p_3v", 0, NULL,
 									3, MIR_T_P, "s", MIR_T_P, "o", MIR_T_P, "e");
+
+	/* Proto for 4-arg void calls: fn(state, op, econtext, slot) -> void */
+	MIR_item_t proto_4arg_void;
+	proto_4arg_void = MIR_new_proto(ctx, "p_4v", 0, NULL,
+									4, MIR_T_P, "a", MIR_T_P, "b", MIR_T_P, "c", MIR_T_P, "d");
 
 	/* Proto + imports for inline error handlers: void -> void (noreturn) */
 	MIR_item_t proto_err_void;
@@ -1315,6 +1354,7 @@ mir_compile_expr(ExprState *state)
 	 */
 	MIR_item_t *step_fn_imports = palloc0(sizeof(MIR_item_t) * steps_len);
 	MIR_item_t *step_direct_imports = palloc0(sizeof(MIR_item_t) * steps_len);
+	MIR_item_t *ioc_in_imports = palloc0(sizeof(MIR_item_t) * steps_len);
 	for (int i = 0; i < steps_len; i++)
 	{
 		ExprEvalStep *op = &steps[i];
@@ -1402,6 +1442,132 @@ mir_compile_expr(ExprState *state)
 			snprintf(name, sizeof(name), "ah_%d", i);
 			step_direct_imports[i] = MIR_new_import(ctx, name);
 		}
+		else if (opcode == EEOP_AGG_STRICT_DESERIALIZE ||
+				 opcode == EEOP_AGG_DESERIALIZE)
+		{
+			/* Import for deserialize function: fcinfo->flinfo->fn_addr */
+			char name[32];
+			snprintf(name, sizeof(name), "dser_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_DISTINCT ||
+				 opcode == EEOP_NOT_DISTINCT)
+		{
+			/* Import for equality function in DISTINCT/NOT_DISTINCT */
+			char name[32];
+			snprintf(name, sizeof(name), "fn_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_NULLIF)
+		{
+			/* Import for equality function in NULLIF */
+			char name[32];
+			snprintf(name, sizeof(name), "fn_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		/* Direct-call opcodes: 3-arg void, 2-arg void, PARAM_CALLBACK */
+		else if (opcode == EEOP_FUNCEXPR_FUSAGE ||
+				 opcode == EEOP_FUNCEXPR_STRICT_FUSAGE ||
+				 opcode == EEOP_NULLTEST_ROWISNULL ||
+				 opcode == EEOP_NULLTEST_ROWISNOTNULL ||
+#ifdef HAVE_EEOP_PARAM_SET
+				 opcode == EEOP_PARAM_SET ||
+#endif
+				 opcode == EEOP_ARRAYCOERCE ||
+				 opcode == EEOP_FIELDSELECT ||
+				 opcode == EEOP_FIELDSTORE_DEFORM ||
+				 opcode == EEOP_FIELDSTORE_FORM ||
+				 opcode == EEOP_CONVERT_ROWTYPE ||
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+				 opcode == EEOP_JSON_CONSTRUCTOR ||
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+				 opcode == EEOP_JSONEXPR_COERCION ||
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+				 opcode == EEOP_MERGE_SUPPORT_FUNC ||
+#endif
+				 opcode == EEOP_SUBPLAN ||
+				 opcode == EEOP_WHOLEROW ||
+				 opcode == EEOP_AGG_ORDERED_TRANS_DATUM ||
+				 opcode == EEOP_AGG_ORDERED_TRANS_TUPLE ||
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+				 opcode == EEOP_IOCOERCE_SAFE ||
+#endif
+				 opcode == EEOP_SCALARARRAYOP ||
+				 opcode == EEOP_SQLVALUEFUNCTION ||
+				 opcode == EEOP_CURRENTOFEXPR ||
+				 opcode == EEOP_NEXTVALUEEXPR ||
+				 opcode == EEOP_ARRAYEXPR ||
+				 opcode == EEOP_ROW ||
+				 opcode == EEOP_MINMAX ||
+				 opcode == EEOP_DOMAIN_NOTNULL ||
+				 opcode == EEOP_DOMAIN_CHECK ||
+				 opcode == EEOP_XMLEXPR ||
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+				 opcode == EEOP_IS_JSON ||
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+				 opcode == EEOP_JSONEXPR_COERCION_FINISH ||
+#endif
+				 opcode == EEOP_GROUPING_FUNC ||
+				 opcode == EEOP_PARAM_CALLBACK ||
+				 opcode == EEOP_PARAM_EXEC ||
+				 opcode == EEOP_PARAM_EXTERN)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "dc_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_INNER_SYSVAR ||
+				 opcode == EEOP_OUTER_SYSVAR ||
+				 opcode == EEOP_SCAN_SYSVAR
+#ifdef HAVE_EEOP_OLD_NEW
+				 || opcode == EEOP_OLD_SYSVAR
+				 || opcode == EEOP_NEW_SYSVAR
+#endif
+				 )
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "sysvar_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_SBSREF_SUBSCRIPTS)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "sbss_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_SBSREF_OLD ||
+				 opcode == EEOP_SBSREF_ASSIGN ||
+				 opcode == EEOP_SBSREF_FETCH)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "sbsf_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_IOCOERCE)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "ioc_out_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+			snprintf(name, sizeof(name), "ioc_in_%d", i);
+			ioc_in_imports[i] = MIR_new_import(ctx, name);
+		}
+		else if (opcode == EEOP_ROWCOMPARE_STEP)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "rcmp_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+#ifdef HAVE_EEOP_JSONEXPR
+		else if (opcode == EEOP_JSONEXPR_PATH)
+		{
+			char name[32];
+			snprintf(name, sizeof(name), "jpath_%d", i);
+			step_fn_imports[i] = MIR_new_import(ctx, name);
+		}
+#endif
 	}
 
 	/*
@@ -1605,11 +1771,14 @@ mir_compile_expr(ExprState *state)
 
 				if (!deform_emitted)
 				{
-					/* Fallback: call slot_getsomeattrs_int(slot, last_var) */
+					/*
+					 * Call deform dispatch: JIT-compiles deform via sljit
+					 * (loop-based for wide, unrolled for narrow) and caches.
+					 */
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
 							MIR_new_ref_op(ctx, proto_getsomeattrs),
-							MIR_new_ref_op(ctx, import_getsomeattrs),
+							MIR_new_ref_op(ctx, import_deform_dispatch),
 							MIR_new_reg_op(ctx, r_slot),
 							MIR_new_int_op(ctx, op->d.fetch.last_var)));
 				}
@@ -4119,6 +4288,1711 @@ mir_compile_expr(ExprState *state)
 			}
 
 			/*
+			 * ---- PRESORTED DISTINCT ----
+			 * Direct call to ExecEvalPreOrderedDistinct{Single,Multi},
+			 * branch on result.
+			 */
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+			case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
+			case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
+			{
+				int jumpdistinct = op->d.agg_presorted_distinctcheck.jumpdistinct;
+				MIR_item_t fn_import =
+					(opcode == EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
+					? import_presorted_single
+					: import_presorted_multi;
+
+				MIR_reg_t r_aggst = mir_new_reg(ctx, f, MIR_T_I64, "pdst");
+
+				/* aggstate = state->parent */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_aggst),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprState, parent),
+							r_state, 0, 1)));
+
+				/* pertrans = op->d.agg_presorted_distinctcheck.pertrans */
+				MIR_STEP_LOAD(r_tmp1, opno,
+					d.agg_presorted_distinctcheck.pertrans);
+
+				/* r_tmp2 = fn(aggstate, pertrans) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 5,
+						MIR_new_ref_op(ctx, proto_presorted_distinct),
+						MIR_new_ref_op(ctx, fn_import),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_aggst),
+						MIR_new_reg_op(ctx, r_tmp1)));
+
+				/* If result == 0 (not distinct), jump to jumpdistinct */
+				if (jumpdistinct >= 0 && jumpdistinct < steps_len)
+				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, step_labels[jumpdistinct]),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_int_op(ctx, 0)));
+				}
+				break;
+			}
+#endif /* HAVE_EEOP_AGG_PRESORTED_DISTINCT */
+
+			/*
+			 * ---- BOOLTEST_IS_TRUE ----
+			 * If null: resvalue=false, resnull=false. Else keep.
+			 */
+			case EEOP_BOOLTEST_IS_TRUE:
+			{
+				MIR_insn_t not_null_label = MIR_new_label(ctx);
+
+				/* r_tmp1 = *op->resnull */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+
+				/* if (!resnull) goto not_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, not_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* null path: *resvalue = 0 (false), *resnull = false */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* not_null: keep resvalue as-is */
+				MIR_append_insn(ctx, func_item, not_null_label);
+				break;
+			}
+
+			/*
+			 * ---- BOOLTEST_IS_NOT_TRUE ----
+			 * If null: resvalue=true, resnull=false. Else invert resvalue.
+			 */
+			case EEOP_BOOLTEST_IS_NOT_TRUE:
+			{
+				MIR_insn_t not_null_label = MIR_new_label(ctx);
+				MIR_insn_t done_label = MIR_new_label(ctx);
+
+				/* r_tmp1 = *op->resnull */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+
+				/* if (!resnull) goto not_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, not_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* null path: *resvalue = 1 (true), *resnull = false */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, done_label)));
+
+				/* not_null: *resvalue = !*resvalue */
+				MIR_append_insn(ctx, func_item, not_null_label);
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_EQ,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp1)));
+
+				MIR_append_insn(ctx, func_item, done_label);
+				break;
+			}
+
+			/*
+			 * ---- BOOLTEST_IS_FALSE ----
+			 * If null: resvalue=false, resnull=false. Else invert resvalue.
+			 */
+			case EEOP_BOOLTEST_IS_FALSE:
+			{
+				MIR_insn_t not_null_label = MIR_new_label(ctx);
+				MIR_insn_t done_label = MIR_new_label(ctx);
+
+				/* r_tmp1 = *op->resnull */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+
+				/* if (!resnull) goto not_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, not_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* null path: *resvalue = 0 (false), *resnull = false */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, done_label)));
+
+				/* not_null: *resvalue = !*resvalue */
+				MIR_append_insn(ctx, func_item, not_null_label);
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_EQ,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp1)));
+
+				MIR_append_insn(ctx, func_item, done_label);
+				break;
+			}
+
+			/*
+			 * ---- BOOLTEST_IS_NOT_FALSE ----
+			 * If null: resvalue=true, resnull=false. Else keep.
+			 */
+			case EEOP_BOOLTEST_IS_NOT_FALSE:
+			{
+				MIR_insn_t not_null_label = MIR_new_label(ctx);
+
+				/* r_tmp1 = *op->resnull */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+
+				/* if (!resnull) goto not_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, not_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* null path: *resvalue = 1 (true), *resnull = false */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* not_null: keep resvalue as-is */
+				MIR_append_insn(ctx, func_item, not_null_label);
+				break;
+			}
+
+			/*
+			 * ---- AGGREF ----
+			 * resvalue = econtext->ecxt_aggvalues[aggno]
+			 * resnull  = econtext->ecxt_aggnulls[aggno]
+			 */
+			case EEOP_AGGREF:
+			{
+				int aggno = op->d.aggref.aggno;
+
+				/* r_tmp1 = econtext->ecxt_aggvalues */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprContext, ecxt_aggvalues),
+							r_econtext, 0, 1)));
+				/* r_tmp2 = aggvalues[aggno] */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64,
+							aggno * (int64_t) sizeof(Datum),
+							r_tmp1, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp1 = econtext->ecxt_aggnulls */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprContext, ecxt_aggnulls),
+							r_econtext, 0, 1)));
+				/* r_tmp2 = aggnulls[aggno] */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							aggno * (int64_t) sizeof(bool),
+							r_tmp1, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+
+			/*
+			 * ---- WINDOW_FUNC ----
+			 * wfuncno read at RUNTIME from op->d.window_func.wfstate->wfuncno
+			 * (assigned after expression compilation).
+			 */
+			case EEOP_WINDOW_FUNC:
+			{
+				MIR_reg_t r_wfno = mir_new_reg(ctx, f, MIR_T_I64, "wfno");
+
+				/* r_tmp1 = op->d.window_func.wfstate */
+				MIR_STEP_LOAD(r_tmp1, opno, d.window_func.wfstate);
+				/* r_wfno = wfstate->wfuncno (int, sign-extend) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_wfno),
+						MIR_new_mem_op(ctx, MIR_T_I32,
+							offsetof(WindowFuncExprState, wfuncno),
+							r_tmp1, 0, 1)));
+
+				/* r_tmp1 = econtext->ecxt_aggvalues */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprContext, ecxt_aggvalues),
+							r_econtext, 0, 1)));
+				/* r_tmp2 = wfuncno * sizeof(Datum) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_LSH,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_wfno),
+						MIR_new_int_op(ctx, 3)));  /* *8 for sizeof(Datum) */
+				/* r_tmp1 = aggvalues + offset */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				/* r_tmp2 = *r_tmp1 (Datum) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp1 = econtext->ecxt_aggnulls */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprContext, ecxt_aggnulls),
+							r_econtext, 0, 1)));
+				/* r_tmp1 = aggnulls + wfuncno (bool is 1 byte, no shift) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_ADD,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_wfno)));
+				/* r_tmp2 = *r_tmp1 (bool) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+
+			/*
+			 * ---- CASE_TESTVAL ----
+			 * resvalue = *op->d.casetest.value
+			 * resnull  = *op->d.casetest.isnull
+			 */
+			case EEOP_CASE_TESTVAL:
+			{
+				/* r_tmp1 = op->d.casetest.value (pointer) */
+				MIR_STEP_LOAD(r_tmp1, opno, d.casetest.value);
+				/* r_tmp2 = *r_tmp1 (Datum) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp1 = op->d.casetest.isnull (pointer) */
+				MIR_STEP_LOAD(r_tmp1, opno, d.casetest.isnull);
+				/* r_tmp2 = *r_tmp1 (bool) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+
+#ifdef HAVE_EEOP_TESTVAL_EXT
+			/*
+			 * ---- CASE_TESTVAL_EXT ----
+			 * resvalue = econtext->caseValue_datum
+			 * resnull  = econtext->caseValue_isNull
+			 */
+			case EEOP_CASE_TESTVAL_EXT:
+			{
+				/* r_tmp2 = econtext->caseValue_datum */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64,
+							offsetof(ExprContext, caseValue_datum),
+							r_econtext, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp2 = econtext->caseValue_isNull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(ExprContext, caseValue_isNull),
+							r_econtext, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+#endif /* HAVE_EEOP_TESTVAL_EXT */
+
+			/*
+			 * ---- DOMAIN_TESTVAL ----
+			 * Same as CASE_TESTVAL (uses same union d.casetest).
+			 */
+			case EEOP_DOMAIN_TESTVAL:
+			{
+				/* r_tmp1 = op->d.casetest.value (pointer) */
+				MIR_STEP_LOAD(r_tmp1, opno, d.casetest.value);
+				/* r_tmp2 = *r_tmp1 (Datum) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp1 = op->d.casetest.isnull (pointer) */
+				MIR_STEP_LOAD(r_tmp1, opno, d.casetest.isnull);
+				/* r_tmp2 = *r_tmp1 (bool) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+
+#ifdef HAVE_EEOP_TESTVAL_EXT
+			/*
+			 * ---- DOMAIN_TESTVAL_EXT ----
+			 * resvalue = econtext->domainValue_datum
+			 * resnull  = econtext->domainValue_isNull
+			 */
+			case EEOP_DOMAIN_TESTVAL_EXT:
+			{
+				/* r_tmp2 = econtext->domainValue_datum */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64,
+							offsetof(ExprContext, domainValue_datum),
+							r_econtext, 0, 1)));
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* r_tmp2 = econtext->domainValue_isNull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(ExprContext, domainValue_isNull),
+							r_econtext, 0, 1)));
+				/* *op->resnull = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+#endif /* HAVE_EEOP_TESTVAL_EXT */
+
+			/*
+			 * ---- MAKE_READONLY ----
+			 * If *op->d.make_readonly.isnull: resnull=true, copy *value.
+			 * Else: resvalue = MakeExpandedObjectReadOnlyInternal(*value),
+			 *       resnull = false.
+			 */
+			case EEOP_MAKE_READONLY:
+			{
+				MIR_insn_t skip_label = MIR_new_label(ctx);
+				MIR_reg_t r_val = mir_new_reg(ctx, f, MIR_T_I64, "mro_v");
+				MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "mro_r");
+
+				/* r_tmp1 = op->d.make_readonly.isnull (pointer) */
+				MIR_STEP_LOAD(r_tmp1, opno, d.make_readonly.isnull);
+				/* r_tmp2 = *isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+
+				/* *op->resnull = isnull */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* if isnull, skip MakeReadOnly call */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, skip_label),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Not null: r_val = *op->d.make_readonly.value */
+				MIR_STEP_LOAD(r_tmp1, opno, d.make_readonly.value);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_val),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+
+				/* r_ret = MakeExpandedObjectReadOnlyInternal(r_val) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_makero),
+						MIR_new_ref_op(ctx, import_makero),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_reg_op(ctx, r_val)));
+
+				/* *op->resvalue = r_ret */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_ret)));
+
+				MIR_append_insn(ctx, func_item, skip_label);
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_INPUT_CHECK_ARGS ----
+			 * Check NullableDatum args[i].isnull for i=0..nargs-1,
+			 * jump to jumpnull if any null.
+			 */
+			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
+			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
+			{
+				int nargs = op->d.agg_strict_input_check.nargs;
+				int jumpnull = op->d.agg_strict_input_check.jumpnull;
+				int64_t isnull_off0 = (int64_t) offsetof(NullableDatum, isnull);
+				int64_t nd_size = (int64_t) sizeof(NullableDatum);
+
+				/* r_tmp1 = op->d.agg_strict_input_check.args */
+				MIR_STEP_LOAD(r_tmp1, opno, d.agg_strict_input_check.args);
+
+				for (int argno = 0; argno < nargs; argno++)
+				{
+					/* r_tmp2 = args[argno].isnull */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								argno * nd_size + isnull_off0,
+								r_tmp1, 0, 1)));
+					/* if isnull, jump to jumpnull */
+					if (jumpnull >= 0 && jumpnull < steps_len)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNE,
+								MIR_new_label_op(ctx, step_labels[jumpnull]),
+								MIR_new_reg_op(ctx, r_tmp2),
+								MIR_new_int_op(ctx, 0)));
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_INPUT_CHECK_NULLS ----
+			 * Check bool nulls[i] for i=0..nargs-1,
+			 * jump to jumpnull if any null.
+			 */
+			case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
+			{
+				int nargs = op->d.agg_strict_input_check.nargs;
+				int jumpnull = op->d.agg_strict_input_check.jumpnull;
+
+				/* r_tmp1 = op->d.agg_strict_input_check.nulls */
+				MIR_STEP_LOAD(r_tmp1, opno, d.agg_strict_input_check.nulls);
+
+				for (int argno = 0; argno < nargs; argno++)
+				{
+					/* r_tmp2 = nulls[argno] */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_mem_op(ctx, MIR_T_U8,
+								argno * (int64_t) sizeof(bool),
+								r_tmp1, 0, 1)));
+					/* if null, jump to jumpnull */
+					if (jumpnull >= 0 && jumpnull < steps_len)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BNE,
+								MIR_new_label_op(ctx, step_labels[jumpnull]),
+								MIR_new_reg_op(ctx, r_tmp2),
+								MIR_new_int_op(ctx, 0)));
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_PLAIN_PERGROUP_NULLCHECK ----
+			 * Load all_pergroups[setoff], jump to jumpnull if NULL.
+			 */
+			case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
+			{
+				int setoff = op->d.agg_plain_pergroup_nullcheck.setoff;
+				int jumpnull = op->d.agg_plain_pergroup_nullcheck.jumpnull;
+
+				/* r_tmp1 = state->parent (AggState*) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(ExprState, parent),
+							r_state, 0, 1)));
+				/* r_tmp1 = aggstate->all_pergroups */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							offsetof(AggState, all_pergroups),
+							r_tmp1, 0, 1)));
+				/* r_tmp1 = all_pergroups[setoff] */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_P,
+							setoff * (int64_t) sizeof(AggStatePerGroup),
+							r_tmp1, 0, 1)));
+				/* if NULL, jump to jumpnull */
+				if (jumpnull >= 0 && jumpnull < steps_len)
+				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, step_labels[jumpnull]),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_DESERIALIZE ----
+			 * If args[0].isnull, jump to jumpnull.
+			 * Then call fcinfo->flinfo->fn_addr(fcinfo), store result.
+			 */
+			case EEOP_AGG_STRICT_DESERIALIZE:
+			{
+				FunctionCallInfo fcinfo = op->d.agg_deserialize.fcinfo_data;
+				int jumpnull = op->d.agg_deserialize.jumpnull;
+				int64_t null0_off =
+					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+				MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "dsfci");
+				MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "dsret");
+
+				/* r_fci = op->d.agg_deserialize.fcinfo_data */
+				MIR_STEP_LOAD(r_fci, opno, d.agg_deserialize.fcinfo_data);
+
+				/* r_tmp1 = fcinfo->args[0].isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, null0_off,
+							r_fci, 0, 1)));
+
+				/* if null, jump to jumpnull */
+				if (jumpnull >= 0 && jumpnull < steps_len)
+				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BNE,
+							MIR_new_label_op(ctx, step_labels[jumpnull]),
+							MIR_new_reg_op(ctx, r_tmp1),
+							MIR_new_int_op(ctx, 0)));
+				}
+
+				/* fcinfo->isnull = false */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* r_ret = fn_addr(fcinfo) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_reg_op(ctx, r_fci)));
+
+				/* *op->resvalue = r_ret */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_ret)));
+
+				/* *op->resnull = fcinfo->isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp1)));
+				break;
+			}
+
+			/*
+			 * ---- AGG_DESERIALIZE ----
+			 * Call fcinfo->flinfo->fn_addr(fcinfo), store result. No jump.
+			 */
+			case EEOP_AGG_DESERIALIZE:
+			{
+				FunctionCallInfo fcinfo = op->d.agg_deserialize.fcinfo_data;
+				MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "adfci");
+				MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "adret");
+
+				/* r_fci = op->d.agg_deserialize.fcinfo_data */
+				MIR_STEP_LOAD(r_fci, opno, d.agg_deserialize.fcinfo_data);
+
+				/* fcinfo->isnull = false */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* r_ret = fn_addr(fcinfo) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_reg_op(ctx, r_fci)));
+
+				/* *op->resvalue = r_ret */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_ret)));
+
+				/* *op->resnull = fcinfo->isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp1)));
+				break;
+			}
+
+			/*
+			 * ---- DISTINCT / NOT_DISTINCT ----
+			 * 3-way null logic + equality function call.
+			 * If null flags differ → DISTINCT=true, NOT_DISTINCT=false
+			 * If both null       → DISTINCT=false, NOT_DISTINCT=true
+			 * If neither null    → call equality fn, invert for DISTINCT
+			 */
+			case EEOP_DISTINCT:
+			case EEOP_NOT_DISTINCT:
+			{
+				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+				int64_t null0_off =
+					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+				int64_t null1_off =
+					(int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+				MIR_insn_t one_null_label = MIR_new_label(ctx);
+				MIR_insn_t both_null_label = MIR_new_label(ctx);
+				MIR_insn_t end_label = MIR_new_label(ctx);
+				MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "dfci");
+				MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "dret");
+				MIR_reg_t r_n0 = mir_new_reg(ctx, f, MIR_T_I64, "dn0");
+				MIR_reg_t r_n1 = mir_new_reg(ctx, f, MIR_T_I64, "dn1");
+
+				/* r_fci = op->d.func.fcinfo_data */
+				MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
+
+				/* r_n0 = args[0].isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_n0),
+						MIR_new_mem_op(ctx, MIR_T_U8, null0_off,
+							r_fci, 0, 1)));
+				/* r_n1 = args[1].isnull */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_n1),
+						MIR_new_mem_op(ctx, MIR_T_U8, null1_off,
+							r_fci, 0, 1)));
+
+				/* if (n0 != n1) goto one_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, one_null_label),
+						MIR_new_reg_op(ctx, r_n0),
+						MIR_new_reg_op(ctx, r_n1)));
+
+				/* n0 == n1: if (n0 != 0) goto both_null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, both_null_label),
+						MIR_new_reg_op(ctx, r_n0),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Neither null: call equality fn */
+				/* fcinfo->isnull = false */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				/* r_ret = fn_addr(fcinfo) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_reg_op(ctx, r_fci)));
+
+				/* For DISTINCT: invert result (resvalue = !result) */
+				if (opcode == EEOP_DISTINCT)
+				{
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_EQ,
+							MIR_new_reg_op(ctx, r_ret),
+							MIR_new_reg_op(ctx, r_ret),
+							MIR_new_int_op(ctx, 0)));
+				}
+
+				/* *op->resvalue = r_ret, *op->resnull = false */
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_ret)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, end_label)));
+
+				/* one_null: nulls differ → DISTINCT=true, NOT_DISTINCT=false */
+				MIR_append_insn(ctx, func_item, one_null_label);
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx,
+							(opcode == EEOP_DISTINCT) ? 1 : 0)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, end_label)));
+
+				/* both_null: both null → DISTINCT=false, NOT_DISTINCT=true */
+				MIR_append_insn(ctx, func_item, both_null_label);
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx,
+							(opcode == EEOP_DISTINCT) ? 0 : 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* end: all paths converge */
+				MIR_append_insn(ctx, func_item, end_label);
+				break;
+			}
+
+			/*
+			 * ---- NULLIF ----
+			 * NULLIF(a,b): if a is null → return null.
+			 * If b is null → return a's value (not null).
+			 * Both non-null → call equality fn.
+			 *   If !fcinfo->isnull && result is true → return null.
+			 *   Else → return a's value.
+			 */
+			case EEOP_NULLIF:
+			{
+				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+				int64_t null0_off =
+					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+				int64_t null1_off =
+					(int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+				int64_t val0_off =
+					(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+				MIR_insn_t a_null_label = MIR_new_label(ctx);
+				MIR_insn_t b_null_label = MIR_new_label(ctx);
+				MIR_insn_t not_equal_label = MIR_new_label(ctx);
+				MIR_insn_t end_label = MIR_new_label(ctx);
+				MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "nfci");
+				MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "nret");
+
+				/* r_fci = op->d.func.fcinfo_data */
+				MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
+
+				/* Check if arg0 is null */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, null0_off,
+							r_fci, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, a_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Check if arg1 is null → skip to return_a */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8, null1_off,
+							r_fci, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, b_null_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Both non-null: call equality function */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_reg_op(ctx, r_fci)));
+
+				/* If fcinfo->isnull, treat as not equal */
+				MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_U8,
+							offsetof(FunctionCallInfoBaseData, isnull),
+							r_fci, 0, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, not_equal_label),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* If result == false (0), not equal */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, not_equal_label),
+						MIR_new_reg_op(ctx, r_ret),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Equal: return null — *op->resnull = true */
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, end_label)));
+
+				/* not_equal / b_null: return a's value with resnull=false */
+				MIR_append_insn(ctx, func_item, not_equal_label);
+				MIR_append_insn(ctx, func_item, b_null_label);
+				MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64, val0_off,
+							r_fci, 0, 1)));
+				MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, end_label)));
+
+				/* a_null: *op->resnull = true */
+				MIR_append_insn(ctx, func_item, a_null_label);
+				MIR_STEP_LOAD(r_tmp3, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 1)));
+
+				/* end: all paths converge */
+				MIR_append_insn(ctx, func_item, end_label);
+				break;
+			}
+
+			/*
+			 * ---- DIRECT CALL: 3-arg void ----
+			 * fn(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+			 */
+			case EEOP_FUNCEXPR_FUSAGE:
+			case EEOP_FUNCEXPR_STRICT_FUSAGE:
+			case EEOP_NULLTEST_ROWISNULL:
+			case EEOP_NULLTEST_ROWISNOTNULL:
+#ifdef HAVE_EEOP_PARAM_SET
+			case EEOP_PARAM_SET:
+#endif
+			case EEOP_ARRAYCOERCE:
+			case EEOP_FIELDSELECT:
+			case EEOP_FIELDSTORE_DEFORM:
+			case EEOP_FIELDSTORE_FORM:
+			case EEOP_CONVERT_ROWTYPE:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			case EEOP_JSON_CONSTRUCTOR:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+			case EEOP_JSONEXPR_COERCION:
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+			case EEOP_MERGE_SUPPORT_FUNC:
+#endif
+			case EEOP_SUBPLAN:
+			case EEOP_WHOLEROW:
+			case EEOP_AGG_ORDERED_TRANS_DATUM:
+			case EEOP_AGG_ORDERED_TRANS_TUPLE:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 5,
+						MIR_new_ref_op(ctx, proto_3arg_void),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+				break;
+			}
+
+			/*
+			 * ---- DIRECT CALL: 2-arg void ----
+			 * fn(ExprState *state, ExprEvalStep *op)
+			 */
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+			case EEOP_IOCOERCE_SAFE:
+#endif
+			case EEOP_SCALARARRAYOP:
+			case EEOP_SQLVALUEFUNCTION:
+			case EEOP_CURRENTOFEXPR:
+			case EEOP_NEXTVALUEEXPR:
+			case EEOP_ARRAYEXPR:
+			case EEOP_ROW:
+			case EEOP_MINMAX:
+			case EEOP_DOMAIN_NOTNULL:
+			case EEOP_DOMAIN_CHECK:
+			case EEOP_XMLEXPR:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			case EEOP_IS_JSON:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+			case EEOP_JSONEXPR_COERCION_FINISH:
+#endif
+			case EEOP_GROUPING_FUNC:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_agg_helper),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1)));
+				break;
+			}
+
+			/*
+			 * ---- PARAM_CALLBACK: indirect fn pointer ----
+			 * op->d.cparam.paramfunc(state, op, econtext)
+			 */
+			case EEOP_PARAM_CALLBACK:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 5,
+						MIR_new_ref_op(ctx, proto_3arg_void),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+				break;
+			}
+
+			/*
+			 * ---- PARAM_EXEC / PARAM_EXTERN ----
+			 * Direct call: fn(state, op, econtext) -> void
+			 */
+			case EEOP_PARAM_EXEC:
+			case EEOP_PARAM_EXTERN:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 5,
+						MIR_new_ref_op(ctx, proto_3arg_void),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+				break;
+			}
+
+			/*
+			 * ---- SYSVAR ----
+			 * Direct call to ExecEvalSysVar(state, op, econtext, slot).
+			 * 4-arg call; slot loaded from econtext at compile-time offset.
+			 */
+			case EEOP_INNER_SYSVAR:
+			case EEOP_OUTER_SYSVAR:
+			case EEOP_SCAN_SYSVAR:
+#ifdef HAVE_EEOP_OLD_NEW
+			case EEOP_OLD_SYSVAR:
+			case EEOP_NEW_SYSVAR:
+#endif
+			{
+				int slot_offset;
+
+				switch (opcode)
+				{
+					case EEOP_INNER_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_innertuple);
+						break;
+					case EEOP_OUTER_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_outertuple);
+						break;
+					case EEOP_SCAN_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_scantuple);
+						break;
+#ifdef HAVE_EEOP_OLD_NEW
+					case EEOP_OLD_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_oldtuple);
+						break;
+					case EEOP_NEW_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_newtuple);
+						break;
+#endif
+					default:
+						pg_unreachable();
+				}
+
+				/* r_tmp2 = econtext->ecxt_*tuple (slot) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_P, slot_offset,
+							r_econtext, 0, 1)));
+
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 6,
+						MIR_new_ref_op(ctx, proto_4arg_void),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext),
+						MIR_new_reg_op(ctx, r_tmp2)));
+				break;
+			}
+
+			/*
+			 * ---- SBSREF_OLD / SBSREF_ASSIGN / SBSREF_FETCH ----
+			 * Indirect call: op->d.sbsref.subscriptfunc(state, op, econtext)
+			 */
+			case EEOP_SBSREF_OLD:
+			case EEOP_SBSREF_ASSIGN:
+			case EEOP_SBSREF_FETCH:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 5,
+						MIR_new_ref_op(ctx, proto_3arg_void),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+				break;
+			}
+
+			/*
+			 * ---- SBSREF_SUBSCRIPTS ----
+			 * Call subscriptfunc(state, op, econtext) -> bool.
+			 * If false (0), jump to jumpdone.
+			 */
+			case EEOP_SBSREF_SUBSCRIPTS:
+			{
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 6,
+						MIR_new_ref_op(ctx, proto_fallback),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_tmp2),  /* return value */
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+
+				/* If false (0), jump to jumpdone */
+				{
+					int jumpdone = op->d.sbsref_subscript.jumpdone;
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, step_labels[jumpdone]),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_int_op(ctx, 0)));
+				}
+				break;
+			}
+
+			/*
+			 * ---- IOCOERCE ----
+			 * Two function calls: output fn -> cstring -> input fn.
+			 * If *resnull, skip entirely.
+			 */
+			case EEOP_IOCOERCE:
+			{
+				FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+				FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+
+				MIR_label_t skip_null = MIR_new_label(ctx);
+
+				/* Load *op->resnull (pointer to bool) */
+				MIR_STEP_LOAD(r_tmp1, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+				/* If resnull != 0, skip */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, skip_null),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Load *op->resvalue */
+				MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+
+				/* fcinfo_out->args[0].value = resvalue */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_out->args[0].value);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* fcinfo_out->args[0].isnull = false */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_out->args[0].isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* fcinfo_out->isnull = false */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_out->isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Call output fn: ret = fn_addr_out(fcinfo_out) */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) fcinfo_out);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_tmp3)));
+
+				/* r_tmp2 now holds cstring result (Datum) */
+				/* fcinfo_in->args[0].value = r_tmp2 */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_in->args[0].value);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* fcinfo_in->args[0].isnull = false */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_in->args[0].isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* fcinfo_in->isnull = false */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_in->isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Call input fn: ret = fn_addr_in(fcinfo_in) */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) fcinfo_in);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, ioc_in_imports[opno]),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_tmp3)));
+
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* *op->resnull = fcinfo_in->isnull */
+				MIR_STEP_ADDR_RAW(r_tmp3, opno, 0, (uint64_t) &fcinfo_in->isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+				MIR_STEP_LOAD(r_tmp1, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				MIR_append_insn(ctx, func_item, skip_null);
+				break;
+			}
+
+			/*
+			 * ---- ROWCOMPARE_STEP ----
+			 * Call comparison fn via fcinfo; jump to jumpnull on NULL
+			 * result, jumpdone on non-zero result.
+			 */
+			case EEOP_ROWCOMPARE_STEP:
+			{
+				FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
+				int jnull = op->d.rowcompare_step.jumpnull;
+				int jdone = op->d.rowcompare_step.jumpdone;
+
+				if (op->d.rowcompare_step.finfo->fn_strict)
+				{
+					/* Check args[0].isnull || args[1].isnull */
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) &fcinfo->args[0].isnull);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+					MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) &fcinfo->args[1].isnull);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_OR,
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_reg_op(ctx, r_tmp3)));
+
+					MIR_label_t not_null = MIR_new_label(ctx);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, not_null),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_int_op(ctx, 0)));
+
+					/* Null path: *resnull = true, jump to jumpnull */
+					MIR_STEP_LOAD(r_tmp1, opno, resnull);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+							MIR_new_int_op(ctx, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, step_labels[jnull])));
+
+					MIR_append_insn(ctx, func_item, not_null);
+				}
+
+				/* fcinfo->isnull = false */
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) &fcinfo->isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Call fn_addr(fcinfo) -> Datum */
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) fcinfo);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 4,
+						MIR_new_ref_op(ctx, proto_v1func),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_tmp1)));
+
+				/* *op->resvalue = r_tmp2 */
+				MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+						MIR_new_reg_op(ctx, r_tmp2)));
+
+				/* If fcinfo->isnull, *resnull = true, jump to jumpnull */
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) &fcinfo->isnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp3),
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+				{
+					MIR_label_t not_null2 = MIR_new_label(ctx);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_BEQ,
+							MIR_new_label_op(ctx, not_null2),
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_int_op(ctx, 0)));
+					MIR_STEP_LOAD(r_tmp1, opno, resnull);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+							MIR_new_int_op(ctx, 1)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, step_labels[jnull])));
+					MIR_append_insn(ctx, func_item, not_null2);
+				}
+
+				/* *resnull = false */
+				MIR_STEP_LOAD(r_tmp1, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+
+				/* If int32(r_tmp2) != 0, jump to jumpdone */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BNE,
+						MIR_new_label_op(ctx, step_labels[jdone]),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_int_op(ctx, 0)));
+				break;
+			}
+
+			/*
+			 * ---- ROWCOMPARE_FINAL ----
+			 * Read int32 result from *op->resvalue, apply comparison,
+			 * store boolean result.
+			 */
+			case EEOP_ROWCOMPARE_FINAL:
+			{
+				CompareType cmptype = op->d.rowcompare_final.cmptype;
+
+				/* Load int32 cmpresult from *op->resvalue */
+				MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_mem_op(ctx, MIR_T_I32, 0, r_tmp1, 0, 1)));
+
+				/* result = (cmpresult <cmp> 0) ? 1 : 0 */
+				{
+					MIR_label_t true_label = MIR_new_label(ctx);
+					MIR_label_t end_label = MIR_new_label(ctx);
+
+					MIR_insn_code_t cmp_code;
+					switch (cmptype)
+					{
+						case COMPARE_LT: cmp_code = MIR_BLT; break;
+						case COMPARE_LE: cmp_code = MIR_BLE; break;
+						case COMPARE_GE: cmp_code = MIR_BGE; break;
+						case COMPARE_GT: cmp_code = MIR_BGT; break;
+						default: cmp_code = MIR_BLT; break;
+					}
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, cmp_code,
+							MIR_new_label_op(ctx, true_label),
+							MIR_new_reg_op(ctx, r_tmp2),
+							MIR_new_int_op(ctx, 0)));
+
+					/* false path: result = 0 */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_int_op(ctx, 0)));
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_JMP,
+							MIR_new_label_op(ctx, end_label)));
+
+					/* true path: result = 1 */
+					MIR_append_insn(ctx, func_item, true_label);
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_reg_op(ctx, r_tmp3),
+							MIR_new_int_op(ctx, 1)));
+
+					MIR_append_insn(ctx, func_item, end_label);
+
+					/* *op->resvalue = result */
+					MIR_append_insn(ctx, func_item,
+						MIR_new_insn(ctx, MIR_MOV,
+							MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+							MIR_new_reg_op(ctx, r_tmp3)));
+				}
+
+				/* *op->resnull = false */
+				MIR_STEP_LOAD(r_tmp1, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				break;
+			}
+
+#ifdef HAVE_EEOP_JSONEXPR
+			/*
+			 * ---- JSONEXPR_PATH ----
+			 * Call ExecEvalJsonExprPath(state, op, econtext) -> int.
+			 * Return value is the step number to jump to.
+			 */
+			case EEOP_JSONEXPR_PATH:
+			{
+				JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+				int targets[4];
+				int ntargets = 0;
+
+				MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t) op);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_call_insn(ctx, 6,
+						MIR_new_ref_op(ctx, proto_fallback),
+						MIR_new_ref_op(ctx, step_fn_imports[opno]),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_state),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_reg_op(ctx, r_econtext)));
+
+				/* Collect unique valid targets */
+				targets[ntargets++] = jsestate->jump_end;
+				if (jsestate->jump_empty >= 0 &&
+					jsestate->jump_empty != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_empty;
+				if (jsestate->jump_error >= 0 &&
+					jsestate->jump_error != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_error;
+				if (jsestate->jump_eval_coercion >= 0 &&
+					jsestate->jump_eval_coercion != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_eval_coercion;
+
+				for (int t = 0; t < ntargets; t++)
+				{
+					if (targets[t] >= 0 && targets[t] < steps_len)
+					{
+						MIR_append_insn(ctx, func_item,
+							MIR_new_insn(ctx, MIR_BEQ,
+								MIR_new_label_op(ctx, step_labels[targets[t]]),
+								MIR_new_reg_op(ctx, r_tmp2),
+								MIR_new_int_op(ctx, targets[t])));
+					}
+				}
+				break;
+			}
+#endif /* HAVE_EEOP_JSONEXPR */
+
+#ifdef HAVE_EEOP_RETURNINGEXPR
+			/*
+			 * ---- RETURNINGEXPR ----
+			 * If state->flags & nullflag: set NULL result, jump to jumpdone.
+			 * Otherwise continue.
+			 */
+			case EEOP_RETURNINGEXPR:
+			{
+				MIR_label_t cont_label = MIR_new_label(ctx);
+
+				/* Load state->flags (int32) */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_mem_op(ctx, MIR_T_I32,
+							offsetof(ExprState, flags), r_state, 0, 1)));
+
+				/* Test: flags & nullflag */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_AND,
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_reg_op(ctx, r_tmp1),
+						MIR_new_int_op(ctx, op->d.returningexpr.nullflag)));
+
+				/* If zero (flag not set), continue */
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_BEQ,
+						MIR_new_label_op(ctx, cont_label),
+						MIR_new_reg_op(ctx, r_tmp2),
+						MIR_new_int_op(ctx, 0)));
+
+				/* Flag set: *resvalue = 0, *resnull = true, jump */
+				MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+						MIR_new_int_op(ctx, 0)));
+				MIR_STEP_LOAD(r_tmp1, opno, resnull);
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_MOV,
+						MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+						MIR_new_int_op(ctx, 1)));
+				MIR_append_insn(ctx, func_item,
+					MIR_new_insn(ctx, MIR_JMP,
+						MIR_new_label_op(ctx, step_labels[op->d.returningexpr.jumpdone])));
+
+				MIR_append_insn(ctx, func_item, cont_label);
+				break;
+			}
+#endif /* HAVE_EEOP_RETURNINGEXPR */
+
+			/*
 			 * ---- DEFAULT: fallback ----
 			 */
 			default:
@@ -4139,109 +6013,17 @@ mir_compile_expr(ExprState *state)
 				/* Check if this opcode could jump */
 				switch (opcode)
 				{
-					case EEOP_AGG_STRICT_DESERIALIZE:
-						fb_jump_target = op->d.agg_deserialize.jumpnull;
-						break;
-					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
-#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
-					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
-#endif
-					case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
-						fb_jump_target = op->d.agg_strict_input_check.jumpnull;
-						break;
-					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
-						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
-						break;
-#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
-					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
-					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
-						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
-						break;
-#endif
 #ifdef HAVE_EEOP_HASHDATUM
 					case EEOP_HASHDATUM_FIRST_STRICT:
 					case EEOP_HASHDATUM_NEXT32_STRICT:
 						fb_jump_target = op->d.hashdatum.jumpdone;
 						break;
 #endif
-					case EEOP_ROWCOMPARE_STEP:
-						fb_jump_target = op->d.rowcompare_step.jumpdone;
-						break;
-					case EEOP_SBSREF_SUBSCRIPTS:
-						fb_jump_target = op->d.sbsref_subscript.jumpdone;
-						break;
-#ifdef HAVE_EEOP_RETURNINGEXPR
-					case EEOP_RETURNINGEXPR:
-						fb_jump_target = op->d.returningexpr.jumpdone;
-						break;
-#endif
 					default:
 						break;
 				}
 
-				if (opcode == EEOP_ROWCOMPARE_STEP)
-				{
-					/*
-					 * ROWCOMPARE_STEP has two jump targets:
-					 * jumpnull and jumpdone.  Fallback returns the
-					 * actual step number, so check against each.
-					 */
-					int jnull = op->d.rowcompare_step.jumpnull;
-					int jdone = op->d.rowcompare_step.jumpdone;
-
-					if (jnull >= 0 && jnull < steps_len)
-					{
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_BEQ,
-								MIR_new_label_op(ctx, step_labels[jnull]),
-								MIR_new_reg_op(ctx, r_tmp2),
-								MIR_new_int_op(ctx, jnull)));
-					}
-					if (jdone >= 0 && jdone < steps_len)
-					{
-						MIR_append_insn(ctx, func_item,
-							MIR_new_insn(ctx, MIR_BEQ,
-								MIR_new_label_op(ctx, step_labels[jdone]),
-								MIR_new_reg_op(ctx, r_tmp2),
-								MIR_new_int_op(ctx, jdone)));
-					}
-				}
-#ifdef HAVE_EEOP_JSONEXPR
-				else if (opcode == EEOP_JSONEXPR_PATH)
-				{
-					/*
-					 * JSONEXPR_PATH always jumps (unconditional).
-					 * Compare return value against each possible target.
-					 */
-					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-					int targets[4];
-					int ntargets = 0;
-
-					targets[ntargets++] = jsestate->jump_end;
-					if (jsestate->jump_empty >= 0 &&
-						jsestate->jump_empty != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_empty;
-					if (jsestate->jump_error >= 0 &&
-						jsestate->jump_error != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_error;
-					if (jsestate->jump_eval_coercion >= 0 &&
-						jsestate->jump_eval_coercion != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_eval_coercion;
-
-					for (int t = 0; t < ntargets; t++)
-					{
-						if (targets[t] >= 0 && targets[t] < steps_len)
-						{
-							MIR_append_insn(ctx, func_item,
-								MIR_new_insn(ctx, MIR_BEQ,
-									MIR_new_label_op(ctx, step_labels[targets[t]]),
-									MIR_new_reg_op(ctx, r_tmp2),
-									MIR_new_int_op(ctx, targets[t])));
-						}
-					}
-				}
-#endif /* HAVE_EEOP_JSONEXPR */
-				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
+				if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					/* If r_tmp2 >= 0, jump to target */
 					MIR_append_insn(ctx, func_item,
@@ -4275,6 +6057,7 @@ mir_compile_expr(ExprState *state)
 		/* Load external symbols (sentinels in shared mode) */
 		MIR_load_external(ctx, "fallback_step", mir_extern_addr((void *) pg_jitter_fallback_step));
 		MIR_load_external(ctx, "getsomeattrs", mir_extern_addr((void *) slot_getsomeattrs_int));
+		MIR_load_external(ctx, "deform_dispatch", mir_extern_addr((void *) pg_jitter_compiled_deform_dispatch));
 		MIR_load_external(ctx, "make_ro", mir_extern_addr((void *) MakeExpandedObjectReadOnlyInternal));
 		/* Inline error handlers */
 		MIR_load_external(ctx, "err_i4ov", mir_extern_addr((void *) jit_error_int4_overflow));
@@ -4283,6 +6066,11 @@ mir_compile_expr(ExprState *state)
 		/* Inline deform helpers */
 		MIR_load_external(ctx, "varsize_any", mir_extern_addr((void *) varsize_any));
 		MIR_load_external(ctx, "strlen", mir_extern_addr((void *) strlen));
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+		/* Presorted distinct helpers */
+		MIR_load_external(ctx, "pdist_single", mir_extern_addr((void *) ExecEvalPreOrderedDistinctSingle));
+		MIR_load_external(ctx, "pdist_multi", mir_extern_addr((void *) ExecEvalPreOrderedDistinctMulti));
+#endif
 
 	for (int i = 0; i < steps_len; i++)
 	{
@@ -4297,6 +6085,219 @@ mir_compile_expr(ExprState *state)
 				snprintf(name, sizeof(name), "saop_%d", i);
 				MIR_load_external(ctx, name,
 								  mir_extern_addr((void *) ExecEvalHashedScalarArrayOp));
+				continue;
+			}
+			else if (op == EEOP_AGG_STRICT_DESERIALIZE ||
+					 op == EEOP_AGG_DESERIALIZE)
+			{
+				FunctionCallInfo fcinfo = steps[i].d.agg_deserialize.fcinfo_data;
+				snprintf(name, sizeof(name), "dser_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) fcinfo->flinfo->fn_addr));
+				continue;
+			}
+			else if (op == EEOP_INNER_SYSVAR ||
+					 op == EEOP_OUTER_SYSVAR ||
+					 op == EEOP_SCAN_SYSVAR
+#ifdef HAVE_EEOP_OLD_NEW
+					 || op == EEOP_OLD_SYSVAR
+					 || op == EEOP_NEW_SYSVAR
+#endif
+					 )
+			{
+				snprintf(name, sizeof(name), "sysvar_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) ExecEvalSysVar));
+				continue;
+			}
+			else if (op == EEOP_SBSREF_SUBSCRIPTS)
+			{
+				snprintf(name, sizeof(name), "sbss_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) steps[i].d.sbsref_subscript.subscriptfunc));
+				continue;
+			}
+			else if (op == EEOP_SBSREF_OLD ||
+					 op == EEOP_SBSREF_ASSIGN ||
+					 op == EEOP_SBSREF_FETCH)
+			{
+				snprintf(name, sizeof(name), "sbsf_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) steps[i].d.sbsref.subscriptfunc));
+				continue;
+			}
+			else if (op == EEOP_IOCOERCE)
+			{
+				FunctionCallInfo fcinfo_out = steps[i].d.iocoerce.fcinfo_data_out;
+				FunctionCallInfo fcinfo_in = steps[i].d.iocoerce.fcinfo_data_in;
+				snprintf(name, sizeof(name), "ioc_out_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) fcinfo_out->flinfo->fn_addr));
+				snprintf(name, sizeof(name), "ioc_in_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) fcinfo_in->flinfo->fn_addr));
+				continue;
+			}
+			else if (op == EEOP_ROWCOMPARE_STEP)
+			{
+				snprintf(name, sizeof(name), "rcmp_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) steps[i].d.rowcompare_step.fn_addr));
+				continue;
+			}
+#ifdef HAVE_EEOP_JSONEXPR
+			else if (op == EEOP_JSONEXPR_PATH)
+			{
+				snprintf(name, sizeof(name), "jpath_%d", i);
+				MIR_load_external(ctx, name,
+								  mir_extern_addr((void *) ExecEvalJsonExprPath));
+				continue;
+			}
+#endif
+			/* Direct-call opcodes: resolve to PG-exported C function */
+			else if (op == EEOP_FUNCEXPR_FUSAGE ||
+					 op == EEOP_FUNCEXPR_STRICT_FUSAGE ||
+					 op == EEOP_NULLTEST_ROWISNULL ||
+					 op == EEOP_NULLTEST_ROWISNOTNULL ||
+#ifdef HAVE_EEOP_PARAM_SET
+					 op == EEOP_PARAM_SET ||
+#endif
+					 op == EEOP_ARRAYCOERCE ||
+					 op == EEOP_FIELDSELECT ||
+					 op == EEOP_FIELDSTORE_DEFORM ||
+					 op == EEOP_FIELDSTORE_FORM ||
+					 op == EEOP_CONVERT_ROWTYPE ||
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					 op == EEOP_JSON_CONSTRUCTOR ||
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					 op == EEOP_JSONEXPR_COERCION ||
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+					 op == EEOP_MERGE_SUPPORT_FUNC ||
+#endif
+					 op == EEOP_SUBPLAN ||
+					 op == EEOP_WHOLEROW ||
+					 op == EEOP_AGG_ORDERED_TRANS_DATUM ||
+					 op == EEOP_AGG_ORDERED_TRANS_TUPLE ||
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+					 op == EEOP_IOCOERCE_SAFE ||
+#endif
+					 op == EEOP_SCALARARRAYOP ||
+					 op == EEOP_SQLVALUEFUNCTION ||
+					 op == EEOP_CURRENTOFEXPR ||
+					 op == EEOP_NEXTVALUEEXPR ||
+					 op == EEOP_ARRAYEXPR ||
+					 op == EEOP_ROW ||
+					 op == EEOP_MINMAX ||
+					 op == EEOP_DOMAIN_NOTNULL ||
+					 op == EEOP_DOMAIN_CHECK ||
+					 op == EEOP_XMLEXPR ||
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					 op == EEOP_IS_JSON ||
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					 op == EEOP_JSONEXPR_COERCION_FINISH ||
+#endif
+					 op == EEOP_GROUPING_FUNC ||
+					 op == EEOP_PARAM_CALLBACK ||
+					 op == EEOP_PARAM_EXEC ||
+					 op == EEOP_PARAM_EXTERN)
+			{
+				void *fn = NULL;
+				switch (op)
+				{
+					/* 3-arg void calls */
+					case EEOP_FUNCEXPR_FUSAGE:
+						fn = (void *) ExecEvalFuncExprFusage; break;
+					case EEOP_FUNCEXPR_STRICT_FUSAGE:
+						fn = (void *) ExecEvalFuncExprStrictFusage; break;
+					case EEOP_NULLTEST_ROWISNULL:
+						fn = (void *) ExecEvalRowNull; break;
+					case EEOP_NULLTEST_ROWISNOTNULL:
+						fn = (void *) ExecEvalRowNotNull; break;
+#ifdef HAVE_EEOP_PARAM_SET
+					case EEOP_PARAM_SET:
+						fn = (void *) ExecEvalParamSet; break;
+#endif
+					case EEOP_ARRAYCOERCE:
+						fn = (void *) ExecEvalArrayCoerce; break;
+					case EEOP_FIELDSELECT:
+						fn = (void *) ExecEvalFieldSelect; break;
+					case EEOP_FIELDSTORE_DEFORM:
+						fn = (void *) ExecEvalFieldStoreDeForm; break;
+					case EEOP_FIELDSTORE_FORM:
+						fn = (void *) ExecEvalFieldStoreForm; break;
+					case EEOP_CONVERT_ROWTYPE:
+						fn = (void *) ExecEvalConvertRowtype; break;
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					case EEOP_JSON_CONSTRUCTOR:
+						fn = (void *) ExecEvalJsonConstructor; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					case EEOP_JSONEXPR_COERCION:
+						fn = (void *) ExecEvalJsonCoercion; break;
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+					case EEOP_MERGE_SUPPORT_FUNC:
+						fn = (void *) ExecEvalMergeSupportFunc; break;
+#endif
+					case EEOP_SUBPLAN:
+						fn = (void *) ExecEvalSubPlan; break;
+					case EEOP_WHOLEROW:
+						fn = (void *) ExecEvalWholeRowVar; break;
+					case EEOP_AGG_ORDERED_TRANS_DATUM:
+						fn = (void *) ExecEvalAggOrderedTransDatum; break;
+					case EEOP_AGG_ORDERED_TRANS_TUPLE:
+						fn = (void *) ExecEvalAggOrderedTransTuple; break;
+					/* 2-arg void calls */
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+					case EEOP_IOCOERCE_SAFE:
+						fn = (void *) ExecEvalCoerceViaIOSafe; break;
+#endif
+					case EEOP_SCALARARRAYOP:
+						fn = (void *) ExecEvalScalarArrayOp; break;
+					case EEOP_SQLVALUEFUNCTION:
+						fn = (void *) ExecEvalSQLValueFunction; break;
+					case EEOP_CURRENTOFEXPR:
+						fn = (void *) ExecEvalCurrentOfExpr; break;
+					case EEOP_NEXTVALUEEXPR:
+						fn = (void *) ExecEvalNextValueExpr; break;
+					case EEOP_ARRAYEXPR:
+						fn = (void *) ExecEvalArrayExpr; break;
+					case EEOP_ROW:
+						fn = (void *) ExecEvalRow; break;
+					case EEOP_MINMAX:
+						fn = (void *) ExecEvalMinMax; break;
+					case EEOP_DOMAIN_NOTNULL:
+						fn = (void *) ExecEvalConstraintNotNull; break;
+					case EEOP_DOMAIN_CHECK:
+						fn = (void *) ExecEvalConstraintCheck; break;
+					case EEOP_XMLEXPR:
+						fn = (void *) ExecEvalXmlExpr; break;
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					case EEOP_IS_JSON:
+						fn = (void *) ExecEvalJsonIsPredicate; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					case EEOP_JSONEXPR_COERCION_FINISH:
+						fn = (void *) ExecEvalJsonCoercionFinish; break;
+#endif
+					case EEOP_GROUPING_FUNC:
+						fn = (void *) ExecEvalGroupingFunc; break;
+					/* PARAM_CALLBACK: indirect fn pointer */
+					case EEOP_PARAM_CALLBACK:
+						fn = (void *) steps[i].d.cparam.paramfunc; break;
+					case EEOP_PARAM_EXEC:
+						fn = (void *) ExecEvalParamExec; break;
+					case EEOP_PARAM_EXTERN:
+						fn = (void *) ExecEvalParamExtern; break;
+					default:
+						break;
+				}
+				snprintf(name, sizeof(name), "dc_%d", i);
+				if (fn)
+					MIR_load_external(ctx, name, mir_extern_addr(fn));
 				continue;
 			}
 #ifdef HAVE_EEOP_HASHDATUM
@@ -4388,6 +6389,7 @@ mir_compile_expr(ExprState *state)
 			pfree(step_labels);
 			pfree(step_fn_imports);
 			pfree(step_direct_imports);
+			pfree(ioc_in_imports);
 			mir_shared_code_mode = false;
 			return false;
 		}
@@ -4415,6 +6417,21 @@ mir_compile_expr(ExprState *state)
 
 #if defined(__APPLE__) && defined(__aarch64__)
 			pthread_jit_write_protect_np(0);	/* write mode */
+#elif defined(__x86_64__) || defined(_M_X64)
+			/*
+			 * MIR sets code pages to PROT_READ|PROT_EXEC after MIR_gen().
+			 * We need write access for sentinel patching.
+			 */
+			{
+				long		pgsz = sysconf(_SC_PAGESIZE);
+				uintptr_t	page_start = (uintptr_t) mcode & ~(pgsz - 1);
+				Size		page_len = ((uintptr_t) mcode + mcode_size) - page_start;
+
+				page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
+				if (mprotect((void *) page_start, page_len,
+							 PROT_READ | PROT_WRITE) != 0)
+					elog(WARNING, "pg_jitter[mir]: mprotect(RW) for sentinel patching failed: %m");
+			}
 #endif
 
 			npatched = mir_patch_sentinels(mcode, mcode_size);
@@ -4426,6 +6443,17 @@ mir_compile_expr(ExprState *state)
 #if defined(__APPLE__) && defined(__aarch64__)
 			sys_icache_invalidate(mcode, mcode_size);
 			pthread_jit_write_protect_np(1);	/* exec mode */
+#elif defined(__x86_64__) || defined(_M_X64)
+			{
+				long		pgsz = sysconf(_SC_PAGESIZE);
+				uintptr_t	page_start = (uintptr_t) mcode & ~(pgsz - 1);
+				Size		page_len = ((uintptr_t) mcode + mcode_size) - page_start;
+
+				page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
+				if (mprotect((void *) page_start, page_len,
+							 PROT_READ | PROT_EXEC) != 0)
+					elog(WARNING, "pg_jitter[mir]: mprotect(RX) for sentinel patching failed: %m");
+			}
 #endif
 		}
 
@@ -4465,6 +6493,7 @@ mir_compile_expr(ExprState *state)
 	pfree(step_labels);
 	pfree(step_fn_imports);
 	pfree(step_direct_imports);
+	pfree(ioc_in_imports);
 
 	/* Reset shared code mode for next compilation */
 	mir_shared_code_mode = false;

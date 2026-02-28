@@ -311,15 +311,20 @@ meta_release_context(JitContext *context)
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
 
-	/* Clean up DSM shared code state */
+	/*
+	 * Clean up DSM shared code state.
+	 *
+	 * Note: we do NOT call SetConfigOption here to reset the _shared_dsm GUC.
+	 * This function may be called from a ResourceOwner release callback during
+	 * subtransaction abort, and SetConfigOption allocates memory — which
+	 * triggers "ResourceOwnerEnlarge called after release started".  The GUC
+	 * is session-scoped and harmless if stale; each new parallel query creates
+	 * a fresh DSM handle.
+	 */
 	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)
 	{
-		dsm_unpin_mapping(ctx->share_state.dsm_seg);
+		/* Just detach — see comment in pg_jitter_cleanup_shared_dsm() */
 		dsm_detach(ctx->share_state.dsm_seg);
-
-		if (ctx->share_state.is_leader)
-			SetConfigOption("pg_jitter._shared_dsm", "",
-							PGC_USERSET, PGC_S_SESSION);
 
 		memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
 	}
@@ -449,22 +454,15 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
 		NULL, NULL, NULL);
 
-	DefineCustomEnumVariable("pg_jitter.backend",
-							 "Selects the active pg_jitter JIT backend.",
-							 NULL,
-							 &pg_jitter_backend,
-							 boot_default,
-							 backend_options,
-							 PGC_USERSET,
-							 GUC_ALLOW_IN_PARALLEL,
-							 NULL,
-							 meta_backend_assign,
-							 NULL);
-
 	/*
 	 * Internal GUC for passing DSM handle from leader to workers.
 	 * Serialized via SerializeGUCState automatically.
 	 * Hidden from pg_settings and config files.
+	 *
+	 * Must be defined BEFORE pg_jitter.backend, because the backend assign
+	 * hook eagerly loads the backend .dylib, which also tries to define this
+	 * GUC.  If we define it afterwards, the backend defines it first, and
+	 * then our define hits "attempt to redefine parameter".
 	 */
 	DefineCustomStringVariable(
 		"pg_jitter._shared_dsm",
@@ -476,5 +474,15 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
 		NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("pg_jitter");
+	DefineCustomEnumVariable("pg_jitter.backend",
+							 "Selects the active pg_jitter JIT backend.",
+							 NULL,
+							 &pg_jitter_backend,
+							 boot_default,
+							 backend_options,
+							 PGC_USERSET,
+							 GUC_ALLOW_IN_PARALLEL,
+							 NULL,
+							 meta_backend_assign,
+							 NULL);
 }

@@ -7,6 +7,14 @@
  * Mechanical translation of pg_jitter_asmjit_arm64.inc.
  */
 
+/*
+ * When true, indicates we are compiling code that will be shared via DSM
+ * with parallel workers. On x86_64, cc.mov(reg, imm64) already emits the
+ * full 10-byte MOVABS instruction, so no special emit function is needed —
+ * the relocation scanner in pg_jitter_common.c handles patching natively.
+ */
+static bool asmjit_shared_code_mode = false;
+
 /* Helper: emit x86 equivalent of ARM64 cbz (compare-and-branch-if-zero) */
 static inline void x86_cbz(x86::Compiler &cc, x86::Gp reg, Label &label)
 {
@@ -78,6 +86,9 @@ asmjit_emit_deform_inline(x86::Compiler &cc,
         ops != &TTSOpsMinimalTuple)
         return false;
     if (natts <= 0 || natts > desc->natts)
+        return false;
+    /* Wide tables: fall back to slot_getsomeattrs_int */
+    if (natts > pg_jitter_deform_threshold())
         return false;
 
     /* Determine slot-type-specific field offsets */
@@ -568,9 +579,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				if (!deform_emitted)
 				{
-					/* Fallback: call slot_getsomeattrs_int(slot, last_var) */
+					/*
+					 * Call deform dispatch: JIT-compiles deform via sljit
+					 * (loop-based for wide, unrolled for narrow) and caches.
+					 */
 					x86::Gp fn_reg = cc.new_gp64();
-					cc.mov(fn_reg, (uint64_t)(void *) slot_getsomeattrs_int);
+					cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_compiled_deform_dispatch);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());
@@ -2032,6 +2046,1131 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
+			/*
+			 * ---- PRESORTED DISTINCT ----
+			 * Direct call to ExecEvalPreOrderedDistinct{Single,Multi},
+			 * branch on result.
+			 */
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+			case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
+			case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
+			{
+				int jumpdistinct = op->d.agg_presorted_distinctcheck.jumpdistinct;
+				void *fn = (opcode == EEOP_AGG_PRESORTED_DISTINCT_SINGLE)
+					? (void *) ExecEvalPreOrderedDistinctSingle
+					: (void *) ExecEvalPreOrderedDistinctMulti;
+
+				/* aggstate = state->parent */
+				x86::Gp aggst = cc.new_gp64();
+				cc.mov(aggst, x86::qword_ptr(v_state, offsetof(ExprState, parent)));
+
+				/* pertrans = op->d.agg_presorted_distinctcheck.pertrans */
+				x86::Gp pt = cc.new_gp64();
+				cc.mov(pt, (uint64_t) op->d.agg_presorted_distinctcheck.pertrans);
+
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t) fn);
+				InvokeNode *invoke;
+				x86::Gp ret_reg = cc.new_gp64();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<int64_t, void *, void *>());
+				invoke->set_arg(0, aggst);
+				invoke->set_arg(1, pt);
+				invoke->set_ret(0, ret_reg);
+
+				/* If result == 0 (not distinct), jump to jumpdistinct */
+				if (jumpdistinct >= 0 && jumpdistinct < steps_len)
+					x86_cbz(cc, ret_reg, step_labels[jumpdistinct]);
+				break;
+			}
+#endif /* HAVE_EEOP_AGG_PRESORTED_DISTINCT */
+
+			/*
+			 * ---- BOOLTEST_IS_TRUE / IS_NOT_TRUE / IS_FALSE / IS_NOT_FALSE ----
+			 */
+			case EEOP_BOOLTEST_IS_TRUE:
+			{
+				/* If null: resvalue=false, resnull=false. Else keep. */
+				Label not_null = cc.new_label();
+
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				x86_cbz(cc, tmp2, not_null);
+
+				/* Null path */
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp1), Imm(0));
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), Imm(0));
+
+				cc.bind(not_null);
+				break;
+			}
+
+			case EEOP_BOOLTEST_IS_NOT_TRUE:
+			{
+				/* If null: resvalue=true, resnull=false. Else invert. */
+				Label not_null = cc.new_label();
+				Label done = cc.new_label();
+
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				x86_cbz(cc, tmp2, not_null);
+
+				/* Null path: resvalue=true, resnull=false */
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp1), Imm(1));
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), Imm(0));
+				cc.jmp(done);
+
+				/* Not null: invert resvalue */
+				cc.bind(not_null);
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(tmp2, x86::qword_ptr(tmp1));
+				cc.test(tmp2, tmp2);
+				x86_cset(cc, tmp2, x86::CondCode::kEqual);
+				cc.mov(x86::qword_ptr(tmp1), tmp2);
+
+				cc.bind(done);
+				break;
+			}
+
+			case EEOP_BOOLTEST_IS_FALSE:
+			{
+				/* If null: resvalue=false, resnull=false. Else invert. */
+				Label not_null = cc.new_label();
+				Label done = cc.new_label();
+
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				x86_cbz(cc, tmp2, not_null);
+
+				/* Null path: resvalue=false, resnull=false */
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp1), Imm(0));
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), Imm(0));
+				cc.jmp(done);
+
+				/* Not null: invert resvalue */
+				cc.bind(not_null);
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(tmp2, x86::qword_ptr(tmp1));
+				cc.test(tmp2, tmp2);
+				x86_cset(cc, tmp2, x86::CondCode::kEqual);
+				cc.mov(x86::qword_ptr(tmp1), tmp2);
+
+				cc.bind(done);
+				break;
+			}
+
+			case EEOP_BOOLTEST_IS_NOT_FALSE:
+			{
+				/* If null: resvalue=true, resnull=false. Else keep. */
+				Label not_null = cc.new_label();
+
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				x86_cbz(cc, tmp2, not_null);
+
+				/* Null path */
+				cc.mov(tmp1, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp1), Imm(1));
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), Imm(0));
+
+				cc.bind(not_null);
+				break;
+			}
+
+			/*
+			 * ---- AGGREF ----
+			 */
+			case EEOP_AGGREF:
+			{
+				int aggno = op->d.aggref.aggno;
+
+				/* resvalue = econtext->ecxt_aggvalues[aggno] */
+				cc.mov(tmp1, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, ecxt_aggvalues)));
+				cc.mov(tmp2, x86::qword_ptr(tmp1,
+					aggno * (int32_t) sizeof(Datum)));
+				cc.mov(tmp3, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp3), tmp2);
+
+				/* resnull = econtext->ecxt_aggnulls[aggno] */
+				cc.mov(tmp1, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, ecxt_aggnulls)));
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1,
+					aggno * (int32_t) sizeof(bool)));
+				cc.mov(tmp3, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp3), tmp2.r8());
+				break;
+			}
+
+			/*
+			 * ---- WINDOW_FUNC ----
+			 * wfuncno read at runtime (assigned after compilation).
+			 */
+			case EEOP_WINDOW_FUNC:
+			{
+				/* tmp1 = wfstate (compile-time known ptr) */
+				cc.mov(tmp1, (uint64_t) op->d.window_func.wfstate);
+				/* tmp2 = wfstate->wfuncno (read at runtime) */
+				cc.movsxd(tmp2, x86::dword_ptr(tmp1,
+					offsetof(WindowFuncExprState, wfuncno)));
+
+				/* tmp3 = econtext->ecxt_aggvalues */
+				cc.mov(tmp3, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, ecxt_aggvalues)));
+				/* tmp1 = tmp2 * 8 (sizeof Datum) */
+				cc.shl(tmp2, 3);
+				cc.add(tmp3, tmp2);
+				cc.mov(tmp1, x86::qword_ptr(tmp3));
+				cc.mov(tmp3, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp3), tmp1);
+
+				/* Reload wfuncno for nulls */
+				cc.mov(tmp1, (uint64_t) op->d.window_func.wfstate);
+				cc.movsxd(tmp2, x86::dword_ptr(tmp1,
+					offsetof(WindowFuncExprState, wfuncno)));
+				/* tmp3 = econtext->ecxt_aggnulls */
+				cc.mov(tmp3, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, ecxt_aggnulls)));
+				cc.add(tmp3, tmp2);
+				cc.movzx(tmp1.r32(), x86::byte_ptr(tmp3));
+				cc.mov(tmp3, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp3), tmp1.r8());
+				break;
+			}
+
+			/*
+			 * ---- CASE_TESTVAL / DOMAIN_TESTVAL ----
+			 * Copy from cached pointer.
+			 */
+			case EEOP_CASE_TESTVAL:
+			case EEOP_DOMAIN_TESTVAL:
+			{
+				/* *op->resvalue = *op->d.casetest.value */
+				cc.mov(tmp1, (uint64_t) op->d.casetest.value);
+				cc.mov(tmp2, x86::qword_ptr(tmp1));
+				cc.mov(tmp3, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp3), tmp2);
+
+				/* *op->resnull = *op->d.casetest.isnull */
+				cc.mov(tmp1, (uint64_t) op->d.casetest.isnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				cc.mov(tmp3, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp3), tmp2.r8());
+				break;
+			}
+
+#ifdef HAVE_EEOP_TESTVAL_EXT
+			case EEOP_CASE_TESTVAL_EXT:
+			{
+				/* *op->resvalue = econtext->caseValue_datum */
+				cc.mov(tmp1, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, caseValue_datum)));
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+
+				/* *op->resnull = econtext->caseValue_isNull */
+				cc.movzx(tmp1.r32(), x86::byte_ptr(v_econtext,
+					offsetof(ExprContext, caseValue_isNull)));
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), tmp1.r8());
+				break;
+			}
+
+			case EEOP_DOMAIN_TESTVAL_EXT:
+			{
+				/* *op->resvalue = econtext->domainValue_datum */
+				cc.mov(tmp1, x86::qword_ptr(v_econtext,
+					offsetof(ExprContext, domainValue_datum)));
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+
+				/* *op->resnull = econtext->domainValue_isNull */
+				cc.movzx(tmp1.r32(), x86::byte_ptr(v_econtext,
+					offsetof(ExprContext, domainValue_isNull)));
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), tmp1.r8());
+				break;
+			}
+#endif /* HAVE_EEOP_TESTVAL_EXT */
+
+			/*
+			 * ---- MAKE_READONLY ----
+			 */
+			case EEOP_MAKE_READONLY:
+			{
+				Label skip_null = cc.new_label();
+
+				/* tmp1 = *op->d.make_readonly.isnull */
+				cc.mov(tmp1, (uint64_t) op->d.make_readonly.isnull);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+
+				/* *op->resnull = isnull */
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), tmp2.r8());
+
+				/* If null, skip */
+				x86_cbnz(cc, tmp2, skip_null);
+
+				/* Not null: resvalue = MakeExpandedObjectReadOnlyInternal(*value) */
+				cc.mov(tmp1, (uint64_t) op->d.make_readonly.value);
+				cc.mov(tmp1, x86::qword_ptr(tmp1));
+				{
+					x86::Gp fn_reg = cc.new_gp64();
+					cc.mov(fn_reg, (uint64_t)(void *) MakeExpandedObjectReadOnlyInternal);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<int64_t, int64_t>());
+					invoke->set_arg(0, tmp1);
+					invoke->set_ret(0, tmp1);
+				}
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+
+				cc.bind(skip_null);
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_INPUT_CHECK_ARGS ----
+			 * Check NullableDatum args[i].isnull for i=0..nargs-1,
+			 * jump to jumpnull if any null.
+			 */
+			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
+			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
+			{
+				NullableDatum *args = op->d.agg_strict_input_check.args;
+				int nargs = op->d.agg_strict_input_check.nargs;
+				int jumpnull = op->d.agg_strict_input_check.jumpnull;
+
+				int64_t isnull_off0 = offsetof(NullableDatum, isnull);
+				int64_t nd_size = (int64_t) sizeof(NullableDatum);
+
+				/* tmp1 = args base */
+				cc.mov(tmp1, (uint64_t) args);
+
+				if (nargs > 1 && nargs <= 4)
+				{
+					/* OR-batch: load all isnull, OR together, 1 branch */
+					cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1, (int32_t) isnull_off0));
+					for (int argno = 1; argno < nargs; argno++)
+					{
+						x86::Gp t = cc.new_gp64();
+						cc.movzx(t.r32(), x86::byte_ptr(tmp1,
+							(int32_t)(argno * nd_size + isnull_off0)));
+						cc.or_(tmp2, t);
+					}
+					x86_cbnz(cc, tmp2, step_labels[jumpnull]);
+				}
+				else
+				{
+					for (int argno = 0; argno < nargs; argno++)
+					{
+						cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1,
+							(int32_t)(argno * nd_size + isnull_off0)));
+						x86_cbnz(cc, tmp2, step_labels[jumpnull]);
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_INPUT_CHECK_NULLS ----
+			 * Check bool nulls[i] for i=0..nargs-1,
+			 * jump to jumpnull if any null.
+			 */
+			case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
+			{
+				bool *nulls = op->d.agg_strict_input_check.nulls;
+				int nargs = op->d.agg_strict_input_check.nargs;
+				int jumpnull = op->d.agg_strict_input_check.jumpnull;
+
+				/* tmp1 = nulls base */
+				cc.mov(tmp1, (uint64_t) nulls);
+
+				if (nargs > 1 && nargs <= 4)
+				{
+					cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1, 0));
+					for (int argno = 1; argno < nargs; argno++)
+					{
+						x86::Gp t = cc.new_gp64();
+						cc.movzx(t.r32(), x86::byte_ptr(tmp1,
+							argno * (int32_t) sizeof(bool)));
+						cc.or_(tmp2, t);
+					}
+					x86_cbnz(cc, tmp2, step_labels[jumpnull]);
+				}
+				else
+				{
+					for (int argno = 0; argno < nargs; argno++)
+					{
+						cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1,
+							argno * (int32_t) sizeof(bool)));
+						x86_cbnz(cc, tmp2, step_labels[jumpnull]);
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_PLAIN_PERGROUP_NULLCHECK ----
+			 */
+			case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
+			{
+				int setoff = op->d.agg_plain_pergroup_nullcheck.setoff;
+				int jumpnull = op->d.agg_plain_pergroup_nullcheck.jumpnull;
+
+				/* tmp1 = state->parent (AggState*) */
+				cc.mov(tmp1, x86::qword_ptr(v_state,
+					offsetof(ExprState, parent)));
+				/* tmp1 = aggstate->all_pergroups */
+				cc.mov(tmp1, x86::qword_ptr(tmp1,
+					offsetof(AggState, all_pergroups)));
+				/* tmp1 = all_pergroups[setoff] */
+				cc.mov(tmp1, x86::qword_ptr(tmp1,
+					setoff * (int32_t) sizeof(AggStatePerGroup)));
+
+				/* If NULL, jump to jumpnull */
+				x86_cbz(cc, tmp1, step_labels[jumpnull]);
+				break;
+			}
+
+			/*
+			 * ---- AGG_STRICT_DESERIALIZE / AGG_DESERIALIZE ----
+			 */
+			case EEOP_AGG_STRICT_DESERIALIZE:
+			case EEOP_AGG_DESERIALIZE:
+			{
+				FunctionCallInfo fcinfo = op->d.agg_deserialize.fcinfo_data;
+
+				if (opcode == EEOP_AGG_STRICT_DESERIALIZE)
+				{
+					/* Check args[0].isnull → jump to jumpnull */
+					int64_t null_off =
+						(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+					cc.mov(tmp1, (uint64_t) fcinfo);
+					cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1, (int32_t) null_off));
+					x86_cbnz(cc, tmp2, step_labels[op->d.agg_deserialize.jumpnull]);
+				}
+
+				/* fcinfo->isnull = false */
+				cc.mov(tmp1, (uint64_t) fcinfo);
+				cc.mov(x86::byte_ptr(tmp1,
+					offsetof(FunctionCallInfoBaseData, isnull)), Imm(0));
+
+				/* R0 = fcinfo->flinfo->fn_addr(fcinfo) */
+				{
+					x86::Gp fn_reg = cc.new_gp64();
+					cc.mov(fn_reg, (uint64_t)(void *) fcinfo->flinfo->fn_addr);
+					x86::Gp fcinfo_reg = cc.new_gp64();
+					cc.mov(fcinfo_reg, (uint64_t) fcinfo);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<int64_t, void *>());
+					invoke->set_arg(0, fcinfo_reg);
+					invoke->set_ret(0, tmp1);
+				}
+
+				/* *op->resvalue = result */
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+
+				/* *op->resnull = fcinfo->isnull */
+				cc.mov(tmp1, (uint64_t) fcinfo);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1,
+					offsetof(FunctionCallInfoBaseData, isnull)));
+				cc.mov(tmp1, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp1), tmp2.r8());
+				break;
+			}
+
+			/*
+			 * ---- DISTINCT / NOT_DISTINCT ----
+			 * 3-way null logic + equality function call.
+			 */
+			case EEOP_DISTINCT:
+			case EEOP_NOT_DISTINCT:
+			{
+				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+				Label one_null = cc.new_label();
+				Label both_null = cc.new_label();
+				Label done = cc.new_label();
+
+				int64_t null0_off =
+					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+				int64_t null1_off =
+					(int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+
+				/* Load both isnull flags */
+				cc.mov(tmp3, (uint64_t) fcinfo);
+				cc.movzx(tmp1.r32(), x86::byte_ptr(tmp3, (int32_t) null0_off));
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp3, (int32_t) null1_off));
+
+				/* If null flags differ → one_null */
+				cc.cmp(tmp1, tmp2);
+				cc.jne(one_null);
+
+				/* Null flags equal. If both null (tmp1 != 0) → both_null */
+				x86_cbnz(cc, tmp1, both_null);
+
+				/* Neither null: call equality function */
+				cc.mov(x86::byte_ptr(tmp3,
+					offsetof(FunctionCallInfoBaseData, isnull)), Imm(0));
+				{
+					x86::Gp fn_reg = cc.new_gp64();
+					cc.mov(fn_reg, (uint64_t)(void *) op->d.func.fn_addr);
+					x86::Gp fcinfo_reg = cc.new_gp64();
+					cc.mov(fcinfo_reg, (uint64_t) fcinfo);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<int64_t, void *>());
+					invoke->set_arg(0, fcinfo_reg);
+					invoke->set_ret(0, tmp1);
+				}
+
+				/* For DISTINCT: invert result */
+				if (opcode == EEOP_DISTINCT)
+				{
+					cc.test(tmp1, tmp1);
+					x86_cset(cc, tmp1, x86::CondCode::kEqual);
+				}
+				/* Store result, resnull=false */
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(0));
+				cc.jmp(done);
+
+				/* one_null: nulls differ → DISTINCT=true, NOT_DISTINCT=false */
+				cc.bind(one_null);
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2),
+					Imm((opcode == EEOP_DISTINCT) ? 1 : 0));
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(0));
+				cc.jmp(done);
+
+				/* both_null: DISTINCT=false, NOT_DISTINCT=true */
+				cc.bind(both_null);
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2),
+					Imm((opcode == EEOP_DISTINCT) ? 0 : 1));
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(0));
+
+				cc.bind(done);
+				break;
+			}
+
+			/*
+			 * ---- NULLIF ----
+			 * If a null: resnull=true. If b null: return a.
+			 * Else call equality; if equal return null, else return a.
+			 */
+			case EEOP_NULLIF:
+			{
+				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+				Label a_null = cc.new_label();
+				Label b_null = cc.new_label();
+				Label not_equal = cc.new_label();
+				Label done = cc.new_label();
+
+				int64_t null0_off =
+					(int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+				int64_t null1_off =
+					(int64_t)((char *)&fcinfo->args[1].isnull - (char *)fcinfo);
+				int64_t val0_off =
+					(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+
+				/* Load fcinfo base */
+				cc.mov(tmp3, (uint64_t) fcinfo);
+
+				/* Check if arg0 is null */
+				cc.movzx(tmp1.r32(), x86::byte_ptr(tmp3, (int32_t) null0_off));
+				x86_cbnz(cc, tmp1, a_null);
+
+				/* Check if arg1 is null → return a */
+				cc.movzx(tmp1.r32(), x86::byte_ptr(tmp3, (int32_t) null1_off));
+				x86_cbnz(cc, tmp1, b_null);
+
+				/* Both non-null: call equality function */
+				cc.mov(x86::byte_ptr(tmp3,
+					offsetof(FunctionCallInfoBaseData, isnull)), Imm(0));
+				{
+					x86::Gp fn_reg = cc.new_gp64();
+					cc.mov(fn_reg, (uint64_t)(void *) op->d.func.fn_addr);
+					x86::Gp fcinfo_reg = cc.new_gp64();
+					cc.mov(fcinfo_reg, (uint64_t) fcinfo);
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<int64_t, void *>());
+					invoke->set_arg(0, fcinfo_reg);
+					invoke->set_ret(0, tmp1);
+				}
+
+				/* If fcinfo->isnull, treat as not equal */
+				cc.mov(tmp3, (uint64_t) fcinfo);
+				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp3,
+					offsetof(FunctionCallInfoBaseData, isnull)));
+				x86_cbnz(cc, tmp2, not_equal);
+
+				/* If result == false (0), not equal */
+				x86_cbz(cc, tmp1, not_equal);
+
+				/* Equal: return null */
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(1));
+				cc.jmp(done);
+
+				/* not_equal / b_null: return a's value */
+				cc.bind(not_equal);
+				cc.bind(b_null);
+				cc.mov(tmp3, (uint64_t) fcinfo);
+				cc.mov(tmp1, x86::qword_ptr(tmp3, (int32_t) val0_off));
+				cc.mov(tmp2, (uint64_t) op->resvalue);
+				cc.mov(x86::qword_ptr(tmp2), tmp1);
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(0));
+				cc.jmp(done);
+
+				/* a_null: resnull = true */
+				cc.bind(a_null);
+				cc.mov(tmp2, (uint64_t) op->resnull);
+				cc.mov(x86::byte_ptr(tmp2), Imm(1));
+
+				cc.bind(done);
+				break;
+			}
+
+			/*
+			 * ---- DIRECT-CALL OPCODES ----
+			 * These opcodes have PG-exported functions with matching signatures.
+			 * Instead of going through fallback_step's switch, we call the
+			 * function directly.
+			 */
+
+			/* 3-arg: fn(ExprState *state, ExprEvalStep *op, ExprContext *econtext) */
+			case EEOP_FUNCEXPR_FUSAGE:
+			case EEOP_FUNCEXPR_STRICT_FUSAGE:
+			case EEOP_NULLTEST_ROWISNULL:
+			case EEOP_NULLTEST_ROWISNOTNULL:
+#ifdef HAVE_EEOP_PARAM_SET
+			case EEOP_PARAM_SET:
+#endif
+			case EEOP_ARRAYCOERCE:
+			case EEOP_FIELDSELECT:
+			case EEOP_FIELDSTORE_DEFORM:
+			case EEOP_FIELDSTORE_FORM:
+			case EEOP_CONVERT_ROWTYPE:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			case EEOP_JSON_CONSTRUCTOR:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+			case EEOP_JSONEXPR_COERCION:
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+			case EEOP_MERGE_SUPPORT_FUNC:
+#endif
+			case EEOP_SUBPLAN:
+			case EEOP_WHOLEROW:
+			case EEOP_AGG_ORDERED_TRANS_DATUM:
+			case EEOP_AGG_ORDERED_TRANS_TUPLE:
+			case EEOP_PARAM_EXEC:
+			case EEOP_PARAM_EXTERN:
+			{
+				void *fn;
+
+				switch (opcode)
+				{
+					case EEOP_FUNCEXPR_FUSAGE:
+						fn = (void *) ExecEvalFuncExprFusage; break;
+					case EEOP_FUNCEXPR_STRICT_FUSAGE:
+						fn = (void *) ExecEvalFuncExprStrictFusage; break;
+					case EEOP_NULLTEST_ROWISNULL:
+						fn = (void *) ExecEvalRowNull; break;
+					case EEOP_NULLTEST_ROWISNOTNULL:
+						fn = (void *) ExecEvalRowNotNull; break;
+#ifdef HAVE_EEOP_PARAM_SET
+					case EEOP_PARAM_SET:
+						fn = (void *) ExecEvalParamSet; break;
+#endif
+					case EEOP_ARRAYCOERCE:
+						fn = (void *) ExecEvalArrayCoerce; break;
+					case EEOP_FIELDSELECT:
+						fn = (void *) ExecEvalFieldSelect; break;
+					case EEOP_FIELDSTORE_DEFORM:
+						fn = (void *) ExecEvalFieldStoreDeForm; break;
+					case EEOP_FIELDSTORE_FORM:
+						fn = (void *) ExecEvalFieldStoreForm; break;
+					case EEOP_CONVERT_ROWTYPE:
+						fn = (void *) ExecEvalConvertRowtype; break;
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					case EEOP_JSON_CONSTRUCTOR:
+						fn = (void *) ExecEvalJsonConstructor; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					case EEOP_JSONEXPR_COERCION:
+						fn = (void *) ExecEvalJsonCoercion; break;
+#endif
+#ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
+					case EEOP_MERGE_SUPPORT_FUNC:
+						fn = (void *) ExecEvalMergeSupportFunc; break;
+#endif
+					case EEOP_SUBPLAN:
+						fn = (void *) ExecEvalSubPlan; break;
+					case EEOP_WHOLEROW:
+						fn = (void *) ExecEvalWholeRowVar; break;
+					case EEOP_AGG_ORDERED_TRANS_DATUM:
+						fn = (void *) ExecEvalAggOrderedTransDatum; break;
+					case EEOP_AGG_ORDERED_TRANS_TUPLE:
+						fn = (void *) ExecEvalAggOrderedTransTuple; break;
+					case EEOP_PARAM_EXEC:
+						fn = (void *) ExecEvalParamExec; break;
+					case EEOP_PARAM_EXTERN:
+						fn = (void *) ExecEvalParamExtern; break;
+					default:
+						pg_unreachable();
+				}
+
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t) fn);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+			case EEOP_IOCOERCE_SAFE:
+#endif
+			case EEOP_SCALARARRAYOP:
+			case EEOP_SQLVALUEFUNCTION:
+			case EEOP_CURRENTOFEXPR:
+			case EEOP_NEXTVALUEEXPR:
+			case EEOP_ARRAYEXPR:
+			case EEOP_ROW:
+			case EEOP_MINMAX:
+			case EEOP_DOMAIN_NOTNULL:
+			case EEOP_DOMAIN_CHECK:
+			case EEOP_XMLEXPR:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			case EEOP_IS_JSON:
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+			case EEOP_JSONEXPR_COERCION_FINISH:
+#endif
+			case EEOP_GROUPING_FUNC:
+			{
+				void *fn;
+
+				switch (opcode)
+				{
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+					case EEOP_IOCOERCE_SAFE:
+						fn = (void *) ExecEvalCoerceViaIOSafe; break;
+#endif
+					case EEOP_SCALARARRAYOP:
+						fn = (void *) ExecEvalScalarArrayOp; break;
+					case EEOP_SQLVALUEFUNCTION:
+						fn = (void *) ExecEvalSQLValueFunction; break;
+					case EEOP_CURRENTOFEXPR:
+						fn = (void *) ExecEvalCurrentOfExpr; break;
+					case EEOP_NEXTVALUEEXPR:
+						fn = (void *) ExecEvalNextValueExpr; break;
+					case EEOP_ARRAYEXPR:
+						fn = (void *) ExecEvalArrayExpr; break;
+					case EEOP_ROW:
+						fn = (void *) ExecEvalRow; break;
+					case EEOP_MINMAX:
+						fn = (void *) ExecEvalMinMax; break;
+					case EEOP_DOMAIN_NOTNULL:
+						fn = (void *) ExecEvalConstraintNotNull; break;
+					case EEOP_DOMAIN_CHECK:
+						fn = (void *) ExecEvalConstraintCheck; break;
+					case EEOP_XMLEXPR:
+						fn = (void *) ExecEvalXmlExpr; break;
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+					case EEOP_IS_JSON:
+						fn = (void *) ExecEvalJsonIsPredicate; break;
+#endif
+#ifdef HAVE_EEOP_JSONEXPR
+					case EEOP_JSONEXPR_COERCION_FINISH:
+						fn = (void *) ExecEvalJsonCoercionFinish; break;
+#endif
+					case EEOP_GROUPING_FUNC:
+						fn = (void *) ExecEvalGroupingFunc; break;
+					default:
+						pg_unreachable();
+				}
+
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t) fn);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				break;
+			}
+
+			/* PARAM_CALLBACK: indirect call through op->d.cparam.paramfunc */
+			case EEOP_PARAM_CALLBACK:
+			{
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) op->d.cparam.paramfunc);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+			/* SYSVAR: ExecEvalSysVar(state, op, econtext, slot) */
+			case EEOP_INNER_SYSVAR:
+			case EEOP_OUTER_SYSVAR:
+			case EEOP_SCAN_SYSVAR:
+#ifdef HAVE_EEOP_OLD_NEW
+			case EEOP_OLD_SYSVAR:
+			case EEOP_NEW_SYSVAR:
+#endif
+			{
+				int64_t slot_offset;
+				switch (opcode)
+				{
+					case EEOP_INNER_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_innertuple); break;
+					case EEOP_OUTER_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_outertuple); break;
+					case EEOP_SCAN_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_scantuple); break;
+#ifdef HAVE_EEOP_OLD_NEW
+					case EEOP_OLD_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_oldtuple); break;
+					case EEOP_NEW_SYSVAR:
+						slot_offset = offsetof(ExprContext, ecxt_newtuple); break;
+#endif
+					default:
+						pg_unreachable();
+				}
+
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) ExecEvalSysVar);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				/* slot = econtext->ecxt_*tuple */
+				x86::Gp slot_reg = cc.new_gp64();
+				cc.mov(slot_reg, x86::ptr(v_econtext, (int32_t) slot_offset));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				invoke->set_arg(3, slot_reg);
+				break;
+			}
+
+			/* SBSREF_OLD / SBSREF_ASSIGN / SBSREF_FETCH: indirect 3-arg void */
+			case EEOP_SBSREF_OLD:
+			case EEOP_SBSREF_ASSIGN:
+			case EEOP_SBSREF_FETCH:
+			{
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) op->d.sbsref.subscriptfunc);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+			/* SBSREF_SUBSCRIPTS: indirect 3-arg returning bool + conditional jump */
+			case EEOP_SBSREF_SUBSCRIPTS:
+			{
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) op->d.sbsref_subscript.subscriptfunc);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				x86::Gp ret_reg = cc.new_gp64();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<int64_t, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				invoke->set_ret(0, ret_reg);
+				/* If false (0), jump to jumpdone */
+				int jumpdone = op->d.sbsref_subscript.jumpdone;
+				cc.test(ret_reg, ret_reg);
+				cc.je(step_labels[jumpdone]);
+				break;
+			}
+
+#ifdef HAVE_EEOP_JSONEXPR
+			/* JSONEXPR_PATH: 3-arg returning int + multi-target jumps */
+			case EEOP_JSONEXPR_PATH:
+			{
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) ExecEvalJsonExprPath);
+				x86::Gp op_reg = cc.new_gp64();
+				cc.mov(op_reg, (uint64_t) op);
+				InvokeNode *invoke;
+				x86::Gp ret_reg = cc.new_gp64();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<int64_t, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				invoke->set_ret(0, ret_reg);
+
+				/* Multi-target jump resolution */
+				JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+				int targets[4];
+				int ntargets = 0;
+
+				targets[ntargets++] = jsestate->jump_end;
+				if (jsestate->jump_empty >= 0 &&
+					jsestate->jump_empty != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_empty;
+				if (jsestate->jump_error >= 0 &&
+					jsestate->jump_error != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_error;
+				if (jsestate->jump_eval_coercion >= 0 &&
+					jsestate->jump_eval_coercion != jsestate->jump_end)
+					targets[ntargets++] = jsestate->jump_eval_coercion;
+
+				for (int t = 0; t < ntargets; t++)
+				{
+					if (targets[t] >= 0 && targets[t] < steps_len)
+					{
+						cc.cmp(ret_reg, targets[t]);
+						cc.je(step_labels[targets[t]]);
+					}
+				}
+				break;
+			}
+#endif
+
+			/* IOCOERCE: two function calls — output fn -> cstring -> input fn */
+			case EEOP_IOCOERCE:
+			{
+				FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+				FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+
+				/* if (*op->resnull) skip */
+				x86::Gp resnull_reg = cc.new_gp64();
+				cc.movzx(resnull_reg, x86::byte_ptr((uint64_t) op->resnull));
+				Label skip_null = cc.new_label();
+				cc.test(resnull_reg, resnull_reg);
+				cc.jne(skip_null);
+
+				/* Setup output function call */
+				/* fcinfo_out->args[0].value = *op->resvalue */
+				x86::Gp resval_reg = cc.new_gp64();
+				cc.mov(resval_reg, x86::ptr((uint64_t) op->resvalue));
+				cc.mov(x86::ptr((uint64_t) &fcinfo_out->args[0].value), resval_reg);
+				/* fcinfo_out->args[0].isnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->args[0].isnull), 0);
+				/* fcinfo_out->isnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->isnull), 0);
+
+				/* R0 = fn_addr_out(fcinfo_out) */
+				{
+					x86::Gp fn_out = cc.new_gp64();
+					cc.mov(fn_out, (uint64_t)(void *) fcinfo_out->flinfo->fn_addr);
+					x86::Gp fcinfo_reg = cc.new_gp64();
+					cc.mov(fcinfo_reg, (uint64_t) fcinfo_out);
+					InvokeNode *invoke_out;
+					x86::Gp ret_out = cc.new_gp64();
+					cc.invoke(Out(invoke_out), fn_out,
+							  FuncSignature::build<int64_t, void *>());
+					invoke_out->set_arg(0, fcinfo_reg);
+					invoke_out->set_ret(0, ret_out);
+
+					/* Setup input function call */
+					/* fcinfo_in->args[0].value = ret_out */
+					cc.mov(x86::ptr((uint64_t) &fcinfo_in->args[0].value), ret_out);
+				}
+				/* fcinfo_in->args[0].isnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_in->args[0].isnull), 0);
+				/* fcinfo_in->isnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_in->isnull), 0);
+
+				/* R0 = fn_addr_in(fcinfo_in) */
+				{
+					x86::Gp fn_in = cc.new_gp64();
+					cc.mov(fn_in, (uint64_t)(void *) fcinfo_in->flinfo->fn_addr);
+					x86::Gp fcinfo_reg = cc.new_gp64();
+					cc.mov(fcinfo_reg, (uint64_t) fcinfo_in);
+					InvokeNode *invoke_in;
+					x86::Gp ret_in = cc.new_gp64();
+					cc.invoke(Out(invoke_in), fn_in,
+							  FuncSignature::build<int64_t, void *>());
+					invoke_in->set_arg(0, fcinfo_reg);
+					invoke_in->set_ret(0, ret_in);
+
+					/* *op->resvalue = ret_in */
+					cc.mov(x86::ptr((uint64_t) op->resvalue), ret_in);
+				}
+				/* *op->resnull = fcinfo_in->isnull */
+				{
+					x86::Gp isnull_reg = cc.new_gp64();
+					cc.movzx(isnull_reg, x86::byte_ptr((uint64_t) &fcinfo_in->isnull));
+					cc.mov(x86::byte_ptr((uint64_t) op->resnull), isnull_reg.r8());
+				}
+
+				cc.bind(skip_null);
+				break;
+			}
+
+			/* ROWCOMPARE_STEP: inline with null checks + dual jumps */
+			case EEOP_ROWCOMPARE_STEP:
+			{
+				FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
+				int jnull = op->d.rowcompare_step.jumpnull;
+				int jdone = op->d.rowcompare_step.jumpdone;
+
+				/* fn_strict: check args[0].isnull || args[1].isnull */
+				if (op->d.rowcompare_step.finfo->fn_strict)
+				{
+					x86::Gp a0null = cc.new_gp64();
+					cc.movzx(a0null, x86::byte_ptr((uint64_t) &fcinfo->args[0].isnull));
+					x86::Gp a1null = cc.new_gp64();
+					cc.movzx(a1null, x86::byte_ptr((uint64_t) &fcinfo->args[1].isnull));
+					cc.or_(a0null, a1null);
+
+					Label not_null = cc.new_label();
+					cc.je(not_null);  /* ZF set by or_ if both 0 */
+
+					/* Null path: *resnull = true, jump to jumpnull */
+					cc.mov(x86::byte_ptr((uint64_t) op->resnull), 1);
+					cc.jmp(step_labels[jnull]);
+
+					cc.bind(not_null);
+				}
+
+				/* fcinfo->isnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) &fcinfo->isnull), 0);
+
+				/* R0 = fn_addr(fcinfo) */
+				x86::Gp fn_reg = cc.new_gp64();
+				cc.mov(fn_reg, (uint64_t)(void *) op->d.rowcompare_step.fn_addr);
+				x86::Gp fcinfo_reg = cc.new_gp64();
+				cc.mov(fcinfo_reg, (uint64_t) fcinfo);
+				InvokeNode *invoke;
+				x86::Gp ret_reg = cc.new_gp64();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<int64_t, void *>());
+				invoke->set_arg(0, fcinfo_reg);
+				invoke->set_ret(0, ret_reg);
+
+				/* *op->resvalue = ret_reg */
+				cc.mov(x86::ptr((uint64_t) op->resvalue), ret_reg);
+
+				/* If fcinfo->isnull, *resnull = true, jump to jumpnull */
+				{
+					x86::Gp isnull_reg = cc.new_gp64();
+					cc.movzx(isnull_reg, x86::byte_ptr((uint64_t) &fcinfo->isnull));
+					cc.test(isnull_reg, isnull_reg);
+					Label not_null2 = cc.new_label();
+					cc.je(not_null2);
+					cc.mov(x86::byte_ptr((uint64_t) op->resnull), 1);
+					cc.jmp(step_labels[jnull]);
+					cc.bind(not_null2);
+				}
+
+				/* *resnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) op->resnull), 0);
+
+				/* If DatumGetInt32(ret_reg) != 0, jump to jumpdone */
+				cc.test(ret_reg.r32(), ret_reg.r32());
+				cc.jne(step_labels[jdone]);
+				break;
+			}
+
+			/* ROWCOMPARE_FINAL: inline comparison dispatch */
+			case EEOP_ROWCOMPARE_FINAL:
+			{
+				CompareType cmptype = op->d.rowcompare_final.cmptype;
+
+				/* Load int32 cmpresult from *op->resvalue */
+				x86::Gp cmpres = cc.new_gp32();
+				cc.mov(cmpres, x86::dword_ptr((uint64_t) op->resvalue));
+
+				/* Compare against 0 */
+				cc.test(cmpres, cmpres);
+
+				/* Set result based on comparison type */
+				x86::Gp result = cc.new_gp64();
+				switch (cmptype)
+				{
+					case COMPARE_LT:
+						cc.setl(result.r8()); break;
+					case COMPARE_LE:
+						cc.setle(result.r8()); break;
+					case COMPARE_GE:
+						cc.setge(result.r8()); break;
+					case COMPARE_GT:
+						cc.setg(result.r8()); break;
+					default:
+						cc.setl(result.r8()); break;
+				}
+				cc.movzx(result, result.r8());
+
+				/* *op->resvalue = BoolGetDatum(result) */
+				cc.mov(x86::ptr((uint64_t) op->resvalue), result);
+				/* *op->resnull = false */
+				cc.mov(x86::byte_ptr((uint64_t) op->resnull), 0);
+				break;
+			}
+
+#ifdef HAVE_EEOP_RETURNINGEXPR
+			/* RETURNINGEXPR: flag test + conditional jump */
+			case EEOP_RETURNINGEXPR:
+			{
+				/* Load state->flags (int32) */
+				x86::Gp flags_reg = cc.new_gp32();
+				cc.mov(flags_reg, x86::dword_ptr(v_state, (int32_t) offsetof(ExprState, flags)));
+
+				/* Test against nullflag */
+				cc.test(flags_reg, (int32_t) op->d.returningexpr.nullflag);
+				Label cont = cc.new_label();
+				cc.je(cont);
+
+				/* Flag set: *resvalue = 0, *resnull = true, jump to jumpdone */
+				cc.mov(x86::ptr((uint64_t) op->resvalue), 0);
+				cc.mov(x86::byte_ptr((uint64_t) op->resnull), 1);
+				cc.jmp(step_labels[op->d.returningexpr.jumpdone]);
+
+				cc.bind(cont);
+				break;
+			}
+#endif
+
 			default:
 			{
 				/* Fallback: call pg_jitter_fallback_step -> int */
@@ -2051,90 +3190,17 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				int fb_jump_target = -1;
 				switch (opcode)
 				{
-					case EEOP_AGG_STRICT_DESERIALIZE:
-						fb_jump_target = op->d.agg_deserialize.jumpnull;
-						break;
-					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
-#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
-					case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
-#endif
-					case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
-						fb_jump_target = op->d.agg_strict_input_check.jumpnull;
-						break;
-					case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
-						fb_jump_target = op->d.agg_plain_pergroup_nullcheck.jumpnull;
-						break;
-#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
-					case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
-					case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
-						fb_jump_target = op->d.agg_presorted_distinctcheck.jumpdistinct;
-						break;
-#endif
 #ifdef HAVE_EEOP_HASHDATUM
 					case EEOP_HASHDATUM_FIRST_STRICT:
 					case EEOP_HASHDATUM_NEXT32_STRICT:
 						fb_jump_target = op->d.hashdatum.jumpdone;
 						break;
 #endif
-					case EEOP_ROWCOMPARE_STEP:
-						fb_jump_target = op->d.rowcompare_step.jumpdone;
-						break;
-					case EEOP_SBSREF_SUBSCRIPTS:
-						fb_jump_target = op->d.sbsref_subscript.jumpdone;
-						break;
-#ifdef HAVE_EEOP_RETURNINGEXPR
-					case EEOP_RETURNINGEXPR:
-						fb_jump_target = op->d.returningexpr.jumpdone;
-						break;
-#endif
 					default:
 						break;
 				}
 
-				if (opcode == EEOP_ROWCOMPARE_STEP)
-				{
-					int jnull = op->d.rowcompare_step.jumpnull;
-					int jdone = op->d.rowcompare_step.jumpdone;
-					if (jnull >= 0 && jnull < steps_len)
-					{
-						cc.cmp(ret_reg, jnull);
-						cc.je(step_labels[jnull]);
-					}
-					if (jdone >= 0 && jdone < steps_len)
-					{
-						cc.cmp(ret_reg, jdone);
-						cc.je(step_labels[jdone]);
-					}
-				}
-#ifdef HAVE_EEOP_JSONEXPR
-				else if (opcode == EEOP_JSONEXPR_PATH)
-				{
-					JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-					int targets[4];
-					int ntargets = 0;
-
-					targets[ntargets++] = jsestate->jump_end;
-					if (jsestate->jump_empty >= 0 &&
-						jsestate->jump_empty != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_empty;
-					if (jsestate->jump_error >= 0 &&
-						jsestate->jump_error != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_error;
-					if (jsestate->jump_eval_coercion >= 0 &&
-						jsestate->jump_eval_coercion != jsestate->jump_end)
-						targets[ntargets++] = jsestate->jump_eval_coercion;
-
-					for (int t = 0; t < ntargets; t++)
-					{
-						if (targets[t] >= 0 && targets[t] < steps_len)
-						{
-							cc.cmp(ret_reg, targets[t]);
-							cc.je(step_labels[targets[t]]);
-						}
-					}
-				}
-#endif
-				else if (fb_jump_target >= 0 && fb_jump_target < steps_len)
+				if (fb_jump_target >= 0 && fb_jump_target < steps_len)
 				{
 					cc.test(ret_reg, ret_reg);
 					cc.jns(step_labels[fb_jump_target]);

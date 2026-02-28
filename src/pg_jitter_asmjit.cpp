@@ -354,7 +354,18 @@ asmjit_compile_expr(ExprState *state)
 		pg_jitter_get_expr_identity(ctx, state,
 									&shared_node_id, &shared_expr_idx);
 
-		asmjit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED);
+		/*
+		 * Shared code mode is only supported on ARM64 where the generated
+		 * code uses steps-relative addressing.  On x86_64, the AsmJIT
+		 * backend embeds absolute ExprEvalStep pointer addresses, which
+		 * belong to the leader and are invalid in the worker.
+		 */
+#if defined(__aarch64__) || defined(_M_ARM64)
+		asmjit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED)
+									&& state->parent->state->es_plannedstmt->parallelModeNeeded;
+#else
+		asmjit_shared_code_mode = false;
+#endif
 
 		elog(DEBUG1, "pg_jitter[asmjit]: compile_expr node=%d expr=%d is_worker=%d "
 			 "shared_mode=%d share_init=%d",

@@ -18,6 +18,13 @@
 
 #include <stdlib.h>  /* for atoi */
 
+#ifdef __linux__
+#include <unistd.h>  /* for sysconf */
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 /* GUC: pg_jitter.parallel_mode — shared across backends */
 int pg_jitter_parallel_mode = 2;	/* PARALLEL_JIT_SHARED */
 
@@ -1671,14 +1678,18 @@ pg_jitter_exec_code_ptr(void *handle)
 }
 
 /*
- * Relocate dylib function addresses in copied ARM64 executable code.
+ * Relocate dylib function addresses in copied executable code.
  *
- * Scans for MOVZ+3×MOVK sequences (the pattern sljit uses for 64-bit
- * immediates when SLJIT_REWRITABLE_JUMP is set). For each sequence,
- * reconstructs the embedded 64-bit address. If the address falls within
- * a generous range around the leader's dylib reference address, it's
- * assumed to be a dylib function pointer and is relocated by adding the
- * delta between leader and worker addresses.
+ * ARM64: Scans for MOVZ+3×MOVK sequences (the pattern sljit uses for
+ * 64-bit immediates when SLJIT_REWRITABLE_JUMP is set).
+ *
+ * x86_64: Scans for MOV r, imm64 (MOVABS) instructions — REX.W prefix
+ * (0x48 or 0x49) followed by opcode 0xB8-0xBF with an 8-byte immediate.
+ *
+ * For each matched instruction, reconstructs the embedded 64-bit address.
+ * If the address falls within a generous range around the leader's dylib
+ * reference address, it's assumed to be a dylib function pointer and is
+ * relocated by adding the delta between leader and worker addresses.
  *
  * Returns the number of addresses patched.
  */
@@ -1795,8 +1806,94 @@ pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 #endif
 
 	return patched;
+#elif defined(__x86_64__) || defined(_M_X64)
+	ExecMemInfo *info = (ExecMemInfo *) handle;
+	uint8_t    *bytes;
+	int			patched = 0;
+	int64		delta;
+	Size		alloc_size;
+
+	if (!info || leader_ref_addr == worker_ref_addr)
+		return 0;
+
+	delta = (int64)(worker_ref_addr - leader_ref_addr);
+	bytes = (uint8_t *) info->code_ptr;
+	alloc_size = info->alloc_size;
+
+	/*
+	 * Make memory writable for patching.
+	 * pg_jitter_copy_to_executable() sets PROT_READ|PROT_EXEC on Linux.
+	 */
+	if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_WRITE) != 0)
+	{
+		elog(WARNING, "pg_jitter: relocate mprotect(RW) failed: %m");
+		return 0;
+	}
+
+	/*
+	 * Scan for MOV r, imm64 (MOVABS) instructions.
+	 *
+	 * x86_64 encoding: REX.W prefix (1 byte) + opcode (1 byte) + imm64 (8 bytes)
+	 *   REX byte: 0x48 (REX.W) for r0-r7, 0x49 (REX.W|REX.B) for r8-r15
+	 *   Opcode:   0xB8 + (reg & 7) — i.e., (byte & 0xF8) == 0xB8
+	 *   Immediate: 8 bytes little-endian at offset +2
+	 *
+	 * Total instruction size: 10 bytes.
+	 */
+	for (Size i = 0; i + 9 < code_size; i++)
+	{
+		uint8_t rex = bytes[i];
+		uint8_t opc = bytes[i + 1];
+
+		/* Check REX.W prefix (0x48 or 0x49) */
+		if (rex != 0x48 && rex != 0x49)
+			continue;
+
+		/* Check MOV r, imm64 opcode: 0xB8-0xBF */
+		if ((opc & 0xF8) != 0xB8)
+			continue;
+
+		/* Extract 8-byte little-endian immediate from bytes[i+2..i+9] */
+		uint64	addr;
+		memcpy(&addr, &bytes[i + 2], sizeof(uint64));
+
+		/*
+		 * Check if this address is within the dylib's address range.
+		 * Same heuristic as ARM64: ±512KB of the reference address.
+		 */
+		int64	offset_from_ref = (int64)(addr - leader_ref_addr);
+
+		elog(DEBUG1, "pg_jitter: relocate scan byte[%zu] rex=0x%02x opc=0x%02x "
+			 "addr=%lx offset_from_ref=%ld",
+			 i, rex, opc, (unsigned long) addr, (long) offset_from_ref);
+
+		if (offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000)
+		{
+			/* Relocate: add delta to get worker's address */
+			uint64 new_addr = addr + delta;
+
+			elog(DEBUG1, "pg_jitter: relocate PATCH byte[%zu] "
+				 "old=%lx new=%lx delta=%ld",
+				 i, (unsigned long) addr, (unsigned long) new_addr,
+				 (long) delta);
+
+			/* Patch the 8-byte immediate in place */
+			memcpy(&bytes[i + 2], &new_addr, sizeof(uint64));
+
+			patched++;
+			i += 9; /* skip past this 10-byte instruction */
+		}
+	}
+
+	/* Restore executable permission */
+	if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_EXEC) != 0)
+		elog(WARNING, "pg_jitter: relocate mprotect(RX) failed: %m");
+
+	/* No I-cache flush needed on x86_64 (coherent I-cache) */
+
+	return patched;
 #else
-	/* TODO: x86_64 relocation (MOV imm64 sequences) */
+	/* Unsupported architecture */
 	return 0;
 #endif
 }
@@ -1931,7 +2028,13 @@ pg_jitter_attach_shared_dsm(PgJitterContext *ctx)
 
 /*
  * Cleanup: unpin mapping and detach from DSM.
- * Leader also resets the GUC so stale handles aren't serialized.
+ *
+ * Note: we do NOT call SetConfigOption here to reset the _shared_dsm GUC.
+ * This function may be called from a ResourceOwner release callback during
+ * subtransaction abort, and SetConfigOption allocates memory — which
+ * triggers "ResourceOwnerEnlarge called after release started".  The GUC
+ * is session-scoped and harmless if stale; each new parallel query creates
+ * a fresh DSM handle.
  */
 void
 pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx)
@@ -1939,15 +2042,65 @@ pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx)
 	if (!ctx->share_state.initialized)
 		return;
 
+	/* Reset shared deform mmap before detaching DSM */
+	pg_jitter_reset_shared_deform();
+
 	if (ctx->share_state.dsm_seg)
 	{
-		dsm_unpin_mapping(ctx->share_state.dsm_seg);
+		/*
+		 * Just detach — do NOT call dsm_unpin_mapping() first.
+		 * dsm_unpin_mapping() calls ResourceOwnerEnlarge() to re-register the
+		 * segment with a resource owner, but this function may be called during
+		 * ResourceOwnerRelease (subtransaction abort), where new registrations
+		 * are forbidden.  dsm_detach() works fine on pinned segments.
+		 */
 		dsm_detach(ctx->share_state.dsm_seg);
 	}
 
-	if (ctx->share_state.is_leader)
-		SetConfigOption("pg_jitter._shared_dsm", "",
-						PGC_USERSET, PGC_S_SESSION);
-
 	memset(&ctx->share_state, 0, sizeof(JitShareState));
+}
+
+/*
+ * pg_jitter_deform_threshold — column count above which loop-based deform
+ * is used instead of unrolled deform.
+ *
+ * Unrolled deform emits ~140 bytes per column. When the total exceeds half
+ * the L1I cache, instruction cache thrashing makes JIT slower than the
+ * interpreter. The loop-based deform emits ~530 bytes of code regardless
+ * of column count.
+ *
+ * Threshold = L1I_cache_size / DEFORM_BYTES_PER_COL / 2
+ * On a typical 32KB L1I CPU this gives ~117 columns.
+ */
+int
+pg_jitter_deform_threshold(void)
+{
+	static int	threshold = 0;
+
+	if (threshold > 0)
+		return threshold;
+
+	{
+		long	l1i_size = 0;
+
+#ifdef __linux__
+		l1i_size = sysconf(_SC_LEVEL1_ICACHE_SIZE);
+		if (l1i_size <= 0)
+			l1i_size = 32768;
+#elif defined(__APPLE__)
+		{
+			size_t	len = sizeof(l1i_size);
+			if (sysctlbyname("hw.l1icachesize", &l1i_size, &len, NULL, 0) != 0)
+				l1i_size = 32768;
+		}
+#else
+		l1i_size = 32768;
+#endif
+
+		threshold = l1i_size / DEFORM_BYTES_PER_COL / 2;
+		if (threshold < 16)
+			threshold = 16;		/* never go below 16 columns */
+
+		return threshold;
+	}
 }
