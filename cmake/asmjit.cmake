@@ -4,6 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 # ---------- Paths ----------
 set(PG_CONFIG "pg_config" CACHE FILEPATH "Path to pg_config")
 set(ASMJIT_DIR "${ROOT}/../asmjit" CACHE PATH "Path to asmjit source directory")
+set(SLJIT_DIR "${ROOT}/../sljit" CACHE PATH "Path to sljit source directory (for deform JIT)")
 
 execute_process(COMMAND ${PG_CONFIG} --includedir-server
     OUTPUT_VARIABLE PG_INCLUDEDIR_SERVER OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -18,6 +19,11 @@ message(STATUS "asmjit source:      ${ASMJIT_DIR}")
 set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(${ASMJIT_DIR} ${CMAKE_BINARY_DIR}/asmjit)
+
+# ---------- sljit (static library, for deform JIT shared across backends) ----------
+add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
+target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
+target_compile_options(sljit PRIVATE -w)
 
 # ---------- Pre-compiled deform templates ----------
 set(DEFORM_GEN_SCRIPT "${ROOT}/tools/gen_deform_templates.py")
@@ -44,9 +50,11 @@ set(COMMON_SRC ${ROOT}/src/pg_jitter_common.c ${ROOT}/src/pg_jit_funcs.c
 
 add_library(pg_jitter_asmjit MODULE ${COMMON_SRC}
             ${ROOT}/src/pg_jitter_asmjit.cpp
+            ${ROOT}/src/pg_jitter_deform_jit.c
             ${ROOT}/src/pg_jit_deform_templates.c)
-target_include_directories(pg_jitter_asmjit PRIVATE ${PG_INCLUDEDIR_SERVER} ${ROOT}/src)
-target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
+target_include_directories(pg_jitter_asmjit PRIVATE ${PG_INCLUDEDIR_SERVER} ${ROOT}/src
+                           ${SLJIT_DIR}/sljit_src)
+target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
 pg_jitter_add_precompiled(pg_jitter_asmjit)
 
 set_target_properties(pg_jitter_asmjit PROPERTIES PREFIX "" SUFFIX "${PG_MODULE_SUFFIX}"

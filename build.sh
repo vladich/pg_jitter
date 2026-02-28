@@ -2,7 +2,7 @@
 # build.sh — Build pg_jitter backends (macOS / Linux)
 #
 # Usage:
-#   ./build.sh [--pg-config PATH] [sljit|asmjit|mir|all] [cmake args...]
+#   ./build.sh [--pg-config PATH] [sljit|asmjit|mir|meta|all] [cmake args...]
 #
 # Examples:
 #   ./build.sh                                          # build all 3
@@ -39,7 +39,7 @@ TARGET="all"
 CMAKE_EXTRA_ARGS=()
 if [ $# -gt 0 ]; then
     case "$1" in
-        sljit|asmjit|mir|all) TARGET="$1"; shift ;;
+        sljit|asmjit|mir|meta|all) TARGET="$1"; shift ;;
     esac
     CMAKE_EXTRA_ARGS=("$@")
 fi
@@ -57,6 +57,12 @@ build_backend() {
     shift
     local build_dir="$SCRIPT_DIR/build/$name"
 
+    # meta-provider target is "pg_jitter", not "pg_jitter_meta"
+    local target="pg_jitter_$name"
+    if [ "$name" = "meta" ]; then
+        target="pg_jitter"
+    fi
+
     echo ""
     echo "=== Building $name ==="
     mkdir -p "$build_dir"
@@ -67,18 +73,20 @@ build_backend() {
         -DBACKEND="$name" \
         "$@"
 
-    make -j"$JOBS" "pg_jitter_$name"
-    echo "  -> $(ls -lh "$build_dir/pg_jitter_$name.dylib" 2>/dev/null || ls -lh "$build_dir/pg_jitter_$name.so" 2>/dev/null | awk '{print $5, $NF}')"
+    make -j"$JOBS" "$target"
+    echo "  -> $(ls -lh "$build_dir/$target.dylib" 2>/dev/null || ls -lh "$build_dir/$target.so" 2>/dev/null | awk '{print $5, $NF}')"
 }
 
 case "$TARGET" in
     sljit)  build_backend sljit  "${CMAKE_EXTRA_ARGS[@]}" ;;
     asmjit) build_backend asmjit "${CMAKE_EXTRA_ARGS[@]}" ;;
     mir)    build_backend mir    "${CMAKE_EXTRA_ARGS[@]}" ;;
+    meta)   build_backend meta   "${CMAKE_EXTRA_ARGS[@]}" ;;
     all)
         build_backend sljit  "${CMAKE_EXTRA_ARGS[@]}"
         build_backend asmjit "${CMAKE_EXTRA_ARGS[@]}"
         build_backend mir    "${CMAKE_EXTRA_ARGS[@]}"
+        build_backend meta   "${CMAKE_EXTRA_ARGS[@]}"
         ;;
 esac
 
