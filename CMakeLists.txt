@@ -201,7 +201,7 @@ set(PG_JITTER_TARGETS "")
 # ---------- pg_jitter_sljit ----------
 if(PG_JITTER_BUILD_SLJIT)
     add_library(pg_jitter_sljit MODULE ${COMMON_SRC} src/pg_jitter_sljit.c
-                src/pg_jit_deform_templates.c)
+                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
     target_link_libraries(pg_jitter_sljit PRIVATE sljit)
     pg_jitter_configure_target(pg_jitter_sljit)
     list(APPEND PG_JITTER_TARGETS pg_jitter_sljit)
@@ -210,8 +210,8 @@ endif()
 # ---------- pg_jitter_asmjit ----------
 if(PG_JITTER_BUILD_ASMJIT)
     add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
-                src/pg_jit_deform_templates.c)
-    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
+                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
+    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
     list(APPEND PG_JITTER_TARGETS pg_jitter_asmjit)
@@ -219,8 +219,9 @@ endif()
 
 # ---------- pg_jitter_mir ----------
 if(PG_JITTER_BUILD_MIR)
-    add_library(pg_jitter_mir MODULE ${COMMON_SRC} src/pg_jitter_mir.c)
-    target_link_libraries(pg_jitter_mir PRIVATE mir_lib)
+    add_library(pg_jitter_mir MODULE ${COMMON_SRC} src/pg_jitter_mir.c
+                src/pg_jitter_deform_jit.c src/pg_jit_deform_templates.c)
+    target_link_libraries(pg_jitter_mir PRIVATE mir_lib sljit)
     pg_jitter_configure_target(pg_jitter_mir)
     list(APPEND PG_JITTER_TARGETS pg_jitter_mir)
 endif()
