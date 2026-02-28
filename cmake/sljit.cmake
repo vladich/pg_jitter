@@ -44,6 +44,7 @@ set(COMMON_SRC ${ROOT}/src/pg_jitter_common.c ${ROOT}/src/pg_jit_funcs.c
 
 add_library(pg_jitter_sljit MODULE ${COMMON_SRC}
             ${ROOT}/src/pg_jitter_sljit.c
+            ${ROOT}/src/pg_jitter_deform_jit.c
             ${ROOT}/src/pg_jit_deform_templates.c)
 target_include_directories(pg_jitter_sljit PRIVATE ${PG_INCLUDEDIR_SERVER} ${ROOT}/src)
 target_link_libraries(pg_jitter_sljit PRIVATE sljit)

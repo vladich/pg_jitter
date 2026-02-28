@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="800px" height="291px" src="img/pg_jitter5.jpeg">
+  <img width="800px" height="200px" src="img/pg_jitter6.jpeg">
 </p>
 
 A lightweight JIT compilation provider for PostgreSQL that adds three alternative JIT backends - **[sljit](https://github.com/zherczeg/sljit)**, **[AsmJit](https://github.com/asmjit/asmjit)** and **[MIR](https://github.com/vnmakarov/mir)** - delivering faster compilation and competitive query execution across PostgreSQL 14–18.
@@ -61,6 +61,8 @@ parent/
 └── mir/          
 ```
 [SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
+
+For MIR, use the patched version from [MIR-patched](https://github.com/vladich/mir-patched) - it has a small change that tracks the size of the generated native code per function.
 
 ### Build
 

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(pg_jitter_build C CXX)
 
 if(NOT DEFINED BACKEND)
-    message(FATAL_ERROR "BACKEND not set. Use -DBACKEND=sljit|asmjit|mir")
+    message(FATAL_ERROR "BACKEND not set. Use -DBACKEND=sljit|asmjit|mir|meta")
 endif()
 
 # ROOT points to the pg_jitter project root (parent of cmake/)

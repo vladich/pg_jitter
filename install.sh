@@ -100,6 +100,19 @@ for b in "${BACKENDS[@]}"; do
     echo "  pg_jitter_$b.$EXT installed"
 done
 
+# Also install the meta-provider if available
+META_LIB=""
+for dir in "$SCRIPT_DIR/build/meta" "$SCRIPT_DIR/build"; do
+    if [ -f "$dir/pg_jitter.$EXT" ]; then
+        META_LIB="$dir/pg_jitter.$EXT"
+        break
+    fi
+done
+if [ -n "$META_LIB" ]; then
+    cp "$META_LIB" "$PKGLIBDIR/"
+    echo "  pg_jitter.$EXT installed (meta-provider)"
+fi
+
 # Restart PostgreSQL
 if [ "${NO_RESTART:-}" = "1" ]; then
     echo ""

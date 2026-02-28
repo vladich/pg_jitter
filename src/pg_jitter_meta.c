@@ -29,6 +29,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "storage/dsm.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
 
@@ -42,11 +43,34 @@ typedef struct MetaCompiledCode
 	void   *data;
 } MetaCompiledCode;
 
+/*
+ * JitShareState — must match pg_jitter_common.h for layout compatibility.
+ * Duplicated here because meta.c doesn't include pg_jitter_common.h.
+ */
+typedef struct MetaJitShareState
+{
+	dsm_segment *dsm_seg;
+	void	   *sjc;			/* SharedJitCompiledCode * */
+	bool		initialized;
+	bool		is_leader;
+} MetaJitShareState;
+
 typedef struct MetaJitterContext
 {
 	JitContext			base;			/* must be first */
 	MetaCompiledCode   *compiled_list;
 	ResourceOwner		resowner;
+
+	/*
+	 * Must mirror PgJitterContext layout for shared code support.
+	 * The sljit/asmjit/mir backends cast es_jit to PgJitterContext
+	 * and access these fields.
+	 */
+	int					last_plan_node_id;
+	int					expr_ordinal;
+
+	/* DSM-based shared code state — mirrors JitShareState */
+	MetaJitShareState	share_state;
 } MetaJitterContext;
 
 /* ----------------------------------------------------------------
@@ -129,6 +153,15 @@ static const char *backend_libnames[] = {
 };
 
 static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
+
+/* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
+static int meta_parallel_mode = 2;		/* PARALLEL_JIT_SHARED */
+static int meta_shared_code_max_kb = 4096;	/* 4 MB */
+static char *meta_shared_dsm_guc = NULL;	/* DSM handle for parallel JIT sharing */
+
+#define PARALLEL_JIT_OFF        0
+#define PARALLEL_JIT_PER_WORKER 1
+#define PARALLEL_JIT_SHARED     2
 
 /* ----------------------------------------------------------------
  * Cached backend state
@@ -232,6 +265,9 @@ meta_ensure_context(ExprState *state)
 #endif
 	ctx->compiled_list = NULL;
 	ctx->resowner = CurrentResourceOwner;
+	ctx->last_plan_node_id = -1;
+	ctx->expr_ordinal = 0;
+	memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
 
@@ -274,6 +310,24 @@ meta_release_context(JitContext *context)
 {
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
+
+	/*
+	 * Clean up DSM shared code state.
+	 *
+	 * Note: we do NOT call SetConfigOption here to reset the _shared_dsm GUC.
+	 * This function may be called from a ResourceOwner release callback during
+	 * subtransaction abort, and SetConfigOption allocates memory — which
+	 * triggers "ResourceOwnerEnlarge called after release started".  The GUC
+	 * is session-scoped and harmless if stale; each new parallel query creates
+	 * a fresh DSM handle.
+	 */
+	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)
+	{
+		/* Just detach — see comment in pg_jitter_cleanup_shared_dsm() */
+		dsm_detach(ctx->share_state.dsm_seg);
+
+		memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
+	}
 
 	/* Free all compiled code — each node carries its own free_fn */
 	for (cc = ctx->compiled_list; cc != NULL; cc = next)
@@ -358,6 +412,68 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	boot_default = meta_detect_default();
 	pg_jitter_backend = boot_default;
 
+	/*
+	 * Define parallel_mode and shared_code_max BEFORE pg_jitter.backend,
+	 * because the backend assign hook (meta_backend_assign) eagerly loads
+	 * the backend .dylib.  That backend's _PG_jit_provider_init will try
+	 * to define these same GUCs — the GetConfigOption guard skips the
+	 * define only if the GUC already exists.  So we must define them first.
+	 */
+	{
+		static const struct config_enum_entry parallel_jit_options[] = {
+			{"off", PARALLEL_JIT_OFF, false},
+			{"per_worker", PARALLEL_JIT_PER_WORKER, false},
+			{"shared", PARALLEL_JIT_SHARED, false},
+			{NULL, 0, false}
+		};
+
+		DefineCustomEnumVariable(
+			"pg_jitter.parallel_mode",
+			"Controls JIT behavior in parallel workers: "
+			"off (workers use interpreter), "
+			"per_worker (each worker compiles independently), "
+			"shared (leader shares compiled code via DSM)",
+			NULL,
+			&meta_parallel_mode,
+			PARALLEL_JIT_SHARED,
+			parallel_jit_options,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	DefineCustomIntVariable(
+		"pg_jitter.shared_code_max",
+		"Maximum shared JIT code DSM size in KB.",
+		NULL,
+		&meta_shared_code_max_kb,
+		4096,		/* 4 MB default */
+		64,			/* 64 KB minimum */
+		1048576,	/* 1 GB maximum */
+		PGC_USERSET,
+		GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
+
+	/*
+	 * Internal GUC for passing DSM handle from leader to workers.
+	 * Serialized via SerializeGUCState automatically.
+	 * Hidden from pg_settings and config files.
+	 *
+	 * Must be defined BEFORE pg_jitter.backend, because the backend assign
+	 * hook eagerly loads the backend .dylib, which also tries to define this
+	 * GUC.  If we define it afterwards, the backend defines it first, and
+	 * then our define hits "attempt to redefine parameter".
+	 */
+	DefineCustomStringVariable(
+		"pg_jitter._shared_dsm",
+		"Internal: DSM handle for parallel JIT code sharing.",
+		NULL,
+		&meta_shared_dsm_guc,
+		"",
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+		NULL, NULL, NULL);
+
 	DefineCustomEnumVariable("pg_jitter.backend",
 							 "Selects the active pg_jitter JIT backend.",
 							 NULL,
@@ -365,10 +481,8 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 boot_default,
 							 backend_options,
 							 PGC_USERSET,
-							 0,
+							 GUC_ALLOW_IN_PARALLEL,
 							 NULL,
 							 meta_backend_assign,
 							 NULL);
-
-	MarkGUCPrefixReserved("pg_jitter");
 }
