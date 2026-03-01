@@ -1337,12 +1337,34 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 typedef struct DeformDispatchEntry
 {
-	Oid			tdtypeid;
-	int32		tdtypmod;
+	uint32		attrs_hash;	/* hash of CompactAttribute array for natts columns */
 	int			natts;
 	const TupleTableSlotOps *ops;
 	void	   *fn;
 } DeformDispatchEntry;
+
+/*
+ * Compute a hash over the CompactAttribute entries relevant to deform code
+ * generation.  Two descriptors produce identical deform code iff they agree
+ * on every column's attlen, attalign, attbyval, attnotnull, attisdropped,
+ * and atthasmissing — all of which live in the CompactAttribute struct.
+ */
+static uint32
+deform_attrs_hash(TupleDesc desc, int natts)
+{
+	uint32 h = 0x811c9dc5;  /* FNV-1a offset basis */
+	for (int i = 0; i < natts; i++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
+		const unsigned char *p = (const unsigned char *) att;
+		for (size_t j = 0; j < sizeof(CompactAttribute); j++)
+		{
+			h ^= p[j];
+			h *= 0x01000193;  /* FNV-1a prime */
+		}
+	}
+	return h;
+}
 
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
 static int n_deform_dispatch = 0;
@@ -1364,6 +1386,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	void *fn = NULL;
 	int i;
 
+
 	/* Shared deform fast path: same VA across all parallel workers */
 	if (shared_deform_fn && natts == shared_deform_natts)
 	{
@@ -1371,12 +1394,12 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		return;
 	}
 
-	/* Fast cache lookup */
+	/* Fast cache lookup (hash of column attributes) */
+	uint32 ahash = deform_attrs_hash(desc, natts);
 	for (i = 0; i < n_deform_dispatch; i++)
 	{
 		DeformDispatchEntry *e = &deform_dispatch_cache[i];
-		if (e->natts == natts && e->ops == ops &&
-			e->tdtypeid == desc->tdtypeid && e->tdtypmod == desc->tdtypmod)
+		if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
 		{
 			((void (*)(TupleTableSlot *)) e->fn)(slot);
 			return;
@@ -1395,8 +1418,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		if (n_deform_dispatch < DEFORM_DISPATCH_CACHE_SIZE)
 		{
 			DeformDispatchEntry *e = &deform_dispatch_cache[n_deform_dispatch++];
-			e->tdtypeid = desc->tdtypeid;
-			e->tdtypmod = desc->tdtypmod;
+			e->attrs_hash = ahash;
 			e->natts = natts;
 			e->ops = ops;
 			e->fn = fn;
@@ -1408,6 +1430,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		/* Final fallback to interpreter */
 		slot_getsomeattrs_int(slot, natts);
 	}
+
 }
 
 
