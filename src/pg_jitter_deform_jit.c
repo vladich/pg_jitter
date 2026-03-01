@@ -549,6 +549,7 @@ pg_jitter_compile_deform(TupleDesc desc,
  *   S2 = tts_isnull
  *   S3 = tupdata_base
  *   S4 = byte offset into tuple data (kept in register!)
+ *   S5 = attnum (column counter, kept in register!)
  *   R0-R3 = scratch
  * ================================================================ */
 
@@ -556,9 +557,7 @@ pg_jitter_compile_deform(TupleDesc desc,
 #define DLOFF_HASNULLS   0
 #define DLOFF_MAXATT     8
 #define DLOFF_TBITS      16
-#define DLOFF_ATTNUM     24
-#define DLOFF_DESCPTR    32
-#define DLOFF_TOTAL      40
+#define DLOFF_TOTAL      24
 
 void *
 pg_jitter_compile_deform_loop(TupleDesc desc,
@@ -647,7 +646,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	 */
 	sljit_emit_enter(C, 0,
 					 SLJIT_ARGS1V(P),
-					 4, 5, DLOFF_TOTAL);
+					 4, 6, DLOFF_TOTAL);
 
 	/* S1 = slot->tts_values */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_S1, 0,
@@ -728,19 +727,17 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	/* ============================================================
 	 * INIT: attnum = tts_nvalid, offset from slot
 	 * ============================================================ */
-	/* R0 = tts_nvalid -> stack as attnum */
-	sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0,
+	/* S5 = tts_nvalid (attnum kept in register) */
+	sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_S5, 0,
 				   SLJIT_MEM1(SLJIT_S0),
 				   offsetof(TupleTableSlot, tts_nvalid));
-	sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM,
-				   SLJIT_R0, 0);
 
 	/* S4 = offset. if attnum == 0: 0, else slot->off */
 	{
 		struct sljit_jump *j_nonzero;
 
 		j_nonzero = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-								   SLJIT_R0, 0, SLJIT_IMM, 0);
+								   SLJIT_S5, 0, SLJIT_IMM, 0);
 
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_S4, 0, SLJIT_IMM, 0);
 
@@ -754,16 +751,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_set_label(j_skip, sljit_emit_label(C));
 		}
 	}
-
-	/* desc_ptr = &descriptors[attnum] -> stack */
-	sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-				   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
-	sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
-				   SLJIT_R0, 0, SLJIT_IMM, 3);
-	sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-				   SLJIT_R0, 0, SLJIT_IMM, (sljit_sw) descriptors);
-	sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR,
-				   SLJIT_R0, 0);
 
 	/* ============================================================
 	 * SPECIALIZATION: all-fixed-byval-notnull uniform tables
@@ -797,22 +784,16 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 					   SLJIT_R2, 0);
 
 		/* Bulk-clear tts_isnull */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-					   SLJIT_S2, 0, SLJIT_R0, 0);
+					   SLJIT_S2, 0, SLJIT_S5, 0);
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, natts);
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
 		sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
-					   SLJIT_R2, 0, SLJIT_R3, 0);
+					   SLJIT_IMM, natts, SLJIT_S5, 0);
 		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
 						 SLJIT_IMM, (sljit_sw) memset);
 
 		/* Tight inner loop — pointer-based do-while */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
 		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
 					   SLJIT_R3, 0, SLJIT_IMM, 3);
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
@@ -888,22 +869,16 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 					   SLJIT_R2, 0);
 
 		/* Bulk-clear tts_isnull */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-					   SLJIT_S2, 0, SLJIT_R0, 0);
+					   SLJIT_S2, 0, SLJIT_S5, 0);
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, natts);
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
 		sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
-					   SLJIT_R2, 0, SLJIT_R3, 0);
+					   SLJIT_IMM, natts, SLJIT_S5, 0);
 		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
 						 SLJIT_IMM, (sljit_sw) memset);
 
 		/* Pointer-based do-while loop */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
 		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
 					   SLJIT_R3, 0, SLJIT_IMM, 3);
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
@@ -952,18 +927,13 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 				l_gn_top = sljit_emit_label(C);
 
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-							   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
+				/* S5 = attnum (in register) */
 				j_gn_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-										   SLJIT_R3, 0, SLJIT_IMM, natts);
+										   SLJIT_S5, 0, SLJIT_IMM, natts);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
 				j_gn_avail = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-											SLJIT_R3, 0, SLJIT_R0, 0);
-
-				/* Load desc_ptr */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-							   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
+											SLJIT_S5, 0, SLJIT_R0, 0);
 
 				/* NULL CHECK: bitmap check (hasnulls is known true here) */
 				{
@@ -971,7 +941,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 					/* byte = t_bits[attnum >> 3] */
 					sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
-								   SLJIT_R3, 0, SLJIT_IMM, 3);
+								   SLJIT_S5, 0, SLJIT_IMM, 3);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
 								   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
@@ -979,7 +949,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 					/* bit = 1 << (attnum & 7) */
 					sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
-								   SLJIT_R3, 0, SLJIT_IMM, 7);
+								   SLJIT_S5, 0, SLJIT_IMM, 7);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, 1);
 					sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
 								   SLJIT_R2, 0, SLJIT_R1, 0);
@@ -990,25 +960,17 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 					/* IS NULL */
 					sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
-								   SLJIT_R3, 0, SLJIT_IMM, 3);
+								   SLJIT_S5, 0, SLJIT_IMM, 3);
 					sljit_emit_op1(C, SLJIT_MOV,
 								   SLJIT_MEM2(SLJIT_S1, SLJIT_R0), 0,
 								   SLJIT_IMM, 0);
 					sljit_emit_op1(C, SLJIT_MOV_U8,
-								   SLJIT_MEM2(SLJIT_S2, SLJIT_R3), 0,
+								   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 								   SLJIT_IMM, 1);
 
-					/* Advance and loop */
-					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-								   SLJIT_R3, 0, SLJIT_IMM, 1);
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM,
-								   SLJIT_R3, 0);
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-								   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-								   SLJIT_R0, 0, SLJIT_IMM, (sljit_sw) sizeof(DeformColDesc));
-					sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR,
-								   SLJIT_R0, 0);
+					/* Advance attnum and loop */
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+								   SLJIT_S5, 0, SLJIT_IMM, 1);
 					sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_gn_top);
 
 					sljit_set_label(j_bit_set, sljit_emit_label(C));
@@ -1016,7 +978,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 				/* NOT NULL: tts_isnull[attnum] = false, extract int value */
 				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_R3), 0,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 							   SLJIT_IMM, 0);
 
 				/* Load value: since uniform attlen, use fixed mov_op */
@@ -1025,7 +987,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 				/* Store: tts_values[attnum] = R0 */
 				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-							   SLJIT_R3, 0, SLJIT_IMM, 3);
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
 				sljit_emit_op1(C, SLJIT_MOV,
 							   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 							   SLJIT_R0, 0);
@@ -1034,18 +996,9 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 							   SLJIT_S4, 0, SLJIT_IMM, attlen);
 
-				/* Advance attnum and desc_ptr */
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-							   SLJIT_R3, 0, SLJIT_IMM, 1);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM,
-							   SLJIT_R3, 0);
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_R0, 0, SLJIT_IMM, (sljit_sw) sizeof(DeformColDesc));
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR,
-							   SLJIT_R0, 0);
-
+				/* Advance attnum and loop */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 1);
 				sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_gn_top);
 
 				{
@@ -1069,23 +1022,19 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 		l_loop_top = sljit_emit_label(C);
 
-		/* R3 = attnum (from stack) */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
-
-		/* if attnum >= natts -> epilogue */
+		/* S5 = attnum (in register), check bounds */
 		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-								SLJIT_R3, 0, SLJIT_IMM, natts);
-
-		/* if attnum >= maxatt -> epilogue */
+								SLJIT_S5, 0, SLJIT_IMM, natts);
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 					   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
 		j_avail_out = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
-									 SLJIT_R3, 0, SLJIT_R0, 0);
+									 SLJIT_S5, 0, SLJIT_R0, 0);
 
-		/* R2 = desc_ptr (from stack) */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
+		/* R3 = desc_ptr = &descriptors[S5] (computed on the fly) */
+		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+					   SLJIT_S5, 0, SLJIT_IMM, 3);
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+					   SLJIT_R3, 0, SLJIT_IMM, (sljit_sw) descriptors);
 
 		/* ---- NULL CHECK ---- */
 		if (!all_notnull)
@@ -1094,21 +1043,21 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			struct sljit_jump *j_bit_set;
 			struct sljit_label *l_not_null;
 
-			/* if desc->attnotnull -> skip */
+			/* if desc->attnotnull -> skip (uses R0 only, R3 preserved) */
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attnotnull));
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attnotnull));
 			j_notnull_attr = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* if !hasnulls -> skip */
+			/* if !hasnulls -> skip (uses R0 only, R3 preserved) */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
 			j_no_tuple_nulls = sljit_emit_cmp(C, SLJIT_EQUAL,
 											  SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* byte = t_bits[attnum >> 3] */
+			/* byte = t_bits[attnum >> 3] (uses R0, R1, R2 — R3 preserved) */
 			sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
-						   SLJIT_R3, 0, SLJIT_IMM, 3);
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
 			sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
@@ -1116,7 +1065,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 			/* bit = 1 << (attnum & 7) */
 			sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
-						   SLJIT_R3, 0, SLJIT_IMM, 7);
+						   SLJIT_S5, 0, SLJIT_IMM, 7);
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, 1);
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
 						   SLJIT_R2, 0, SLJIT_R1, 0);
@@ -1128,73 +1077,62 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 			/* IS NULL: tts_values[attnum] = 0, tts_isnull[attnum] = true */
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
-						   SLJIT_R3, 0, SLJIT_IMM, 3);
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R0), 0,
 						   SLJIT_IMM, 0);
 			sljit_emit_op1(C, SLJIT_MOV_U8,
-						   SLJIT_MEM2(SLJIT_S2, SLJIT_R3), 0,
+						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 						   SLJIT_IMM, 1);
 
-			/* Advance attnum and desc_ptr, then loop */
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-						   SLJIT_R3, 0, SLJIT_IMM, 1);
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM,
-						   SLJIT_R3, 0);
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-						   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-						   SLJIT_R0, 0, SLJIT_IMM, (sljit_sw) sizeof(DeformColDesc));
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR,
-						   SLJIT_R0, 0);
+			/* Advance attnum and loop (register-only, no stack ops) */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
 			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
 
 			l_not_null = sljit_emit_label(C);
 			sljit_set_label(j_notnull_attr, l_not_null);
 			sljit_set_label(j_no_tuple_nulls, l_not_null);
 			sljit_set_label(j_bit_set, l_not_null);
-
-			/* Re-load R2 = desc_ptr (clobbered by bit-shift above) */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-						   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
 		}
 
 		/* ---- ALIGNMENT ---- */
+		/* R3 = desc_ptr (still live from loop top or null check) */
 		{
 			struct sljit_jump *j_no_align;
 
-			/* R1 = attlen, R0 = attalign */
+			/* R1 = attlen, R0 = attalign (from R3 = desc_ptr) */
 			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attlen));
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attlen));
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attalign));
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attalign));
 
 			j_no_align = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										SLJIT_R0, 0, SLJIT_IMM, 1);
 
-			/* Varlena short-header check */
+			/* Varlena short-header check (uses R2 scratch, R3 preserved) */
 			{
 				struct sljit_jump *j_not_varlena, *j_is_short;
 
 				j_not_varlena = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											   SLJIT_R1, 0, SLJIT_IMM, -1);
 
-				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0,
+				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
 							   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 				j_is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-											SLJIT_R3, 0, SLJIT_IMM, 0);
+											SLJIT_R2, 0, SLJIT_IMM, 0);
 
 				sljit_set_label(j_not_varlena, sljit_emit_label(C));
 
 				/* TYPEALIGN: S4 = (S4 + (align-1)) & ~(align-1) */
-				sljit_emit_op2(C, SLJIT_SUB, SLJIT_R3, 0,
+				sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
 							   SLJIT_R0, 0, SLJIT_IMM, 1);
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
-							   SLJIT_S4, 0, SLJIT_R3, 0);
-				sljit_emit_op2(C, SLJIT_XOR, SLJIT_R3, 0,
-							   SLJIT_R3, 0, SLJIT_IMM, -1);
+							   SLJIT_S4, 0, SLJIT_R2, 0);
+				sljit_emit_op2(C, SLJIT_XOR, SLJIT_R2, 0,
+							   SLJIT_R2, 0, SLJIT_IMM, -1);
 				sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
-							   SLJIT_S4, 0, SLJIT_R3, 0);
+							   SLJIT_S4, 0, SLJIT_R2, 0);
 
 				{
 					struct sljit_label *l_aligned = sljit_emit_label(C);
@@ -1205,30 +1143,23 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		}
 
 		/* ---- EXTRACT VALUE ---- */
+		/* R3 = desc_ptr (still live), R1 = attlen (still live from alignment) */
 		{
 			struct sljit_jump *j_not_byval, *j_byval_done;
 
-			/* Reload desc fields: R1 = attlen, R0 = attbyval */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-						   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attlen));
+			/* R0 = attbyval (from R3, no reload needed) */
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attbyval));
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attbyval));
 
-			/* R3 = attnum (for indexing) */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-						   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
-
-			/* tts_isnull[attnum] = false */
+			/* tts_isnull[attnum] = false (using S5 directly) */
 			sljit_emit_op1(C, SLJIT_MOV_U8,
-						   SLJIT_MEM2(SLJIT_S2, SLJIT_R3), 0,
+						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 						   SLJIT_IMM, 0);
 
 			j_not_byval = sljit_emit_cmp(C, SLJIT_EQUAL,
 										 SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* BYVAL: switch on attlen (R1) */
+			/* BYVAL: switch on attlen (R1, still live) */
 			{
 				struct sljit_jump *j_len1, *j_len2, *j_len4;
 				struct sljit_jump *j_s8, *j_s1, *j_s2;
@@ -1257,14 +1188,14 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
 							   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 
-				/* Store: tts_values[attnum] = R0 */
+				/* Store: tts_values[attnum] = R0 (using S5 for index) */
 				l_store = sljit_emit_label(C);
 				sljit_set_label(j_s8, l_store);
 				sljit_set_label(j_s1, l_store);
 				sljit_set_label(j_s2, l_store);
 
 				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-							   SLJIT_R3, 0, SLJIT_IMM, 3);
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
 				sljit_emit_op1(C, SLJIT_MOV,
 							   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 							   SLJIT_R0, 0);
@@ -1277,7 +1208,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 						   SLJIT_S3, 0, SLJIT_S4, 0);
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-						   SLJIT_R3, 0, SLJIT_IMM, 3);
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
@@ -1286,15 +1217,10 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		}
 
 		/* ---- ADVANCE OFFSET ---- */
+		/* R1 = attlen (still live from alignment, never clobbered) */
 		{
 			struct sljit_jump *j_fixedlen, *j_varlena;
 			struct sljit_label *l_next;
-
-			/* R2 = desc_ptr, R1 = attlen */
-			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-						   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0,
-						   SLJIT_MEM1(SLJIT_R2), offsetof(DeformColDesc, attlen));
 
 			j_fixedlen = sljit_emit_cmp(C, SLJIT_SIG_GREATER,
 										SLJIT_R1, 0, SLJIT_IMM, 0);
@@ -1313,7 +1239,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			{
 				struct sljit_jump *j_cstr_done = sljit_emit_jump(C, SLJIT_JUMP);
 
-				/* FIXED: S4 += attlen */
+				/* FIXED: S4 += attlen (R1 still live) */
 				sljit_set_label(j_fixedlen, sljit_emit_label(C));
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 							   SLJIT_S4, 0, SLJIT_R1, 0);
@@ -1336,21 +1262,9 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			}
 		}
 
-		/* Advance attnum and desc_ptr, then loop */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-					   SLJIT_R0, 0, SLJIT_IMM, 1);
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_ATTNUM,
-					   SLJIT_R0, 0);
-
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-					   SLJIT_R0, 0, SLJIT_IMM, (sljit_sw) sizeof(DeformColDesc));
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DESCPTR,
-					   SLJIT_R0, 0);
-
+		/* Advance attnum and loop (register-only, no stack ops) */
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+					   SLJIT_S5, 0, SLJIT_IMM, 1);
 		sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
 
 		l_epilogue = sljit_emit_label(C);

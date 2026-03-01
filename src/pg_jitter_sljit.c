@@ -130,7 +130,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			&sljit_shared_dsm_guc,
 			"",
 			PGC_USERSET,
-			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_ALLOW_IN_PARALLEL,
 			NULL, NULL, NULL);
 	}
 }
@@ -2655,6 +2655,122 @@ sljit_compile_expr(ExprState *state)
 					batch_end++;
 				}
 				int batch_count = batch_end - opno + 1;
+
+				/*
+				 * For large sequential batches (>= 32 consecutive attnums
+				 * and resultnums), emit a counted loop instead of unrolling.
+				 * This keeps generated code under ~200 bytes vs ~30KB for
+				 * 1000 columns, avoiding L1I cache thrashing.
+				 */
+				if (batch_count >= 32)
+				{
+					int att0 = op->d.assign_var.attnum;
+					int res0 = op->d.assign_var.resultnum;
+					bool is_sequential = true;
+
+					for (int bi = 1; bi < batch_count; bi++)
+					{
+						ExprEvalStep *cur = &steps[opno + bi];
+						if (cur->d.assign_var.attnum != att0 + bi ||
+							cur->d.assign_var.resultnum != res0 + bi)
+						{
+							is_sequential = false;
+							break;
+						}
+					}
+
+					if (is_sequential)
+					{
+						struct sljit_label *loop_top;
+						struct sljit_jump  *loop_back;
+
+						/* -- values loop -- */
+						if (use_cache)
+							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+										   SLJIT_MEM1(SLJIT_SP), vals_off);
+						else
+						{
+							emit_load_econtext_slot(C, SLJIT_R0, opcode);
+							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+										   SLJIT_MEM1(SLJIT_R0),
+										   offsetof(TupleTableSlot, tts_values));
+						}
+						/* R0 = &tts_values[att0] */
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+									   SLJIT_R0, 0,
+									   SLJIT_IMM, att0 * (sljit_sw) sizeof(Datum));
+						/* R1 = &resultvals[res0] */
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+									   SREG_RESULTVALS, 0,
+									   SLJIT_IMM, res0 * (sljit_sw) sizeof(Datum));
+						/* R3 = batch_count */
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+									   SLJIT_IMM, batch_count);
+
+						loop_top = sljit_emit_label(C);
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+									   SLJIT_MEM1(SLJIT_R0), 0);
+						sljit_emit_op1(C, SLJIT_MOV,
+									   SLJIT_MEM1(SLJIT_R1), 0,
+									   SLJIT_R2, 0);
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+									   SLJIT_R0, 0,
+									   SLJIT_IMM, (sljit_sw) sizeof(Datum));
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+									   SLJIT_R1, 0,
+									   SLJIT_IMM, (sljit_sw) sizeof(Datum));
+						sljit_emit_op2(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R3, 0,
+									   SLJIT_R3, 0, SLJIT_IMM, 1);
+						loop_back = sljit_emit_jump(C, SLJIT_NOT_ZERO);
+						sljit_set_label(loop_back, loop_top);
+
+						/* -- isnulls loop -- */
+						if (use_cache)
+							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+										   SLJIT_MEM1(SLJIT_SP), vals_off + 8);
+						else
+						{
+							emit_load_econtext_slot(C, SLJIT_R0, opcode);
+							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+										   SLJIT_MEM1(SLJIT_R0),
+										   offsetof(TupleTableSlot, tts_isnull));
+						}
+						/* R0 = &tts_isnull[att0] */
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+									   SLJIT_R0, 0,
+									   SLJIT_IMM, att0 * (sljit_sw) sizeof(bool));
+						/* R1 = &resultnulls[res0] */
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+									   SREG_RESULTNULLS, 0,
+									   SLJIT_IMM, res0 * (sljit_sw) sizeof(bool));
+						/* R3 = batch_count */
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+									   SLJIT_IMM, batch_count);
+
+						loop_top = sljit_emit_label(C);
+						sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+									   SLJIT_MEM1(SLJIT_R0), 0);
+						sljit_emit_op1(C, SLJIT_MOV_U8,
+									   SLJIT_MEM1(SLJIT_R1), 0,
+									   SLJIT_R2, 0);
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+									   SLJIT_R0, 0,
+									   SLJIT_IMM, (sljit_sw) sizeof(bool));
+						sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+									   SLJIT_R1, 0,
+									   SLJIT_IMM, (sljit_sw) sizeof(bool));
+						sljit_emit_op2(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R3, 0,
+									   SLJIT_R3, 0, SLJIT_IMM, 1);
+						loop_back = sljit_emit_jump(C, SLJIT_NOT_ZERO);
+						sljit_set_label(loop_back, loop_top);
+
+						/* Emit labels for skipped steps */
+						for (int bi = 1; bi < batch_count; bi++)
+							step_labels[opno + bi] = sljit_emit_label(C);
+						opno = batch_end;
+						break;
+					}
+				}
 
 				/* Phase 1: load all values from source tts_values */
 				if (use_cache)

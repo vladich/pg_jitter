@@ -471,7 +471,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		&meta_shared_dsm_guc,
 		"",
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_ALLOW_IN_PARALLEL,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("pg_jitter.backend",

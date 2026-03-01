@@ -31,6 +31,7 @@ REQUESTED_BACKENDS=""
 CSV_FILE=""
 MD_FILE="$REPO_DIR/BENCHMARKS.md"
 GENERATE_MD=1
+MD_ONLY=0
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --csv)       CSV_FILE="$2";  shift 2;;
         --md)        MD_FILE="$2";   shift 2;;
         --no-md)     GENERATE_MD=0;  shift;;
+        --md-only)   MD_ONLY=1; GENERATE_MD=1; shift;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
 done
@@ -318,7 +320,7 @@ add_query "CASE_searched_4way"  "SELECT SUM(CASE WHEN val < 1000 THEN 1 WHEN val
 add_query "COALESCE_NULLIF"     "SELECT SUM(COALESCE(NULLIF(val, 0), -1)) FROM join_left"
 add_query "Bool_AND_OR"         "SELECT COUNT(*) FROM join_left WHERE (val > 1000 AND val < 9000) OR (key1 > 100 AND key2 < 400)"
 add_query "Arith_expr"          "SELECT SUM(val + key1 * 3 - key2) FROM join_left"
-add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE grp IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
+add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
 
 # --- Subqueries & Lateral ---
 add_section "Subqueries"
@@ -348,13 +350,13 @@ add_query "Numeric_arith"       "SELECT SUM(val1 * val2 + val1 - val2) FROM nume
 # --- JSONB ---
 add_section "JSONB"
 add_query "JSONB_extract"       "SELECT SUM((doc->>'a')::int) FROM jsonb_data"
-add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE doc @> '{\"a\": 42}'"
+add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE (doc->>'a')::int = 42"
 add_query "JSONB_agg"           "SELECT grp_jsonb, COUNT(*), SUM((doc->>'a')::int) FROM jsonb_data GROUP BY grp_jsonb"
 
 # --- Arrays ---
 add_section "Arrays"
-add_query "Array_overlap"       "SELECT COUNT(*) FROM array_data WHERE tags && ARRAY[1,2,3,4,5]"
-add_query "Array_contains"      "SELECT COUNT(*) FROM array_data WHERE tags @> ARRAY[10,20]"
+add_query "Array_overlap"       "SELECT SUM(CASE WHEN tags && ARRAY[1,2,3,4,5] THEN 1 ELSE 0 END) FROM array_data"
+add_query "Array_contains"      "SELECT SUM(CASE WHEN tags @> ARRAY[10,20] THEN 1 ELSE 0 END) FROM array_data"
 add_query "Unnest_agg"          "SELECT u, COUNT(*) FROM array_data, unnest(tags) u WHERE id <= 100000 GROUP BY u"
 
 # --- Wide Row / Deform ---
@@ -393,6 +395,27 @@ NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""
 
+# ================================================================
+# --md-only: skip benchmarking, derive NAMES from existing CSV
+# ================================================================
+if [ "$MD_ONLY" -eq 1 ]; then
+    if [ -z "$CSV_FILE" ] || [ ! -f "$CSV_FILE" ]; then
+        echo "ERROR: --md-only requires --csv with an existing CSV file" >&2
+        exit 1
+    fi
+    # Derive unique backend names from CSV (preserving order of appearance)
+    NAMES=()
+    while IFS= read -r bname; do
+        NAMES+=("$bname")
+    done < <(tail -n +2 "$CSV_FILE" | cut -d',' -f2 | awk '!seen[$0]++')
+    BACKENDS=("${NAMES[@]}")
+    GENERATE_MD=1
+    echo "MD-only mode: using CSV $CSV_FILE"
+    echo "Backends from CSV: ${NAMES[*]}"
+    echo ""
+fi
+
+if [ "$MD_ONLY" -eq 0 ]; then
 # ================================================================
 # Warmup buffer cache
 # ================================================================
@@ -562,6 +585,8 @@ echo ""
     echo "All times in ms (median of $NRUNS). Lower is better."
 } | tee "$SCRIPT_DIR/bench_comprehensive_summary_$(date +%Y%m%d_%H%M%S).txt"
 
+fi  # end of MD_ONLY=0 block (benchmarking + summary)
+
 # ================================================================
 # Generate BENCHMARKS.md
 # ================================================================
@@ -713,7 +738,7 @@ JIT_HEADER
         jit_sep+="------|"
     done
     # Rewrite the last partial header
-    sed -i '$ d' "$MD_FILE"
+    sed -i '' '$ d' "$MD_FILE"
     echo "$jit_header" >> "$MD_FILE"
     echo "$jit_sep" >> "$MD_FILE"
 

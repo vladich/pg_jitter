@@ -499,7 +499,8 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 					   int natts, ExprEvalOp fetch_opcode,
 					   MIR_reg_t r_econtext, MIR_reg_t r_slot,
 					   MIR_item_t proto_varsize, MIR_item_t import_varsize,
-					   MIR_item_t proto_strlen, MIR_item_t import_strlen)
+					   MIR_item_t proto_strlen, MIR_item_t import_strlen,
+					   MIR_item_t proto_missingattrs, MIR_item_t import_missingattrs)
 {
 	int			attnum;
 	int			known_alignment = 0;
@@ -619,6 +620,32 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 			MIR_new_reg_op(ctx, r_maxatt),
 			MIR_new_reg_op(ctx, r_maxatt),
 			MIR_new_int_op(ctx, HEAP_NATTS_MASK)));
+
+	/* ============================================================
+	 * MISSING ATTRIBUTES CHECK
+	 * ============================================================ */
+	if ((natts - 1) > guaranteed_column_number)
+	{
+		MIR_insn_t skip_missing = MIR_new_label(ctx);
+
+		/* if r_maxatt >= natts, skip */
+		MIR_append_insn(ctx, func_item,
+			MIR_new_insn(ctx, MIR_BGE,
+				MIR_new_label_op(ctx, skip_missing),
+				MIR_new_reg_op(ctx, r_maxatt),
+				MIR_new_int_op(ctx, natts)));
+
+		/* call slot_getmissingattrs(r_slot, r_maxatt, natts) */
+		MIR_append_insn(ctx, func_item,
+			MIR_new_call_insn(ctx, 5,
+				MIR_new_ref_op(ctx, proto_missingattrs),
+				MIR_new_ref_op(ctx, import_missingattrs),
+				MIR_new_reg_op(ctx, r_slot),
+				MIR_new_reg_op(ctx, r_maxatt),
+				MIR_new_int_op(ctx, natts)));
+
+		MIR_append_insn(ctx, func_item, skip_missing);
+	}
 
 	/* r_tbits = r_dtmp + offsetof(HeapTupleHeaderData, t_bits) */
 	MIR_append_insn(ctx, func_item,
@@ -1338,6 +1365,7 @@ mir_compile_expr(ExprState *state)
 	/* Proto + imports for inline deform helpers */
 	MIR_item_t proto_deform_varsize, import_deform_varsize;
 	MIR_item_t proto_deform_strlen, import_deform_strlen;
+	MIR_item_t proto_deform_missingattrs, import_deform_missingattrs;
 	{
 		MIR_type_t rt = MIR_T_I64;
 		proto_deform_varsize = MIR_new_proto(ctx, "p_varsize",
@@ -1346,6 +1374,9 @@ mir_compile_expr(ExprState *state)
 		proto_deform_strlen = MIR_new_proto(ctx, "p_strlen",
 			1, &rt, 1, MIR_T_P, "s");
 		import_deform_strlen = MIR_new_import(ctx, "strlen");
+		proto_deform_missingattrs = MIR_new_proto(ctx, "p_missattr",
+			0, NULL, 3, MIR_T_P, "sl", MIR_T_I32, "s", MIR_T_I32, "e");
+		import_deform_missingattrs = MIR_new_import(ctx, "missattr");
 	}
 
 	/*
@@ -1628,6 +1659,21 @@ mir_compile_expr(ExprState *state)
 				offsetof(ExprState, resultslot),
 				r_state, 0, 1)));
 
+	/*
+	 * Initialize rvals/rnulls to 0 before the resultslot NULL check.
+	 * This ensures MIR's register allocator doesn't leave them with
+	 * uninitialized garbage on the NULL path (important at opt level 0
+	 * where MIR may reuse registers from a previous compilation).
+	 */
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_resultvals),
+			MIR_new_int_op(ctx, 0)));
+	MIR_append_insn(ctx, func_item,
+		MIR_new_insn(ctx, MIR_MOV,
+			MIR_new_reg_op(ctx, r_resultnulls),
+			MIR_new_int_op(ctx, 0)));
+
 	{
 		MIR_label_t skip_rs_label = MIR_new_label(ctx);
 
@@ -1766,7 +1812,9 @@ mir_compile_expr(ExprState *state)
 						proto_deform_varsize,
 						import_deform_varsize,
 						proto_deform_strlen,
-						import_deform_strlen);
+						import_deform_strlen,
+						proto_deform_missingattrs,
+						import_deform_missingattrs);
 				}
 
 				if (!deform_emitted)
@@ -6066,6 +6114,7 @@ mir_compile_expr(ExprState *state)
 		/* Inline deform helpers */
 		MIR_load_external(ctx, "varsize_any", mir_extern_addr((void *) varsize_any));
 		MIR_load_external(ctx, "strlen", mir_extern_addr((void *) strlen));
+		MIR_load_external(ctx, "missattr", mir_extern_addr((void *) slot_getmissingattrs));
 #ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
 		/* Presorted distinct helpers */
 		MIR_load_external(ctx, "pdist_single", mir_extern_addr((void *) ExecEvalPreOrderedDistinctSingle));
@@ -6485,10 +6534,11 @@ mir_compile_expr(ExprState *state)
 	}
 
 	/*
-	 * No per-expression registration needed — the per-query MIR context
-	 * (registered via mir_ctx_free in mir_get_or_create_ctx) handles cleanup
-	 * of all generated code when the JitContext is released.
+	 * Unload the module from the MIR context to free IR memory and remove
+	 * items from the global hash table.  The generated machine code survives
+	 * independently (it was copied to executable memory by MIR_gen).
 	 */
+	MIR_unload_module(ctx, m);
 
 	pfree(step_labels);
 	pfree(step_fn_imports);
