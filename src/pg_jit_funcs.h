@@ -19,6 +19,12 @@
 #define JIT_TYPE_64   1   /* 64-bit: int64, Datum, pointer */
 
 /*
+ * Flags for JitDirectFn entries.
+ */
+#define JIT_FN_FLAG_NONE       0x00
+#define JIT_FN_FLAG_COLLATION  0x01  /* pass fcinfo->fncollation as last native arg */
+
+/*
  * Inline operation codes for emit_inline_funcexpr().
  * When set on a JitDirectFn entry, the sljit backend emits the operation
  * as inline instructions instead of calling jit_fn.
@@ -39,6 +45,13 @@ typedef enum JitInlineOp
 	JIT_INLINE_INT8_EQ, JIT_INLINE_INT8_NE,
 	JIT_INLINE_INT8_LT, JIT_INLINE_INT8_LE,
 	JIT_INLINE_INT8_GT, JIT_INLINE_INT8_GE,
+	/* float64 arithmetic (IEEE 754, check isinf after) */
+	JIT_INLINE_FLOAT8_ADD, JIT_INLINE_FLOAT8_SUB,
+	JIT_INLINE_FLOAT8_MUL, JIT_INLINE_FLOAT8_DIV,
+	/* float64 comparison */
+	JIT_INLINE_FLOAT8_EQ, JIT_INLINE_FLOAT8_NE,
+	JIT_INLINE_FLOAT8_LT, JIT_INLINE_FLOAT8_LE,
+	JIT_INLINE_FLOAT8_GT, JIT_INLINE_FLOAT8_GE,
 } JitInlineOp;
 
 /*
@@ -49,12 +62,23 @@ typedef struct JitDirectFn
 {
 	PGFunction   pg_fn;        /* PG's V1 function address (e.g., int4pl) */
 	void        *jit_fn;       /* our unwrapped native version, or NULL */
-	uint8        nargs;        /* number of native args (0-4) */
+	uint8        nargs;        /* number of PG args (1-4) */
 	uint8        ret_type;     /* JIT_TYPE_32 or JIT_TYPE_64 */
 	uint8        arg_types[4]; /* type of each arg */
 	uint8        inline_op;    /* JitInlineOp, or 0 for none */
+	uint8        flags;        /* JIT_FN_FLAG_* */
 	const char  *jit_fn_name;  /* name of jit_fn for precompiled blob lookup */
 } JitDirectFn;
+
+/*
+ * Total number of native args including implicit collation arg.
+ * Used by backends to allocate registers and select calling convention.
+ */
+static inline int
+jit_native_nargs(const JitDirectFn *dfn)
+{
+	return dfn->nargs + ((dfn->flags & JIT_FN_FLAG_COLLATION) ? 1 : 0);
+}
 
 extern const JitDirectFn jit_direct_fns[];
 extern const int jit_direct_fns_count;
@@ -79,6 +103,9 @@ jit_sljit_call_type(const JitDirectFn *dfn)
 	uint32 result = type_map[dfn->ret_type];
 	for (int i = 0; i < dfn->nargs; i++)
 		result |= type_map[dfn->arg_types[i]] << ((i + 1) * 4);
+	/* Collation arg (Oid = uint32) goes after PG args as 32-bit */
+	if (dfn->flags & JIT_FN_FLAG_COLLATION)
+		result |= 2 << ((dfn->nargs + 1) * 4);
 	return result;
 }
 
@@ -120,6 +147,38 @@ extern int32 jit_interval_cmp(int64 a, int64 b);
 extern int64 jit_interval_smaller(int64 a, int64 b);
 extern int64 jit_interval_larger(int64 a, int64 b);
 extern int32 jit_interval_hash(int64 a);
+
+/*
+ * Interval / timestamp arithmetic wrappers.
+ * Pass-through to PG's complex interval arithmetic via DirectFunctionCall2.
+ */
+extern int64 jit_interval_pl(int64 a, int64 b);
+extern int64 jit_interval_mi(int64 a, int64 b);
+extern int64 jit_timestamp_pl_interval(int64 ts, int64 span);
+extern int64 jit_timestamp_mi_interval(int64 ts, int64 span);
+
+/*
+ * Text comparison wrappers (collation-aware).
+ * Collation Oid is passed as int32 last arg (JIT_FN_FLAG_COLLATION).
+ */
+extern int32 jit_texteq(int64 a, int64 b, int32 collid);
+extern int32 jit_textne(int64 a, int64 b, int32 collid);
+extern int32 jit_text_lt(int64 a, int64 b, int32 collid);
+extern int32 jit_text_le(int64 a, int64 b, int32 collid);
+extern int32 jit_text_gt(int64 a, int64 b, int32 collid);
+extern int32 jit_text_ge(int64 a, int64 b, int32 collid);
+extern int32 jit_bttextcmp(int64 a, int64 b, int32 collid);
+extern int64 jit_text_larger(int64 a, int64 b, int32 collid);
+extern int64 jit_text_smaller(int64 a, int64 b, int32 collid);
+
+/* Text functions (no collation needed) */
+extern int32 jit_textlen(int64 a);
+extern int32 jit_textoctetlen(int64 a);
+extern int32 jit_text_pattern_lt(int64 a, int64 b);
+extern int32 jit_text_pattern_le(int64 a, int64 b);
+extern int32 jit_text_pattern_ge(int64 a, int64 b);
+extern int32 jit_text_pattern_gt(int64 a, int64 b);
+extern int32 jit_bttext_pattern_cmp(int64 a, int64 b);
 
 /*
  * Tier 2 C wrapper declarations — always available, no external deps.

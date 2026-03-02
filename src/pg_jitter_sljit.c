@@ -29,6 +29,12 @@
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 
+/* Inline VARSIZE_ANY helper (defined in pg_jitter_deform_jit.c) */
+extern void sljit_emit_varsize_any_inline(struct sljit_compiler *C,
+										  sljit_s32 r_ptr, sljit_sw r_ptr_w,
+										  sljit_s32 r_result, sljit_sw r_result_w,
+										  sljit_s32 r_byte, sljit_sw r_byte_w);
+
 /*
  * Mirror of Int8TransTypeData from numeric.c (not exported in headers).
  * Used by int2_avg_accum / int4_avg_accum: an ArrayType wrapping {count, sum}.
@@ -67,6 +73,15 @@ static const struct config_enum_entry parallel_jit_options[] = {
  * File-scoped so helper functions (emit_inline_funcexpr etc.) can access it.
  */
 static bool sljit_shared_code_mode = false;
+
+/*
+ * Per-compilation cached register for state->steps base pointer.
+ * When non-zero, emit_load_step_field() uses this register directly
+ * instead of reloading from SOFF_STEPS on the stack (saves 1 load per
+ * step field access). Set by sljit_compile_expr on architectures with
+ * enough saved registers (ARM64: 10 saved, uses S6 or S7).
+ */
+static int sljit_sreg_steps = 0;
 
 /* GUC variable for _shared_dsm (needed when loaded standalone without meta) */
 static char *sljit_shared_dsm_guc = NULL;
@@ -223,9 +238,13 @@ sljit_code_free(void *data)
  *   S3 = resultslot->tts_values  (loaded in prologue)
  *   S4 = resultslot->tts_isnull  (loaded in prologue)
  *   S5 = AggState *aggstate  (when has_agg) OR sreg_hash (when has_hash_next && !has_agg)
+ *   S6 = sreg_hash  (when has_agg && has_hash_next, on archs with >= 7 saved regs)
  *
- * Max 6 saved registers — safe on all sljit architectures
+ * Base: 6 saved registers — safe on all sljit architectures
  * (SLJIT_NUMBER_OF_SAVED_REGISTERS >= 6 everywhere, including x86-64).
+ * When agg+hash coexist and the architecture has >= 7 saved registers
+ * (ARM64=10, ARM32=8, x86-32=7; x86-64 non-Windows = 6), we use S6 for
+ * sreg_hash to avoid spilling the rotated hash to the stack in NEXT32.
  * &CurrentMemoryContext is accessed only twice per AGG_TRANS (save + restore)
  * so it moves to SOFF_AGG_CURRMCTXP on the stack.
  */
@@ -495,6 +514,11 @@ find_or_compile_deform(PgJitterContext *ctx,
             return cache[i].code;
     }
 
+#ifdef PG18_WIDE_DEFORM_LIMIT
+    if (natts > PG18_WIDE_DEFORM_LIMIT)
+        return NULL;
+#endif
+
     /* Compile new deform function */
     if (*ncache >= MAX_DEFORM_CACHE)
         return NULL;
@@ -616,6 +640,11 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         return false;
     if (natts <= 0 || natts > desc->natts)
         return false;
+
+#ifdef PG18_WIDE_DEFORM_LIMIT
+    if (natts > PG18_WIDE_DEFORM_LIMIT)
+        return false;
+#endif
 
     /* Wide tables: skip inline deform, fall through to compiled loop deform */
     if (natts > pg_jitter_deform_threshold())
@@ -1006,16 +1035,14 @@ sljit_emit_deform_inline(struct sljit_compiler *C,
         else if (att->attlen == -1)
         {
             /*
-             * Varlena: off += varsize_any(attdatap).
+             * Varlena: off += VARSIZE_ANY(attdatap).
              * R1 still holds attdatap from value extraction.
-             * icall clobbers R0-R3, so save R3 (deform_off) to stack
-             * first. S3-S5 are callee-saved, so they survive the call.
+             * Save R3 (deform_off) around icall (clobbers R0-R3).
              */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off,
-                           SLJIT_R3, 0);  /* save R3 (vals_off is unused during deform) */
+                           SLJIT_R3, 0);
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
             EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), varsize_any);
-            /* R0 = varsize_any result. Restore R3 and add. */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
                            SLJIT_MEM1(SLJIT_SP), vals_off);
             sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
@@ -1218,11 +1245,21 @@ static inline void
 emit_load_step_field(struct sljit_compiler *C, int opno,
                      sljit_sw field_offset, int dst_reg)
 {
-    sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                   SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
-    sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                   SLJIT_MEM1(dst_reg),
-                   opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    if (sljit_sreg_steps)
+    {
+        /* Steps pointer cached in saved register — single load */
+        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
+                       SLJIT_MEM1(sljit_sreg_steps),
+                       opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    }
+    else
+    {
+        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
+        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
+                       SLJIT_MEM1(dst_reg),
+                       opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    }
 }
 
 /* Load the address of steps[opno] into dst_reg.  Used for fallback calls
@@ -1233,11 +1270,22 @@ emit_load_step_field(struct sljit_compiler *C, int opno,
 static inline void
 emit_load_step_addr(struct sljit_compiler *C, int opno, int dst_reg)
 {
-    sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                   SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
-    if (opno != 0)
-        sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, dst_reg, 0,
-                       SLJIT_IMM, opno * (sljit_sw)sizeof(ExprEvalStep));
+    if (sljit_sreg_steps)
+    {
+        if (opno != 0)
+            sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, sljit_sreg_steps, 0,
+                           SLJIT_IMM, opno * (sljit_sw)sizeof(ExprEvalStep));
+        else
+            sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0, sljit_sreg_steps, 0);
+    }
+    else
+    {
+        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
+        if (opno != 0)
+            sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, dst_reg, 0,
+                           SLJIT_IMM, opno * (sljit_sw)sizeof(ExprEvalStep));
+    }
 }
 
 /* Load the address of a field within steps[opno] into dst_reg.
@@ -1248,11 +1296,20 @@ static inline void
 emit_load_step_field_addr(struct sljit_compiler *C, int opno,
                           sljit_sw field_offset, int dst_reg)
 {
-    sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
-                   SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
-    sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, dst_reg, 0,
-                   SLJIT_IMM,
-                   opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    if (sljit_sreg_steps)
+    {
+        sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, sljit_sreg_steps, 0,
+                       SLJIT_IMM,
+                       opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    }
+    else
+    {
+        sljit_emit_op1(C, SLJIT_MOV, dst_reg, 0,
+                       SLJIT_MEM1(SLJIT_SP), SOFF_STEPS);
+        sljit_emit_op2(C, SLJIT_ADD, dst_reg, 0, dst_reg, 0,
+                       SLJIT_IMM,
+                       opno * (sljit_sw)sizeof(ExprEvalStep) + field_offset);
+    }
 }
 
 /*
@@ -1721,6 +1778,427 @@ emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op)
 			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_SIG_GREATER_EQUAL);
 			return true;
 
+		/* ---- float64 arithmetic (overflow-checked) ---- */
+		/*
+		 * float8 values are stored as Datum (int64 bit-pattern).
+		 * R0=arg0, R1=arg1 on entry. Result in R0.
+		 *
+		 * For add/sub: check isinf(result) && !isinf(arg0) && !isinf(arg1)
+		 * For mul: also check underflow (result==0 && arg0!=0 && arg1!=0)
+		 * For div: check divisor==0, isinf, and underflow
+		 *
+		 * Strategy: save original args in FR2/FR3, do the op, check result
+		 * for infinity. If inf, check that neither arg was inf; if so,
+		 * call jit_error_float_overflow. This keeps the hot path short
+		 * (branch-not-taken for the overflow case).
+		 */
+		case JIT_INLINE_FLOAT8_ADD:
+		{
+			struct sljit_jump *j_not_inf;
+			struct sljit_jump *j_arg0_inf, *j_done;
+
+			/* Move int64 bit-patterns to float regs */
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			/* Save args for overflow check */
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR2, 0, SLJIT_FR0, 0);
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR3, 0, SLJIT_FR1, 0);
+			/* float64 add */
+			sljit_emit_fop2(C, SLJIT_ADD_F64, SLJIT_FR0, 0,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			/* Move result back to integer register */
+			sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+			/* Check: is result ±Inf? Compare |result| with +Inf */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR0, 0);
+			sljit_emit_fset64(C, SLJIT_FR5, (double) INFINITY);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_not_inf = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			/* Result is Inf — check if arg0 was Inf */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR2, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_arg0_inf = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			/* arg0 was not Inf — check arg1 */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR3, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			/* Neither arg was Inf → overflow error */
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+			sljit_set_label(j_not_inf, sljit_emit_label(C));
+			sljit_set_label(j_arg0_inf, sljit_emit_label(C));
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_SUB:
+		{
+			struct sljit_jump *j_not_inf;
+			struct sljit_jump *j_arg0_inf, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR2, 0, SLJIT_FR0, 0);
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR3, 0, SLJIT_FR1, 0);
+			sljit_emit_fop2(C, SLJIT_SUB_F64, SLJIT_FR0, 0,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+			/* Overflow check: isinf(result) && !isinf(a) && !isinf(b) */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR0, 0);
+			sljit_emit_fset64(C, SLJIT_FR5, (double) INFINITY);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_not_inf = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR2, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_arg0_inf = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR3, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+			sljit_set_label(j_not_inf, sljit_emit_label(C));
+			sljit_set_label(j_arg0_inf, sljit_emit_label(C));
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_MUL:
+		{
+			struct sljit_jump *j_not_inf;
+			struct sljit_jump *j_arg0_inf, *j_inf_done;
+			struct sljit_jump *j_not_zero;
+			struct sljit_jump *j_a_zero, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR2, 0, SLJIT_FR0, 0);
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR3, 0, SLJIT_FR1, 0);
+			sljit_emit_fop2(C, SLJIT_MUL_F64, SLJIT_FR0, 0,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+			/* Overflow check */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR0, 0);
+			sljit_emit_fset64(C, SLJIT_FR5, (double) INFINITY);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_not_inf = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			/* result is Inf — check args */
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR2, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_arg0_inf = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR3, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_inf_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+			sljit_set_label(j_not_inf, sljit_emit_label(C));
+			sljit_set_label(j_arg0_inf, sljit_emit_label(C));
+			sljit_set_label(j_inf_done, sljit_emit_label(C));
+			/* Underflow check: result==0 && a!=0 && b!=0 */
+			sljit_emit_fset64(C, SLJIT_FR4, 0.0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR4, 0);
+			j_not_zero = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			/* result is 0 — check if args were 0 */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR2, 0, SLJIT_FR4, 0);
+			j_a_zero = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR3, 0, SLJIT_FR4, 0);
+			j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
+			sljit_set_label(j_not_zero, sljit_emit_label(C));
+			sljit_set_label(j_a_zero, sljit_emit_label(C));
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_DIV:
+		{
+			struct sljit_jump *j_not_zero_divisor;
+			struct sljit_jump *j_not_inf;
+			struct sljit_jump *j_arg0_inf;
+			struct sljit_jump *j_not_zero_result;
+			struct sljit_jump *j_a_zero, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			/* Check divisor == 0 */
+			sljit_emit_fset64(C, SLJIT_FR4, 0.0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR1, 0, SLJIT_FR4, 0);
+			j_not_zero_divisor = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
+			sljit_set_label(j_not_zero_divisor, sljit_emit_label(C));
+			/* Save arg0 for overflow check (divisor can't be Inf if it's 0) */
+			sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR2, 0, SLJIT_FR0, 0);
+			/* float64 div */
+			sljit_emit_fop2(C, SLJIT_DIV_F64, SLJIT_FR0, 0,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+			/* Overflow check: isinf(result) && !isinf(a) */
+			sljit_emit_fset64(C, SLJIT_FR5, (double) INFINITY);
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR0, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_not_inf = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			sljit_emit_fop1(C, SLJIT_ABS_F64, SLJIT_FR4, 0, SLJIT_FR2, 0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR4, 0, SLJIT_FR5, 0);
+			j_arg0_inf = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+			sljit_set_label(j_not_inf, sljit_emit_label(C));
+			sljit_set_label(j_arg0_inf, sljit_emit_label(C));
+			/* Underflow check: result==0 && a!=0 */
+			sljit_emit_fset64(C, SLJIT_FR4, 0.0);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR4, 0);
+			j_not_zero_result = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR2, 0, SLJIT_FR4, 0);
+			j_a_zero = sljit_emit_jump(C, SLJIT_F_EQUAL);
+			EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
+			sljit_set_label(j_not_zero_result, sljit_emit_label(C));
+			sljit_set_label(j_a_zero, sljit_emit_label(C));
+			return true;
+		}
+
+		/* ---- float64 comparison ---- */
+		/*
+		 * PostgreSQL float8 comparison semantics:
+		 * - NaN is treated as equal to NaN and greater than all non-NaN.
+		 * - This matches the float8_cmp_internal() behavior in PG.
+		 *
+		 * We use the ORDERED float comparison flags which treat NaN
+		 * comparisons as false (IEEE 754 default), then handle NaN
+		 * specially. For simplicity, we use the same approach as PG:
+		 * call the C wrapper for NaN cases. But since NaN is rare,
+		 * we inline the common non-NaN path.
+		 *
+		 * Actually, PG's float8eq etc. use float8_cmp_internal which
+		 * treats NaN == NaN = true and NaN > everything.
+		 * The SLJIT ORDERED_EQUAL flag gives: false if either is NaN.
+		 * So for EQ: ordered_equal is correct for non-NaN, but we need
+		 * to also return true if both are NaN.
+		 *
+		 * For simplicity and correctness, check for NaN first:
+		 * if (unordered) → both args may be NaN → fall through to C wrapper
+		 * else → use ordered comparison result
+		 *
+		 * Even simpler: use SLJIT_UNORDERED to detect NaN, then
+		 * handle the NaN case. For EQ: NaN==NaN→true, NaN==x→false.
+		 */
+		case JIT_INLINE_FLOAT8_EQ:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			/* Check for NaN (unordered) */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			/* No NaN: use ordered equal */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_F_EQUAL);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN case: both NaN → true, else false */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			/* Check if both are NaN: a != a && b != b */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+			/* R0 = (a is NaN). If a is NaN, check b is NaN too */
+			{
+				struct sljit_jump *j_a_not_nan;
+				j_a_not_nan = sljit_emit_cmp(C, SLJIT_EQUAL,
+											 SLJIT_R0, 0, SLJIT_IMM, 0);
+				/* a is NaN, check b */
+				sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+								SLJIT_FR1, 0, SLJIT_FR1, 0);
+				sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+				sljit_set_label(j_a_not_nan, sljit_emit_label(C));
+			}
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_NE:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_F_NOT_EQUAL);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN: ne is true unless both are NaN */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+			{
+				struct sljit_jump *j_a_not_nan;
+				j_a_not_nan = sljit_emit_cmp(C, SLJIT_EQUAL,
+											 SLJIT_R0, 0, SLJIT_IMM, 0);
+				/* a is NaN, check if b is NaN too → NaN!=NaN is false */
+				sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+								SLJIT_FR1, 0, SLJIT_FR1, 0);
+				/* ne = !(b is NaN) = ordered */
+				sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_ORDERED);
+				{
+					struct sljit_jump *j_end;
+					j_end = sljit_emit_jump(C, SLJIT_JUMP);
+					sljit_set_label(j_a_not_nan, sljit_emit_label(C));
+					/* a is not NaN but b is → not equal = true */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 1);
+					sljit_set_label(j_end, sljit_emit_label(C));
+				}
+			}
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_LT:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			/* No NaN: a < b in IEEE order matches PG semantics */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_LESS,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_F_LESS);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN: in PG, NaN > everything. So a < b is:
+			 * - false if a is NaN (NaN is greatest)
+			 * - true if b is NaN and a is not NaN */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			/* Check if a is NaN */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			/* a < b when NaN involved: true iff a is NOT NaN (b must be NaN) */
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_ORDERED);
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_LE:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_LESS_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_F_LESS_EQUAL);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN: a <= b is true if a is not NaN (b is NaN = greatest)
+			 * OR if both are NaN (NaN == NaN in PG) */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			/* Always true when NaN involved:
+			 * - a=NaN, b=NaN → NaN<=NaN = true (equal)
+			 * - a=NaN, b=val → false (NaN > val)
+			 * - a=val, b=NaN → true (val < NaN)
+			 * So: result = !(a is NaN) || (b is NaN)
+			 * But if we got here, at least one is NaN.
+			 * If a is not NaN → b is NaN → true
+			 * If a is NaN → true iff b is NaN too */
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+			{
+				struct sljit_jump *j_a_nan;
+				j_a_nan = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+										 SLJIT_R0, 0, SLJIT_IMM, 0);
+				/* a is not NaN, b is NaN → a <= NaN = true */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 1);
+				{
+					struct sljit_jump *j_end;
+					j_end = sljit_emit_jump(C, SLJIT_JUMP);
+					sljit_set_label(j_a_nan, sljit_emit_label(C));
+					/* a is NaN: true iff b is also NaN */
+					sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+									SLJIT_FR1, 0, SLJIT_FR1, 0);
+					sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0,
+										SLJIT_UNORDERED);
+					sljit_set_label(j_end, sljit_emit_label(C));
+				}
+			}
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_GT:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_GREATER,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_F_GREATER);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN: a > b is true if a is NaN and b is not NaN */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+			{
+				struct sljit_jump *j_a_not_nan;
+				j_a_not_nan = sljit_emit_cmp(C, SLJIT_EQUAL,
+											 SLJIT_R0, 0, SLJIT_IMM, 0);
+				/* a is NaN: gt = b is not NaN */
+				sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+								SLJIT_FR1, 0, SLJIT_FR1, 0);
+				sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_ORDERED);
+				sljit_set_label(j_a_not_nan, sljit_emit_label(C));
+			}
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
+		case JIT_INLINE_FLOAT8_GE:
+		{
+			struct sljit_jump *j_nan, *j_done;
+
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+			sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			j_nan = sljit_emit_jump(C, SLJIT_UNORDERED);
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_GREATER_EQUAL,
+							SLJIT_FR0, 0, SLJIT_FR1, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0,
+								SLJIT_F_GREATER_EQUAL);
+			j_done = sljit_emit_jump(C, SLJIT_JUMP);
+			/* NaN: a >= b is true if a is NaN (NaN is greatest) */
+			sljit_set_label(j_nan, sljit_emit_label(C));
+			sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED,
+							SLJIT_FR0, 0, SLJIT_FR0, 0);
+			sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
+			sljit_set_label(j_done, sljit_emit_label(C));
+			return true;
+		}
+
 		default:
 			return false;
 	}
@@ -2139,14 +2617,17 @@ sljit_compile_expr(ExprState *state)
 	/*
 	 * Pre-scan: check if expression has aggregate transition steps.
 	 * Aggregates need S5 for aggstate.
-	 * HASHDATUM_NEXT32 uses S5 for the rotated hash when no agg.
+	 * HASHDATUM_NEXT32 uses S5 for the rotated hash when no agg,
+	 * or S6 when agg+hash coexist (on archs with >= 7 saved regs).
 	 * Deform is compiled as separate functions (no S3-S5 conflict).
 	 *
 	 * Register layout (see SREG_RESULTVALS/SREG_RESULTNULLS defines):
 	 *   S0-S2: state, econtext, isNull (always)
 	 *   S3-S4: resultvals, resultnulls (always, loaded in prologue)
 	 *   S5:    aggstate (when has_agg) OR sreg_hash (when has_hash_next)
-	 * Max 6 saved regs — SLJIT_NUMBER_OF_SAVED_REGISTERS >= 6 on all archs.
+	 *   S6:    sreg_hash (when has_agg && has_hash_next, >= 7 saved)
+	 *          OR sreg_steps (when >= 7 saved and no agg+hash conflict)
+	 *   S7:    sreg_steps (when has_agg && has_hash_next, >= 8 saved)
 	 */
 	int sreg_hash = 0;		/* saved register for rotated hash in NEXT32 */
 	bool use_sreg_hash = false;	/* true if sreg_hash is a register, not stack */
@@ -2172,7 +2653,7 @@ sljit_compile_expr(ExprState *state)
 
 		/*
 		 * Compute saved register count.
-		 * Always use 6 saved registers (S0-S5):
+		 * Base: 6 saved registers (S0-S5):
 		 *   S0=state, S1=econtext, S2=isNull,
 		 *   S3=resultvals, S4=resultnulls (always)
 		 *   S5=aggstate (agg) / sreg_hash (hash_next) / temp (deform)
@@ -2182,16 +2663,53 @@ sljit_compile_expr(ExprState *state)
 		 * This requires S5 to be allocated even when there's no agg
 		 * or hash_next.
 		 *
-		 * Max 6 saved registers — the guaranteed minimum across all
-		 * sljit architectures (x86-64 non-Windows has exactly 6).
-		 * When agg+hash coexist, hash falls back to SOFF_TEMP.
+		 * When agg+hash coexist and the architecture has >= 7 saved
+		 * registers (ARM64=10, ARM32=8, x86-32=7), we use S6 for
+		 * sreg_hash. On x86-64 non-Windows (exactly 6), hash falls
+		 * back to SOFF_TEMP on the stack.
+		 *
+		 * sreg_steps caches state->steps in a saved register, saving
+		 * 1 load per emit_load_step_field() call.  Assigned to the
+		 * next available S register after agg/hash allocation.
 		 */
-		nsaved = 6;
+		sljit_sreg_steps = 0;	/* reset for this compilation */
+
 		if (has_hash_next && !has_agg)
 		{
 			sreg_hash = SLJIT_S5;
 			use_sreg_hash = true;
+			nsaved = 6;
 		}
+		else if (has_hash_next && has_agg)
+		{
+#if SLJIT_NUMBER_OF_SAVED_REGISTERS >= 7
+			sreg_hash = SLJIT_S6;
+			use_sreg_hash = true;
+			nsaved = 7;
+#else
+			/* x86-64 non-Windows: only 6 saved regs, fall back to stack */
+			nsaved = 6;
+#endif
+		}
+		else
+		{
+			nsaved = 6;
+		}
+
+		/*
+		 * Steps pointer caching: use a saved register to avoid reloading
+		 * state->steps from the stack on every step field access.
+		 * Only enable for complex expressions (>= 10 steps) where the
+		 * per-step savings outweigh the register save/restore cost.
+		 * SLJIT_S(n) = SLJIT_NUMBER_OF_REGISTERS - n (saved regs count down).
+		 */
+#if SLJIT_NUMBER_OF_SAVED_REGISTERS >= 7
+		if (steps_len >= 10 && nsaved < SLJIT_NUMBER_OF_SAVED_REGISTERS)
+		{
+			sljit_sreg_steps = SLJIT_S(nsaved);
+			nsaved++;
+		}
+#endif
 
 		C = sljit_create_compiler(NULL);
 		if (!C)
@@ -2212,7 +2730,8 @@ sljit_compile_expr(ExprState *state)
 		 */
 		sljit_emit_enter(C, 0,
 						 SLJIT_ARGS3(W, P, P, P),
-						 4, nsaved, SOFF_TOTAL);
+						 4 | SLJIT_ENTER_FLOAT(6),
+						 nsaved, SOFF_TOTAL);
 
 		if (has_agg)
 		{
@@ -2228,14 +2747,17 @@ sljit_compile_expr(ExprState *state)
 		}
 	}
 
-	/* Cache state->steps pointer on the stack for steps-relative addressing.
-	 * This enables PIC code: per-expression pointers are loaded via
-	 * steps[stepno].field instead of 64-bit immediates (2 insn vs 4). */
+	/* Cache state->steps pointer for steps-relative addressing.
+	 * Stored on the stack at SOFF_STEPS (always, for fallback paths).
+	 * Also cached in sreg_steps saved register when available,
+	 * eliminating 1 load per emit_load_step_field() call. */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 				   SLJIT_MEM1(SLJIT_S0), offsetof(ExprState, steps));
 	sljit_emit_op1(C, SLJIT_MOV,
 				   SLJIT_MEM1(SLJIT_SP), SOFF_STEPS,
 				   SLJIT_R0, 0);
+	if (sljit_sreg_steps)
+		sljit_emit_op1(C, SLJIT_MOV, sljit_sreg_steps, 0, SLJIT_R0, 0);
 
 	/* Load resultslot values/nulls into saved registers S3/S4 */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -2424,6 +2946,9 @@ sljit_compile_expr(ExprState *state)
 					if (!IsParallelWorker() &&
 						op->d.fetch.known_desc &&
 						op->d.fetch.last_var > pg_jitter_deform_threshold() &&
+#ifdef PG18_WIDE_DEFORM_LIMIT
+						op->d.fetch.last_var <= PG18_WIDE_DEFORM_LIMIT &&
+#endif
 						ctx->share_state.sjc)
 					{
 						pg_jitter_compile_shared_deform(
@@ -3114,23 +3639,22 @@ sljit_compile_expr(ExprState *state)
 					if (!call_target)
 						call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
 #endif
-					if (dfn->nargs > 0)
 					{
-						int base_reg;
+						/*
+						 * Load PG args into R0..R(nargs-1), and optionally
+						 * fcinfo->fncollation into R(nargs) for collation-aware fns.
+						 * Place fcinfo base in R(native_nargs) to avoid collisions.
+						 */
+						int native_nargs = jit_native_nargs(dfn);
+						int base_reg = SLJIT_R0 + native_nargs;
 						if (r1_has_fcinfo)
 						{
-							/*
-							 * R1 = fcinfo from strict null checks.
-							 * Move to R2 so R0/R1 are free for args.
-							 */
-							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+							sljit_emit_op1(C, SLJIT_MOV, base_reg, 0,
 										   SLJIT_R1, 0);
-							base_reg = SLJIT_R2;
 						}
 						else
 						{
-							emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data), SLJIT_R2);
-							base_reg = SLJIT_R2;
+							emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data), base_reg);
 						}
 						for (int i = 0; i < dfn->nargs; i++)
 						{
@@ -3139,6 +3663,13 @@ sljit_compile_expr(ExprState *state)
 								(sljit_sw) fcinfo;
 							sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0 + i, 0,
 										   SLJIT_MEM1(base_reg), val_off);
+						}
+						/* Load collation Oid as last native arg */
+						if (dfn->flags & JIT_FN_FLAG_COLLATION)
+						{
+							sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0 + dfn->nargs, 0,
+										   SLJIT_MEM1(base_reg),
+										   offsetof(FunctionCallInfoBaseData, fncollation));
 						}
 					}
 
@@ -4247,6 +4778,9 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_IMM,
 							   (sljit_sw) op->d.hashdatum_initvalue.init_value);
 				emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+				if (use_sreg_hash)
+					sljit_emit_op1(C, SLJIT_MOV, sreg_hash, 0,
+								   SLJIT_R0, 0);
 				break;
 			}
 
@@ -4325,6 +4859,9 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+				if (use_sreg_hash)
+					sljit_emit_op1(C, SLJIT_MOV, sreg_hash, 0,
+								   SLJIT_R0, 0);
 				break;
 			}
 
@@ -4384,6 +4921,9 @@ sljit_compile_expr(ExprState *state)
 				}
 
 				emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+				if (use_sreg_hash)
+					sljit_emit_op1(C, SLJIT_MOV, sreg_hash, 0,
+								   SLJIT_R0, 0);
 
 				/* Jump past null_path (fall through to next step) */
 				{
@@ -4429,24 +4969,24 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_isnull;
 				struct sljit_jump *j_done;
 
-				/* Load existing hash from iresult->value as uint32 into R0 */
-				emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
-				sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   offsetof(NullableDatum, value));
-
 				/*
-				 * Rotate left 1.  If we have a dedicated saved register,
-				 * store there (survives call without stack traffic).
-				 * Otherwise spill to SOFF_TEMP on the stack.
+				 * Rotate existing hash left 1.
+				 * When use_sreg_hash, the hash is already in sreg_hash
+				 * from FIRST/FIRST_STRICT/SET_INITVAL — rotate in-place,
+				 * skipping the memory round-trip entirely.
+				 * Otherwise load from iresult->value and spill to stack.
 				 */
 				if (use_sreg_hash)
 				{
 					sljit_emit_op2(C, SLJIT_ROTL32, sreg_hash, 0,
-								   SLJIT_R0, 0, SLJIT_IMM, 1);
+								   sreg_hash, 0, SLJIT_IMM, 1);
 				}
 				else
 				{
+					emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
+					sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   offsetof(NullableDatum, value));
 					sljit_emit_op2(C, SLJIT_ROTL32, SLJIT_R0, 0,
 								   SLJIT_R0, 0, SLJIT_IMM, 1);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP),
@@ -4500,8 +5040,11 @@ sljit_compile_expr(ExprState *state)
 				/* XOR rotated hash with hash result (R0) */
 				if (use_sreg_hash)
 				{
-					sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0,
+					/* XOR into sreg_hash (cached for next NEXT32) */
+					sljit_emit_op2(C, SLJIT_XOR32, sreg_hash, 0,
 								   sreg_hash, 0, SLJIT_R0, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   sreg_hash, 0);
 				}
 				else
 				{
@@ -4513,7 +5056,10 @@ sljit_compile_expr(ExprState *state)
 
 				j_done = sljit_emit_jump(C, SLJIT_JUMP);
 
-				/* skip_hash: R0 = rotated hash (from register or stack) */
+				/*
+				 * skip_hash: arg was null, hash = rotated value (no XOR).
+				 * sreg_hash already holds the rotated value when cached.
+				 */
 				{
 					struct sljit_label *lbl_skip = sljit_emit_label(C);
 					sljit_set_label(j_isnull, lbl_skip);
@@ -4559,20 +5105,20 @@ sljit_compile_expr(ExprState *state)
 				j_isnull = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 										  SLJIT_R0, 0, SLJIT_IMM, 0);
 
-				/* Not null path: load existing hash, rotate, call, XOR */
-				emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
-				sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
-							   SLJIT_MEM1(SLJIT_R0),
-							   offsetof(NullableDatum, value));
-
-				/* Rotate left 1, store in saved reg or stack */
+				/* Not null path: rotate existing hash, call hash fn, XOR */
 				if (use_sreg_hash)
 				{
+					/* Rotate directly from cached register */
 					sljit_emit_op2(C, SLJIT_ROTL32, sreg_hash, 0,
-								   SLJIT_R0, 0, SLJIT_IMM, 1);
+								   sreg_hash, 0, SLJIT_IMM, 1);
 				}
 				else
 				{
+					/* Load from memory, rotate, spill to stack */
+					emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
+					sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0,
+								   SLJIT_MEM1(SLJIT_R0),
+								   offsetof(NullableDatum, value));
 					sljit_emit_op2(C, SLJIT_ROTL32, SLJIT_R0, 0,
 								   SLJIT_R0, 0, SLJIT_IMM, 1);
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP),
@@ -4614,8 +5160,11 @@ sljit_compile_expr(ExprState *state)
 				/* XOR rotated hash with hash result (R0) */
 				if (use_sreg_hash)
 				{
-					sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0,
+					/* XOR into sreg_hash (cached for next NEXT32) */
+					sljit_emit_op2(C, SLJIT_XOR32, sreg_hash, 0,
 								   sreg_hash, 0, SLJIT_R0, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   sreg_hash, 0);
 				}
 				else
 				{

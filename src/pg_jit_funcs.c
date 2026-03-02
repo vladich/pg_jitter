@@ -24,6 +24,10 @@
 #include "utils/date.h"        /* DateADT, date constants */
 #include "datatype/timestamp.h" /* USECS_PER_DAY, INTERVAL_NOT_FINITE */
 #include "utils/float.h"       /* get_float8_nan */
+#include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
+#include "utils/varlena.h"     /* varstr_cmp */
+#include "access/detoast.h"    /* toast_raw_datum_size */
+#include "mb/pg_wchar.h"       /* pg_mbstrlen_with_len */
 
 #include "pg_jit_funcs.h"
 #include "pg_jit_tier2_wrappers.h"
@@ -911,6 +915,36 @@ jit_interval_hash(int64 a_ptr)
 }
 
 /* ================================================================
+ * TIER 1: Interval / timestamp arithmetic (4 functions)
+ * These are pass-through wrappers that bypass V1 fcinfo overhead
+ * while delegating to PG's complex interval arithmetic.
+ * ================================================================ */
+
+int64
+jit_interval_pl(int64 a, int64 b)
+{
+	return (int64) DirectFunctionCall2(interval_pl, (Datum) a, (Datum) b);
+}
+
+int64
+jit_interval_mi(int64 a, int64 b)
+{
+	return (int64) DirectFunctionCall2(interval_mi, (Datum) a, (Datum) b);
+}
+
+int64
+jit_timestamp_pl_interval(int64 ts, int64 span)
+{
+	return (int64) DirectFunctionCall2(timestamp_pl_interval, (Datum) ts, (Datum) span);
+}
+
+int64
+jit_timestamp_mi_interval(int64 ts, int64 span)
+{
+	return (int64) DirectFunctionCall2(timestamp_mi_interval, (Datum) ts, (Datum) span);
+}
+
+/* ================================================================
  * TIER 1: hashfloat4 / hashfloat8 (2 functions)
  * Must handle -0.0 → 0 hash and NaN normalization.
  * ================================================================ */
@@ -944,6 +978,103 @@ jit_hashfloat8(int64 datum)
 }
 
 /* ================================================================
+ * TIER 1: Text comparison wrappers (collation-aware)
+ *
+ * These take fcinfo->fncollation as an explicit last argument,
+ * bypassing PG_GET_COLLATION() which requires fcinfo.
+ * ================================================================ */
+
+/* Free detoasted copy if different from original datum */
+#define JIT_FREE_IF_COPY(ptr, datum) \
+	do { if ((Pointer)(ptr) != DatumGetPointer(datum)) pfree(ptr); } while(0)
+
+static inline int
+jit_text_cmp_internal(Datum a, Datum b, Oid collid)
+{
+	text *t1 = DatumGetTextPP(a);
+	text *t2 = DatumGetTextPP(b);
+	int result = varstr_cmp(VARDATA_ANY(t1), VARSIZE_ANY_EXHDR(t1),
+							VARDATA_ANY(t2), VARSIZE_ANY_EXHDR(t2), collid);
+	JIT_FREE_IF_COPY(t1, a);
+	JIT_FREE_IF_COPY(t2, b);
+	return result;
+}
+
+int32
+jit_texteq(int64 a, int64 b, int32 collid)
+{
+	Datum da = (Datum) a, db = (Datum) b;
+
+	/*
+	 * Deterministic collation fast path: if lengths differ, not equal.
+	 * toast_raw_datum_size includes VARHDRSZ but cancels out in comparison.
+	 */
+	if (toast_raw_datum_size(da) != toast_raw_datum_size(db))
+		return 0;
+
+	return jit_text_cmp_internal(da, db, (Oid) collid) == 0 ? 1 : 0;
+}
+
+int32
+jit_textne(int64 a, int64 b, int32 collid)
+{
+	Datum da = (Datum) a, db = (Datum) b;
+	if (toast_raw_datum_size(da) != toast_raw_datum_size(db))
+		return 1;
+	return jit_text_cmp_internal(da, db, (Oid) collid) != 0 ? 1 : 0;
+}
+
+int32 jit_text_lt(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) < 0 ? 1 : 0; }
+int32 jit_text_le(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) <= 0 ? 1 : 0; }
+int32 jit_text_gt(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) > 0 ? 1 : 0; }
+int32 jit_text_ge(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) >= 0 ? 1 : 0; }
+int32 jit_bttextcmp(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid); }
+int64 jit_text_larger(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) >= 0 ? a : b; }
+int64 jit_text_smaller(int64 a, int64 b, int32 collid) { return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) <= 0 ? a : b; }
+
+/* ================================================================
+ * TIER 1: Text functions (no collation needed)
+ * ================================================================ */
+
+int32
+jit_textlen(int64 a)
+{
+	text *t = DatumGetTextPP((Datum) a);
+	int32 result = pg_mbstrlen_with_len(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+	JIT_FREE_IF_COPY(t, (Datum) a);
+	return result;
+}
+
+int32
+jit_textoctetlen(int64 a)
+{
+	/* toast_raw_datum_size returns on-disk size including VARHDRSZ */
+	return (int32)(toast_raw_datum_size((Datum) a) - VARHDRSZ);
+}
+
+/* text_pattern_* comparison: raw byte-wise (no collation) */
+static inline int
+jit_text_pattern_cmp_internal(Datum a, Datum b)
+{
+	text *t1 = DatumGetTextPP(a);
+	text *t2 = DatumGetTextPP(b);
+	int len1 = VARSIZE_ANY_EXHDR(t1);
+	int len2 = VARSIZE_ANY_EXHDR(t2);
+	int result = memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), Min(len1, len2));
+	if (result == 0)
+		result = (len1 < len2) ? -1 : ((len1 > len2) ? 1 : 0);
+	JIT_FREE_IF_COPY(t1, a);
+	JIT_FREE_IF_COPY(t2, b);
+	return result;
+}
+
+int32 jit_text_pattern_lt(int64 a, int64 b) { return jit_text_pattern_cmp_internal((Datum)a, (Datum)b) < 0 ? 1 : 0; }
+int32 jit_text_pattern_le(int64 a, int64 b) { return jit_text_pattern_cmp_internal((Datum)a, (Datum)b) <= 0 ? 1 : 0; }
+int32 jit_text_pattern_ge(int64 a, int64 b) { return jit_text_pattern_cmp_internal((Datum)a, (Datum)b) >= 0 ? 1 : 0; }
+int32 jit_text_pattern_gt(int64 a, int64 b) { return jit_text_pattern_cmp_internal((Datum)a, (Datum)b) > 0 ? 1 : 0; }
+int32 jit_bttext_pattern_cmp(int64 a, int64 b) { return jit_text_pattern_cmp_internal((Datum)a, (Datum)b); }
+
+/* ================================================================
  * LOOKUP TABLE
  *
  * Maps PG function address → direct-call entry.
@@ -956,12 +1087,15 @@ jit_hashfloat8(int64 datum)
 
 /* Shorthand: E<nargs>(pg_fn, jit_fn, ret_type, arg_types...)
  * The stringified jit_fn name is stored for precompiled blob lookup. */
-#define E0(pg, jf, rt)           { (PGFunction)(pg), (void*)(jf), 0, rt, {0}, 0, #jf }
-#define E1(pg, jf, rt, a0)      { (PGFunction)(pg), (void*)(jf), 1, rt, {a0}, 0, #jf }
-#define E2(pg, jf, rt, a0, a1)  { (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, 0, #jf }
+#define E0(pg, jf, rt)           { (PGFunction)(pg), (void*)(jf), 0, rt, {0}, 0, 0, #jf }
+#define E1(pg, jf, rt, a0)      { (PGFunction)(pg), (void*)(jf), 1, rt, {a0}, 0, 0, #jf }
+#define E2(pg, jf, rt, a0, a1)  { (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, 0, 0, #jf }
 /* EI2: 2-arg entry with inline_op tag for sljit inlining */
 #define EI2(pg, jf, rt, a0, a1, iop) \
-	{ (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, iop, #jf }
+	{ (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, iop, 0, #jf }
+/* EC<nargs>: collation-aware entry — passes fcinfo->fncollation as last arg */
+#define EC1(pg, jf, rt, a0)      { (PGFunction)(pg), (void*)(jf), 1, rt, {a0}, 0, JIT_FN_FLAG_COLLATION, #jf }
+#define EC2(pg, jf, rt, a0, a1)  { (PGFunction)(pg), (void*)(jf), 2, rt, {a0, a1}, 0, JIT_FN_FLAG_COLLATION, #jf }
 
 /* NULL means no native implementation yet — fall through to fcinfo path */
 #define DEFERRED NULL
@@ -1122,10 +1256,10 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(int8shr, jit_int8shr, T64, T64, T64),
 
 	/* ---- float8 arithmetic ---- */
-	E2(float8pl,  jit_float8pl,  T64, T64, T64),
-	E2(float8mi,  jit_float8mi,  T64, T64, T64),
-	E2(float8mul, jit_float8mul, T64, T64, T64),
-	E2(float8div, jit_float8div, T64, T64, T64),
+	EI2(float8pl,  jit_float8pl,  T64, T64, T64, JIT_INLINE_FLOAT8_ADD),
+	EI2(float8mi,  jit_float8mi,  T64, T64, T64, JIT_INLINE_FLOAT8_SUB),
+	EI2(float8mul, jit_float8mul, T64, T64, T64, JIT_INLINE_FLOAT8_MUL),
+	EI2(float8div, jit_float8div, T64, T64, T64, JIT_INLINE_FLOAT8_DIV),
 	E1(float8abs, jit_float8abs, T64, T64),
 	E1(float8um,  jit_float8um,  T64, T64),
 
@@ -1144,12 +1278,12 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(float4le, jit_float4le, T32, T64, T64),
 	E2(float4gt, jit_float4gt, T32, T64, T64),
 	E2(float4ge, jit_float4ge, T32, T64, T64),
-	E2(float8eq, jit_float8eq, T32, T64, T64),
-	E2(float8ne, jit_float8ne, T32, T64, T64),
-	E2(float8lt, jit_float8lt, T32, T64, T64),
-	E2(float8le, jit_float8le, T32, T64, T64),
-	E2(float8gt, jit_float8gt, T32, T64, T64),
-	E2(float8ge, jit_float8ge, T32, T64, T64),
+	EI2(float8eq, jit_float8eq, T32, T64, T64, JIT_INLINE_FLOAT8_EQ),
+	EI2(float8ne, jit_float8ne, T32, T64, T64, JIT_INLINE_FLOAT8_NE),
+	EI2(float8lt, jit_float8lt, T32, T64, T64, JIT_INLINE_FLOAT8_LT),
+	EI2(float8le, jit_float8le, T32, T64, T64, JIT_INLINE_FLOAT8_LE),
+	EI2(float8gt, jit_float8gt, T32, T64, T64, JIT_INLINE_FLOAT8_GT),
+	EI2(float8ge, jit_float8ge, T32, T64, T64, JIT_INLINE_FLOAT8_GE),
 
 	/* ---- float min/max ---- */
 	E2(float4larger,  jit_float4larger,  T64, T64, T64),
@@ -1191,6 +1325,10 @@ const JitDirectFn jit_direct_fns[] = {
 #if PG_VERSION_NUM >= 180000
 	E1(timestamptz_hash, jit_timestamptz_hash, T64, T64),
 #endif
+
+	/* ---- timestamp/interval arithmetic ---- */
+	E2(timestamp_pl_interval, jit_timestamp_pl_interval, T64, T64, T64),
+	E2(timestamp_mi_interval, jit_timestamp_mi_interval, T64, T64, T64),
 
 	/* ---- date comparison ---- */
 	E2(date_eq, jit_date_eq, T32, T32, T32),
@@ -1252,15 +1390,15 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(interval_smaller, jit_interval_smaller, T64, T64, T64),
 	E2(interval_larger,  jit_interval_larger,  T64, T64, T64),
 	E1(interval_hash, jit_interval_hash, T32, T64),
-	E2(interval_pl, DEFERRED, T64, T64, T64),
-	E2(interval_mi, DEFERRED, T64, T64, T64),
+	E2(interval_pl, jit_interval_pl, T64, T64, T64),
+	E2(interval_mi, jit_interval_mi, T64, T64, T64),
 	E1(interval_um, DEFERRED, T64, T64),
 
-	/* ---- text/varchar comparison ---- */
 	/*
-	 * Text functions require collation (PG_GET_COLLATION).  DirectFunctionCall
-	 * passes InvalidOid for collation, so wrappers cannot be used.  These must
-	 * go through the fcinfo path which has fncollation set by ExecInitFunc.
+	 * Text/varchar comparison — DEFERRED for now.
+	 * PG's texteq has a specialized memcmp fast path for C/default collation
+	 * that our jit_texteq wrapper misses (it uses varstr_cmp instead).
+	 * Re-enable with EC2 once jit_texteq gets the C-collation fast path.
 	 */
 	E2(texteq,  DEFERRED, T32, T64, T64),
 	E2(textne,  DEFERRED, T32, T64, T64),
@@ -1271,16 +1409,17 @@ const JitDirectFn jit_direct_fns[] = {
 	E2(bttextcmp, DEFERRED, T32, T64, T64),
 	E2(text_larger,  DEFERRED, T64, T64, T64),
 	E2(text_smaller, DEFERRED, T64, T64, T64),
-	E1(hashtext, DEFERRED, T32, T64),
-	E2(text_pattern_lt, DEFERRED, T32, T64, T64),
-	E2(text_pattern_le, DEFERRED, T32, T64, T64),
-	E2(text_pattern_ge, DEFERRED, T32, T64, T64),
-	E2(text_pattern_gt, DEFERRED, T32, T64, T64),
-	E2(bttext_pattern_cmp, DEFERRED, T32, T64, T64),
-	E2(text_starts_with, DEFERRED, T32, T64, T64),
-	E1(textlen, DEFERRED, T32, T64),
-	E1(textoctetlen, DEFERRED, T32, T64),
-	E2(nameeqtext, DEFERRED, T32, T64, T64),
+	E1(hashtext, DEFERRED, T32, T64),	/* keep DEFERRED: needs hash-specific collation handling */
+	/* text_pattern_*: raw byte comparison, no collation needed */
+	E2(text_pattern_lt,    jit_text_pattern_lt,    T32, T64, T64),
+	E2(text_pattern_le,    jit_text_pattern_le,    T32, T64, T64),
+	E2(text_pattern_ge,    jit_text_pattern_ge,    T32, T64, T64),
+	E2(text_pattern_gt,    jit_text_pattern_gt,    T32, T64, T64),
+	E2(bttext_pattern_cmp, jit_bttext_pattern_cmp, T32, T64, T64),
+	E2(text_starts_with, DEFERRED, T32, T64, T64),	/* keep DEFERRED: complex logic */
+	E1(textlen,      DEFERRED,         T32, T64),
+	E1(textoctetlen, DEFERRED,         T32, T64),
+	E2(nameeqtext, DEFERRED, T32, T64, T64),	/* keep DEFERRED: name→text conversion */
 	E2(texteqname, DEFERRED, T32, T64, T64),
 	E2(namenetext, DEFERRED, T32, T64, T64),
 	E2(textnename, DEFERRED, T32, T64, T64),

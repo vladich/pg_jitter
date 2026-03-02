@@ -522,6 +522,10 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item,
 		return false;
 	if (natts <= 0 || natts > desc->natts)
 		return false;
+#ifdef PG18_WIDE_DEFORM_LIMIT
+	if (natts > PG18_WIDE_DEFORM_LIMIT)
+		return false;
+#endif
 	/* Wide tables: fall back to slot_getsomeattrs_int */
 	if (natts > pg_jitter_deform_threshold())
 		return false;
@@ -2156,11 +2160,14 @@ mir_compile_expr(ExprState *state)
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
-				if (dfn && dfn->inline_op != JIT_INLINE_NONE)
+				if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD
+					&& dfn->inline_op <= JIT_INLINE_INT8_GE)
 				{
 					/*
 					 * TIER 0 — INLINE: emit the operation as MIR
-					 * instructions, no function call at all.
+					 * instructions for int32/int64 ops.
+					 * Float8 inline ops are not handled here — they
+					 * fall through to the direct-call path below.
 					 */
 					MIR_reg_t a0 = mir_new_reg(ctx, f, MIR_T_I64, "ia0");
 					MIR_reg_t a1 = mir_new_reg(ctx, f, MIR_T_I64, "ia1");

@@ -11,9 +11,10 @@
 
 set -euo pipefail
 
-PG_INSTALL="$HOME/PgCypher/pg_install"
-PG_DATA="$HOME/PgCypher/pg_data"
-PSQL="$PG_INSTALL/bin/psql -p 5433 -d postgres -tAX"
+PG_INSTALL="${PG_INSTALL:-$HOME/PgCypher/postgres-jit/tmp_install/Users/vladimir/PgCypher/pg_install}"
+PG_DATA="${PGDATA:-/tmp/pg18_jitter_test}"
+PG_PORT="${PG_PORT:-5434}"
+PSQL="$PG_INSTALL/bin/psql -p $PG_PORT -d postgres -tAX"
 PGCTL="$PG_INSTALL/bin/pg_ctl"
 
 RUNS=7

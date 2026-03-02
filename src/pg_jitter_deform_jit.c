@@ -1369,6 +1369,19 @@ deform_attrs_hash(TupleDesc desc, int natts)
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
 static int n_deform_dispatch = 0;
 
+/*
+ * Single-entry type-based fast-path cache.  Avoids recomputing the O(natts)
+ * FNV hash on every row by caching (tdtypeid, tdtypmod, natts) → fn.
+ *
+ * Safe because tdtypeid (the composite type OID) uniquely identifies the
+ * column layout for non-RECORD tables.  RECORDOID tables skip the fast path
+ * and fall through to the FNV hash lookup.
+ */
+static Oid    last_dispatch_typeid = InvalidOid;
+static int32  last_dispatch_typmod = -1;
+static int    last_dispatch_natts = 0;
+static void  *last_dispatch_fn = NULL;
+
 /* ================================================================
  * Shared deform state — set by leader (compile) or worker (attach),
  * used as fast-path in dispatch.
@@ -1386,6 +1399,13 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	void *fn = NULL;
 	int i;
 
+#ifdef PG18_WIDE_DEFORM_LIMIT
+	if (natts > PG18_WIDE_DEFORM_LIMIT)
+	{
+		slot_getsomeattrs_int(slot, natts);
+		return;
+	}
+#endif
 
 	/* Shared deform fast path: same VA across all parallel workers */
 	if (shared_deform_fn && natts == shared_deform_natts)
@@ -1394,13 +1414,28 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		return;
 	}
 
-	/* Fast cache lookup (hash of column attributes) */
+	/* Type-based single-entry fast path — O(1) for repeated calls.
+	 * Skip for RECORDOID since different record types share the same OID. */
+	if (desc->tdtypeid != RECORDOID &&
+		desc->tdtypeid == last_dispatch_typeid &&
+		desc->tdtypmod == last_dispatch_typmod &&
+		natts == last_dispatch_natts)
+	{
+		((void (*)(TupleTableSlot *)) last_dispatch_fn)(slot);
+		return;
+	}
+
+	/* Full lookup with FNV hash (first call or different table/RECORD) */
 	uint32 ahash = deform_attrs_hash(desc, natts);
 	for (i = 0; i < n_deform_dispatch; i++)
 	{
 		DeformDispatchEntry *e = &deform_dispatch_cache[i];
 		if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
 		{
+			last_dispatch_typeid = desc->tdtypeid;
+			last_dispatch_typmod = desc->tdtypmod;
+			last_dispatch_natts = natts;
+			last_dispatch_fn = e->fn;
 			((void (*)(TupleTableSlot *)) e->fn)(slot);
 			return;
 		}
@@ -1423,6 +1458,10 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 			e->ops = ops;
 			e->fn = fn;
 		}
+		last_dispatch_typeid = desc->tdtypeid;
+		last_dispatch_typmod = desc->tdtypmod;
+		last_dispatch_natts = natts;
+		last_dispatch_fn = fn;
 		((void (*)(TupleTableSlot *)) fn)(slot);
 	}
 	else

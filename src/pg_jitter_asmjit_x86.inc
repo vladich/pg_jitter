@@ -87,6 +87,10 @@ asmjit_emit_deform_inline(x86::Compiler &cc,
         return false;
     if (natts <= 0 || natts > desc->natts)
         return false;
+#ifdef PG18_WIDE_DEFORM_LIMIT
+    if (natts > PG18_WIDE_DEFORM_LIMIT)
+        return false;
+#endif
     /* Wide tables: fall back to slot_getsomeattrs_int */
     if (natts > pg_jitter_deform_threshold())
         return false;
@@ -758,11 +762,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
-				if (dfn && dfn->inline_op != JIT_INLINE_NONE)
+				if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD
+					&& dfn->inline_op <= JIT_INLINE_INT8_GE)
 				{
 					/*
-					 * TIER 0 — INLINE: emit the operation as native x86_64
-					 * instructions, no function call at all.
+					 * TIER 0 — INLINE: emit int32/int64 ops as native
+					 * x86_64 instructions. Float8 inline ops are not
+					 * handled here — they fall through to the direct-
+					 * call path below.
 					 */
 					x86::Gp fci_base = cc.new_gp64();
 					x86::Gp a0 = cc.new_gp64(), a1 = cc.new_gp64();
