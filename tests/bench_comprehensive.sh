@@ -738,7 +738,7 @@ JIT_HEADER
         jit_sep+="------|"
     done
     # Rewrite the last partial header
-    sed -i '' '$ d' "$MD_FILE"
+    sed -i '$ d' "$MD_FILE"
     echo "$jit_header" >> "$MD_FILE"
     echo "$jit_sep" >> "$MD_FILE"
 

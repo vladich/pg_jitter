@@ -24,7 +24,9 @@
 #include "utils/date.h"        /* DateADT, date constants */
 #include "datatype/timestamp.h" /* USECS_PER_DAY, INTERVAL_NOT_FINITE */
 #include "utils/float.h"       /* get_float8_nan */
+#if PG_VERSION_NUM >= 160000
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
+#endif
 #include "utils/varlena.h"     /* varstr_cmp */
 #include "access/detoast.h"    /* toast_raw_datum_size */
 #include "mb/pg_wchar.h"       /* pg_mbstrlen_with_len */

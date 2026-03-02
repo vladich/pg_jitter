@@ -30,8 +30,60 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "storage/dsm.h"
+#include "storage/shmem.h"
+#include "port/atomics.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
+
+/* ----------------------------------------------------------------
+ * Shmem slot table — minimal local copy for clearing DSM handles.
+ * Must match JitDsmSlotTable layout in pg_jitter_common.h.
+ * ---------------------------------------------------------------- */
+typedef struct MetaDsmSlotTable
+{
+	int					num_slots;
+	pg_atomic_uint32	handles[FLEXIBLE_ARRAY_MEMBER];
+} MetaDsmSlotTable;
+
+static MetaDsmSlotTable *meta_dsm_slots = NULL;
+static bool meta_shmem_init_attempted = false;
+
+static void
+meta_shmem_clear_dsm_handle(void)
+{
+	int		proc_index = JITTER_MY_PROC_INDEX();
+	bool	found;
+	Size	size;
+
+	/* Try to find existing shmem slot table */
+	if (meta_dsm_slots == NULL)
+	{
+		if (meta_shmem_init_attempted)
+			return;
+		meta_shmem_init_attempted = true;
+
+		size = offsetof(MetaDsmSlotTable, handles) +
+			   sizeof(pg_atomic_uint32) * MaxBackends;
+
+		PG_TRY();
+		{
+			meta_dsm_slots = (MetaDsmSlotTable *)
+				ShmemInitStruct("pg_jitter_dsm_slots", size, &found);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			return;
+		}
+		PG_END_TRY();
+
+		if (!found)
+			return;		/* table doesn't exist yet, nothing to clear */
+	}
+
+	if (proc_index >= 0 && proc_index < meta_dsm_slots->num_slots)
+		pg_atomic_write_u32(&meta_dsm_slots->handles[proc_index], 0);
+}
 
 /* ----------------------------------------------------------------
  * PgJitterContext — must match the layout in pg_jitter_common.h
@@ -157,7 +209,6 @@ static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 /* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
 static int meta_parallel_mode = 2;		/* PARALLEL_JIT_SHARED */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
-static char *meta_shared_dsm_guc = NULL;	/* DSM handle for parallel JIT sharing */
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
@@ -311,18 +362,13 @@ meta_release_context(JitContext *context)
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
 
-	/*
-	 * Clean up DSM shared code state.
-	 *
-	 * Note: we do NOT call SetConfigOption here to reset the _shared_dsm GUC.
-	 * This function may be called from a ResourceOwner release callback during
-	 * subtransaction abort, and SetConfigOption allocates memory — which
-	 * triggers "ResourceOwnerEnlarge called after release started".  The GUC
-	 * is session-scoped and harmless if stale; each new parallel query creates
-	 * a fresh DSM handle.
-	 */
+	/* Clean up DSM shared code state */
 	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)
 	{
+		/* Clear shmem slot so workers don't find a stale handle */
+		if (ctx->share_state.is_leader)
+			meta_shmem_clear_dsm_handle();
+
 		/* Just detach — see comment in pg_jitter_cleanup_shared_dsm() */
 		dsm_detach(ctx->share_state.dsm_seg);
 
@@ -452,26 +498,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		1048576,	/* 1 GB maximum */
 		PGC_USERSET,
 		GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
-		NULL, NULL, NULL);
-
-	/*
-	 * Internal GUC for passing DSM handle from leader to workers.
-	 * Serialized via SerializeGUCState automatically.
-	 * Hidden from pg_settings and config files.
-	 *
-	 * Must be defined BEFORE pg_jitter.backend, because the backend assign
-	 * hook eagerly loads the backend .dylib, which also tries to define this
-	 * GUC.  If we define it afterwards, the backend defines it first, and
-	 * then our define hits "attempt to redefine parameter".
-	 */
-	DefineCustomStringVariable(
-		"pg_jitter._shared_dsm",
-		"Internal: DSM handle for parallel JIT code sharing.",
-		NULL,
-		&meta_shared_dsm_guc,
-		"",
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("pg_jitter.backend",

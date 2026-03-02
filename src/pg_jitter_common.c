@@ -14,6 +14,7 @@
 #include "utils/resowner.h"
 #include "utils/expandeddatum.h"
 #include "utils/guc.h"
+#include "storage/shmem.h"
 #include "fmgr.h"
 
 #include <stdlib.h>  /* for atoi */
@@ -30,6 +31,103 @@ int pg_jitter_parallel_mode = 2;	/* PARALLEL_JIT_SHARED */
 
 /* GUC: pg_jitter.shared_code_max — cap in KB */
 int pg_jitter_shared_code_max_kb = 4096;	/* 4 MB default */
+
+/* ----------------------------------------------------------------
+ * Shared memory slot table for DSM handle passing
+ *
+ * Lazily allocated from PG's spare shmem pool via ShmemInitStruct.
+ * Each backend slot holds one atomic uint32 DSM handle.
+ * Size: sizeof(int) + MaxBackends * sizeof(pg_atomic_uint32) ≈ 4KB.
+ * ---------------------------------------------------------------- */
+static JitDsmSlotTable *jit_dsm_slots = NULL;
+static bool shmem_init_attempted = false;
+static bool shmem_init_failed = false;
+
+/*
+ * Lazy init: try to allocate from PG's spare shmem pool.
+ * Returns true if the slot table is usable.
+ */
+static bool
+pg_jitter_shmem_init(void)
+{
+	bool	found;
+	Size	size;
+
+	if (jit_dsm_slots != NULL)
+		return true;
+
+	if (shmem_init_failed)
+		return false;
+
+	if (shmem_init_attempted)
+		return false;
+
+	shmem_init_attempted = true;
+
+	size = offsetof(JitDsmSlotTable, handles) +
+		   sizeof(pg_atomic_uint32) * MaxBackends;
+
+	PG_TRY();
+	{
+		jit_dsm_slots = (JitDsmSlotTable *)
+			ShmemInitStruct("pg_jitter_dsm_slots", size, &found);
+	}
+	PG_CATCH();
+	{
+		/* Shmem pool exhausted — fall back to per-worker compilation */
+		FlushErrorState();
+		shmem_init_failed = true;
+		elog(DEBUG1, "pg_jitter: shmem allocation failed, "
+			 "falling back to per-worker JIT compilation");
+		return false;
+	}
+	PG_END_TRY();
+
+	if (!found)
+	{
+		jit_dsm_slots->num_slots = MaxBackends;
+		for (int i = 0; i < MaxBackends; i++)
+			pg_atomic_init_u32(&jit_dsm_slots->handles[i], 0);
+	}
+
+	return true;
+}
+
+bool
+pg_jitter_shmem_available(void)
+{
+	return pg_jitter_shmem_init();
+}
+
+void
+pg_jitter_shmem_set_dsm_handle(int proc_index, dsm_handle handle)
+{
+	if (!pg_jitter_shmem_init())
+		return;
+	if (proc_index < 0 || proc_index >= jit_dsm_slots->num_slots)
+		return;
+	pg_atomic_write_u32(&jit_dsm_slots->handles[proc_index], handle);
+}
+
+dsm_handle
+pg_jitter_shmem_get_dsm_handle(int proc_index)
+{
+	if (!pg_jitter_shmem_init())
+		return 0;
+	if (proc_index < 0 || proc_index >= jit_dsm_slots->num_slots)
+		return 0;
+	return pg_atomic_read_u32(&jit_dsm_slots->handles[proc_index]);
+}
+
+void
+pg_jitter_shmem_clear_dsm_handle(int proc_index)
+{
+	if (jit_dsm_slots == NULL)
+		return;
+	if (proc_index < 0 || proc_index >= jit_dsm_slots->num_slots)
+		return;
+	pg_atomic_write_u32(&jit_dsm_slots->handles[proc_index], 0);
+}
 
 /*
  * Read the current pg_jitter.parallel_mode from PG's GUC system.
@@ -1942,16 +2040,24 @@ pg_jitter_get_expr_identity(PgJitterContext *ctx, ExprState *state,
  */
 
 /*
- * Leader: create DSM for shared JIT code and store handle in GUC.
+ * Leader: create DSM for shared JIT code and store handle in shmem slot.
  */
 void
 pg_jitter_init_shared_dsm(PgJitterContext *ctx)
 {
 	Size		dsm_size;
-	char		buf[32];
+	dsm_handle	handle;
+	int			proc_index;
 
 	if (ctx->share_state.initialized)
 		return;
+
+	/* If shmem slot table is unavailable, skip DSM (fall back to per-worker) */
+	if (!pg_jitter_shmem_available())
+	{
+		elog(DEBUG1, "pg_jitter: shmem unavailable, skipping shared DSM");
+		return;
+	}
 
 	dsm_size = (Size) pg_jitter_get_shared_code_max_kb() * 1024;
 
@@ -1967,42 +2073,36 @@ pg_jitter_init_shared_dsm(PgJitterContext *ctx)
 	ctx->share_state.sjc->capacity = dsm_size;
 	ctx->share_state.sjc->used = MAXALIGN(sizeof(SharedJitCompiledCode));
 
-	/* Store handle in GUC for worker discovery */
-	snprintf(buf, sizeof(buf), "%u",
-			 dsm_segment_handle(ctx->share_state.dsm_seg));
-	SetConfigOption("pg_jitter._shared_dsm", buf,
-					PGC_USERSET, PGC_S_SESSION);
+	/* Store handle in shmem slot for worker discovery */
+	handle = dsm_segment_handle(ctx->share_state.dsm_seg);
+	proc_index = JITTER_MY_PROC_INDEX();
+	pg_jitter_shmem_set_dsm_handle(proc_index, handle);
 
 	ctx->share_state.is_leader = true;
 	ctx->share_state.initialized = true;
 
-	elog(DEBUG1, "pg_jitter: leader created shared DSM handle=%s size=%zu",
-		 buf, dsm_size);
+	elog(DEBUG1, "pg_jitter: leader created shared DSM handle=%u size=%zu "
+		 "proc_index=%d", handle, dsm_size, proc_index);
 }
 
 /*
- * Worker: read DSM handle from GUC and attach.
+ * Worker: read DSM handle from leader's shmem slot and attach.
  */
 void
 pg_jitter_attach_shared_dsm(PgJitterContext *ctx)
 {
-	const char *val;
 	dsm_handle	handle;
+	int			leader_index;
 
 	if (ctx->share_state.initialized)
 		return;
 
-	val = GetConfigOption("pg_jitter._shared_dsm", true, false);
-	if (val == NULL || val[0] == '\0')
-	{
-		elog(DEBUG1, "pg_jitter: worker found no shared DSM GUC");
-		return;
-	}
-
-	handle = (dsm_handle) strtoul(val, NULL, 10);
+	leader_index = JITTER_LEADER_PROC_INDEX();
+	handle = pg_jitter_shmem_get_dsm_handle(leader_index);
 	if (handle == 0)
 	{
-		elog(DEBUG1, "pg_jitter: worker got invalid DSM handle from GUC");
+		elog(DEBUG1, "pg_jitter: worker found no shared DSM in leader slot %d",
+			 leader_index);
 		return;
 	}
 
@@ -2021,26 +2121,24 @@ pg_jitter_attach_shared_dsm(PgJitterContext *ctx)
 	ctx->share_state.initialized = true;
 
 	elog(DEBUG1, "pg_jitter: worker attached to shared DSM handle=%u "
-		 "entries=%d used=%zu/%zu",
+		 "entries=%d used=%zu/%zu (leader slot %d)",
 		 handle, ctx->share_state.sjc->num_entries,
-		 ctx->share_state.sjc->used, ctx->share_state.sjc->capacity);
+		 ctx->share_state.sjc->used, ctx->share_state.sjc->capacity,
+		 leader_index);
 }
 
 /*
- * Cleanup: unpin mapping and detach from DSM.
- *
- * Note: we do NOT call SetConfigOption here to reset the _shared_dsm GUC.
- * This function may be called from a ResourceOwner release callback during
- * subtransaction abort, and SetConfigOption allocates memory — which
- * triggers "ResourceOwnerEnlarge called after release started".  The GUC
- * is session-scoped and harmless if stale; each new parallel query creates
- * a fresh DSM handle.
+ * Cleanup: clear shmem slot, unpin mapping and detach from DSM.
  */
 void
 pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx)
 {
 	if (!ctx->share_state.initialized)
 		return;
+
+	/* Clear our shmem slot so workers don't find a stale handle */
+	if (ctx->share_state.is_leader)
+		pg_jitter_shmem_clear_dsm_handle(JITTER_MY_PROC_INDEX());
 
 	/* Reset shared deform mmap before detaching DSM */
 	pg_jitter_reset_shared_deform();

@@ -45,6 +45,8 @@ typedef struct
 	int64		sum;
 } JitInt8TransTypeData;
 
+#include <math.h>              /* INFINITY */
+
 /* W^X and I-cache support for code patching (precompiled blobs) */
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <pthread.h>
@@ -82,9 +84,6 @@ static bool sljit_shared_code_mode = false;
  * enough saved registers (ARM64: 10 saved, uses S6 or S7).
  */
 static int sljit_sreg_steps = 0;
-
-/* GUC variable for _shared_dsm (needed when loaded standalone without meta) */
-static char *sljit_shared_dsm_guc = NULL;
 
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
@@ -136,18 +135,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			NULL, NULL, NULL);
 	}
 
-	if (!GetConfigOption("pg_jitter._shared_dsm", true, false))
-	{
-		DefineCustomStringVariable(
-			"pg_jitter._shared_dsm",
-			"Internal: DSM handle for parallel JIT code sharing.",
-			NULL,
-			&sljit_shared_dsm_guc,
-			"",
-			PGC_USERSET,
-			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_ALLOW_IN_PARALLEL,
-			NULL, NULL, NULL);
-	}
 }
 
 /*

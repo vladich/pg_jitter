@@ -113,9 +113,6 @@ asmjit_code_free(void *data)
 	}
 }
 
-/* GUC variable for _shared_dsm (needed when loaded standalone without meta) */
-static char *asmjit_shared_dsm_guc = NULL;
-
 extern "C" void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
@@ -159,18 +156,6 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			NULL, NULL, NULL);
 	}
 
-	if (!GetConfigOption("pg_jitter._shared_dsm", true, false))
-	{
-		DefineCustomStringVariable(
-			"pg_jitter._shared_dsm",
-			"Internal: DSM handle for parallel JIT code sharing.",
-			NULL,
-			&asmjit_shared_dsm_guc,
-			"",
-			PGC_USERSET,
-			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
-			NULL, NULL, NULL);
-	}
 }
 
 /*

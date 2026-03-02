@@ -9,6 +9,21 @@
 #define PG_JITTER_COMPAT_H
 
 #include "postgres.h"
+#include "miscadmin.h"             /* MaxBackends */
+
+/* ----------------------------------------------------------------
+ * ProcNumber compat — PG17+ uses ProcNumber (0-based);
+ * PG14-16 uses BackendId (1-based).
+ * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 170000
+#include "storage/procnumber.h"
+#define JITTER_MY_PROC_INDEX()       ((int) MyProcNumber)
+#define JITTER_LEADER_PROC_INDEX()   ((int) ParallelLeaderProcNumber)
+#else
+#include "storage/backendid.h"
+#define JITTER_MY_PROC_INDEX()       ((int) MyBackendId - 1)
+#define JITTER_LEADER_PROC_INDEX()   ((int) ParallelLeaderBackendId - 1)
+#endif
 
 /* ----------------------------------------------------------------
  * PG_MODULE_MAGIC_EXT — PG18+ extended module magic
@@ -109,6 +124,32 @@ jitter_attalign_to_int(char align)
  * ---------------------------------------------------------------- */
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(prefix)	EmitWarningsOnPlaceholders(prefix)
+#endif
+
+/* ----------------------------------------------------------------
+ * DLSUFFIX — PG15+ defines this in pg_config.h; PG14 only defines it
+ * on Windows in port/win32_port.h.
+ * ---------------------------------------------------------------- */
+#ifndef DLSUFFIX
+#ifdef WIN32
+#define DLSUFFIX ".dll"
+#elif defined(__APPLE__)
+#define DLSUFFIX ".dylib"
+#else
+#define DLSUFFIX ".so"
+#endif
+#endif
+
+/* ----------------------------------------------------------------
+ * pg_file_exists — added in PG17.  On older versions, use access().
+ * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM < 170000
+#include <unistd.h>
+static inline bool
+pg_file_exists(const char *name)
+{
+	return access(name, F_OK) == 0;
+}
 #endif
 
 /* ----------------------------------------------------------------

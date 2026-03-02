@@ -22,6 +22,7 @@
 #include "sljitLir.h"
 
 #include <sys/mman.h>
+#include <unistd.h>            /* sysconf, _SC_PAGESIZE */
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE

@@ -16,6 +16,7 @@
 #include "utils/resowner.h"
 #include "access/parallel.h"
 #include "storage/dsm.h"
+#include "port/atomics.h"
 
 /*
  * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
@@ -57,10 +58,26 @@ typedef struct CompiledCode
 } CompiledCode;
 
 /*
+ * Shared memory slot table for passing DSM handles between leader and workers.
+ * Lazily allocated via ShmemInitStruct from PG's spare shmem pool (~100KB).
+ * Each slot holds one pg_atomic_uint32 DSM handle, indexed by proc index.
+ */
+typedef struct JitDsmSlotTable
+{
+	int					num_slots;
+	pg_atomic_uint32	handles[FLEXIBLE_ARRAY_MEMBER];
+} JitDsmSlotTable;
+
+extern dsm_handle pg_jitter_shmem_get_dsm_handle(int proc_index);
+extern void pg_jitter_shmem_set_dsm_handle(int proc_index, dsm_handle handle);
+extern void pg_jitter_shmem_clear_dsm_handle(int proc_index);
+extern bool pg_jitter_shmem_available(void);
+
+/*
  * Process-local state for DSM-based JIT code sharing.
  *
- * Leader creates DSM via dsm_create(), stores handle in a GUC.
- * Workers read the GUC, attach via dsm_attach().
+ * Leader creates DSM via dsm_create(), stores handle in shmem slot table.
+ * Workers read the leader's slot, attach via dsm_attach().
  * Both pin their mapping and explicitly unpin+detach in release_context.
  */
 typedef struct JitShareState
@@ -199,8 +216,8 @@ extern void pg_jitter_get_expr_identity(PgJitterContext *ctx,
  * DSM-based shared code management for parallel queries.
  *
  * Leader calls pg_jitter_init_shared_dsm() during first compile_expr to
- * create the DSM and store its handle in a GUC.
- * Workers call pg_jitter_attach_shared_dsm() to read the GUC and attach.
+ * create the DSM and store its handle in the shmem slot table.
+ * Workers call pg_jitter_attach_shared_dsm() to read the leader's slot.
  * Both call pg_jitter_cleanup_shared_dsm() during release_context.
  */
 extern void pg_jitter_init_shared_dsm(PgJitterContext *ctx);
