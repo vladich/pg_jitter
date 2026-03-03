@@ -85,9 +85,7 @@ if(PG_JITTER_USE_LLVM)
     if(LLVM_DIR)
         list(APPEND _llvm_hints "${LLVM_DIR}/bin" "${LLVM_DIR}")
     endif()
-    list(APPEND _llvm_hints
-        /opt/homebrew/opt/llvm/bin /opt/homebrew/opt/llvm@18/bin
-        /usr/lib/llvm-18/bin /usr/lib/llvm-17/bin /usr/lib/llvm-16/bin)
+    # No hardcoded search paths — use -DLLVM_DIR=/path/to/llvm if not on PATH
 
     find_program(CLANG_EXE NAMES clang clang-18 clang-17 clang-16
                  HINTS ${_llvm_hints})

@@ -294,6 +294,7 @@ extern void *pg_jitter_compile_deform_loop(TupleDesc desc,
 										   struct sljit_generate_code_buffer *gen_buf);
 extern void pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot,
 											   int natts);
+extern void pg_jitter_deform_dispatch_reset_fastpath(void);
 
 /*
  * Shared deform for parallel I-cache sharing.

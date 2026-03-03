@@ -32,6 +32,7 @@
 #include "storage/dsm.h"
 #include "storage/shmem.h"
 #include "port/atomics.h"
+#include "pg_jitter_common.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
 
@@ -361,6 +362,9 @@ meta_release_context(JitContext *context)
 {
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
+
+	/* Clear deform dispatch fast-path cache */
+	pg_jitter_deform_dispatch_reset_fastpath();
 
 	/* Clean up DSM shared code state */
 	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)

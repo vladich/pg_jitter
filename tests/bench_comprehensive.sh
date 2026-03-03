@@ -52,9 +52,9 @@ done
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
-PGDATA="$("$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
 PGCTL="$PGBIN/pg_ctl"
 PG_VERSION="$("$PG_CONFIG" --version)"
+PGDATA="$("$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
 PARSE_JSON="$SCRIPT_DIR/parse_explain_json.py"
 
 if [ -z "$CSV_FILE" ]; then
@@ -82,6 +82,8 @@ ensure_pg_running() {
         fi
     fi
 }
+
+if [ "$MD_ONLY" -eq 0 ]; then
 
 # ================================================================
 # Setup: create benchmark tables if missing
@@ -138,8 +140,8 @@ fi
 ALL_BACKENDS=("interp")
 ALL_NAMES=("interp")
 
-# Check for llvmjit
-if [ -f "$PKGLIBDIR/llvmjit${DLSUFFIX}" ]; then
+# Check for llvmjit (may use .so or .dylib depending on PG version)
+if [ -f "$PKGLIBDIR/llvmjit${DLSUFFIX}" ] || [ -f "$PKGLIBDIR/llvmjit.so" ] || [ -f "$PKGLIBDIR/llvmjit.dylib" ]; then
     ALL_BACKENDS+=("llvmjit")
     ALL_NAMES+=("llvmjit")
 fi
@@ -178,6 +180,8 @@ echo "CSV output: $CSV_FILE"
 [ "$GENERATE_MD" -eq 1 ] && echo "Markdown: $MD_FILE"
 echo ""
 
+fi  # end of MD_ONLY=0 setup block
+
 # ================================================================
 # Switch backend helper
 # ================================================================
@@ -212,9 +216,17 @@ switch_backend() {
 restore_provider() {
     # Restore meta-provider if we changed it
     if [ "$META_MODE" -eq 1 ] || [ "$JIT_PROVIDER" = "pg_jitter" ]; then
-        ensure_pg_running
-        psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
-        "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
+        # Stop server first (might be crashed)
+        "$PGCTL" -D "$PGDATA" stop -m immediate 2>/dev/null || true
+        sleep 1
+        # Overwrite postgresql.auto.conf to restore jit_provider
+        # (psql might fail if server crashed from llvmjit)
+        if [ -f "$PGDATA/postgresql.auto.conf" ]; then
+            sed -i '' "/jit_provider/d" "$PGDATA/postgresql.auto.conf"
+            echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.auto.conf"
+        fi
+        "$PGCTL" -D "$PGDATA" start -l "$PGDATA/logfile" -w 2>/dev/null || true
+        sleep 1
     fi
 }
 
@@ -407,7 +419,7 @@ if [ "$MD_ONLY" -eq 1 ]; then
     NAMES=()
     while IFS= read -r bname; do
         NAMES+=("$bname")
-    done < <(tail -n +2 "$CSV_FILE" | cut -d',' -f2 | awk '!seen[$0]++')
+    done < <(tail -n +2 "$CSV_FILE" | cut -d',' -f2 | awk 'seen[$0]==0{print; seen[$0]=1}')
     BACKENDS=("${NAMES[@]}")
     GENERATE_MD=1
     echo "MD-only mode: using CSV $CSV_FILE"
@@ -596,8 +608,12 @@ if [ "$GENERATE_MD" -eq 1 ]; then
 
     # Collect system info
     OS_INFO=$(uname -srm)
-    CPU_INFO=$(lscpu 2>/dev/null | grep "Model name" | sed 's/Model name:[[:space:]]*//' || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
-    RAM_INFO=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GB", $1/1073741824}' || echo "unknown")
+    CPU_INFO=$(lscpu 2>/dev/null | grep "Model name" | sed 's/Model name:[[:space:]]*//')
+    [ -z "$CPU_INFO" ] && CPU_INFO=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+    [ -z "$CPU_INFO" ] && CPU_INFO="unknown"
+    RAM_INFO=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')
+    [ -z "$RAM_INFO" ] && RAM_INFO=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GB", $1/1073741824}')
+    [ -z "$RAM_INFO" ] && RAM_INFO="unknown"
 
     # Find the interp column index (for baseline)
     INTERP_IDX=-1
@@ -737,8 +753,8 @@ JIT_HEADER
         jit_header+=" $bname |"
         jit_sep+="------|"
     done
-    # Rewrite the last partial header
-    sed -i '$ d' "$MD_FILE"
+    # Rewrite the last partial header (macOS-compatible sed -i)
+    sed -i '' '$ d' "$MD_FILE"
     echo "$jit_header" >> "$MD_FILE"
     echo "$jit_sep" >> "$MD_FILE"
 

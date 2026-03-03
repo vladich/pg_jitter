@@ -1371,17 +1371,30 @@ static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
 static int n_deform_dispatch = 0;
 
 /*
- * Single-entry type-based fast-path cache.  Avoids recomputing the O(natts)
- * FNV hash on every row by caching (tdtypeid, tdtypmod, natts) → fn.
+ * Multi-entry fast-path cache for deform dispatch.  Avoids recomputing the
+ * O(natts) FNV hash on every row.
  *
- * Safe because tdtypeid (the composite type OID) uniquely identifies the
- * column layout for non-RECORD tables.  RECORDOID tables skip the fast path
- * and fall through to the FNV hash lookup.
+ * Uses (TupleDesc pointer, natts) as the cache key.  Within a single query,
+ * a given slot always has the same TupleDesc pointer, so this is safe for
+ * the hot inner loop.  The attrs_hash is stored alongside to verify
+ * correctness across query boundaries (where palloc can reuse TupleDesc
+ * addresses with different layouts).
+ *
+ * 4 entries handles hash joins (inner + outer slots) and complex queries
+ * with up to 4 distinct table types.
  */
-static Oid    last_dispatch_typeid = InvalidOid;
-static int32  last_dispatch_typmod = -1;
-static int    last_dispatch_natts = 0;
-static void  *last_dispatch_fn = NULL;
+#define DISPATCH_FASTPATH_SIZE 4
+
+typedef struct DispatchFastEntry
+{
+	TupleDesc	desc;		/* TupleDesc pointer — fast match key */
+	int			natts;
+	uint32		attrs_hash;	/* FNV hash for cross-query validation */
+	void	   *fn;
+} DispatchFastEntry;
+
+static DispatchFastEntry dispatch_fast[DISPATCH_FASTPATH_SIZE];
+static int n_dispatch_fast = 0;
 
 /* ================================================================
  * Shared deform state — set by leader (compile) or worker (attach),
@@ -1391,6 +1404,12 @@ static void *shared_deform_fn = NULL;
 static int   shared_deform_natts = 0;
 static void *shared_deform_page = NULL;		/* for munmap on cleanup */
 static Size  shared_deform_page_size = 0;
+
+void
+pg_jitter_deform_dispatch_reset_fastpath(void)
+{
+	n_dispatch_fast = 0;
+}
 
 void
 pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
@@ -1415,15 +1434,25 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		return;
 	}
 
-	/* Type-based single-entry fast path — O(1) for repeated calls.
-	 * Skip for RECORDOID since different record types share the same OID. */
-	if (desc->tdtypeid != RECORDOID &&
-		desc->tdtypeid == last_dispatch_typeid &&
-		desc->tdtypmod == last_dispatch_typmod &&
-		natts == last_dispatch_natts)
+	/* TupleDesc-pointer fast path — O(1) for repeated calls within a query.
+	 * Pointer is stable within a query; cache is cleared at query end
+	 * (pg_jitter_release_context) to prevent stale pointer matches. */
+	for (i = 0; i < n_dispatch_fast; i++)
 	{
-		((void (*)(TupleTableSlot *)) last_dispatch_fn)(slot);
-		return;
+		DispatchFastEntry *fe = &dispatch_fast[i];
+		if (fe->desc == desc && fe->natts == natts)
+		{
+			/* Move to front (MRU) for hot-path O(1) */
+			if (i > 0)
+			{
+				DispatchFastEntry tmp = *fe;
+				memmove(&dispatch_fast[1], &dispatch_fast[0],
+						i * sizeof(DispatchFastEntry));
+				dispatch_fast[0] = tmp;
+			}
+			((void (*)(TupleTableSlot *)) dispatch_fast[0].fn)(slot);
+			return;
+		}
 	}
 
 	/* Full lookup with FNV hash (first call or different table/RECORD) */
@@ -1433,12 +1462,8 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		DeformDispatchEntry *e = &deform_dispatch_cache[i];
 		if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
 		{
-			last_dispatch_typeid = desc->tdtypeid;
-			last_dispatch_typmod = desc->tdtypmod;
-			last_dispatch_natts = natts;
-			last_dispatch_fn = e->fn;
-			((void (*)(TupleTableSlot *)) e->fn)(slot);
-			return;
+			fn = e->fn;
+			goto found;
 		}
 	}
 
@@ -1459,10 +1484,19 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 			e->ops = ops;
 			e->fn = fn;
 		}
-		last_dispatch_typeid = desc->tdtypeid;
-		last_dispatch_typmod = desc->tdtypmod;
-		last_dispatch_natts = natts;
-		last_dispatch_fn = fn;
+found:
+		/* Add to TupleDesc-pointer fast-path cache (MRU front insertion) */
+		{
+			int slot_idx = (n_dispatch_fast < DISPATCH_FASTPATH_SIZE)
+				? n_dispatch_fast++ : DISPATCH_FASTPATH_SIZE - 1;
+			if (slot_idx > 0)
+				memmove(&dispatch_fast[1], &dispatch_fast[0],
+						slot_idx * sizeof(DispatchFastEntry));
+			dispatch_fast[0].desc = desc;
+			dispatch_fast[0].natts = natts;
+			dispatch_fast[0].attrs_hash = ahash;
+			dispatch_fast[0].fn = fn;
+		}
 		((void (*)(TupleTableSlot *)) fn)(slot);
 	}
 	else

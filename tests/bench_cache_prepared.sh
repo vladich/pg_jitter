@@ -6,7 +6,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 PGBIN="$("$PG_CONFIG" --bindir)"
-PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "$HOME/pgdata")}"
+PG_DATA="${PGDATA:-$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null)}"
+if [ -z "$PG_DATA" ] || [ ! -d "$PG_DATA" ]; then
+    echo "ERROR: Cannot determine PGDATA. Is PostgreSQL running on port ${PGPORT:-5432}?"
+    exit 1
+fi
 PGCTL="$PGBIN/pg_ctl"
 LOGFILE="$PG_DATA/logfile"
 OUTFILE="$SCRIPT_DIR/bench_prepared_$(date +%Y%m%d_%H%M%S).txt"

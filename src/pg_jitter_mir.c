@@ -2535,15 +2535,18 @@ mir_compile_expr(ExprState *state)
 					{
 						char aname[16];
 						snprintf(aname, sizeof(aname), "da%d_%d", i, opno);
-						MIR_type_t atype = (dfn->arg_types[i] == JIT_TYPE_32)
-							? MIR_T_I32 : MIR_T_I64;
-						r_args[i] = mir_new_reg(ctx, f, atype, aname);
+						/*
+						 * Always use I64 registers — MIR_MOV only supports I64.
+						 * Datum values in fcinfo->args[].value are always 8 bytes.
+						 * The function call proto handles the I64→I32 narrowing.
+						 */
+						r_args[i] = mir_new_reg(ctx, f, MIR_T_I64, aname);
 						int64_t val_off = (int64_t)((char *)&fcinfo->args[i].value -
 													(char *)fcinfo);
 						MIR_append_insn(ctx, func_item,
 							MIR_new_insn(ctx, MIR_MOV,
 								MIR_new_reg_op(ctx, r_args[i]),
-								MIR_new_mem_op(ctx, atype, val_off,
+								MIR_new_mem_op(ctx, MIR_T_I64, val_off,
 									r_fci, 0, 1)));
 					}
 
@@ -3071,16 +3074,16 @@ mir_compile_expr(ExprState *state)
 				/* Call hash function (direct or fcinfo) */
 				if (step_direct_imports[opno])
 				{
-					/* Direct: load arg from fcinfo->args[0].value */
+					/* Direct: load Datum arg from fcinfo->args[0].value.
+					 * Always use I64 register — MIR_MOV only supports I64.
+					 * Proto handles I64→I32 narrowing at call boundary. */
 					int64_t val_off = (int64_t)((char *)&fcinfo->args[0].value -
 												(char *)fcinfo);
-					MIR_type_t htype = (step_direct_arg0_types[opno] == JIT_TYPE_32)
-						? MIR_T_I32 : MIR_T_I64;
-					MIR_reg_t r_harg = mir_new_reg(ctx, f, htype, "harg");
+					MIR_reg_t r_harg = mir_new_reg(ctx, f, MIR_T_I64, "harg");
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_harg),
-							MIR_new_mem_op(ctx, htype, val_off,
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off,
 								r_fci, 0, 1)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
@@ -3172,13 +3175,11 @@ mir_compile_expr(ExprState *state)
 				{
 					int64_t val_off = (int64_t)((char *)&fcinfo->args[0].value -
 												(char *)fcinfo);
-					MIR_type_t htype = (step_direct_arg0_types[opno] == JIT_TYPE_32)
-						? MIR_T_I32 : MIR_T_I64;
-					MIR_reg_t r_harg = mir_new_reg(ctx, f, htype, "harg");
+					MIR_reg_t r_harg = mir_new_reg(ctx, f, MIR_T_I64, "harg");
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_harg),
-							MIR_new_mem_op(ctx, htype, val_off,
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off,
 								r_fci, 0, 1)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
@@ -3305,13 +3306,11 @@ mir_compile_expr(ExprState *state)
 				{
 					int64_t val_off = (int64_t)((char *)&fcinfo->args[0].value -
 												(char *)fcinfo);
-					MIR_type_t htype = (step_direct_arg0_types[opno] == JIT_TYPE_32)
-						? MIR_T_I32 : MIR_T_I64;
-					MIR_reg_t r_harg = mir_new_reg(ctx, f, htype, "harg");
+					MIR_reg_t r_harg = mir_new_reg(ctx, f, MIR_T_I64, "harg");
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_harg),
-							MIR_new_mem_op(ctx, htype, val_off,
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off,
 								r_fci, 0, 1)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,
@@ -3427,13 +3426,11 @@ mir_compile_expr(ExprState *state)
 				{
 					int64_t val_off = (int64_t)((char *)&fcinfo->args[0].value -
 												(char *)fcinfo);
-					MIR_type_t htype = (step_direct_arg0_types[opno] == JIT_TYPE_32)
-						? MIR_T_I32 : MIR_T_I64;
-					MIR_reg_t r_harg = mir_new_reg(ctx, f, htype, "harg");
+					MIR_reg_t r_harg = mir_new_reg(ctx, f, MIR_T_I64, "harg");
 					MIR_append_insn(ctx, func_item,
 						MIR_new_insn(ctx, MIR_MOV,
 							MIR_new_reg_op(ctx, r_harg),
-							MIR_new_mem_op(ctx, htype, val_off,
+							MIR_new_mem_op(ctx, MIR_T_I64, val_off,
 								r_fci, 0, 1)));
 					MIR_append_insn(ctx, func_item,
 						MIR_new_call_insn(ctx, 4,

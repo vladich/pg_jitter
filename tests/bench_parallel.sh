@@ -11,11 +11,12 @@
 
 set -euo pipefail
 
-PG_INSTALL="${PG_INSTALL:-$HOME/PgCypher/postgres-jit/tmp_install/Users/vladimir/PgCypher/pg_install}"
-PG_DATA="${PGDATA:-/tmp/pg18_jitter_test}"
-PG_PORT="${PG_PORT:-5434}"
-PSQL="$PG_INSTALL/bin/psql -p $PG_PORT -d postgres -tAX"
-PGCTL="$PG_INSTALL/bin/pg_ctl"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PG_BIN="$("$PG_CONFIG" --bindir)"
+PG_PORT="${PG_PORT:-${PGPORT:-5432}}"
+PG_DATA="${PGDATA:-$("$PG_BIN/psql" -p "$PG_PORT" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null)}"
+PSQL="$PG_BIN/psql -p $PG_PORT -d postgres -tAX"
+PGCTL="$PG_BIN/pg_ctl"
 
 RUNS=7
 WORKERS=4

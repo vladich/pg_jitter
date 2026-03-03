@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PGBASE="$HOME/postgres"
+PGBASE="${PGBASE:-$HOME/postgres}"
 RESULTS_DIR="$PROJECT_DIR/tests/results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 

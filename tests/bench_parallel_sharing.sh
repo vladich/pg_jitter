@@ -8,9 +8,10 @@
 # Workers fixed at 4.
 #
 
-PG_INSTALL="${PG_INSTALL:-$HOME/PgCypher/postgres-jit/tmp_install/Users/vladimir/PgCypher/pg_install}"
-PG_PORT="${PG_PORT:-5434}"
-PSQL="$PG_INSTALL/bin/psql -p $PG_PORT -d postgres -tA"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+PG_BIN="$("$PG_CONFIG" --bindir)"
+PG_PORT="${PG_PORT:-${PGPORT:-5432}}"
+PSQL="$PG_BIN/psql -p $PG_PORT -d postgres -tA"
 WORKERS=24
 RUNS=7
 BACKENDS=(sljit asmjit)

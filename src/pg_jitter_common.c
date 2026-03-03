@@ -306,6 +306,10 @@ pg_jitter_release_context(JitContext *context)
 	PgJitterContext *ctx = (PgJitterContext *) context;
 	CompiledCode *cc, *next;
 
+	/* Clear deform dispatch fast-path cache — TupleDesc pointers from this
+	 * query may be reused by palloc for different layouts in future queries. */
+	pg_jitter_deform_dispatch_reset_fastpath();
+
 	/* Clean up DSM shared code state before freeing compiled code */
 	pg_jitter_cleanup_shared_dsm(ctx);
 
