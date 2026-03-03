@@ -2539,7 +2539,6 @@ sljit_compile_expr(ExprState *state)
 		const void *code_bytes;
 		Size		code_size;
 		uint64		leader_dylib_ref;
-
 		if (!ctx->share_state.initialized)
 			pg_jitter_attach_shared_dsm(ctx);
 
@@ -2547,6 +2546,9 @@ sljit_compile_expr(ExprState *state)
 		if (ctx->share_state.sjc)
 			pg_jitter_attach_shared_deform(ctx->share_state.sjc);
 
+		/* DEBUG: share_max_expr controls which expressions use shared code.
+		 * -1 = share none, 0 = share expr 0 only, 1 = share 0+1, etc.
+		 * Set to 99 to share all (normal behavior). */
 		if (ctx->share_state.sjc &&
 			pg_jitter_find_shared_code(ctx->share_state.sjc,
 									   shared_node_id, shared_expr_idx,
@@ -3398,8 +3400,22 @@ sljit_compile_expr(ExprState *state)
 			case EEOP_CONST:
 			{
 				/* *op->resvalue = constval.value */
-				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) op->d.constval.value);
+				if (sljit_shared_code_mode)
+				{
+					/*
+					 * In shared mode, load from step data at runtime.
+					 * Pass-by-reference Datums (text, bytea, etc.) are
+					 * pointers into process-local heap memory that differ
+					 * between leader and worker processes.
+					 */
+					emit_load_step_field(C, opno,
+						offsetof(ExprEvalStep, d.constval.value), SLJIT_R0);
+				}
+				else
+				{
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_IMM, (sljit_sw) op->d.constval.value);
+				}
 				emit_store_resvalue(C, state, opno, op, SLJIT_R0);
 
 				/* *op->resnull = constval.isnull */
@@ -3687,7 +3703,21 @@ sljit_compile_expr(ExprState *state)
 
 				/* Call fn_addr(fcinfo) */
 				/* R0 still = fcinfo */
-				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
+				if (sljit_shared_code_mode)
+				{
+					/*
+					 * In shared mode, fn_addr may point into a dynamically-
+					 * loaded library (e.g. plpgsql.dylib) whose load address
+					 * differs between leader and worker processes.  Load from
+					 * step data at runtime instead of embedding.
+					 */
+					emit_load_step_field(C, opno,
+						offsetof(ExprEvalStep, d.func.fn_addr), SLJIT_R1);
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+									 SLJIT_R1, 0);
+				}
+				else
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* *op->resvalue = R0 (return value) */
 				emit_store_resvalue(C, state, opno, op, SLJIT_R0);
@@ -4204,6 +4234,7 @@ sljit_compile_expr(ExprState *state)
 				struct sljit_jump *j_to_end[2];
 				int		n_to_end = 0;
 
+
 				/*
 				 * Compute pergroup at runtime — all_pergroups[setoff]
 				 * changes per tuple for hash aggregation.
@@ -4656,7 +4687,20 @@ sljit_compile_expr(ExprState *state)
 					/* Call fn_addr(fcinfo) */
 					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 								   SLJIT_R2, 0);
-					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fn_addr);
+					if (sljit_shared_code_mode)
+					{
+						/* Load fn_addr at runtime: fcinfo->flinfo->fn_addr */
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+							SLJIT_MEM1(SLJIT_R2),
+							offsetof(FunctionCallInfoBaseData, flinfo));
+						sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+							SLJIT_MEM1(SLJIT_R1),
+							offsetof(FmgrInfo, fn_addr));
+						sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+										 SLJIT_R1, 0);
+					}
+					else
+						EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), fn_addr);
 
 					/* Store result back to pergroup */
 					if (!is_byref)
@@ -5621,7 +5665,15 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_IMM, 0);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R2, 0);
-				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
+				if (sljit_shared_code_mode)
+				{
+					emit_load_step_field(C, opno,
+						offsetof(ExprEvalStep, d.func.fn_addr), SLJIT_R1);
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+									 SLJIT_R1, 0);
+				}
+				else
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* For DISTINCT: invert the equality result */
 				if (opcode == EEOP_DISTINCT)
@@ -5697,7 +5749,15 @@ sljit_compile_expr(ExprState *state)
 							   SLJIT_IMM, 0);
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_R2, 0);
-				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
+				if (sljit_shared_code_mode)
+				{
+					emit_load_step_field(C, opno,
+						offsetof(ExprEvalStep, d.func.fn_addr), SLJIT_R1);
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+									 SLJIT_R1, 0);
+				}
+				else
+					EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
 
 				/* If !fcinfo->isnull && result is true → return null */
 				emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data), SLJIT_R2);
@@ -6538,6 +6598,23 @@ sljit_compile_expr(ExprState *state)
 				int jnull = op->d.rowcompare_step.jumpnull;
 				int jdone = op->d.rowcompare_step.jumpdone;
 
+				/* Compute struct field offsets (constant, safe to embed) */
+				sljit_sw off_arg0_null =
+					(sljit_sw) &fcinfo->args[0].isnull - (sljit_sw) fcinfo;
+				sljit_sw off_arg1_null =
+					(sljit_sw) &fcinfo->args[1].isnull - (sljit_sw) fcinfo;
+				sljit_sw off_isnull =
+					(sljit_sw) &fcinfo->isnull - (sljit_sw) fcinfo;
+
+				/*
+				 * Load fcinfo pointer from step data (PIC — safe for
+				 * shared code where worker fcinfo differs from leader).
+				 * R2 = fcinfo throughout this opcode.
+				 */
+				emit_load_step_field(C, opno,
+					offsetof(ExprEvalStep, d.rowcompare_step.fcinfo_data),
+					SLJIT_R2);
+
 				/*
 				 * If fn_strict and either arg is null → set resnull=true,
 				 * jump to jumpnull.
@@ -6546,12 +6623,10 @@ sljit_compile_expr(ExprState *state)
 				{
 					/* R0 = fcinfo->args[0].isnull */
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
-						SLJIT_MEM0(),
-						(sljit_sw) &fcinfo->args[0].isnull);
+						SLJIT_MEM1(SLJIT_R2), off_arg0_null);
 					/* R1 = fcinfo->args[1].isnull */
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
-						SLJIT_MEM0(),
-						(sljit_sw) &fcinfo->args[1].isnull);
+						SLJIT_MEM1(SLJIT_R2), off_arg1_null);
 					sljit_emit_op2(C, SLJIT_OR, SLJIT_R0, 0,
 								   SLJIT_R0, 0, SLJIT_R1, 0);
 
@@ -6574,13 +6649,12 @@ sljit_compile_expr(ExprState *state)
 
 				/* fcinfo->isnull = false */
 				sljit_emit_op1(C, SLJIT_MOV_U8,
-					SLJIT_MEM0(),
-					(sljit_sw) &fcinfo->isnull,
+					SLJIT_MEM1(SLJIT_R2), off_isnull,
 					SLJIT_IMM, 0);
 
-				/* R0 = fn_addr(fcinfo) */
+				/* R0 = fn_addr(fcinfo) — pass fcinfo from R2 */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-							   SLJIT_IMM, (sljit_sw) fcinfo);
+							   SLJIT_R2, 0);
 				EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
 						   op->d.rowcompare_step.fn_addr);
 
@@ -6589,9 +6663,12 @@ sljit_compile_expr(ExprState *state)
 
 				/* If fcinfo->isnull, set resnull=true and jump to jumpnull */
 				{
+					/* Reload fcinfo (R2 clobbered by call) */
+					emit_load_step_field(C, opno,
+						offsetof(ExprEvalStep, d.rowcompare_step.fcinfo_data),
+						SLJIT_R1);
 					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
-						SLJIT_MEM0(),
-						(sljit_sw) &fcinfo->isnull);
+						SLJIT_MEM1(SLJIT_R1), off_isnull);
 					struct sljit_jump *j_not_null2 =
 						sljit_emit_cmp(C, SLJIT_EQUAL,
 									   SLJIT_R1, 0, SLJIT_IMM, 0);
@@ -6842,9 +6919,25 @@ sljit_compile_expr(ExprState *state)
 			Size	gen_code_size = sljit_get_generated_code_size(C);
 
 			elog(DEBUG1, "pg_jitter: leader storing code "
-				 "node=%d expr=%d (%zu bytes) at %p fallback=%p",
+				 "node=%d expr=%d (%zu bytes) at %p fallback=%p "
+				 "byref_finish=%p",
 				 shared_node_id, shared_expr_idx,
-				 gen_code_size, code, (void *) pg_jitter_fallback_step);
+				 gen_code_size, code,
+				 (void *) pg_jitter_fallback_step,
+				 (void *) pg_jitter_agg_byref_finish);
+
+			/* DEBUG: dump leader code to file */
+			{
+				char fname[128];
+				snprintf(fname, sizeof(fname),
+						 "/tmp/jit_leader_n%d_e%d.bin",
+						 shared_node_id, shared_expr_idx);
+				FILE *fp = fopen(fname, "wb");
+				if (fp) {
+					fwrite(code, 1, gen_code_size, fp);
+					fclose(fp);
+				}
+			}
 
 			pg_jitter_store_shared_code(ctx->share_state.sjc,
 										code, gen_code_size,

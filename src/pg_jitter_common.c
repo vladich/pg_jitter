@@ -1867,9 +1867,15 @@ pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 		 */
 		int64	offset_from_ref = (int64)(addr - leader_ref_addr);
 
+		/* Check what instruction follows the MOVZ+3×MOVK sequence */
+		uint32_t w4 = (i + 4 < ninsns) ? insns[i + 4] : 0;
+		bool is_blr = (w4 & 0xFFFFFC1F) == (0xD63F0000 | rd); /* BLR Xrd */
+		bool is_br = (w4 & 0xFFFFFC1F) == (0xD61F0000 | rd);  /* BR Xrd */
+
 		elog(DEBUG1, "pg_jitter: relocate scan insn[%d] rd=x%d addr=%lx "
-			 "offset_from_ref=%ld",
-			 i, rd, (unsigned long) addr, (long) offset_from_ref);
+			 "offset_from_ref=%ld next_insn=%08x is_call=%d",
+			 i, rd, (unsigned long) addr, (long) offset_from_ref,
+			 w4, (int)(is_blr || is_br));
 
 		if (offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000)
 		{
@@ -2106,13 +2112,26 @@ pg_jitter_attach_shared_dsm(PgJitterContext *ctx)
 		return;
 	}
 
+	/*
+	 * If this handle is already mapped by another JitContext (e.g. the outer
+	 * query's context when fmgr_sql evaluates a SQL function body), skip
+	 * attachment.  The DSM entries belong to the outer plan; this nested
+	 * context's plan_node_ids would produce false matches.  Fall through to
+	 * local (per-worker) compilation instead.
+	 */
+	if (dsm_find_mapping(handle) != NULL)
+	{
+		elog(DEBUG1, "pg_jitter: worker DSM handle=%u already mapped, "
+			 "skipping nested attach", handle);
+		return;
+	}
+
 	ctx->share_state.dsm_seg = dsm_attach(handle);
 	if (ctx->share_state.dsm_seg == NULL)
 	{
 		elog(DEBUG1, "pg_jitter: worker failed to attach DSM handle=%u", handle);
 		return;
 	}
-
 	dsm_pin_mapping(ctx->share_state.dsm_seg);
 
 	ctx->share_state.sjc = (SharedJitCompiledCode *)
