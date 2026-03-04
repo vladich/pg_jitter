@@ -28,13 +28,23 @@ It's recommended to set this parameter value to something from ~200 to low thous
 - **MIR** provides solid gains while being the most portable backend
 - **LLVM** was supposed to be fast at execution time, due to clang optimization advantages, but in fact, in most cases, it's slower than all 3 pg_jitter backends, even not counting compilation performance differences. This is due to zero-cost inlining using compile-time pre-extracted code and manual instruction-level optimization.
 
+## Benchmarks
+
+There are several scripts in the `tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
+Here are some results run ARM64 (Apple Silicon M1 Pro) / x86_64 (Ryzen AI 9 HX PRO 370) for different versions of Postgres and different backends
+Some of them are pretty revealing. Look at the super wide table section for both ARM and x86, where LLVM's performance is simply atrocious (thousands of percents of the baseline).
+
+[ARM64](bench/ARM64) -> [PG14](bench/ARM64/BENCHMARK_PG14.md) | [PG15](bench/ARM64/BENCHMARK_PG15.md) | [PG16](bench/ARM64/BENCHMARK_PG16.md) | [PG17](bench/ARM64/BENCHMARK_PG17.md) | [PG18](bench/ARM64/BENCHMARK_PG18.md) * [sljit](bench/ARM64/BENCHMARK_sljit.md) * [AsmJit](bench/ARM64/BENCHMARK_asmjit.md) * [MIR](bench/ARM64/BENCHMARK_mir.md)
+
+[x86_64](bench/x86_64) -> [PG14](bench/x86_64/BENCHMARK_PG14.md) | [PG15](bench/x86_64/BENCHMARK_PG15.md) | [PG16](bench/x86_64/BENCHMARK_PG16.md) | [PG17](bench/x86_64/BENCHMARK_PG17.md) | [PG18](bench/x86_64/BENCHMARK_PG18.md) * [sljit](bench/x86_64/BENCHMARK_sljit.md) * [AsmJit](bench/x86_64/BENCHMARK_asmjit.md) * [MIR](bench/x86_64/BENCHMARK_mir.md)
+
 ## Features
 
 - **Zero-config** - set `jit_provider` and go
 - **Three independent backends** with different strengths
 - **Runtime backend switching** via `SET pg_jitter.backend = 'sljit'` (no restart)
 - **PostgreSQL 14–18** support from one codebase
-- **Two-tier function optimization** - 350+ hot-path PG functions compiled as direct native calls
+- **Two-tier function optimization** - hot-path PG functions compiled as direct native calls
 - **No LLVM dependency** - pure C/C++ with small, embeddable libraries
 - **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
 - **Supported platforms** - aside from AsmJit, other providers (in theory) can be used on most platforms supported by Postgres. But **pg_jitter** was only tested on Linux/MacOS/ARM64 and Linux/x86_64 so far. Testing it on other platforms is planned, but if you had success (or issues) running it, please let me know at vladimir@churyukin.com. 
@@ -62,7 +72,7 @@ parent/
 ```
 [SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
 
-For MIR, use the patched version from [MIR-patched](https://github.com/vladich/mir-patched) - it has a small change that tracks the size of the generated native code per function.
+For MIR, use the patched version from [MIR-patched](https://github.com/vladich/mir-patched) - it has a few changes about tracking the size of the generated native code per function, and per-function memory management.
 
 ### Build
 
@@ -121,7 +131,7 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 
 ### Two-Tier Function Optimization
 
-- **Tier 1** (~350 functions): Pass-by-value operations (int, float, bool, date, timestamp, OID) compiled as direct native calls with inline overflow checking. No `FunctionCallInfo` overhead.
+- **Tier 1**: Pass-by-value operations (int, float, bool, date, timestamp, OID) compiled as direct native calls with inline overflow checking. No `FunctionCallInfo` overhead.
 - **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON` or c2mir-optimized when built with `-DPG_JITTER_USE_C2MIR=ON`.
 
 ### Three JIT Backends
@@ -181,8 +191,9 @@ Without either pipeline, all three backends still work — Tier 1 functions use 
 # Correctness: 203 JIT-compiled functions (all types, overflow, NULL propagation, 100K-row validation)
 psql -d postgres -f tests/test_precompiled.sql
 
-# Benchmarks: 49 queries across 5 backends
+# Benchmarks
 ./tests/bench_all_backends.sh
+./tests/gen_cross_version_benchmarks.py
 
 # I-cache impact analysis
 ./tests/bench_cache_compare.sh
@@ -192,47 +203,6 @@ psql -d postgres -f tests/test_precompiled.sql
 
 # Multi-version build + test (PG14–18)
 ./tests/run_all_versions.sh
-```
-
-All 15 combinations (5 PG versions × 3 backends) pass the full PostgreSQL regression test suite.
-
-## Project Structure
-
-```
-src/
-├── pg_jitter_common.c/h     # Shared: context management, resource owner, fallback dispatch
-├── pg_jitter_compat.h        # PG14–18 compatibility layer
-├── pg_jitter_sljit.c         # sljit backend
-├── pg_jitter_asmjit.cpp      # AsmJIT backend
-├── pg_jitter_asmjit_arm64.inc  # AsmJIT arm64 code generation
-├── pg_jitter_asmjit_x86.inc   # AsmJIT x86_64 code generation
-├── pg_jitter_mir.c            # MIR backend
-├── pg_jitter_meta.c           # Meta provider (runtime backend switching)
-├── pg_jit_funcs.c/h           # Tier 1 hot-path function table (350+ functions)
-├── pg_jit_tier2_wrappers.c/h  # Tier 2 pass-by-ref wrappers
-└── pg_jit_deform_templates.c/h  # 68 specialized tuple deform functions (generated)
-
-cmake/
-├── CMakeLists.txt             # Per-backend build (used by build.sh)
-├── sljit.cmake                # sljit backend configuration
-├── asmjit.cmake               # AsmJIT backend configuration
-├── mir.cmake                  # MIR backend configuration
-└── precompiled.cmake          # Precompilation pipeline (LLVM / c2mir)
-
-tools/
-├── gen_deform_templates.py    # Generates specialized deform functions
-├── gen_tier2_wrappers.py      # Generates LLVM IR for Tier 2 wrappers
-├── extract_inlines.py         # Extracts native blobs from .o files
-└── mir_precompile.c           # Standalone c2mir → native code compiler
-
-tests/
-├── test_precompiled.sql       # Correctness suite (203 functions)
-├── test_leak.sql              # Memory leak detection (single session)
-├── test_leak_trend.sh         # RSS trend across 10K queries
-├── bench_all_backends.sh      # Full benchmark suite (49 queries)
-├── bench_setup.sql            # Benchmark table creation (1M+ rows)
-├── bench_setup_extra.sql      # Additional benchmark tables
-└── run_all_versions.sh        # Multi-version test runner (PG14–18)
 ```
 
 ## License
