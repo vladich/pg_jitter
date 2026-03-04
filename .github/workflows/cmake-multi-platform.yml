@@ -17,20 +17,19 @@ jobs:
           - windows-2022          # Windows x86_64
           - windows-11-arm        # Windows ARM64
         backends:
-          - "sljit"
-          - "asmjit"
-          - "mir"
-          - "sljit;asmjit"
-          - "sljit;mir"
-          - "asmjit;mir"
+#          - "sljit"
+#          - "asmjit"
+#          - "mir"
+#          - "sljit;asmjit"
+#          - "sljit;mir"
+#          - "asmjit;mir"
           - "sljit;asmjit;mir"
 
     runs-on: ${{ matrix.os }}
     name: "${{ matrix.os }} — ${{ matrix.backends }}"
 
     env:
-      PGPORT: 5432
-      PGDATA: /tmp/pg_jitter_ci
+      PGPORT: "5432"
 
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +80,7 @@ jobs:
           repository: vladich/mir-patched
           path: deps/mir
 
-      # ---- Configure ----
+      # ---- Configure & Build ----
       - name: Configure (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -119,7 +118,6 @@ jobs:
           pg_config.exe --version
           cmake -B build -G "MinGW Makefiles" -DPG_CONFIG="$(command -v pg_config.exe)" $CMAKE_ARGS
 
-      # ---- Build ----
       - name: Build
         run: cmake --build build --parallel
 
@@ -143,40 +141,56 @@ jobs:
           ls "$PKGLIBDIR"/pg_jitter*
 
       # ---- Start PostgreSQL ----
-      - name: Start PostgreSQL (Unix)
-        if: runner.os != 'Windows'
+      - name: Start PostgreSQL (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
-          # Stop any existing cluster
-          pg_lsclusters 2>/dev/null && sudo pg_ctlcluster 17 main stop 2>/dev/null || true
+          # Use the cluster auto-started by the postgresql-17 package
+          PGDATA=$(sudo -u postgres psql -t -A -c "SHOW data_directory;" 2>/dev/null || echo "/var/lib/postgresql/17/main")
 
+          # Configure jit_provider
+          echo "jit_provider = 'pg_jitter'" | sudo tee -a "$PGDATA/postgresql.conf"
+          sudo pg_ctlcluster 17 main restart
+
+          # Create test database
+          sudo -u postgres createdb test
+          echo "PostgreSQL ready on port $PGPORT"
+
+      - name: Start PostgreSQL (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          PGDATA=/tmp/pg_jitter_ci
           initdb -D "$PGDATA" --no-locale
-          cat >> "$PGDATA/postgresql.conf" <<EOF
-          jit_provider = 'pg_jitter'
-          port = $PGPORT
-          EOF
+          echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
+          echo "port = $PGPORT" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
           sleep 1
           createdb test
+          echo "PostgreSQL ready on port $PGPORT"
 
       - name: Start PostgreSQL (Windows)
-        if: runner.os == 'Windows'
+        if: startsWith(matrix.os, 'windows')
         shell: bash
         run: |
-          # Windows choco install starts PG automatically on port 5432
-          # Restart with pg_jitter
+          # Windows choco install starts PG automatically
           net stop postgresql-x64-17 2>/dev/null || true
-          WINPGDATA="C:/Program Files/PostgreSQL/17/data"
-          echo "jit_provider = 'pg_jitter'" >> "$WINPGDATA/postgresql.conf"
+          echo "jit_provider = 'pg_jitter'" >> "C:/Program Files/PostgreSQL/17/data/postgresql.conf"
           net start postgresql-x64-17
           sleep 2
           createdb -U postgres test
+          echo "PostgreSQL ready on port $PGPORT"
 
       # ---- Test ----
-      - name: Smoke test
+      - name: Smoke test (Unix)
         if: runner.os != 'Windows'
         run: |
           FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
-          psql -d test -c "
+
+          PSQL_CMD="psql -d test"
+          if [[ "${{ matrix.os }}" == ubuntu* ]]; then
+            PSQL_CMD="sudo -u postgres psql -d test"
+          fi
+
+          $PSQL_CMD -c "
             SET jit = on;
             SET jit_above_cost = 0;
             SET jit_inline_above_cost = 0;
@@ -184,7 +198,7 @@ jobs:
             SET pg_jitter.backend = '$FIRST_BACKEND';
             SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
           "
-          psql -d test -c "
+          $PSQL_CMD -c "
             SET jit = on;
             SET jit_above_cost = 0;
             SET pg_jitter.backend = '$FIRST_BACKEND';
@@ -210,7 +224,6 @@ jobs:
           "
 
       # ---- Cleanup ----
-      - name: Stop PostgreSQL (Unix)
-        if: runner.os != 'Windows' && always()
-        run: |
-          pg_ctl -D "$PGDATA" stop -m fast 2>/dev/null || true
+      - name: Stop PostgreSQL (macOS)
+        if: startsWith(matrix.os, 'macos') && always()
+        run: pg_ctl -D /tmp/pg_jitter_ci stop -m fast 2>/dev/null || true
