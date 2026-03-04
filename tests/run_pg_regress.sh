@@ -122,6 +122,83 @@ echo "  pkglibdir:  $PKGLIBDIR"
 echo "  Backends:   $BACKENDS"
 echo ""
 
+# ================================================================
+# Pre-test cleanup function: remove leftover state from previous runs
+# ================================================================
+cleanup_database() {
+    echo "Cleaning up leftover database state..."
+    "$PSQL" -p "$PGPORT" -d postgres -q -X <<'CLEANUP_SQL'
+-- Drop leftover event triggers
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT evtname FROM pg_event_trigger LOOP
+        EXECUTE format('DROP EVENT TRIGGER IF EXISTS %I CASCADE', r.evtname);
+    END LOOP;
+END $$;
+
+-- Drop leftover publications
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT pubname FROM pg_publication LOOP
+        EXECUTE format('DROP PUBLICATION IF EXISTS %I CASCADE', r.pubname);
+    END LOOP;
+END $$;
+
+-- Drop leftover subscriptions
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT subname FROM pg_subscription LOOP
+        BEGIN
+            EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', r.subname);
+            EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', r.subname);
+            EXECUTE format('DROP SUBSCRIPTION IF EXISTS %I', r.subname);
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+    END LOOP;
+END $$;
+
+-- Drop leftover foreign servers
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT srvname FROM pg_foreign_server LOOP
+        EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', r.srvname);
+    END LOOP;
+END $$;
+
+-- Drop leftover schemas (except system ones)
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT nspname FROM pg_namespace
+             WHERE nspname NOT IN ('pg_catalog','information_schema','public')
+               AND nspname NOT LIKE 'pg_temp%'
+               AND nspname NOT LIKE 'pg_toast%' LOOP
+        EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', r.nspname);
+    END LOOP;
+END $$;
+
+-- Drop leftover tablespaces
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT spcname FROM pg_tablespace
+             WHERE spcname NOT IN ('pg_default','pg_global') LOOP
+        EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
+    END LOOP;
+END $$;
+
+-- Drop leftover roles (regress_* roles from previous test runs)
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT rolname FROM pg_roles
+             WHERE rolname LIKE 'regress_%'
+               AND rolname NOT IN (SELECT usename FROM pg_stat_activity) LOOP
+        BEGIN
+            EXECUTE format('REASSIGN OWNED BY %I TO CURRENT_USER', r.rolname);
+            EXECUTE format('DROP OWNED BY %I', r.rolname);
+            EXECUTE format('DROP ROLE IF EXISTS %I', r.rolname);
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+    END LOOP;
+END $$;
+CLEANUP_SQL
+    echo "Cleanup complete."
+}
+
+cleanup_database
+echo ""
+
 PASSED=0
 FAILED=0
 RESULTS=""
@@ -131,8 +208,9 @@ for backend in $BACKENDS; do
     echo "  $backend"
     echo "============================================"
 
-    # Switch provider
+    # Clean up leftover state between backends
     ensure_pg_running
+    cleanup_database
     "$PSQL" -p "$PGPORT" -d postgres -q -c \
         "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
     "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1

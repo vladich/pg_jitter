@@ -584,11 +584,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!deform_emitted)
 				{
 					/*
-					 * Call deform dispatch: JIT-compiles deform via sljit
-					 * (loop-based for wide, unrolled for narrow) and caches.
+					 * Fallback: call slot_getsomeattrs_int(slot, natts).
+					 * No sljit deform — asmjit backend is self-contained.
 					 */
 					x86::Gp fn_reg = cc.new_gp64();
-					cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_compiled_deform_dispatch);
+					cc.mov(fn_reg, (uint64_t)(void *) slot_getsomeattrs_int);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());

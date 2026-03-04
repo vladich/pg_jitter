@@ -194,7 +194,8 @@ if(PG_JITTER_USE_LLVM)
                 COMMENT "Linking Tier 2 wrappers with PG bitcode")
             add_custom_command(OUTPUT ${TIER2_LINKED}
                 COMMAND ${LLVM_DIS_EXE} ${TIER2_LINKED_RAW} -o ${TIER2_LINKED_LL}
-                COMMAND sed -i "s/ dso_local / /g" ${TIER2_LINKED_LL}
+                COMMAND sed "s/ dso_local / /g" ${TIER2_LINKED_LL} > ${TIER2_LINKED_LL}.tmp
+                COMMAND ${CMAKE_COMMAND} -E rename ${TIER2_LINKED_LL}.tmp ${TIER2_LINKED_LL}
                 COMMAND ${LLVM_AS_EXE} ${TIER2_LINKED_LL} -o ${TIER2_LINKED}
                 DEPENDS ${TIER2_LINKED_RAW}
                 COMMENT "Stripping dso_local from linked bitcode for PIC compatibility")

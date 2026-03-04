@@ -62,10 +62,13 @@ execute_process(COMMAND ${PG_CONFIG} --includedir-server
 if(NOT _pg_config_result EQUAL 0)
     message(FATAL_ERROR "pg_config failed. Set -DPG_CONFIG=/path/to/pg_config")
 endif()
+execute_process(COMMAND ${PG_CONFIG} --includedir
+    OUTPUT_VARIABLE PG_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${PG_CONFIG} --pkglibdir
     OUTPUT_VARIABLE PG_PKGLIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 message(STATUS "PG server includes: ${PG_INCLUDEDIR_SERVER}")
+message(STATUS "PG includes:        ${PG_INCLUDEDIR}")
 message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
 
 # ---------- Installation directory ----------
@@ -180,7 +183,7 @@ endif()
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
-    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} src)
+    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
     pg_jitter_add_precompiled(${TARGET_NAME})
     set_target_properties(${TARGET_NAME} PROPERTIES
         PREFIX ""
@@ -203,6 +206,7 @@ if(PG_JITTER_BUILD_SLJIT)
     add_library(pg_jitter_sljit MODULE ${COMMON_SRC} src/pg_jitter_sljit.c
                 src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
     target_link_libraries(pg_jitter_sljit PRIVATE sljit)
+    target_compile_definitions(pg_jitter_sljit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_sljit)
     list(APPEND PG_JITTER_TARGETS pg_jitter_sljit)
 endif()
@@ -210,8 +214,8 @@ endif()
 # ---------- pg_jitter_asmjit ----------
 if(PG_JITTER_BUILD_ASMJIT)
     add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
-                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
-    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
+                src/pg_jit_deform_templates.c)
+    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
     list(APPEND PG_JITTER_TARGETS pg_jitter_asmjit)
@@ -220,15 +224,15 @@ endif()
 # ---------- pg_jitter_mir ----------
 if(PG_JITTER_BUILD_MIR)
     add_library(pg_jitter_mir MODULE ${COMMON_SRC} src/pg_jitter_mir.c
-                src/pg_jitter_deform_jit.c src/pg_jit_deform_templates.c)
-    target_link_libraries(pg_jitter_mir PRIVATE mir_lib sljit)
+                src/pg_jit_deform_templates.c)
+    target_link_libraries(pg_jitter_mir PRIVATE mir_lib)
     pg_jitter_configure_target(pg_jitter_mir)
     list(APPEND PG_JITTER_TARGETS pg_jitter_mir)
 endif()
 
 # ---------- pg_jitter meta-provider (always built) ----------
 add_library(pg_jitter MODULE src/pg_jitter_meta.c)
-target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} src)
+target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
 set_target_properties(pg_jitter PROPERTIES
     PREFIX ""
     SUFFIX "${PG_JITTER_SHARED_SUFFIX}"

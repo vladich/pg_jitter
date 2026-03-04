@@ -612,11 +612,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!deform_emitted)
 				{
 					/*
-					 * Call deform dispatch: JIT-compiles deform via sljit
-					 * (loop-based for wide, unrolled for narrow) and caches.
+					 * Fallback: call slot_getsomeattrs_int(slot, natts).
+					 * No sljit deform — asmjit backend is self-contained.
 					 */
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_compiled_deform_dispatch);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) slot_getsomeattrs_int);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());
@@ -3947,23 +3947,28 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke->set_arg(2, v_econtext);
 				invoke->set_ret(0, ret_reg);
 
-				int fb_jump_target = -1;
-				switch (opcode)
+				/*
+				 * Generic jump dispatch: fallback_step returns >= 0 when a
+				 * jump is needed (the return value is the target step index).
+				 * Build a jump table for all reachable labels.
+				 */
 				{
-#ifdef HAVE_EEOP_HASHDATUM
-					case EEOP_HASHDATUM_FIRST_STRICT:
-					case EEOP_HASHDATUM_NEXT32_STRICT:
-						fb_jump_target = op->d.hashdatum.jumpdone;
-						break;
-#endif
-					default:
-						break;
-				}
+					Label no_jump = cc.new_label();
 
-				if (fb_jump_target >= 0 && fb_jump_target < steps_len)
-				{
 					cc.cmp(ret_reg, 0);
-					cc.b(a64::CondCode::kGE, step_labels[fb_jump_target]);
+					cc.b(a64::CondCode::kLT, no_jump);
+
+					/*
+					 * Emit a chain of comparisons for each possible jump
+					 * target step.  For most expressions this is 1-3 targets.
+					 */
+					for (int t = 0; t < steps_len; t++)
+					{
+						cc.cmp(ret_reg, t);
+						cc.b(a64::CondCode::kEQ, step_labels[t]);
+					}
+					/* Should not reach here, but fall through to no_jump */
+					cc.bind(no_jump);
 				}
 				break;
 			}

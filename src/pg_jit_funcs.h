@@ -52,6 +52,9 @@ typedef enum JitInlineOp
 	JIT_INLINE_FLOAT8_EQ, JIT_INLINE_FLOAT8_NE,
 	JIT_INLINE_FLOAT8_LT, JIT_INLINE_FLOAT8_LE,
 	JIT_INLINE_FLOAT8_GT, JIT_INLINE_FLOAT8_GE,
+	/* hash functions (1-arg, inline hash_bytes_uint32) */
+	JIT_INLINE_HASHINT4,	/* hash_bytes_uint32((uint32) arg) */
+	JIT_INLINE_HASHINT8,	/* fold int64 → uint32, then hash_bytes_uint32 */
 } JitInlineOp;
 
 /*
