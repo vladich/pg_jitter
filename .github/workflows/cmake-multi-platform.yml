@@ -1,9 +1,6 @@
 name: Build
 
-on:
-  push:
-    branches: [master]
-  pull_request:
+on: [push, pull_request]
 
 jobs:
   build:
@@ -15,7 +12,7 @@ jobs:
           - ubuntu-24.04-arm      # Linux ARM64
           - macos-15              # macOS ARM64 (Apple Silicon)
           - windows-2022          # Windows x86_64
-          - windows-11-arm        # Windows ARM64
+#          - windows-11-arm        # Windows ARM64 (no PG installer available)
         backends:
 #          - "sljit"
 #          - "asmjit"
@@ -31,7 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Install PostgreSQL dev headers ----
+      # ---- PostgreSQL: running server + pg_config on PATH ----
+      - name: Setup PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: "17"
+        id: postgres
+
+      # Ubuntu: action provides server but not dev headers
       - name: Install PostgreSQL dev headers (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -40,24 +44,21 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-server-dev-17
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
-      - name: Install PostgreSQL dev headers (macOS)
+      # macOS: PG headers include <libintl.h> which comes from gettext
+      - name: Install gettext (macOS)
         if: startsWith(matrix.os, 'macos')
         run: |
-          brew install postgresql@17 gettext
-          echo "/opt/homebrew/opt/postgresql@17/bin" >> "$GITHUB_PATH"
+          brew install gettext
           echo "GETTEXT_INCLUDE=-I$(brew --prefix gettext)/include" >> "$GITHUB_ENV"
 
-      - name: Find PostgreSQL (Windows)
-        if: startsWith(matrix.os, 'windows')
+      - name: Verify pg_config
         shell: bash
         run: |
-          # GH runner images have PostgreSQL pre-installed
-          PG_DIR=$(ls -d "C:/Program Files/PostgreSQL/"* 2>/dev/null | sort -V | tail -1)
-          echo "Found PostgreSQL at: $PG_DIR"
-          echo "$PG_DIR/bin" >> "$GITHUB_PATH"
-          "$PG_DIR/bin/pg_config.exe" --version
+          pg_config --version
+          echo "includedir-server: $(pg_config --includedir-server)"
+          echo "includedir:        $(pg_config --includedir)"
+          echo "pkglibdir:         $(pg_config --pkglibdir)"
 
       # ---- Clone dependencies ----
       - name: Clone sljit
@@ -102,7 +103,6 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
           fi
 
-          pg_config --version
           cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
 
       - name: Configure (Windows)
@@ -121,51 +121,34 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           fi
 
-          pg_config.exe --version
-          cmake -B build -DPG_CONFIG="$(command -v pg_config.exe)" $CMAKE_ARGS
+          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
 
       - name: Build
         run: cmake --build build --parallel
 
-      # ---- Install pg_jitter into PG ----
-      - name: Install pg_jitter (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          PKGLIBDIR="$(pg_config --pkglibdir)"
-          echo "Installing to $PKGLIBDIR"
-          sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
-          sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
-          ls "$PKGLIBDIR"/pg_jitter*
-
-      - name: Install pg_jitter (Windows)
-        if: runner.os == 'Windows'
+      # ---- Install pg_jitter & restart with it ----
+      - name: Install pg_jitter and restart PostgreSQL
         shell: bash
         run: |
           PKGLIBDIR="$(pg_config --pkglibdir)"
           echo "Installing to $PKGLIBDIR"
-          cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp build/Debug/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+            cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+          else
+            sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
+            sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
+          fi
           ls "$PKGLIBDIR"/pg_jitter*
 
-      # ---- Start PostgreSQL with pg_jitter ----
-      - name: Start PostgreSQL
-        uses: ikalnytskyi/action-setup-postgres@v8
-        with:
-          postgres-version: "17"
-        id: postgres
-
-      - name: Configure pg_jitter and restart
-        shell: bash
-        run: |
+          # Restart with pg_jitter
           PGDATA=$(psql "${{ steps.postgres.outputs.connection-uri }}" -t -A -c "SHOW data_directory;")
           echo "PGDATA: $PGDATA"
-
-          # Stop, configure, restart
           pg_ctl -D "$PGDATA" stop -m fast
           echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
           sleep 1
-
-          # Verify
           psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
 
       # ---- Test ----
