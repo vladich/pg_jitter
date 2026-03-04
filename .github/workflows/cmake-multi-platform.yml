@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
   pull_request:
 
 jobs:
@@ -28,6 +28,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: "${{ matrix.os }} — ${{ matrix.backends }}"
 
+    env:
+      PGPORT: 5432
+      PGDATA: /tmp/pg_jitter_ci
+
     steps:
       - uses: actions/checkout@v4
 
@@ -35,13 +39,18 @@ jobs:
       - name: Install PostgreSQL (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-server-dev-all
+          sudo apt-get install -y -qq postgresql-17 postgresql-server-dev-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
       - name: Install PostgreSQL (macOS)
         if: startsWith(matrix.os, 'macos')
         run: |
           brew install postgresql@17
+          echo "/opt/homebrew/opt/postgresql@17/bin" >> "$GITHUB_PATH"
 
       - name: Install PostgreSQL (Windows)
         if: startsWith(matrix.os, 'windows')
@@ -72,7 +81,7 @@ jobs:
           repository: vladich/mir-patched
           path: deps/mir
 
-      # ---- Configure & Build (Unix) ----
+      # ---- Configure ----
       - name: Configure (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -88,21 +97,9 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           fi
 
-          # Find pg_config
-          if command -v pg_config >/dev/null 2>&1; then
-            PG_CFG=pg_config
-          elif [ -x "/opt/homebrew/opt/postgresql@17/bin/pg_config" ]; then
-            PG_CFG=/opt/homebrew/opt/postgresql@17/bin/pg_config
-          elif [ -x "/usr/local/opt/postgresql@17/bin/pg_config" ]; then
-            PG_CFG=/usr/local/opt/postgresql@17/bin/pg_config
-          else
-            PG_CFG=$(find /usr -name pg_config -type f 2>/dev/null | head -1)
-          fi
-          echo "Using pg_config: $PG_CFG"
+          pg_config --version
+          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
 
-          cmake -B build -DPG_CONFIG="$PG_CFG" $CMAKE_ARGS
-
-      # ---- Configure & Build (Windows) ----
       - name: Configure (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -119,23 +116,101 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           fi
 
-          PG_CFG="C:/Program Files/PostgreSQL/17/bin/pg_config.exe"
-          cmake -B build -DPG_CONFIG="$PG_CFG" $CMAKE_ARGS
+          pg_config.exe --version
+          cmake -B build -G "MinGW Makefiles" -DPG_CONFIG="$(command -v pg_config.exe)" $CMAKE_ARGS
 
+      # ---- Build ----
       - name: Build
         run: cmake --build build --parallel
 
-      # ---- Verify ----
-      - name: Verify built libraries (Unix)
+      # ---- Install into PG ----
+      - name: Install pg_jitter (Unix)
         if: runner.os != 'Windows'
         run: |
-          echo "Built libraries:"
-          find build -name 'pg_jitter*' \( -name '*.so' -o -name '*.dylib' \) | sort
-          test -n "$(find build -name 'pg_jitter.so' -o -name 'pg_jitter.dylib' | head -1)"
+          PKGLIBDIR="$(pg_config --pkglibdir)"
+          echo "Installing to $PKGLIBDIR"
+          sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
+          sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
+          ls "$PKGLIBDIR"/pg_jitter*
 
-      - name: Verify built libraries (Windows)
+      - name: Install pg_jitter (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          echo "Built libraries:"
-          find build -name 'pg_jitter*' -name '*.dll' | sort
+          PKGLIBDIR="$(pg_config --pkglibdir)"
+          echo "Installing to $PKGLIBDIR"
+          cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+          ls "$PKGLIBDIR"/pg_jitter*
+
+      # ---- Start PostgreSQL ----
+      - name: Start PostgreSQL (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          # Stop any existing cluster
+          pg_lsclusters 2>/dev/null && sudo pg_ctlcluster 17 main stop 2>/dev/null || true
+
+          initdb -D "$PGDATA" --no-locale
+          cat >> "$PGDATA/postgresql.conf" <<EOF
+          jit_provider = 'pg_jitter'
+          port = $PGPORT
+          EOF
+          pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+          sleep 1
+          createdb test
+
+      - name: Start PostgreSQL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Windows choco install starts PG automatically on port 5432
+          # Restart with pg_jitter
+          net stop postgresql-x64-17 2>/dev/null || true
+          WINPGDATA="C:/Program Files/PostgreSQL/17/data"
+          echo "jit_provider = 'pg_jitter'" >> "$WINPGDATA/postgresql.conf"
+          net start postgresql-x64-17
+          sleep 2
+          createdb -U postgres test
+
+      # ---- Test ----
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: |
+          FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
+          psql -d test -c "
+            SET jit = on;
+            SET jit_above_cost = 0;
+            SET jit_inline_above_cost = 0;
+            SET jit_optimize_above_cost = 0;
+            SET pg_jitter.backend = '$FIRST_BACKEND';
+            SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
+          "
+          psql -d test -c "
+            SET jit = on;
+            SET jit_above_cost = 0;
+            SET pg_jitter.backend = '$FIRST_BACKEND';
+            EXPLAIN (ANALYZE, COSTS OFF, SUMMARY ON)
+            SELECT i % 100 AS bucket, sum(i), avg(i)
+            FROM generate_series(1, 100000) i
+            GROUP BY bucket
+            ORDER BY bucket;
+          " | tail -5
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
+          psql -U postgres -d test -c "
+            SET jit = on;
+            SET jit_above_cost = 0;
+            SET jit_inline_above_cost = 0;
+            SET jit_optimize_above_cost = 0;
+            SET pg_jitter.backend = '$FIRST_BACKEND';
+            SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
+          "
+
+      # ---- Cleanup ----
+      - name: Stop PostgreSQL (Unix)
+        if: runner.os != 'Windows' && always()
+        run: |
+          pg_ctl -D "$PGDATA" stop -m fast 2>/dev/null || true
