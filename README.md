@@ -18,7 +18,7 @@ Typical compilation time:
 - **sljit**: tens to low hundreds of microseconds
 - **AsmJIT**: hundreds of microseconds
 - **MIR**: hundreds of microseconds to single milliseconds
-- **LLVM (Postgres default)**: tens to hundreds of milliseconds
+- **LLVM (Postgres default)**: tens to hundreds of milliseconds (seconds in the worst cases)
 
 In reality, the effect of JIT compilation is broader - execution can slow down for up to ~1ms even for sljit, because of other related things, mostly cold processor cache and effects of increased memory pressure (rapid allocations / deallocations related to code generation and JIT compilation). Therefore, on systems executing a lot of queries per second, it's recommended to avoid JIT compilation for very fast queries such as point lookups or queries processing only a few records. By default, `jit_above_cost` parameter is set to a very high number (100'000). This makes sense for LLVM, but doesn't make sense for faster providers.
 It's recommended to set this parameter value to something from ~200 to low thousands for pg_jitter (depending on what specific backend you use and your specific workloads).
