@@ -31,8 +31,8 @@ It's recommended to set this parameter value to something from ~200 to low thous
 ## Benchmarks
 
 There are several scripts in the `tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
-Here are some results for ARM64 (Apple Silicon M1 Pro) and x86_64 (Ryzen AI 9 HX PRO 370) for different versions of Postgres and different backends
-Some of them are pretty revealing. Look at the super wide table section for both ARM and x86, where LLVM's performance is simply atrocious (thousands of percents of the baseline).
+Here are some results for ARM64 (Apple Silicon M1 Pro) and x86_64 (Ryzen AI 9 HX PRO 370) for different versions of Postgres and different backends.
+Some of them are pretty interesting, for example the "super wide table" section for both ARM and x86, where LLVM's performance is simply atrocious (10x-30x of the baseline).
 
 [ARM64](bench/ARM64) -> [PG14](bench/ARM64/BENCHMARK_PG14.md) | [PG15](bench/ARM64/BENCHMARK_PG15.md) | [PG16](bench/ARM64/BENCHMARK_PG16.md) | [PG17](bench/ARM64/BENCHMARK_PG17.md) | [PG18](bench/ARM64/BENCHMARK_PG18.md) * [sljit](bench/ARM64/BENCHMARK_sljit.md) * [AsmJit](bench/ARM64/BENCHMARK_asmjit.md) * [MIR](bench/ARM64/BENCHMARK_mir.md)
 
