@@ -5,13 +5,13 @@
  * Hot-path opcodes (~30) get native code; everything else falls back to
  * pg_jitter_fallback_step().
  */
+#include "postgres.h"
 #include "executor/execExpr.h"
 #include "executor/nodeAgg.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "jit/jit.h"
 #include "nodes/execnodes.h"
-#include "postgres.h"
 #include "utils/array.h"
 #include "utils/expandeddatum.h"
 #include "utils/lsyscache.h"

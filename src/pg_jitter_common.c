@@ -3,6 +3,7 @@
  *
  * This file is compiled into each pg_jitter provider library.
  */
+#include "postgres.h"
 #include "pg_jitter_common.h"
 
 #include "executor/execExpr.h"
@@ -10,7 +11,6 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
-#include "postgres.h"
 #include "storage/shmem.h"
 #include "utils/expandeddatum.h"
 #include "utils/guc.h"
