@@ -67,19 +67,19 @@ def generate_wrapper(name, nargs, ret_64, arg_types):
 
     lines = [f'{sig} {{', 'entry:']
 
-    # FunctionCallInfoBaseData struct layout (PG18, 64-bit):
-    #   Node       tag;           //  0: 8 bytes  (type + padding)
-    #   FmgrInfo  *flinfo;        //  8: 8 bytes
-    #   fmNodePtr  context;       // 16: 8 bytes
-    #   fmNodePtr  resultinfo;    // 24: 8 bytes
-    #   bool       isnull;        // 32: 1 byte
-    #   short      nargs;         // 34: 2 bytes (after alignment)
-    #   [padding]                 // 36: 4 bytes
-    #   NullableDatum args[0];    // 40: array of (Datum[8] + bool[1] + pad[7]) = 16 each
+    # FunctionCallInfoBaseData struct layout (PG14-18, 64-bit):
+    #   FmgrInfo  *flinfo;        //  0: 8 bytes
+    #   fmNodePtr  context;       //  8: 8 bytes
+    #   fmNodePtr  resultinfo;    // 16: 8 bytes
+    #   Oid        fncollation;   // 24: 4 bytes
+    #   bool       isnull;        // 28: 1 byte
+    #   [padding]                 // 29: 1 byte
+    #   short      nargs;         // 30: 2 bytes
+    #   NullableDatum args[0];    // 32: array of (Datum[8] + bool[1] + pad[7]) = 16 each
     #
-    # Total for nargs args: 40 + nargs * 16
+    # Total for nargs args: 32 + nargs * 16
 
-    struct_size = 40 + nargs * 16
+    struct_size = 32 + nargs * 16
 
     # Allocate FunctionCallInfoBaseData on stack
     lines.append(f'    %fcinfo = alloca i8, i64 {struct_size}, align 8')
@@ -87,15 +87,15 @@ def generate_wrapper(name, nargs, ret_64, arg_types):
     lines.append(f'    call void @llvm.memset.p0.i64('
                  f'ptr %fcinfo, i8 0, i64 {struct_size}, i1 false)')
 
-    # Set nargs (offset 34, i16)
-    lines.append(f'    %nargs_ptr = getelementptr i8, ptr %fcinfo, i64 34')
+    # Set nargs (offset 30, i16)
+    lines.append(f'    %nargs_ptr = getelementptr i8, ptr %fcinfo, i64 30')
     lines.append(f'    store i16 {nargs}, ptr %nargs_ptr, align 2')
 
-    # Set isnull = false (offset 32, i8) — already zero from memset
+    # Set isnull = false (offset 28, i8) — already zero from memset
 
     # Set each arg's value and isnull
     for i, at in enumerate(arg_types):
-        val_offset = 40 + i * 16
+        val_offset = 32 + i * 16
         null_offset = val_offset + 8
 
         # args[i].value (Datum = i64)
