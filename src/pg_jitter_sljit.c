@@ -3555,9 +3555,28 @@ sljit_compile_expr(ExprState *state)
 					 * - Are ≤48 bytes (avoid I-cache bloat from large
 					 *   float/div blobs; those fall through to direct call)
 					 */
-					if (pi && pi->ret_offset >= 0 && pi->code_len <= 48)
+					if (pi && pi->ret_offset >= 0 && pi->code_len <= 48
+#if defined(__x86_64__) || defined(_M_X64)
+					/*
+					 * x86_64: sljit R0..R3 != SysV ABI arg regs.
+					 * We can map arg0→rdi(R2), arg1→rsi(R1), but
+					 * arg2 needs rdx which is sljit's TMP_REG1.
+					 * Limit inline blobs to ≤2 args; 3+ use call.
+					 */
+					&& dfn->nargs <= 2
+#endif
+					)
 					{
-						/* Load args from fcinfo→args[].value into R0..R3 */
+						/*
+						 * Load args from fcinfo→args[].value into ABI
+						 * argument registers for the pre-compiled blob.
+						 *
+						 * ARM64: SLJIT_R0..R3 = x0..x3 = AAPCS64 args.
+						 * x86_64: SLJIT_R0=rax, R1=rsi, R2=rdi, R3=rcx
+						 *   but SysV ABI is arg0=rdi(R2), arg1=rsi(R1).
+						 *   Load in reverse so base_reg (R2=rdi) is
+						 *   clobbered last.
+						 */
 						if (dfn->nargs > 0)
 						{
 							int base_reg;
@@ -3572,6 +3591,31 @@ sljit_compile_expr(ExprState *state)
 								emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data), SLJIT_R2);
 								base_reg = SLJIT_R2;
 							}
+#if defined(__x86_64__) || defined(_M_X64)
+							{
+								/*
+								 * SysV x86_64: arg0=rdi(SLJIT_R2),
+								 * arg1=rsi(SLJIT_R1). Load in reverse
+								 * order to avoid clobbering base_reg
+								 * (SLJIT_R2 = rdi) before all args
+								 * are read.
+								 */
+								static const int abi_reg[] = {
+									SLJIT_R2,	/* arg0 → rdi */
+									SLJIT_R1,	/* arg1 → rsi */
+								};
+								for (int i = dfn->nargs - 1; i >= 0; i--)
+								{
+									sljit_sw val_off =
+										(sljit_sw) &fcinfo->args[i].value -
+										(sljit_sw) fcinfo;
+									sljit_emit_op1(C, SLJIT_MOV,
+												   abi_reg[i], 0,
+												   SLJIT_MEM1(base_reg),
+												   val_off);
+								}
+							}
+#else
 							for (int i = 0; i < dfn->nargs && i < 4; i++)
 							{
 								sljit_sw val_off =
@@ -3580,6 +3624,7 @@ sljit_compile_expr(ExprState *state)
 								sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0 + i, 0,
 											   SLJIT_MEM1(base_reg), val_off);
 							}
+#endif
 						}
 
 						used_precompiled = emit_precompiled_inline(

@@ -10,11 +10,11 @@ Comprehensive benchmark comparing pg_jitter JIT backends against PostgreSQL's in
 | OS | Linux 6.6.87.2-microsoft-standard-WSL2 x86_64 |
 | CPU | AMD Ryzen AI 9 HX PRO 370 w/ Radeon 890M |
 | RAM | 23Gi |
-| Backends tested | interp sljit asmjit mir |
-| Runs per query | 3 (median) |
-| Warmup runs | 2 |
+| Backends tested | interp llvmjit sljit asmjit mir |
+| Runs per query | 5 (median) |
+| Warmup runs | 3 |
 | Parallel workers | 0 (disabled) |
-| Date | 2026-03-02 |
+| Date | 2026-03-03 |
 
 ## Dataset
 
@@ -39,7 +39,7 @@ Comprehensive benchmark comparing pg_jitter JIT backends against PostgreSQL's in
 - All queries run with `max_parallel_workers_per_gather = 0`
 - JIT thresholds set to 0 to force JIT compilation on every query
 - Buffer cache warmed before benchmarking
-- Each query: 2 warmup runs, then 3 timed runs, median reported
+- Each query: 3 warmup runs, then 5 timed runs, median reported
 - JIT compilation timing from a separate `EXPLAIN (ANALYZE, FORMAT JSON)` run
 - Percentages relative to interpreter (no JIT) baseline: <100% = faster, >100% = slower
 
@@ -47,199 +47,199 @@ Comprehensive benchmark comparing pg_jitter JIT backends against PostgreSQL's in
 
 ### Basic Aggregation
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| SUM_int | 39.235 ms | 37.909 ms (96%) | 39.110 ms (99%) | 35.363 ms (90%) |
-| COUNT_star | 32.184 ms | 31.475 ms (97%) | 31.992 ms (99%) | 31.847 ms (98%) |
-| GroupBy_5agg | 97.712 ms | 82.406 ms (84%) | 83.566 ms (85%) | 103.351 ms (105%) |
-| GroupBy_100K_grp | 152.385 ms | 142.572 ms (93%) | 141.099 ms (92%) | 155.672 ms (102%) |
-| COUNT_DISTINCT | 32.580 ms | 32.528 ms (99%) | 32.433 ms (99%) | 32.737 ms (100%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| SUM_int | 39.812 ms | 83.838 ms (210%) | 43.825 ms (110%) | 36.853 ms (92%) | 36.741 ms (92%) |
+| COUNT_star | 33.588 ms | 72.831 ms (216%) | 30.445 ms (90%) | 31.192 ms (92%) | 32.195 ms (95%) |
+| GroupBy_5agg | 100.158 ms | 158.117 ms (157%) | 86.467 ms (86%) | 89.670 ms (89%) | 109.880 ms (109%) |
+| GroupBy_100K_grp | 153.894 ms | 206.924 ms (134%) | 138.825 ms (90%) | 141.053 ms (91%) | 143.676 ms (93%) |
+| COUNT_DISTINCT | 35.142 ms | 84.610 ms (240%) | 35.490 ms (100%) | 35.032 ms (99%) | 36.882 ms (104%) |
 
 ### Hash Joins
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| HashJoin_single | 451.699 ms | 416.016 ms (92%) | 404.191 ms (89%) | 624.320 ms (138%) |
-| HashJoin_composite | 467.934 ms | 425.303 ms (90%) | 410.686 ms (87%) | 552.123 ms (117%) |
-| HashJoin_filter | 356.419 ms | 334.591 ms (93%) | 326.046 ms (91%) | 509.968 ms (143%) |
-| HashJoin_GroupBy | 782.169 ms | 597.025 ms (76%) | 655.675 ms (83%) | 966.776 ms (123%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| HashJoin_single | 374.854 ms | 366.511 ms (97%) | 327.365 ms (87%) | 312.366 ms (83%) | 554.009 ms (147%) |
+| HashJoin_composite | 377.152 ms | 372.874 ms (98%) | 328.947 ms (87%) | 301.565 ms (79%) | 501.530 ms (132%) |
+| HashJoin_filter | 302.188 ms | 315.820 ms (104%) | 274.834 ms (90%) | 256.545 ms (84%) | 467.941 ms (154%) |
+| HashJoin_GroupBy | 615.457 ms | 541.044 ms (87%) | 510.074 ms (82%) | 478.447 ms (77%) | 784.584 ms (127%) |
 
 ### Outer Joins
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| LeftJoin | 145.130 ms | 131.830 ms (90%) | 131.781 ms (90%) | 173.893 ms (119%) |
-| RightJoin | 155.624 ms | 146.952 ms (94%) | 147.079 ms (94%) | 159.949 ms (102%) |
-| FullOuterJoin | 56.870 ms | 53.361 ms (93%) | 53.039 ms (93%) | 61.513 ms (108%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| LeftJoin | 134.922 ms | 195.925 ms (145%) | 129.918 ms (96%) | 122.541 ms (90%) | 164.829 ms (122%) |
+| RightJoin | 132.099 ms | 187.968 ms (142%) | 124.379 ms (94%) | 122.528 ms (92%) | 141.055 ms (106%) |
+| FullOuterJoin | 56.132 ms | 138.557 ms (246%) | 50.592 ms (90%) | 52.453 ms (93%) | 59.580 ms (106%) |
 
 ### Semi/Anti Joins
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| EXISTS_semi | 148.745 ms | 137.426 ms (92%) | 128.441 ms (86%) | 156.988 ms (105%) |
-| NOT_EXISTS_anti | 105.236 ms | 95.432 ms (90%) | 109.510 ms (104%) | 136.171 ms (129%) |
-| IN_subquery | 118.137 ms | 106.470 ms (90%) | 108.525 ms (91%) | 125.367 ms (106%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| EXISTS_semi | 136.400 ms | 203.438 ms (149%) | 127.296 ms (93%) | 130.416 ms (95%) | 148.011 ms (108%) |
+| NOT_EXISTS_anti | 144.905 ms | 194.832 ms (134%) | 140.901 ms (97%) | 141.648 ms (97%) | 161.042 ms (111%) |
+| IN_subquery | 113.183 ms | 170.281 ms (150%) | 105.591 ms (93%) | 107.426 ms (94%) | 121.546 ms (107%) |
 
 ### Set Operations
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| INTERSECT | 123.605 ms | 118.522 ms (95%) | 117.295 ms (94%) | 151.472 ms (122%) |
-| EXCEPT | 117.633 ms | 115.404 ms (98%) | 117.964 ms (100%) | 142.960 ms (121%) |
-| UNION_ALL_agg | 66.124 ms | 63.964 ms (96%) | 62.444 ms (94%) | 64.116 ms (96%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| INTERSECT | 115.532 ms | 153.823 ms (133%) | 117.098 ms (101%) | 118.826 ms (102%) | 142.391 ms (123%) |
+| EXCEPT | 110.816 ms | 148.333 ms (133%) | 113.168 ms (102%) | 122.993 ms (110%) | 141.596 ms (127%) |
+| UNION_ALL_agg | 68.966 ms | 119.291 ms (172%) | 64.526 ms (93%) | 67.683 ms (98%) | 66.837 ms (96%) |
 
 ### Expressions
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| CASE_simple | 39.179 ms | 35.167 ms (89%) | 34.298 ms (87%) | 36.968 ms (94%) |
-| CASE_searched_4way | 44.585 ms | 38.069 ms (85%) | 36.655 ms (82%) | 41.773 ms (93%) |
-| COALESCE_NULLIF | 36.047 ms | 31.621 ms (87%) | 30.703 ms (85%) | 32.286 ms (89%) |
-| Bool_AND_OR | 43.751 ms | 34.782 ms (79%) | 34.108 ms (77%) | 38.082 ms (87%) |
-| Arith_expr | 39.214 ms | 33.531 ms (85%) | 32.272 ms (82%) | 34.282 ms (87%) |
-| IN_list_20 | 43.365 ms | 28.078 ms (64%) | 29.079 ms (67%) | 29.893 ms (68%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| CASE_simple | 40.525 ms | 86.208 ms (212%) | 35.206 ms (86%) | 36.814 ms (90%) | 37.035 ms (91%) |
+| CASE_searched_4way | 45.780 ms | 88.798 ms (193%) | 38.538 ms (84%) | 39.924 ms (87%) | 42.244 ms (92%) |
+| COALESCE_NULLIF | 36.628 ms | 81.472 ms (222%) | 31.707 ms (86%) | 33.768 ms (92%) | 33.901 ms (92%) |
+| Bool_AND_OR | 43.666 ms | 89.481 ms (204%) | 34.484 ms (78%) | 36.604 ms (83%) | 39.630 ms (90%) |
+| Arith_expr | 40.552 ms | 84.792 ms (209%) | 33.440 ms (82%) | 35.362 ms (87%) | 36.262 ms (89%) |
+| IN_list_20 | 45.178 ms | 92.288 ms (204%) | 25.138 ms (55%) | 29.158 ms (64%) | 31.468 ms (69%) |
 
 ### Subqueries
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Scalar_subq | 84.142 ms | 79.000 ms (93%) | 80.612 ms (95%) | 79.327 ms (94%) |
-| Correlated_subq | 151.852 ms | 149.479 ms (98%) | 149.438 ms (98%) | 155.455 ms (102%) |
-| LATERAL_top3 | 30.007 ms | 29.069 ms (96%) | 28.617 ms (95%) | 30.086 ms (100%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Scalar_subq | 85.340 ms | 152.350 ms (178%) | 76.162 ms (89%) | 85.175 ms (99%) | 84.224 ms (98%) |
+| Correlated_subq | 162.029 ms | 223.573 ms (137%) | 149.633 ms (92%) | 158.108 ms (97%) | 165.061 ms (101%) |
+| LATERAL_top3 | 31.149 ms | 80.951 ms (259%) | 28.915 ms (92%) | 29.693 ms (95%) | 28.474 ms (91%) |
 
 ### Date/Timestamp
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Date_extract | 113.175 ms | 103.911 ms (91%) | 104.571 ms (92%) | 119.776 ms (105%) |
-| Timestamp_trunc | 102.500 ms | 91.044 ms (88%) | 91.009 ms (88%) | 106.311 ms (103%) |
-| Interval_arith | 44.724 ms | 44.187 ms (98%) | 51.166 ms (114%) | 46.352 ms (103%) |
-| Timestamp_diff | 54.199 ms | 50.958 ms (94%) | 54.107 ms (99%) | 54.728 ms (100%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Date_extract | 129.822 ms | 188.917 ms (145%) | 115.080 ms (88%) | 119.575 ms (92%) | 127.221 ms (97%) |
+| Timestamp_trunc | 99.587 ms | 146.149 ms (146%) | 92.145 ms (92%) | 91.477 ms (91%) | 101.246 ms (101%) |
+| Interval_arith | 50.190 ms | 102.594 ms (204%) | 51.570 ms (102%) | 56.635 ms (112%) | 51.713 ms (103%) |
+| Timestamp_diff | 61.723 ms | 113.585 ms (184%) | 57.405 ms (93%) | 58.754 ms (95%) | 61.080 ms (98%) |
 
 ### Text/String
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Text_EQ_filter | 20.509 ms | 19.629 ms (95%) | 20.631 ms (100%) | 22.103 ms (107%) |
-| Text_LIKE | 25.633 ms | 23.747 ms (92%) | 25.124 ms (98%) | 26.483 ms (103%) |
-| Text_concat_agg | 19.953 ms | 18.165 ms (91%) | 19.720 ms (98%) | 22.314 ms (111%) |
-| Text_length_expr | 47.669 ms | 44.498 ms (93%) | 45.246 ms (94%) | 46.859 ms (98%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Text_EQ_filter | 23.248 ms | 81.092 ms (348%) | 22.477 ms (96%) | 22.756 ms (97%) | 24.707 ms (106%) |
+| Text_LIKE | 27.776 ms | 90.912 ms (327%) | 26.708 ms (96%) | 27.792 ms (100%) | 29.561 ms (106%) |
+| Text_concat_agg | 20.702 ms | 105.582 ms (510%) | 20.893 ms (100%) | 21.875 ms (105%) | 24.629 ms (118%) |
+| Text_length_expr | 30.463 ms | 96.502 ms (316%) | 27.881 ms (91%) | 28.000 ms (91%) | 30.444 ms (99%) |
 
 ### Numeric
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Numeric_agg | 68.546 ms | 66.985 ms (97%) | 72.175 ms (105%) | 80.726 ms (117%) |
-| Numeric_arith | 81.551 ms | 81.232 ms (99%) | 84.597 ms (103%) | 85.036 ms (104%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Numeric_agg | 70.700 ms | 149.643 ms (211%) | 70.624 ms (99%) | 72.306 ms (102%) | 84.633 ms (119%) |
+| Numeric_arith | 83.762 ms | 139.721 ms (166%) | 84.585 ms (100%) | 85.571 ms (102%) | 89.221 ms (106%) |
 
 ### JSONB
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| JSONB_extract | 50.605 ms | 49.416 ms (97%) | 54.846 ms (108%) | 53.859 ms (106%) |
-| JSONB_contains | 50.161 ms | 47.864 ms (95%) | 51.149 ms (101%) | 52.804 ms (105%) |
-| JSONB_agg | 112.723 ms | 110.236 ms (97%) | 114.602 ms (101%) | 122.739 ms (108%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| JSONB_extract | 49.727 ms | 113.307 ms (227%) | 50.136 ms (100%) | 49.791 ms (100%) | 56.278 ms (113%) |
+| JSONB_contains | 55.395 ms | 111.995 ms (202%) | 48.335 ms (87%) | 50.660 ms (91%) | 56.305 ms (101%) |
+| JSONB_agg | 121.103 ms | 183.570 ms (151%) | 119.484 ms (98%) | 112.908 ms (93%) | 128.432 ms (106%) |
 
 ### Arrays
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Array_overlap | 27.622 ms | 26.423 ms (95%) | 27.489 ms (99%) | 28.426 ms (102%) |
-| Array_contains | 20.481 ms | 19.653 ms (95%) | 20.541 ms (100%) | 21.316 ms (104%) |
-| Unnest_agg | 46.233 ms | 44.832 ms (96%) | 46.867 ms (101%) | 54.521 ms (117%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Array_overlap | 28.116 ms | 76.414 ms (271%) | 27.156 ms (96%) | 27.145 ms (96%) | 29.038 ms (103%) |
+| Array_contains | 20.937 ms | 68.977 ms (329%) | 19.876 ms (94%) | 19.993 ms (95%) | 22.017 ms (105%) |
+| Unnest_agg | 48.330 ms | 101.221 ms (209%) | 45.647 ms (94%) | 45.225 ms (93%) | 55.805 ms (115%) |
 
 ### Wide Row / Deform
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Wide_10col_sum | 76.482 ms | 67.918 ms (88%) | 62.359 ms (81%) | 67.613 ms (88%) |
-| Wide_20col_sum | 103.531 ms | 95.385 ms (92%) | 84.603 ms (81%) | 92.682 ms (89%) |
-| Wide_GroupBy_expr | 119.413 ms | 112.545 ms (94%) | 113.372 ms (94%) | 133.745 ms (112%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Wide_10col_sum | 78.920 ms | 114.280 ms (144%) | 71.557 ms (90%) | 60.549 ms (76%) | 70.362 ms (89%) |
+| Wide_20col_sum | 106.719 ms | 138.680 ms (129%) | 105.859 ms (99%) | 83.077 ms (77%) | 100.714 ms (94%) |
+| Wide_GroupBy_expr | 129.467 ms | 208.742 ms (161%) | 118.825 ms (91%) | 122.207 ms (94%) | 142.584 ms (110%) |
 
 ### Super-Wide Tables
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| Wide100_sum | 51.090 ms | 48.146 ms (94%) | 52.349 ms (102%) | 65.751 ms (128%) |
-| Wide100_groupby | 71.356 ms | 68.656 ms (96%) | 75.464 ms (105%) | 98.612 ms (138%) |
-| Wide100_filter | 45.748 ms | 41.370 ms (90%) | 46.241 ms (101%) | 56.226 ms (122%) |
-| Wide300_sum | 54.488 ms | 55.857 ms (102%) | 57.635 ms (105%) | 57.366 ms (105%) |
-| Wide300_groupby | 62.547 ms | 62.700 ms (100%) | 64.894 ms (103%) | 69.185 ms (110%) |
-| Wide300_filter | 52.441 ms | 54.200 ms (103%) | 55.880 ms (106%) | 54.426 ms (103%) |
-| Wide1K_sum | 86.571 ms | 88.902 ms (102%) | 89.096 ms (102%) | 88.996 ms (102%) |
-| Wide1K_groupby | 94.467 ms | 93.899 ms (99%) | 95.288 ms (100%) | 97.303 ms (103%) |
-| Wide1K_filter | 89.652 ms | 89.361 ms (99%) | 90.739 ms (101%) | 91.700 ms (102%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| Wide100_sum | 57.034 ms | 190.760 ms (334%) | 58.153 ms (101%) | 60.685 ms (106%) | 74.796 ms (131%) |
+| Wide100_groupby | 83.015 ms | 320.073 ms (385%) | 76.444 ms (92%) | 84.870 ms (102%) | 110.560 ms (133%) |
+| Wide100_filter | 54.906 ms | 196.316 ms (357%) | 49.490 ms (90%) | 51.303 ms (93%) | 62.411 ms (113%) |
+| Wide300_sum | 64.128 ms | 443.054 ms (690%) | 65.135 ms (101%) | 57.659 ms (89%) | 57.517 ms (89%) |
+| Wide300_groupby | 72.379 ms | 757.312 ms (1046%) | 66.405 ms (91%) | 71.833 ms (99%) | 77.622 ms (107%) |
+| Wide300_filter | 56.235 ms | 428.879 ms (762%) | 57.057 ms (101%) | 58.770 ms (104%) | 58.349 ms (103%) |
+| Wide1K_sum | 91.139 ms | 2016.595 ms (2212%) | 91.238 ms (100%) | 101.992 ms (111%) | 102.656 ms (112%) |
+| Wide1K_groupby | 96.964 ms | 3886.275 ms (4007%) | 106.637 ms (109%) | 106.501 ms (109%) | 110.080 ms (113%) |
+| Wide1K_filter | 91.711 ms | 2028.356 ms (2211%) | 101.712 ms (110%) | 103.535 ms (112%) | 103.097 ms (112%) |
 
 ### Partitioned
 
-| Query | No JIT | sljit | asmjit | mir |
-|-------|--------|------|------|------|
-| PartScan_filter | 19.196 ms | 17.694 ms (92%) | 17.969 ms (93%) | 19.474 ms (101%) |
-| PartScan_agg_all | 83.603 ms | 73.567 ms (87%) | 72.718 ms (86%) | 91.082 ms (108%) |
+| Query | No JIT | llvmjit | sljit | asmjit | mir |
+|-------|--------|------|------|------|------|
+| PartScan_filter | 19.867 ms | 79.573 ms (400%) | 17.420 ms (87%) | 18.153 ms (91%) | 21.028 ms (105%) |
+| PartScan_agg_all | 83.423 ms | 144.891 ms (173%) | 76.003 ms (91%) | 74.976 ms (89%) | 99.545 ms (119%) |
 
 ## JIT Compilation Overhead
 
 Time spent on JIT compilation (generation + optimization + emission), extracted from EXPLAIN JSON.
 
-| Query | sljit | asmjit | mir |
-|-------|------|------|------|
-| SUM_int | 0.047 ms | 0.383 ms | 1.496 ms |
-| COUNT_star | 0.045 ms | 0.405 ms | 0.75 ms |
-| GroupBy_5agg | 0.075 ms | 0.809 ms | 3.267 ms |
-| GroupBy_100K_grp | 0.071 ms | 0.625 ms | 2.898 ms |
-| COUNT_DISTINCT | 0.046 ms | 0.405 ms | 0.938 ms |
-| HashJoin_single | 0.077 ms | 0.841 ms | 3.959 ms |
-| HashJoin_composite | 0.077 ms | 0.845 ms | 4.37 ms |
-| HashJoin_filter | 0.09 ms | 0.796 ms | 5.004 ms |
-| HashJoin_GroupBy | 0.103 ms | 0.955 ms | 4.949 ms |
-| LeftJoin | 0.073 ms | 0.676 ms | 3.635 ms |
-| RightJoin | 0.065 ms | 0.595 ms | 2.403 ms |
-| FullOuterJoin | 0.132 ms | 0.8 ms | 4.872 ms |
-| EXISTS_semi | 0.072 ms | 0.74 ms | 3.467 ms |
-| NOT_EXISTS_anti | 0.057 ms | 0.513 ms | 2.066 ms |
-| IN_subquery | 0.098 ms | 0.853 ms | 3.47 ms |
-| INTERSECT | 0.041 ms | 0.365 ms | 0.814 ms |
-| EXCEPT | 0.058 ms | 0.373 ms | 0.802 ms |
-| UNION_ALL_agg | 0.041 ms | 0.344 ms | 0.788 ms |
-| CASE_simple | 0.051 ms | 0.429 ms | 1.689 ms |
-| CASE_searched_4way | 0.06 ms | 0.495 ms | 1.983 ms |
-| COALESCE_NULLIF | 0.054 ms | 0.439 ms | 1.647 ms |
-| Bool_AND_OR | 0.064 ms | 0.635 ms | 2.548 ms |
-| Arith_expr | 0.056 ms | 0.538 ms | 1.99 ms |
-| IN_list_20 | 0.064 ms | 0.552 ms | 2.155 ms |
-| Scalar_subq | 0.069 ms | 0.644 ms | 3.336 ms |
-| Correlated_subq | 0.11 ms | 0.839 ms | 3.65 ms |
-| LATERAL_top3 | 0.064 ms | 0.614 ms | 1.452 ms |
-| Date_extract | 0.076 ms | 0.815 ms | 2.484 ms |
-| Timestamp_trunc | 0.079 ms | 0.671 ms | 2.231 ms |
-| Interval_arith | 0.06 ms | 0.546 ms | 2.078 ms |
-| Timestamp_diff | 0.06 ms | 0.502 ms | 2.121 ms |
-| Text_EQ_filter | 0.064 ms | 0.537 ms | 1.513 ms |
-| Text_LIKE | 0.07 ms | 0.666 ms | 1.928 ms |
-| Text_concat_agg | 0.108 ms | 1.224 ms | 3.224 ms |
-| Text_length_expr | 0.07 ms | 0.74 ms | 2.005 ms |
-| Numeric_agg | 0.095 ms | 1.085 ms | 2.912 ms |
-| Numeric_arith | 0.135 ms | 0.733 ms | 1.754 ms |
-| JSONB_extract | 0.062 ms | 0.294 ms | 1.585 ms |
-| JSONB_contains | 0.067 ms | 0.093 ms | 1.734 ms |
-| JSONB_agg | 0.088 ms | 0.771 ms | 2.749 ms |
-| Array_overlap | 0.066 ms | 0.531 ms | 1.445 ms |
-| Array_contains | 0.06 ms | 0.529 ms | 1.45 ms |
-| Unnest_agg | 0.085 ms | 0.847 ms | 2.537 ms |
-| Wide_10col_sum | 0.083 ms | 1.081 ms | 3.647 ms |
-| Wide_20col_sum | 0.103 ms | 1.701 ms | 6.221 ms |
-| Wide_GroupBy_expr | 0.12 ms | 1.712 ms | 7.369 ms |
-| Wide100_sum | 0.197 ms | 3.868 ms | 15.045 ms |
-| Wide100_groupby | 0.205 ms | 4.028 ms | 15.632 ms |
-| Wide100_filter | 0.181 ms | 3.86 ms | 14.086 ms |
-| Wide300_sum | 0.047 ms | 0.363 ms | 0.831 ms |
-| Wide300_groupby | 0.071 ms | 0.549 ms | 1.494 ms |
-| Wide300_filter | 0.076 ms | 0.418 ms | 0.988 ms |
-| Wide1K_sum | 0.05 ms | 0.383 ms | 0.811 ms |
-| Wide1K_groupby | 0.067 ms | 0.536 ms | 1.595 ms |
-| Wide1K_filter | 0.052 ms | 0.448 ms | 1.128 ms |
-| PartScan_filter | 0.066 ms | 0.651 ms | 2.407 ms |
-| PartScan_agg_all | 0.078 ms | 0.784 ms | 3.898 ms |
+| Query | llvmjit | sljit | asmjit | mir |
+|-------|------|------|------|------|
+| SUM_int | 40.001 ms | 0.044 ms | 0.423 ms | 1.541 ms |
+| COUNT_star | 33.305 ms | 0.042 ms | 0.291 ms | 0.775 ms |
+| GroupBy_5agg | 74.026 ms | 0.073 ms | 0.795 ms | 3.397 ms |
+| GroupBy_100K_grp | 64.086 ms | 0.072 ms | 0.637 ms | 3.04 ms |
+| COUNT_DISTINCT | 41.072 ms | 0.05 ms | 0.349 ms | 0.876 ms |
+| HashJoin_single | 63.542 ms | 0.092 ms | 1.011 ms | 4.226 ms |
+| HashJoin_composite | 62.915 ms | 0.178 ms | 0.861 ms | 4.192 ms |
+| HashJoin_filter | 74.622 ms | 0.093 ms | 0.937 ms | 5.376 ms |
+| HashJoin_GroupBy | 85.382 ms | 0.122 ms | 1.199 ms | 5.312 ms |
+| LeftJoin | 65.176 ms | 0.092 ms | 0.771 ms | 3.293 ms |
+| RightJoin | 60.29 ms | 0.078 ms | 0.698 ms | 3.17 ms |
+| FullOuterJoin | 80.203 ms | 0.084 ms | 0.842 ms | 5.404 ms |
+| EXISTS_semi | 76.246 ms | 0.092 ms | 0.799 ms | 3.567 ms |
+| NOT_EXISTS_anti | 51.075 ms | 0.073 ms | 0.583 ms | 1.495 ms |
+| IN_subquery | 70.742 ms | 0.084 ms | 0.853 ms | 3.641 ms |
+| INTERSECT | 46.119 ms | 0.042 ms | 0.384 ms | 0.793 ms |
+| EXCEPT | 46.682 ms | 0.05 ms | 0.351 ms | 0.885 ms |
+| UNION_ALL_agg | 49.839 ms | 0.045 ms | 0.344 ms | 0.792 ms |
+| CASE_simple | 44.179 ms | 0.053 ms | 0.435 ms | 1.705 ms |
+| CASE_searched_4way | 44.98 ms | 0.059 ms | 0.483 ms | 2.136 ms |
+| COALESCE_NULLIF | 43.455 ms | 0.053 ms | 0.436 ms | 1.751 ms |
+| Bool_AND_OR | 50.332 ms | 0.067 ms | 0.716 ms | 2.589 ms |
+| Arith_expr | 45.057 ms | 0.054 ms | 0.504 ms | 2.075 ms |
+| IN_list_20 | 44.407 ms | 0.064 ms | 0.556 ms | 2.006 ms |
+| Scalar_subq | 67.175 ms | 0.07 ms | 0.663 ms | 3.284 ms |
+| Correlated_subq | 61.432 ms | 0.099 ms | 0.888 ms | 3.517 ms |
+| LATERAL_top3 | 43.713 ms | 0.095 ms | 0.518 ms | 1.418 ms |
+| Date_extract | 65.036 ms | 0.127 ms | 0.759 ms | 2.72 ms |
+| Timestamp_trunc | 51.981 ms | 0.072 ms | 0.542 ms | 2.01 ms |
+| Interval_arith | 49.176 ms | 0.07 ms | 0.54 ms | 2.178 ms |
+| Timestamp_diff | 50.865 ms | 0.063 ms | 0.427 ms | 2.223 ms |
+| Text_EQ_filter | 48.532 ms | 0.065 ms | 0.5 ms | 1.567 ms |
+| Text_LIKE | 52.893 ms | 0.07 ms | 0.621 ms | 2.226 ms |
+| Text_concat_agg | 73.536 ms | 0.096 ms | 1.099 ms | 3.321 ms |
+| Text_length_expr | 58.466 ms | 0.072 ms | 0.638 ms | 2.182 ms |
+| Numeric_agg | 75.179 ms | 0.093 ms | 0.974 ms | 3.011 ms |
+| Numeric_arith | 52.092 ms | 0.065 ms | 0.672 ms | 1.908 ms |
+| JSONB_extract | 55.342 ms | 0.067 ms | 0.249 ms | 1.533 ms |
+| JSONB_contains | 57.723 ms | 0.07 ms | 0.093 ms | 1.728 ms |
+| JSONB_agg | 74.191 ms | 0.092 ms | 0.837 ms | 2.843 ms |
+| Array_overlap | 44.054 ms | 0.063 ms | 0.474 ms | 1.621 ms |
+| Array_contains | 43.931 ms | 0.059 ms | 0.504 ms | 1.48 ms |
+| Unnest_agg | 54.142 ms | 0.091 ms | 0.77 ms | 2.674 ms |
+| Wide_10col_sum | 52.807 ms | 0.087 ms | 0.937 ms | 3.745 ms |
+| Wide_20col_sum | 65.451 ms | 0.106 ms | 1.618 ms | 6.541 ms |
+| Wide_GroupBy_expr | 95.996 ms | 0.131 ms | 1.688 ms | 7.792 ms |
+| Wide100_sum | 132.937 ms | 0.178 ms | 3.928 ms | 15.699 ms |
+| Wide100_groupby | 233.806 ms | 0.215 ms | 4.192 ms | 17.117 ms |
+| Wide100_filter | 145.384 ms | 0.186 ms | 3.834 ms | 15.065 ms |
+| Wide300_sum | 346.293 ms | 0.089 ms | 0.356 ms | 0.876 ms |
+| Wide300_groupby | 684.571 ms | 0.068 ms | 0.52 ms | 1.63 ms |
+| Wide300_filter | 350.977 ms | 0.052 ms | 0.406 ms | 1.091 ms |
+| Wide1K_sum | 1872.455 ms | 0.051 ms | 0.346 ms | 0.791 ms |
+| Wide1K_groupby | 3790.512 ms | 0.064 ms | 0.547 ms | 1.647 ms |
+| Wide1K_filter | 1785.233 ms | 0.052 ms | 0.488 ms | 1.0 ms |
+| PartScan_filter | 53.185 ms | 0.06 ms | 0.666 ms | 2.443 ms |
+| PartScan_agg_all | 67.675 ms | 0.101 ms | 0.694 ms | 4.254 ms |
 
 ## Key Observations
 
@@ -3857,4 +3857,4 @@ ANALYZE wide_1000;
 
 ---
 
-*Generated by `tests/bench_comprehensive.sh` on 2026-03-02*
+*Generated by `tests/bench_comprehensive.sh` on 2026-03-03*
