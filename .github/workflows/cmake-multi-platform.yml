@@ -1,0 +1,141 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04          # Linux x86_64
+          - ubuntu-24.04-arm      # Linux ARM64
+          - macos-15              # macOS ARM64 (Apple Silicon)
+          - windows-2022          # Windows x86_64
+          - windows-11-arm        # Windows ARM64
+        backends:
+          - "sljit"
+          - "asmjit"
+          - "mir"
+          - "sljit;asmjit"
+          - "sljit;mir"
+          - "asmjit;mir"
+          - "sljit;asmjit;mir"
+
+    runs-on: ${{ matrix.os }}
+    name: "${{ matrix.os }} — ${{ matrix.backends }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Install PostgreSQL ----
+      - name: Install PostgreSQL (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-server-dev-all
+
+      - name: Install PostgreSQL (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install postgresql@17
+
+      - name: Install PostgreSQL (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          choco install postgresql17 --params '/Password:postgres' -y --no-progress
+          echo "C:/Program Files/PostgreSQL/17/bin" >> "$GITHUB_PATH"
+
+      # ---- Clone dependencies ----
+      - name: Clone sljit
+        if: contains(matrix.backends, 'sljit')
+        uses: actions/checkout@v4
+        with:
+          repository: zherczeg/sljit
+          path: deps/sljit
+
+      - name: Clone AsmJIT
+        if: contains(matrix.backends, 'asmjit')
+        uses: actions/checkout@v4
+        with:
+          repository: asmjit/asmjit
+          path: deps/asmjit
+
+      - name: Clone MIR
+        if: contains(matrix.backends, 'mir')
+        uses: actions/checkout@v4
+        with:
+          repository: vladich/mir-patched
+          path: deps/mir
+
+      # ---- Configure & Build (Unix) ----
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
+
+          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          fi
+          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          fi
+          if [[ "${{ matrix.backends }}" == *mir* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
+          fi
+
+          # Find pg_config
+          if command -v pg_config >/dev/null 2>&1; then
+            PG_CFG=pg_config
+          elif [ -x "/opt/homebrew/opt/postgresql@17/bin/pg_config" ]; then
+            PG_CFG=/opt/homebrew/opt/postgresql@17/bin/pg_config
+          elif [ -x "/usr/local/opt/postgresql@17/bin/pg_config" ]; then
+            PG_CFG=/usr/local/opt/postgresql@17/bin/pg_config
+          else
+            PG_CFG=$(find /usr -name pg_config -type f 2>/dev/null | head -1)
+          fi
+          echo "Using pg_config: $PG_CFG"
+
+          cmake -B build -DPG_CONFIG="$PG_CFG" $CMAKE_ARGS
+
+      # ---- Configure & Build (Windows) ----
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
+
+          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          fi
+          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          fi
+          if [[ "${{ matrix.backends }}" == *mir* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
+          fi
+
+          PG_CFG="C:/Program Files/PostgreSQL/17/bin/pg_config.exe"
+          cmake -B build -DPG_CONFIG="$PG_CFG" $CMAKE_ARGS
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # ---- Verify ----
+      - name: Verify built libraries (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          echo "Built libraries:"
+          find build -name 'pg_jitter*' \( -name '*.so' -o -name '*.dylib' \) | sort
+          test -n "$(find build -name 'pg_jitter.so' -o -name 'pg_jitter.dylib' | head -1)"
+
+      - name: Verify built libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "Built libraries:"
+          find build -name 'pg_jitter*' -name '*.dll' | sort
