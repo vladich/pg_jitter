@@ -5,7 +5,7 @@
 #   ./build.sh [--pg-config PATH] [sljit|asmjit|mir|meta|all] [cmake args...]
 #
 # Examples:
-#   ./build.sh                                          # build all 3
+#   ./build.sh                                          # build all backends
 #   ./build.sh sljit                                    # build sljit only
 #   ./build.sh --pg-config /opt/pg18/bin/pg_config all  # custom PG install
 #   ./build.sh sljit -DPG_JITTER_USE_LLVM=ON            # sljit with LLVM blobs
@@ -52,43 +52,38 @@ if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
     exit 1
 fi
 
-build_backend() {
-    local name="$1"
-    shift
-    local build_dir="$SCRIPT_DIR/build/$name"
-
-    # meta-provider target is "pg_jitter", not "pg_jitter_meta"
-    local target="pg_jitter_$name"
-    if [ "$name" = "meta" ]; then
-        target="pg_jitter"
-    fi
-
-    echo ""
-    echo "=== Building $name ==="
-    mkdir -p "$build_dir"
-    cd "$build_dir"
-
-    cmake "$SCRIPT_DIR/cmake" \
-        -DPG_CONFIG="$PG_CONFIG" \
-        -DBACKEND="$name" \
-        "$@"
-
-    make -j"$JOBS" "$target"
-    echo "  -> $(ls -lh "$build_dir/$target.dylib" 2>/dev/null || ls -lh "$build_dir/$target.so" 2>/dev/null | awk '{print $5, $NF}')"
-}
-
+# Map target to backend list for CMake
 case "$TARGET" in
-    sljit)  build_backend sljit  "${CMAKE_EXTRA_ARGS[@]}" ;;
-    asmjit) build_backend asmjit "${CMAKE_EXTRA_ARGS[@]}" ;;
-    mir)    build_backend mir    "${CMAKE_EXTRA_ARGS[@]}" ;;
-    meta)   build_backend meta   "${CMAKE_EXTRA_ARGS[@]}" ;;
-    all)
-        build_backend sljit  "${CMAKE_EXTRA_ARGS[@]}"
-        build_backend asmjit "${CMAKE_EXTRA_ARGS[@]}"
-        build_backend mir    "${CMAKE_EXTRA_ARGS[@]}"
-        build_backend meta   "${CMAKE_EXTRA_ARGS[@]}"
-        ;;
+    sljit)  BACKENDS_LIST="sljit" ;;
+    asmjit) BACKENDS_LIST="asmjit" ;;
+    mir)    BACKENDS_LIST="mir" ;;
+    meta)   BACKENDS_LIST="" ;;
+    all)    BACKENDS_LIST="" ;;  # empty = use CMakeLists.txt default (auto-detect)
 esac
+
+# Determine PG version for per-version build directory
+PG_VERSION=$("$PG_CONFIG" --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
+BUILD_DIR="$SCRIPT_DIR/build/pg$PG_VERSION"
+
+echo ""
+echo "=== Building pg_jitter ($TARGET) for PostgreSQL $PG_VERSION ==="
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+CMAKE_ARGS=(
+    -DPG_CONFIG="$PG_CONFIG"
+)
+
+# Only override backends if a specific one was requested
+if [ "$TARGET" != "all" ] && [ "$TARGET" != "meta" ]; then
+    CMAKE_ARGS+=(-DPG_JITTER_BACKENDS="$BACKENDS_LIST")
+elif [ "$TARGET" = "meta" ]; then
+    CMAKE_ARGS+=(-DPG_JITTER_BACKENDS="")
+fi
+
+cmake "$SCRIPT_DIR" "${CMAKE_ARGS[@]}" "${CMAKE_EXTRA_ARGS[@]}"
+
+make -j"$JOBS"
 
 echo ""
 echo "=== Done ==="

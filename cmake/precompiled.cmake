@@ -173,15 +173,31 @@ if(PG_JITTER_USE_LLVM)
                         --output ${TIER2_IR} --arch ${PRECOMPILED_ARCH}
                 DEPENDS ${GEN_TIER2_SCRIPT}
                 COMMENT "Generating LLVM IR wrappers for Tier 2 functions")
-            add_custom_command(OUTPUT ${TIER2_LINKED}
+            # Strip dso_local from PG bitcode: PG compiles with dso_local which
+            # forces R_X86_64_PC32 relocations even under -relocation-model=pic,
+            # breaking linking into shared objects.
+            set(TIER2_LINKED_RAW "${CMAKE_BINARY_DIR}/tier2_linked_raw.bc")
+            set(TIER2_LINKED_LL "${CMAKE_BINARY_DIR}/tier2_linked.ll")
+            find_program(LLVM_DIS_EXE NAMES llvm-dis llvm-dis-18 llvm-dis-17
+                         HINTS ${_llvm_hints})
+            find_program(LLVM_AS_EXE NAMES llvm-as llvm-as-18 llvm-as-17
+                         HINTS ${_llvm_hints})
+
+            add_custom_command(OUTPUT ${TIER2_LINKED_RAW}
                 COMMAND ${LLVM_LINK_EXE} ${TIER2_IR}
                         ${PG_BITCODE_DIR}/utils/adt/numeric.bc
                         ${PG_BITCODE_DIR}/utils/adt/varlena.bc
                         ${PG_BITCODE_DIR}/utils/adt/uuid.bc
                         ${PG_BITCODE_DIR}/utils/adt/timestamp.bc
-                        -o ${TIER2_LINKED}
+                        -o ${TIER2_LINKED_RAW}
                 DEPENDS ${TIER2_IR}
                 COMMENT "Linking Tier 2 wrappers with PG bitcode")
+            add_custom_command(OUTPUT ${TIER2_LINKED}
+                COMMAND ${LLVM_DIS_EXE} ${TIER2_LINKED_RAW} -o ${TIER2_LINKED_LL}
+                COMMAND sed -i "s/ dso_local / /g" ${TIER2_LINKED_LL}
+                COMMAND ${LLVM_AS_EXE} ${TIER2_LINKED_LL} -o ${TIER2_LINKED}
+                DEPENDS ${TIER2_LINKED_RAW}
+                COMMENT "Stripping dso_local from linked bitcode for PIC compatibility")
             add_custom_command(OUTPUT ${TIER2_OPT}
                 COMMAND ${LLVM_OPT_EXE} -O2 ${TIER2_LINKED} -o ${TIER2_OPT}
                 DEPENDS ${TIER2_LINKED}
