@@ -28,35 +28,36 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: "${{ matrix.os }} — ${{ matrix.backends }}"
 
-    env:
-      PGPORT: "5432"
-
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Install PostgreSQL ----
-      - name: Install PostgreSQL (Ubuntu)
+      # ---- Install PostgreSQL dev headers ----
+      - name: Install PostgreSQL dev headers (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-17 postgresql-server-dev-17
+          sudo apt-get install -y -qq postgresql-server-dev-17
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
-      - name: Install PostgreSQL (macOS)
+      - name: Install PostgreSQL dev headers (macOS)
         if: startsWith(matrix.os, 'macos')
         run: |
-          brew install postgresql@17
+          brew install postgresql@17 gettext
           echo "/opt/homebrew/opt/postgresql@17/bin" >> "$GITHUB_PATH"
+          echo "GETTEXT_INCLUDE=-I$(brew --prefix gettext)/include" >> "$GITHUB_ENV"
 
-      - name: Install PostgreSQL (Windows)
+      - name: Find PostgreSQL (Windows)
         if: startsWith(matrix.os, 'windows')
         shell: bash
         run: |
-          choco install postgresql17 --params '/Password:postgres' -y --no-progress
-          echo "C:/Program Files/PostgreSQL/17/bin" >> "$GITHUB_PATH"
+          # GH runner images have PostgreSQL pre-installed
+          PG_DIR=$(ls -d "C:/Program Files/PostgreSQL/"* 2>/dev/null | sort -V | tail -1)
+          echo "Found PostgreSQL at: $PG_DIR"
+          echo "$PG_DIR/bin" >> "$GITHUB_PATH"
+          "$PG_DIR/bin/pg_config.exe" --version
 
       # ---- Clone dependencies ----
       - name: Clone sljit
@@ -96,6 +97,11 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           fi
 
+          # macOS: PG headers need gettext's libintl.h
+          if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
+          fi
+
           pg_config --version
           cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
 
@@ -116,12 +122,12 @@ jobs:
           fi
 
           pg_config.exe --version
-          cmake -B build -G "MinGW Makefiles" -DPG_CONFIG="$(command -v pg_config.exe)" $CMAKE_ARGS
+          cmake -B build -DPG_CONFIG="$(command -v pg_config.exe)" $CMAKE_ARGS
 
       - name: Build
         run: cmake --build build --parallel
 
-      # ---- Install into PG ----
+      # ---- Install pg_jitter into PG ----
       - name: Install pg_jitter (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -140,57 +146,36 @@ jobs:
           cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
           ls "$PKGLIBDIR"/pg_jitter*
 
-      # ---- Start PostgreSQL ----
-      - name: Start PostgreSQL (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          # Use the cluster auto-started by the postgresql-17 package
-          PGDATA=$(sudo -u postgres psql -t -A -c "SHOW data_directory;" 2>/dev/null || echo "/var/lib/postgresql/17/main")
+      # ---- Start PostgreSQL with pg_jitter ----
+      - name: Start PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: "17"
+        id: postgres
 
-          # Configure jit_provider
-          echo "jit_provider = 'pg_jitter'" | sudo tee -a "$PGDATA/postgresql.conf"
-          sudo pg_ctlcluster 17 main restart
-
-          # Create test database
-          sudo -u postgres createdb test
-          echo "PostgreSQL ready on port $PGPORT"
-
-      - name: Start PostgreSQL (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          PGDATA=/tmp/pg_jitter_ci
-          initdb -D "$PGDATA" --no-locale
-          echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
-          echo "port = $PGPORT" >> "$PGDATA/postgresql.conf"
-          pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
-          sleep 1
-          createdb test
-          echo "PostgreSQL ready on port $PGPORT"
-
-      - name: Start PostgreSQL (Windows)
-        if: startsWith(matrix.os, 'windows')
+      - name: Configure pg_jitter and restart
         shell: bash
         run: |
-          # Windows choco install starts PG automatically
-          net stop postgresql-x64-17 2>/dev/null || true
-          echo "jit_provider = 'pg_jitter'" >> "C:/Program Files/PostgreSQL/17/data/postgresql.conf"
-          net start postgresql-x64-17
-          sleep 2
-          createdb -U postgres test
-          echo "PostgreSQL ready on port $PGPORT"
+          PGDATA=$(psql "${{ steps.postgres.outputs.connection-uri }}" -t -A -c "SHOW data_directory;")
+          echo "PGDATA: $PGDATA"
+
+          # Stop, configure, restart
+          pg_ctl -D "$PGDATA" stop -m fast
+          echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
+          pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+          sleep 1
+
+          # Verify
+          psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
 
       # ---- Test ----
-      - name: Smoke test (Unix)
-        if: runner.os != 'Windows'
+      - name: Smoke test
+        shell: bash
         run: |
           FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
+          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
 
-          PSQL_CMD="psql -d test"
-          if [[ "${{ matrix.os }}" == ubuntu* ]]; then
-            PSQL_CMD="sudo -u postgres psql -d test"
-          fi
-
-          $PSQL_CMD -c "
+          psql "$CONNURI" -c "
             SET jit = on;
             SET jit_above_cost = 0;
             SET jit_inline_above_cost = 0;
@@ -198,7 +183,7 @@ jobs:
             SET pg_jitter.backend = '$FIRST_BACKEND';
             SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
           "
-          $PSQL_CMD -c "
+          psql "$CONNURI" -c "
             SET jit = on;
             SET jit_above_cost = 0;
             SET pg_jitter.backend = '$FIRST_BACKEND';
@@ -208,22 +193,3 @@ jobs:
             GROUP BY bucket
             ORDER BY bucket;
           " | tail -5
-
-      - name: Smoke test (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
-          psql -U postgres -d test -c "
-            SET jit = on;
-            SET jit_above_cost = 0;
-            SET jit_inline_above_cost = 0;
-            SET jit_optimize_above_cost = 0;
-            SET pg_jitter.backend = '$FIRST_BACKEND';
-            SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
-          "
-
-      # ---- Cleanup ----
-      - name: Stop PostgreSQL (macOS)
-        if: startsWith(matrix.os, 'macos') && always()
-        run: pg_ctl -D /tmp/pg_jitter_ci stop -m fast 2>/dev/null || true
