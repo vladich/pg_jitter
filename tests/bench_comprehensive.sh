@@ -222,7 +222,7 @@ restore_provider() {
         # Overwrite postgresql.auto.conf to restore jit_provider
         # (psql might fail if server crashed from llvmjit)
         if [ -f "$PGDATA/postgresql.auto.conf" ]; then
-            sed -i '' "/jit_provider/d" "$PGDATA/postgresql.auto.conf"
+            sed -i.bak "/jit_provider/d" "$PGDATA/postgresql.auto.conf" && rm -f "$PGDATA/postgresql.auto.conf.bak"
             echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.auto.conf"
         fi
         "$PGCTL" -D "$PGDATA" start -l "$PGDATA/logfile" -w 2>/dev/null || true
@@ -754,7 +754,7 @@ JIT_HEADER
         jit_sep+="------|"
     done
     # Rewrite the last partial header (macOS-compatible sed -i)
-    sed -i '' '$ d' "$MD_FILE"
+    sed -i.bak '$ d' "$MD_FILE" && rm -f "$MD_FILE.bak"
     echo "$jit_header" >> "$MD_FILE"
     echo "$jit_sep" >> "$MD_FILE"
 
