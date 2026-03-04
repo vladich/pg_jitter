@@ -1,0 +1,178 @@
+name: Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04          # Linux x86_64
+          - ubuntu-24.04-arm      # Linux ARM64
+          - macos-15              # macOS ARM64 (Apple Silicon)
+          - windows-2022          # Windows x86_64
+#          - windows-11-arm        # Windows ARM64 (no PG installer available)
+        backends:
+#          - "sljit"
+#          - "asmjit"
+#          - "mir"
+#          - "sljit;asmjit"
+#          - "sljit;mir"
+#          - "asmjit;mir"
+          - "sljit;asmjit;mir"
+
+    runs-on: ${{ matrix.os }}
+    name: "${{ matrix.os }} — ${{ matrix.backends }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- PostgreSQL: running server + pg_config on PATH ----
+      - name: Setup PostgreSQL
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: "17"
+        id: postgres
+
+      # Ubuntu: action provides server but not dev headers
+      - name: Install PostgreSQL dev headers (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-server-dev-17
+
+      # macOS: PG headers include <libintl.h> which comes from gettext
+      - name: Install gettext (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install gettext
+          echo "GETTEXT_INCLUDE=-I$(brew --prefix gettext)/include" >> "$GITHUB_ENV"
+
+      - name: Verify pg_config
+        shell: bash
+        run: |
+          pg_config --version
+          echo "includedir-server: $(pg_config --includedir-server)"
+          echo "includedir:        $(pg_config --includedir)"
+          echo "pkglibdir:         $(pg_config --pkglibdir)"
+
+      # ---- Clone dependencies ----
+      - name: Clone sljit
+        if: contains(matrix.backends, 'sljit')
+        uses: actions/checkout@v4
+        with:
+          repository: zherczeg/sljit
+          path: deps/sljit
+
+      - name: Clone AsmJIT
+        if: contains(matrix.backends, 'asmjit')
+        uses: actions/checkout@v4
+        with:
+          repository: asmjit/asmjit
+          path: deps/asmjit
+
+      - name: Clone MIR
+        if: contains(matrix.backends, 'mir')
+        uses: actions/checkout@v4
+        with:
+          repository: vladich/mir-patched
+          path: deps/mir
+
+      # ---- Configure & Build ----
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
+
+          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          fi
+          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          fi
+          if [[ "${{ matrix.backends }}" == *mir* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
+          fi
+
+          # macOS: PG headers need gettext's libintl.h
+          if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
+          fi
+
+          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
+
+          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          fi
+          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          fi
+          if [[ "${{ matrix.backends }}" == *mir* ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
+          fi
+
+          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # ---- Install pg_jitter & restart with it ----
+      - name: Install pg_jitter and restart PostgreSQL
+        shell: bash
+        run: |
+          PKGLIBDIR="$(pg_config --pkglibdir)"
+          echo "Installing to $PKGLIBDIR"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp build/Debug/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+            cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+          else
+            sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
+            sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
+          fi
+          ls "$PKGLIBDIR"/pg_jitter*
+
+          # Restart with pg_jitter
+          PGDATA=$(psql "${{ steps.postgres.outputs.connection-uri }}" -t -A -c "SHOW data_directory;")
+          echo "PGDATA: $PGDATA"
+          pg_ctl -D "$PGDATA" stop -m fast
+          echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
+          pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+          sleep 1
+          psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
+
+      # ---- Test ----
+      - name: Smoke test
+        shell: bash
+        run: |
+          FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
+          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+
+          psql "$CONNURI" -c "
+            SET jit = on;
+            SET jit_above_cost = 0;
+            SET jit_inline_above_cost = 0;
+            SET jit_optimize_above_cost = 0;
+            SET pg_jitter.backend = '$FIRST_BACKEND';
+            SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
+          "
+          psql "$CONNURI" -c "
+            SET jit = on;
+            SET jit_above_cost = 0;
+            SET pg_jitter.backend = '$FIRST_BACKEND';
+            EXPLAIN (ANALYZE, COSTS OFF, SUMMARY ON)
+            SELECT i % 100 AS bucket, sum(i), avg(i)
+            FROM generate_series(1, 100000) i
+            GROUP BY bucket
+            ORDER BY bucket;
+          " | tail -5
