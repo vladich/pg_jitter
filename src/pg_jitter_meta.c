@@ -32,7 +32,6 @@
 #include "storage/dsm.h"
 #include "storage/shmem.h"
 #include "port/atomics.h"
-#include "pg_jitter_common.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
 
