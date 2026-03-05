@@ -16,15 +16,26 @@
 #include "utils/resowner.h"
 #include "access/parallel.h"
 #include "storage/dsm.h"
+#ifndef __cplusplus
 #include "port/atomics.h"
+#endif
 
 /*
  * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
  * compiled JIT code between leader and parallel workers via DSM.
+ *
+ * Note: pg_atomic_uint32 is replaced with uint32 for C++ because PG's
+ * atomics headers use MSVC intrinsics with LONG64* casts that are
+ * incompatible with C++ strict type checking.  The atomic operations
+ * are only used in pg_jitter_common.c (compiled as C).
  */
 typedef struct SharedJitCompiledCode
 {
+#ifdef __cplusplus
+	uint32		lock;				/* simple spinlock (atomic ops in C code only) */
+#else
 	pg_atomic_uint32 lock;			/* simple spinlock for concurrent writes */
+#endif
 	int			num_entries;
 	Size		capacity;			/* total allocated size */
 	Size		used;				/* bytes used so far (header + entries) */
@@ -65,7 +76,11 @@ typedef struct CompiledCode
 typedef struct JitDsmSlotTable
 {
 	int					num_slots;
+#ifdef __cplusplus
+	uint32				handles[FLEXIBLE_ARRAY_MEMBER];
+#else
 	pg_atomic_uint32	handles[FLEXIBLE_ARRAY_MEMBER];
+#endif
 } JitDsmSlotTable;
 
 extern dsm_handle pg_jitter_shmem_get_dsm_handle(int proc_index);
