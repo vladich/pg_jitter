@@ -27,7 +27,7 @@
 #endif
 
 /* GUC: pg_jitter.parallel_mode — shared across backends */
-int pg_jitter_parallel_mode = 2; /* PARALLEL_JIT_SHARED */
+int pg_jitter_parallel_mode = 1; /* PARALLEL_JIT_PER_WORKER */
 
 /* GUC: pg_jitter.shared_code_max — cap in KB */
 int pg_jitter_shared_code_max_kb = 4096; /* 4 MB default */

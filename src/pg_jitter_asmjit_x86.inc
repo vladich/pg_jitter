@@ -2259,15 +2259,31 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_CASE_TESTVAL:
 			case EEOP_DOMAIN_TESTVAL:
 			{
-				/* *op->resvalue = *op->d.casetest.value */
-				cc.mov(tmp1, (uint64_t) op->d.casetest.value);
-				cc.mov(tmp2, x86::qword_ptr(tmp1));
+				/*
+				 * If d.casetest.value is non-NULL, dereference it.
+				 * Otherwise read from econtext (JSON_TABLE etc.).
+				 */
+				if (op->d.casetest.value) {
+					cc.mov(tmp1, (uint64_t) op->d.casetest.value);
+					cc.mov(tmp2, x86::qword_ptr(tmp1));
+				} else {
+					int cv_off = (opcode == EEOP_CASE_TESTVAL)
+						? offsetof(ExprContext, caseValue_datum)
+						: offsetof(ExprContext, domainValue_datum);
+					cc.mov(tmp2, x86::qword_ptr(v_econtext, cv_off));
+				}
 				cc.mov(tmp3, (uint64_t) op->resvalue);
 				cc.mov(x86::qword_ptr(tmp3), tmp2);
 
-				/* *op->resnull = *op->d.casetest.isnull */
-				cc.mov(tmp1, (uint64_t) op->d.casetest.isnull);
-				cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				if (op->d.casetest.isnull) {
+					cc.mov(tmp1, (uint64_t) op->d.casetest.isnull);
+					cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1));
+				} else {
+					int cn_off = (opcode == EEOP_CASE_TESTVAL)
+						? offsetof(ExprContext, caseValue_isNull)
+						: offsetof(ExprContext, domainValue_isNull);
+					cc.movzx(tmp2.r32(), x86::byte_ptr(v_econtext, cn_off));
+				}
 				cc.mov(tmp3, (uint64_t) op->resnull);
 				cc.mov(x86::byte_ptr(tmp3), tmp2.r8());
 				break;
@@ -2947,8 +2963,13 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(op_reg, (uint64_t) op);
 				InvokeNode *invoke;
 				x86::Gp ret_reg = cc.new_gp64();
+				/*
+				 * ExecEvalJsonExprPath returns int (32-bit).  Use int32_t
+				 * in signature so AsmJIT properly sign-extends the return
+				 * value (upper 32 bits of rax may be undefined).
+				 */
 				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *, void *>());
+						  FuncSignature::build<int32_t, void *, void *, void *>());
 				invoke->set_arg(0, v_state);
 				invoke->set_arg(1, op_reg);
 				invoke->set_arg(2, v_econtext);

@@ -114,7 +114,7 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
                              "per_worker (each worker compiles independently), "
                              "shared (leader shares compiled code via DSM)",
                              NULL, &pg_jitter_parallel_mode,
-                             PARALLEL_JIT_SHARED, parallel_jit_options,
+                             PARALLEL_JIT_PER_WORKER, parallel_jit_options,
                              PGC_USERSET, GUC_ALLOW_IN_PARALLEL, NULL, NULL,
                              NULL);
   }
@@ -4749,17 +4749,36 @@ static bool sljit_compile_expr(ExprState *state) {
      * Copy casetest value/null into resvalue/resnull.
      */
     case EEOP_CASE_TESTVAL: {
-      /* *op->resvalue = *op->d.casetest.value */
-      emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.value),
-                           SLJIT_R0);
-      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
-      emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+      /*
+       * If d.casetest.value is non-NULL, read from it.
+       * Otherwise fall back to econtext->caseValue_datum/isNull.
+       * This matches the interpreter which checks for NULL because
+       * some callers (e.g. JSON_TABLE) set caseValue via econtext
+       * at runtime rather than through innermost_caseval at init.
+       */
+      if (op->d.casetest.value) {
+        /* *op->resvalue = *op->d.casetest.value */
+        emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.value),
+                             SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
 
-      /* *op->resnull = *op->d.casetest.isnull */
-      emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.isnull),
-                           SLJIT_R0);
-      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
-      emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+        /* *op->resnull = *op->d.casetest.isnull */
+        emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.isnull),
+                             SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+        emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+      } else {
+        /* *op->resvalue = econtext->caseValue_datum */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                       offsetof(ExprContext, caseValue_datum));
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+
+        /* *op->resnull = econtext->caseValue_isNull */
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                       offsetof(ExprContext, caseValue_isNull));
+        emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+      }
       break;
     }
 
@@ -4784,17 +4803,26 @@ static bool sljit_compile_expr(ExprState *state) {
      * copy from cached pointer or from econtext fields.
      */
     case EEOP_DOMAIN_TESTVAL: {
-      /* *op->resvalue = *op->d.casetest.value */
-      emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.value),
-                           SLJIT_R0);
-      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
-      emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+      /* Same NULL check as CASE_TESTVAL — see interpreter comment. */
+      if (op->d.casetest.value) {
+        emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.value),
+                             SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
 
-      /* *op->resnull = *op->d.casetest.isnull */
-      emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.isnull),
-                           SLJIT_R0);
-      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
-      emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+        emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.casetest.isnull),
+                             SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+        emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+      } else {
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                       offsetof(ExprContext, domainValue_datum));
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                       offsetof(ExprContext, domainValue_isNull));
+        emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+      }
       break;
     }
 
@@ -6126,7 +6154,7 @@ static bool sljit_compile_expr(ExprState *state) {
       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
       emit_load_step_addr(C, opno, SLJIT_R1);
       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_S1, 0);
-      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(W, P, P, P), ExecEvalJsonExprPath);
+      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, P, P, P), ExecEvalJsonExprPath);
 
       /* Collect unique valid targets */
       targets[ntargets++] = jsestate->jump_end;
