@@ -75,6 +75,21 @@ execute_process(COMMAND ${PG_CONFIG} --pkglibdir
 execute_process(COMMAND ${PG_CONFIG} --libdir
     OUTPUT_VARIABLE PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
+# Extract CPPFLAGS from pg_config for additional include paths (e.g. libintl)
+execute_process(COMMAND ${PG_CONFIG} --cppflags
+    OUTPUT_VARIABLE PG_CPPFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(PG_CPPFLAGS)
+    separate_arguments(_pg_cppflags_list NATIVE_COMMAND "${PG_CPPFLAGS}")
+    foreach(_flag IN LISTS _pg_cppflags_list)
+        if(_flag MATCHES "^-I(.+)")
+            list(APPEND PG_EXTRA_INCLUDE_DIRS "${CMAKE_MATCH_1}")
+        else()
+            string(APPEND CMAKE_C_FLAGS " ${_flag}")
+            string(APPEND CMAKE_CXX_FLAGS " ${_flag}")
+        endif()
+    endforeach()
+endif()
+
 message(STATUS "PG server includes: ${PG_INCLUDEDIR_SERVER}")
 message(STATUS "PG includes:        ${PG_INCLUDEDIR}")
 message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
@@ -205,7 +220,7 @@ endif()
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
-    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
+    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS})
     if(WIN32)
         # Our compat headers must come first to provide mmap/sysconf/etc.
         # that PG's own win32_msvc headers are missing.
@@ -272,7 +287,7 @@ endif()
 
 # ---------- pg_jitter meta-provider (always built) ----------
 add_library(pg_jitter MODULE src/pg_jitter_meta.c)
-target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
+target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS})
 if(WIN32)
     target_include_directories(pg_jitter BEFORE PRIVATE
         ${CMAKE_SOURCE_DIR}/compat/win32

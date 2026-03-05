@@ -463,6 +463,7 @@ mir_emit_deform_inline(MIR_context_t ctx, MIR_item_t func_item, MIR_func_t f,
   MIR_insn_t *att_labels;
   MIR_insn_t deform_done;
 
+
   /* --- Guards --- */
   if (ops == &TTSOpsVirtual)
     return false;

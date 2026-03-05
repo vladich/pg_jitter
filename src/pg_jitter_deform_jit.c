@@ -1417,6 +1417,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	TupleDesc desc = slot->tts_tupleDescriptor;
 	const TupleTableSlotOps *ops = slot->tts_ops;
 	void *fn = NULL;
+	uint32 ahash = 0;
 	int i;
 
 	if (natts > WIDE_DEFORM_LIMIT)
@@ -1432,36 +1433,39 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		return;
 	}
 
-	/* TupleDesc-pointer fast path — O(1) for repeated calls within a query.
-	 * Pointer is stable within a query; cache is cleared at query end
-	 * (pg_jitter_release_context) to prevent stale pointer matches. */
-	for (i = 0; i < n_dispatch_fast; i++)
+	if (pg_jitter_deform_cache)
 	{
-		DispatchFastEntry *fe = &dispatch_fast[i];
-		if (fe->desc == desc && fe->natts == natts)
+		/* TupleDesc-pointer fast path — O(1) for repeated calls within a query.
+		 * Pointer is stable within a query; cache is cleared at query end
+		 * (pg_jitter_release_context) to prevent stale pointer matches. */
+		for (i = 0; i < n_dispatch_fast; i++)
 		{
-			/* Move to front (MRU) for hot-path O(1) */
-			if (i > 0)
+			DispatchFastEntry *fe = &dispatch_fast[i];
+			if (fe->desc == desc && fe->natts == natts)
 			{
-				DispatchFastEntry tmp = *fe;
-				memmove(&dispatch_fast[1], &dispatch_fast[0],
-						i * sizeof(DispatchFastEntry));
-				dispatch_fast[0] = tmp;
+				/* Move to front (MRU) for hot-path O(1) */
+				if (i > 0)
+				{
+					DispatchFastEntry tmp = *fe;
+					memmove(&dispatch_fast[1], &dispatch_fast[0],
+							i * sizeof(DispatchFastEntry));
+					dispatch_fast[0] = tmp;
+				}
+				((void (*)(TupleTableSlot *)) dispatch_fast[0].fn)(slot);
+				return;
 			}
-			((void (*)(TupleTableSlot *)) dispatch_fast[0].fn)(slot);
-			return;
 		}
-	}
 
-	/* Full lookup with FNV hash (first call or different table/RECORD) */
-	uint32 ahash = deform_attrs_hash(desc, natts);
-	for (i = 0; i < n_deform_dispatch; i++)
-	{
-		DeformDispatchEntry *e = &deform_dispatch_cache[i];
-		if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
+		/* Full lookup with FNV hash (first call or different table/RECORD) */
+		ahash = deform_attrs_hash(desc, natts);
+		for (i = 0; i < n_deform_dispatch; i++)
 		{
-			fn = e->fn;
-			goto found;
+			DeformDispatchEntry *e = &deform_dispatch_cache[i];
+			if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
+			{
+				fn = e->fn;
+				goto found;
+			}
 		}
 	}
 
@@ -1473,27 +1477,30 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 
 	if (fn)
 	{
-		/* Cache for future calls (code persists for backend lifetime) */
-		if (n_deform_dispatch < DEFORM_DISPATCH_CACHE_SIZE)
+		if (pg_jitter_deform_cache)
 		{
-			DeformDispatchEntry *e = &deform_dispatch_cache[n_deform_dispatch++];
-			e->attrs_hash = ahash;
-			e->natts = natts;
-			e->ops = ops;
-			e->fn = fn;
-		}
+			/* Cache for future calls (code persists for backend lifetime) */
+			if (n_deform_dispatch < DEFORM_DISPATCH_CACHE_SIZE)
+			{
+				DeformDispatchEntry *e = &deform_dispatch_cache[n_deform_dispatch++];
+				e->attrs_hash = ahash;
+				e->natts = natts;
+				e->ops = ops;
+				e->fn = fn;
+			}
 found:
-		/* Add to TupleDesc-pointer fast-path cache (MRU front insertion) */
-		{
-			int slot_idx = (n_dispatch_fast < DISPATCH_FASTPATH_SIZE)
-				? n_dispatch_fast++ : DISPATCH_FASTPATH_SIZE - 1;
-			if (slot_idx > 0)
-				memmove(&dispatch_fast[1], &dispatch_fast[0],
-						slot_idx * sizeof(DispatchFastEntry));
-			dispatch_fast[0].desc = desc;
-			dispatch_fast[0].natts = natts;
-			dispatch_fast[0].attrs_hash = ahash;
-			dispatch_fast[0].fn = fn;
+			/* Add to TupleDesc-pointer fast-path cache (MRU front insertion) */
+			{
+				int slot_idx = (n_dispatch_fast < DISPATCH_FASTPATH_SIZE)
+					? n_dispatch_fast++ : DISPATCH_FASTPATH_SIZE - 1;
+				if (slot_idx > 0)
+					memmove(&dispatch_fast[1], &dispatch_fast[0],
+							slot_idx * sizeof(DispatchFastEntry));
+				dispatch_fast[0].desc = desc;
+				dispatch_fast[0].natts = natts;
+				dispatch_fast[0].attrs_hash = ahash;
+				dispatch_fast[0].fn = fn;
+			}
 		}
 		((void (*)(TupleTableSlot *)) fn)(slot);
 	}

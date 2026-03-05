@@ -118,6 +118,16 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
                              PGC_USERSET, GUC_ALLOW_IN_PARALLEL, NULL, NULL,
                              NULL);
   }
+
+  if (!GetConfigOption("pg_jitter.deform_cache", true, false)) {
+    DefineCustomBoolVariable("pg_jitter.deform_cache",
+                             "Cache compiled deform functions across queries. "
+                             "When off, deform is recompiled each query.",
+                             NULL, &pg_jitter_deform_cache,
+                             false, /* off by default */
+                             PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+                             NULL, NULL, NULL);
+  }
 }
 
 /*
