@@ -149,7 +149,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			"shared (leader shares compiled code via DSM)",
 			NULL,
 			&pg_jitter_parallel_mode,
-			PARALLEL_JIT_SHARED,
+			PARALLEL_JIT_PER_WORKER,
 			parallel_jit_options,
 			PGC_USERSET,
 			GUC_ALLOW_IN_PARALLEL,
