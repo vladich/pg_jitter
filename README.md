@@ -40,7 +40,7 @@ Some of them are pretty interesting, for example the "super wide table" section 
 
 ## Features
 
-- **Zero-config** - set `jit_provider` and go
+- **Simple-configuration** - set `jit_provider` and go
 - **Three independent backends** with different strengths
 - **Runtime backend switching** via `SET pg_jitter.backend = 'sljit'` (no restart)
 - **PostgreSQL 14–18** support from one codebase
@@ -212,3 +212,6 @@ Apache License 2.0. See [LICENSE](LICENSE).
 ## Copyrights
 
 All copyrights belong to their respective owners.
+
+## Builds
+[![Build & Test](https://github.com/vladich/pg_jitter/actions/workflows/cmake-multi-platform.yml/badge.svg?branch=master)](https://github.com/vladich/pg_jitter/actions/workflows/cmake-multi-platform.yml)
