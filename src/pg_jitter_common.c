@@ -32,6 +32,9 @@ int pg_jitter_parallel_mode = 1; /* PARALLEL_JIT_PER_WORKER */
 /* GUC: pg_jitter.shared_code_max — cap in KB */
 int pg_jitter_shared_code_max_kb = 4096; /* 4 MB default */
 
+/* GUC: pg_jitter.deform_cache — cache compiled deform functions across queries */
+bool pg_jitter_deform_cache = false;
+
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
  *
@@ -2089,3 +2092,4 @@ int pg_jitter_deform_threshold(void) {
     return threshold;
   }
 }
+

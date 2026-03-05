@@ -232,6 +232,7 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 /* GUC variables shared across backends (defined in pg_jitter_common.c) */
 extern int pg_jitter_parallel_mode;
 extern int pg_jitter_shared_code_max_kb;
+extern bool pg_jitter_deform_cache;
 
 /*
  * Read the current parallel mode from the GUC system.
