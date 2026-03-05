@@ -286,36 +286,46 @@ jobs:
             cleanup_database
 
             psql "$CONNURI" -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';"
+            psql "$CONNURI" -c "ALTER SYSTEM SET jit_above_cost = 0;"
+            psql "$CONNURI" -c "ALTER SYSTEM SET jit_inline_above_cost = 0;"
+            psql "$CONNURI" -c "ALTER SYSTEM SET jit_optimize_above_cost = 0;"
             pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w
             sleep 1
 
             ACTIVE=$(psql "$CONNURI" -t -A -c "SHOW jit_provider;")
             echo "Active provider: $ACTIVE"
 
+            OUTDIR="${{ github.workspace }}/regress-output-$backend"
+            mkdir -p "$OUTDIR"
+
             set +e
             "$PG_REGRESS" \
               --inputdir="$REGRESS_DIR" \
+              --outputdir="$OUTDIR" \
               --bindir="$(pg_config --bindir)" \
               --dlpath="$REGRESS_DIR" \
               --schedule="$REGRESS_DIR/parallel_schedule" \
               --host=localhost \
               --port="$PGPORT" \
               --user=postgres \
-              --dbname=regression 2>&1 | tail -30
-            RC=${PIPESTATUS[0]}
+              --dbname=regression > "$OUTDIR/pg_regress.log" 2>&1
+            RC=$?
             set -e
+            tail -50 "$OUTDIR/pg_regress.log"
 
             if [ $RC -eq 0 ]; then
               echo "  => $backend: PASSED"
               RESULTS="$RESULTS  $backend: PASSED (all tests)\n"
               PASSED=$((PASSED + 1))
             else
-              FAIL_LINE=$(grep -E '[0-9]+ of [0-9]+ tests failed' "$REGRESS_DIR/regression.out" 2>/dev/null | tail -1)
+              FAIL_LINE=$(grep -E '[0-9]+ of [0-9]+ tests failed' "$OUTDIR/regression.out" 2>/dev/null | tail -1 || true)
               echo "  => $backend: FAILED — $FAIL_LINE"
               RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
-              if [ -f "$REGRESS_DIR/regression.diffs" ]; then
+              # Show which tests failed
+              grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
+              if [ -f "$OUTDIR/regression.diffs" ]; then
                 echo "--- First 500 lines of regression.diffs ---"
-                head -500 "$REGRESS_DIR/regression.diffs"
+                head -500 "$OUTDIR/regression.diffs"
               fi
               FAILED=$((FAILED + 1))
             fi

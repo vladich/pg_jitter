@@ -451,10 +451,8 @@ static void *find_or_compile_deform(PgJitterContext *ctx,
       return cache[i].code;
   }
 
-#ifdef PG18_WIDE_DEFORM_LIMIT
-  if (natts > PG18_WIDE_DEFORM_LIMIT)
+  if (natts > WIDE_DEFORM_LIMIT)
     return NULL;
-#endif
 
   /* Compile new deform function */
   if (*ncache >= MAX_DEFORM_CACHE)
@@ -572,10 +570,8 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
   if (natts <= 0 || natts > desc->natts)
     return false;
 
-#ifdef PG18_WIDE_DEFORM_LIMIT
-  if (natts > PG18_WIDE_DEFORM_LIMIT)
+  if (natts > WIDE_DEFORM_LIMIT)
     return false;
-#endif
 
   /* Wide tables: skip inline deform, fall through to compiled loop deform */
   if (natts > pg_jitter_deform_threshold())
@@ -2733,9 +2729,7 @@ static bool sljit_compile_expr(ExprState *state) {
          */
         if (!IsParallelWorker() && op->d.fetch.known_desc &&
             op->d.fetch.last_var > pg_jitter_deform_threshold() &&
-#ifdef PG18_WIDE_DEFORM_LIMIT
-            op->d.fetch.last_var <= PG18_WIDE_DEFORM_LIMIT &&
-#endif
+            op->d.fetch.last_var <= WIDE_DEFORM_LIMIT &&
             ctx->share_state.sjc) {
           pg_jitter_compile_shared_deform(
               ctx->share_state.sjc, op->d.fetch.known_desc, op->d.fetch.kind,

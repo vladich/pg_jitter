@@ -1419,13 +1419,11 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	void *fn = NULL;
 	int i;
 
-#ifdef PG18_WIDE_DEFORM_LIMIT
-	if (natts > PG18_WIDE_DEFORM_LIMIT)
+	if (natts > WIDE_DEFORM_LIMIT)
 	{
 		slot_getsomeattrs_int(slot, natts);
 		return;
 	}
-#endif
 
 	/* Shared deform fast path: same VA across all parallel workers */
 	if (shared_deform_fn && natts == shared_deform_natts)
