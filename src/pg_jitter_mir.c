@@ -25,7 +25,7 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
-#elif defined(__x86_64__) || defined(_M_X64)
+#else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -6523,7 +6523,7 @@ static bool mir_compile_expr(ExprState *state) {
 
 #if defined(__APPLE__) && defined(__aarch64__)
       pthread_jit_write_protect_np(0); /* write mode */
-#elif defined(__x86_64__) || defined(_M_X64)
+#else
       /*
        * MIR sets code pages to PROT_READ|PROT_EXEC after MIR_gen().
        * We need write access for sentinel patching.
@@ -6550,7 +6550,21 @@ static bool mir_compile_expr(ExprState *state) {
 #if defined(__APPLE__) && defined(__aarch64__)
       sys_icache_invalidate(mcode, mcode_size);
       pthread_jit_write_protect_np(1); /* exec mode */
-#elif defined(__x86_64__) || defined(_M_X64)
+#elif defined(__aarch64__) || defined(_M_ARM64)
+      /* ARM64 has non-coherent I/D caches: flush before executing */
+      __builtin___clear_cache((char *)mcode, (char *)mcode + mcode_size);
+      {
+        long pgsz = sysconf(_SC_PAGESIZE);
+        uintptr_t page_start = (uintptr_t)mcode & ~(pgsz - 1);
+        Size page_len = ((uintptr_t)mcode + mcode_size) - page_start;
+
+        page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
+        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC) != 0)
+          elog(WARNING,
+               "pg_jitter[mir]: mprotect(RX) for sentinel patching failed: %m");
+      }
+#else
+      /* x86_64: coherent I/D caches, no flush needed */
       {
         long pgsz = sysconf(_SC_PAGESIZE);
         uintptr_t page_start = (uintptr_t)mcode & ~(pgsz - 1);
