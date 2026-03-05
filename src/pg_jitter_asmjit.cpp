@@ -5,6 +5,43 @@
  * Architecture-specific code generation is in .inc files.
  */
 
+/*
+ * MSVC C++ workaround: PG's port/atomics/generic-msvc.h passes
+ * volatile uint64* to _InterlockedCompareExchange64 etc. which expect
+ * volatile LONG64*.  In C these are implicitly compatible; in C++ they're
+ * not.  We wrap the intrinsics with casts before PG headers are included.
+ */
+#if defined(_MSC_VER) && defined(_WIN64)
+#include <intrin.h>
+#pragma intrinsic(_InterlockedCompareExchange64)
+#pragma intrinsic(_InterlockedExchange64)
+#pragma intrinsic(_InterlockedExchangeAdd64)
+
+static __forceinline LONG64
+_pg_InterlockedCompareExchange64(volatile LONG64 *Destination,
+								 LONG64 ExChange, LONG64 Comperand)
+{
+	return _InterlockedCompareExchange64(Destination, ExChange, Comperand);
+}
+static __forceinline LONG64
+_pg_InterlockedExchange64(volatile LONG64 *Target, LONG64 Value)
+{
+	return _InterlockedExchange64(Target, Value);
+}
+static __forceinline LONG64
+_pg_InterlockedExchangeAdd64(volatile LONG64 *Addend, LONG64 Value)
+{
+	return _InterlockedExchangeAdd64(Addend, Value);
+}
+
+#define _InterlockedCompareExchange64(dest, exch, comp) \
+	_pg_InterlockedCompareExchange64((volatile LONG64 *)(dest), (exch), (comp))
+#define _InterlockedExchange64(target, val) \
+	_pg_InterlockedExchange64((volatile LONG64 *)(target), (val))
+#define _InterlockedExchangeAdd64(addend, val) \
+	_pg_InterlockedExchangeAdd64((volatile LONG64 *)(addend), (val))
+#endif /* _MSC_VER && _WIN64 */
+
 extern "C" {
 #include "postgres.h"
 #include "fmgr.h"
