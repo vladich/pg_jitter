@@ -192,6 +192,9 @@ jobs:
           PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
           PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
 
+          # pg_regress spawns psql over TCP — needs password from env
+          export PGPASSWORD="postgres"
+
           # Find pg_regress (with or without .exe suffix)
           PG_REGRESS=""
           for candidate in \
