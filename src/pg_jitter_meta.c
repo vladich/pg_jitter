@@ -506,7 +506,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 "When off, deform is recompiled each query.",
 							 NULL,
 							 &meta_deform_cache,
-							 false, /* off by default */
+							 true, /* on by default */
 							 PGC_USERSET,
 							 GUC_ALLOW_IN_PARALLEL,
 							 NULL, NULL, NULL);
