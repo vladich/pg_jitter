@@ -94,7 +94,7 @@ message(STATUS "Install directory:  ${PG_JITTER_INSTALL_DIR}")
 # ---------- Dependency directories ----------
 set(SLJIT_DIR "${CMAKE_SOURCE_DIR}/../sljit" CACHE PATH
     "Path to sljit source directory")
-set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir" CACHE PATH
+set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir-patched" CACHE PATH
     "Path to MIR source directory")
 set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
