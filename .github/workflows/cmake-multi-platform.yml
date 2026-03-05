@@ -174,7 +174,7 @@ jobs:
             cl //nologo //c //I"$INCSERVER" //I"$INC" //I"$INCMSVC" //I"$INCWIN32" regress.c
             link //nologo //DLL //OUT:regress.dll regress.obj
           else
-            cc -fPIC -I"$INCSERVER" -I"$INC" -c regress.c -o regress.o
+            cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} -c regress.c -o regress.o
             if [[ "$(uname)" == "Darwin" ]]; then
               cc -bundle -undefined dynamic_lookup regress.o -o regress.dylib
             else
