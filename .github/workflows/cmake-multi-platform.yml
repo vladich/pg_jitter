@@ -295,6 +295,7 @@ jobs:
               --bindir="$(pg_config --bindir)" \
               --dlpath="$REGRESS_DIR" \
               --schedule="$REGRESS_DIR/parallel_schedule" \
+              --host=localhost \
               --port="$PGPORT" \
               --user=postgres \
               --dbname=regression 2>&1 | tail -30
