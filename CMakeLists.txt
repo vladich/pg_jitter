@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 3.16)
 project(pg_jitter C CXX)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+# PG17+ headers use C99 designated initializers in inline functions
+# (e.g. storage/fd.h). MSVC requires C++20 for designated initializer support.
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 20)
+else()
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 
 # ==========================================================================
 # Options & dependency paths
