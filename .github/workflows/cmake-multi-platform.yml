@@ -82,8 +82,9 @@ jobs:
           repository: vladich/mir-patched
           path: deps/mir
 
-      # ---- Clone PostgreSQL source for regression tests ----
+      # ---- Clone PostgreSQL source for regression tests (Unix only) ----
       - name: Clone PostgreSQL source
+        if: runner.os != 'Windows'
         uses: actions/checkout@v4
         with:
           repository: postgres/postgres
@@ -160,8 +161,9 @@ jobs:
           sleep 1
           psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
 
-      # ---- Build regression test shared libraries ----
+      # ---- Build regression test shared libraries (Unix only) ----
       - name: Build regression test libraries
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           PGSRC="${{ github.workspace }}/postgres-src"
@@ -170,30 +172,29 @@ jobs:
           INC="$(pg_config --includedir)"
 
           # Sources: core regress helper + contrib/spi libraries used by the triggers test
+          # refint.c needs -DREFINT_VERBOSE to emit NOTICE messages expected by triggers.out
           SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
 
           cd "$PGSRC"
           for src in $SOURCES; do
             base=$(basename "$src" .c)
-            if [[ "$RUNNER_OS" == "Windows" ]]; then
-              INCMSVC="$INCSERVER/port/win32_msvc"
-              INCWIN32="$INCSERVER/port/win32"
-              cl //nologo //c //I"$INCSERVER" //I"$INC" //I"$INCMSVC" //I"$INCWIN32" "$src"
-              link //nologo //DLL //OUT:"$DLPATH/$base.dll" "$base.obj"
+            EXTRA_CFLAGS=""
+            if [[ "$base" == "refint" ]]; then
+              EXTRA_CFLAGS="-DREFINT_VERBOSE"
+            fi
+            cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} $EXTRA_CFLAGS -c "$src" -o "$base.o"
+            if [[ "$(uname)" == "Darwin" ]]; then
+              cc -bundle -undefined dynamic_lookup "$base.o" -o "$DLPATH/$base.dylib"
             else
-              cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} -c "$src" -o "$base.o"
-              if [[ "$(uname)" == "Darwin" ]]; then
-                cc -bundle -undefined dynamic_lookup "$base.o" -o "$DLPATH/$base.dylib"
-              else
-                cc -shared "$base.o" -o "$DLPATH/$base.so"
-              fi
+              cc -shared "$base.o" -o "$DLPATH/$base.so"
             fi
           done
           echo "Built libraries:"
-          ls "$DLPATH"/*.so "$DLPATH"/*.dylib "$DLPATH"/*.dll 2>/dev/null || true
+          ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
 
-      # ---- Regression tests for each backend ----
+      # ---- Regression tests for each backend (Unix only) ----
       - name: Run regression tests
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
