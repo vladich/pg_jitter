@@ -71,10 +71,8 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         return false;
     if (natts <= 0 || natts > desc->natts)
         return false;
-#ifdef PG18_WIDE_DEFORM_LIMIT
-    if (natts > PG18_WIDE_DEFORM_LIMIT)
+    if (natts > WIDE_DEFORM_LIMIT)
         return false;
-#endif
     /* Wide tables: fall back to slot_getsomeattrs_int */
     if (natts > pg_jitter_deform_threshold())
         return false;
@@ -612,11 +610,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!deform_emitted)
 				{
 					/*
-					 * Call deform dispatch: JIT-compiles deform via sljit
-					 * (loop-based for wide, unrolled for narrow) and caches.
+					 * Fallback: call slot_getsomeattrs_int(slot, natts).
+					 * No sljit deform — asmjit backend is self-contained.
 					 */
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_compiled_deform_dispatch);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) slot_getsomeattrs_int);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());
@@ -733,7 +731,17 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_CONST:
 			{
 				/* *op->resvalue = constval.value (steps-relative) */
-				cc.mov(tmp1, (int64_t) op->d.constval.value);
+				if (asmjit_shared_code_mode) {
+					/*
+					 * In shared mode, load constval.value from step data
+					 * at runtime.  Pass-by-reference Datums (text, bytea)
+					 * are pointers into process-local heap memory that
+					 * differ between leader and worker.
+					 */
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, d.constval.value)));
+				} else {
+					cc.mov(tmp1, (int64_t) op->d.constval.value);
+				}
 				if (op->resvalue == &state->resvalue)
 					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
 				else
@@ -1181,7 +1189,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				}
 				{
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
+					if (asmjit_shared_code_mode) {
+						/*
+						 * In shared mode, fn_addr may point into a dynamically-
+						 * loaded library whose address differs per process.
+						 * Load from step data at runtime.
+						 */
+						cc.ldr(fn_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fn_addr)));
+					} else {
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
+					}
 					a64::Gp fcinfo_reg = cc.new_gpx();
 					cc.ldr(fcinfo_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
 					InvokeNode *invoke;
@@ -2864,10 +2881,22 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_CASE_TESTVAL:
 			case EEOP_DOMAIN_TESTVAL:
 			{
-				/* *op->resvalue = *op->d.casetest.value (steps-relative) */
-				cc.ldr(tmp1, a64::ptr(v_steps,
-					STEP_OFFSET(opno, d.casetest.value)));
-				cc.ldr(tmp2, a64::ptr(tmp1));
+				/*
+				 * If d.casetest.value is non-NULL, dereference it.
+				 * Otherwise read from econtext->caseValue (or domainValue).
+				 * Matches interpreter NULL-check for callers like JSON_TABLE
+				 * that set caseValue via econtext at runtime.
+				 */
+				if (op->d.casetest.value) {
+					cc.ldr(tmp1, a64::ptr(v_steps,
+						STEP_OFFSET(opno, d.casetest.value)));
+					cc.ldr(tmp2, a64::ptr(tmp1));
+				} else {
+					int cv_off = (opcode == EEOP_CASE_TESTVAL)
+						? offsetof(ExprContext, caseValue_datum)
+						: offsetof(ExprContext, domainValue_datum);
+					cc.ldr(tmp2, a64::ptr(v_econtext, cv_off));
+				}
 				if (op->resvalue == &state->resvalue)
 					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
 				else
@@ -2876,10 +2905,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.str(tmp2, a64::ptr(tmp3));
 				}
 
-				/* *op->resnull = *op->d.casetest.isnull (steps-relative) */
-				cc.ldr(tmp1, a64::ptr(v_steps,
-					STEP_OFFSET(opno, d.casetest.isnull)));
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				if (op->d.casetest.isnull) {
+					cc.ldr(tmp1, a64::ptr(v_steps,
+						STEP_OFFSET(opno, d.casetest.isnull)));
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+				} else {
+					int cn_off = (opcode == EEOP_CASE_TESTVAL)
+						? offsetof(ExprContext, caseValue_isNull)
+						: offsetof(ExprContext, domainValue_isNull);
+					cc.ldrb(tmp2.w(), a64::ptr(v_econtext, cn_off));
+				}
 				if (op->resnull == &state->resnull)
 					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
 				else
@@ -3196,7 +3231,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					offsetof(FunctionCallInfoBaseData, isnull)));
 				{
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
+					if (asmjit_shared_code_mode)
+						cc.ldr(fn_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fn_addr)));
+					else
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
 					a64::Gp fcinfo_reg = cc.new_gpx();
 					cc.ldr(fcinfo_reg, a64::ptr(v_steps,
 						STEP_OFFSET(opno, d.func.fcinfo_data)));
@@ -3313,7 +3351,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					offsetof(FunctionCallInfoBaseData, isnull)));
 				{
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
+					if (asmjit_shared_code_mode)
+						cc.ldr(fn_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fn_addr)));
+					else
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) op->d.func.fn_addr);
 					a64::Gp fcinfo_reg = cc.new_gpx();
 					cc.ldr(fcinfo_reg, a64::ptr(v_steps,
 						STEP_OFFSET(opno, d.func.fcinfo_data)));
@@ -3677,8 +3718,13 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
 				InvokeNode *invoke;
 				a64::Gp ret_reg = cc.new_gpx();
+				/*
+				 * ExecEvalJsonExprPath returns int (32-bit).  Use int32_t
+				 * in signature so AsmJIT properly sign-extends the return
+				 * value on ARM64 (upper 32 bits of x0 are undefined).
+				 */
 				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *, void *>());
+						  FuncSignature::build<int32_t, void *, void *, void *>());
 				invoke->set_arg(0, v_state);
 				invoke->set_arg(1, op_reg);
 				invoke->set_arg(2, v_econtext);
@@ -3947,23 +3993,28 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke->set_arg(2, v_econtext);
 				invoke->set_ret(0, ret_reg);
 
-				int fb_jump_target = -1;
-				switch (opcode)
+				/*
+				 * Generic jump dispatch: fallback_step returns >= 0 when a
+				 * jump is needed (the return value is the target step index).
+				 * Build a jump table for all reachable labels.
+				 */
 				{
-#ifdef HAVE_EEOP_HASHDATUM
-					case EEOP_HASHDATUM_FIRST_STRICT:
-					case EEOP_HASHDATUM_NEXT32_STRICT:
-						fb_jump_target = op->d.hashdatum.jumpdone;
-						break;
-#endif
-					default:
-						break;
-				}
+					Label no_jump = cc.new_label();
 
-				if (fb_jump_target >= 0 && fb_jump_target < steps_len)
-				{
 					cc.cmp(ret_reg, 0);
-					cc.b(a64::CondCode::kGE, step_labels[fb_jump_target]);
+					cc.b(a64::CondCode::kLT, no_jump);
+
+					/*
+					 * Emit a chain of comparisons for each possible jump
+					 * target step.  For most expressions this is 1-3 targets.
+					 */
+					for (int t = 0; t < steps_len; t++)
+					{
+						cc.cmp(ret_reg, t);
+						cc.b(a64::CondCode::kEQ, step_labels[t]);
+					}
+					/* Should not reach here, but fall through to no_jump */
+					cc.bind(no_jump);
 				}
 				break;
 			}

@@ -207,8 +207,9 @@ static const char *backend_libnames[] = {
 static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 
 /* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
-static int meta_parallel_mode = 2;		/* PARALLEL_JIT_SHARED */
+static int meta_parallel_mode = 1;		/* PARALLEL_JIT_PER_WORKER */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
+static bool meta_deform_cache = false;
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
@@ -481,7 +482,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			"shared (leader shares compiled code via DSM)",
 			NULL,
 			&meta_parallel_mode,
-			PARALLEL_JIT_SHARED,
+			PARALLEL_JIT_PER_WORKER,
 			parallel_jit_options,
 			PGC_USERSET,
 			GUC_ALLOW_IN_PARALLEL,
@@ -499,6 +500,16 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		PGC_USERSET,
 		GUC_UNIT_KB | GUC_ALLOW_IN_PARALLEL,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_jitter.deform_cache",
+							 "Cache compiled deform functions across queries. "
+							 "When off, deform is recompiled each query.",
+							 NULL,
+							 &meta_deform_cache,
+							 false, /* off by default */
+							 PGC_USERSET,
+							 GUC_ALLOW_IN_PARALLEL,
+							 NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("pg_jitter.backend",
 							 "Selects the active pg_jitter JIT backend.",

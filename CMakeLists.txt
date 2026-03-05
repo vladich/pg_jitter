@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 3.16)
 project(pg_jitter C CXX)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+# PG17+ headers use C99 designated initializers in inline functions
+# (e.g. storage/fd.h). MSVC requires C++20 for designated initializer support.
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 20)
+else()
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 
 # ==========================================================================
 # Options & dependency paths
@@ -62,11 +68,43 @@ execute_process(COMMAND ${PG_CONFIG} --includedir-server
 if(NOT _pg_config_result EQUAL 0)
     message(FATAL_ERROR "pg_config failed. Set -DPG_CONFIG=/path/to/pg_config")
 endif()
+execute_process(COMMAND ${PG_CONFIG} --includedir
+    OUTPUT_VARIABLE PG_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${PG_CONFIG} --pkglibdir
     OUTPUT_VARIABLE PG_PKGLIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${PG_CONFIG} --libdir
+    OUTPUT_VARIABLE PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+# Extract CPPFLAGS from pg_config for additional include paths (e.g. libintl)
+execute_process(COMMAND ${PG_CONFIG} --cppflags
+    OUTPUT_VARIABLE PG_CPPFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(PG_CPPFLAGS)
+    separate_arguments(_pg_cppflags_list NATIVE_COMMAND "${PG_CPPFLAGS}")
+    foreach(_flag IN LISTS _pg_cppflags_list)
+        if(_flag MATCHES "^-I(.+)")
+            list(APPEND PG_EXTRA_INCLUDE_DIRS "${CMAKE_MATCH_1}")
+        else()
+            string(APPEND CMAKE_C_FLAGS " ${_flag}")
+            string(APPEND CMAKE_CXX_FLAGS " ${_flag}")
+        endif()
+    endforeach()
+endif()
 
 message(STATUS "PG server includes: ${PG_INCLUDEDIR_SERVER}")
+message(STATUS "PG includes:        ${PG_INCLUDEDIR}")
 message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
+message(STATUS "PG libdir:          ${PG_LIBDIR}")
+
+# ---------- Windows: find postgres import library ----------
+if(WIN32)
+    find_library(POSTGRES_LIB postgres
+        PATHS "${PG_LIBDIR}" "${PG_PKGLIBDIR}"
+        NO_DEFAULT_PATH)
+    if(NOT POSTGRES_LIB)
+        message(FATAL_ERROR "postgres.lib not found in ${PG_LIBDIR} or ${PG_PKGLIBDIR}")
+    endif()
+    message(STATUS "postgres.lib:       ${POSTGRES_LIB}")
+endif()
 
 # ---------- Installation directory ----------
 # By default, install into PG's pkglibdir. Override with -DPG_JITTER_INSTALL_DIR.
@@ -77,7 +115,7 @@ message(STATUS "Install directory:  ${PG_JITTER_INSTALL_DIR}")
 # ---------- Dependency directories ----------
 set(SLJIT_DIR "${CMAKE_SOURCE_DIR}/../sljit" CACHE PATH
     "Path to sljit source directory")
-set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir" CACHE PATH
+set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir-patched" CACHE PATH
     "Path to MIR source directory")
 set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
@@ -170,6 +208,8 @@ if(PG_JITTER_BUILD_SLJIT OR PG_JITTER_BUILD_ASMJIT)
             DEPENDS ${DEFORM_GEN_SCRIPT}
             COMMENT "Generating pre-compiled deform templates (68 functions)"
         )
+        # Single target so the generator runs exactly once in parallel builds
+        add_custom_target(generate_deform_templates DEPENDS ${DEFORM_TEMPLATE_C})
     else()
         # Fallback: use pre-generated file (already in src/)
         message(STATUS "Python3 not found; using pre-generated deform templates")
@@ -180,7 +220,16 @@ endif()
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
-    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} src)
+    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS})
+    if(WIN32)
+        # Our compat headers must come first to provide mmap/sysconf/etc.
+        # that PG's own win32_msvc headers are missing.
+        target_include_directories(${TARGET_NAME} BEFORE PRIVATE
+            ${CMAKE_SOURCE_DIR}/compat/win32
+            ${PG_INCLUDEDIR_SERVER}/port/win32_msvc
+            ${PG_INCLUDEDIR_SERVER}/port/win32)
+        target_link_libraries(${TARGET_NAME} PRIVATE ${POSTGRES_LIB} ws2_32)
+    endif()
     pg_jitter_add_precompiled(${TARGET_NAME})
     set_target_properties(${TARGET_NAME} PROPERTIES
         PREFIX ""
@@ -203,32 +252,49 @@ if(PG_JITTER_BUILD_SLJIT)
     add_library(pg_jitter_sljit MODULE ${COMMON_SRC} src/pg_jitter_sljit.c
                 src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
     target_link_libraries(pg_jitter_sljit PRIVATE sljit)
+    target_compile_definitions(pg_jitter_sljit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_sljit)
+    if(TARGET generate_deform_templates)
+        add_dependencies(pg_jitter_sljit generate_deform_templates)
+    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_sljit)
 endif()
 
 # ---------- pg_jitter_asmjit ----------
 if(PG_JITTER_BUILD_ASMJIT)
     add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
-                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
-    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
+                src/pg_jit_deform_templates.c)
+    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
+    if(TARGET generate_deform_templates)
+        add_dependencies(pg_jitter_asmjit generate_deform_templates)
+    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_asmjit)
 endif()
 
 # ---------- pg_jitter_mir ----------
 if(PG_JITTER_BUILD_MIR)
     add_library(pg_jitter_mir MODULE ${COMMON_SRC} src/pg_jitter_mir.c
-                src/pg_jitter_deform_jit.c src/pg_jit_deform_templates.c)
-    target_link_libraries(pg_jitter_mir PRIVATE mir_lib sljit)
+                src/pg_jit_deform_templates.c)
+    target_link_libraries(pg_jitter_mir PRIVATE mir_lib)
     pg_jitter_configure_target(pg_jitter_mir)
+    if(TARGET generate_deform_templates)
+        add_dependencies(pg_jitter_mir generate_deform_templates)
+    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_mir)
 endif()
 
 # ---------- pg_jitter meta-provider (always built) ----------
 add_library(pg_jitter MODULE src/pg_jitter_meta.c)
-target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} src)
+target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS})
+if(WIN32)
+    target_include_directories(pg_jitter BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/compat/win32
+        ${PG_INCLUDEDIR_SERVER}/port/win32_msvc
+        ${PG_INCLUDEDIR_SERVER}/port/win32)
+    target_link_libraries(pg_jitter PRIVATE ${POSTGRES_LIB} ws2_32)
+endif()
 set_target_properties(pg_jitter PROPERTIES
     PREFIX ""
     SUFFIX "${PG_JITTER_SHARED_SUFFIX}"
