@@ -184,6 +184,10 @@ endif()
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
     target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
+    if(WIN32)
+        target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/compat/win32)
+        target_link_libraries(${TARGET_NAME} PRIVATE ws2_32)
+    endif()
     pg_jitter_add_precompiled(${TARGET_NAME})
     set_target_properties(${TARGET_NAME} PROPERTIES
         PREFIX ""
@@ -233,6 +237,10 @@ endif()
 # ---------- pg_jitter meta-provider (always built) ----------
 add_library(pg_jitter MODULE src/pg_jitter_meta.c)
 target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
+if(WIN32)
+    target_include_directories(pg_jitter PRIVATE ${CMAKE_SOURCE_DIR}/compat/win32)
+    target_link_libraries(pg_jitter PRIVATE ws2_32)
+endif()
 set_target_properties(pg_jitter PROPERTIES
     PREFIX ""
     SUFFIX "${PG_JITTER_SHARED_SUFFIX}"
