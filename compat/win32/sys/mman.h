@@ -22,7 +22,9 @@
 #define MAP_JIT         0       /* no-op on Windows */
 #define MAP_FIXED_NOREPLACE 0x100000    /* hint; best-effort on Windows */
 
+#ifndef MAP_FAILED
 #define MAP_FAILED ((void *)-1)
+#endif
 
 static inline DWORD
 mman_prot_to_win32(int prot)

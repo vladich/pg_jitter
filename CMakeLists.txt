@@ -66,10 +66,24 @@ execute_process(COMMAND ${PG_CONFIG} --includedir
     OUTPUT_VARIABLE PG_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${PG_CONFIG} --pkglibdir
     OUTPUT_VARIABLE PG_PKGLIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${PG_CONFIG} --libdir
+    OUTPUT_VARIABLE PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 message(STATUS "PG server includes: ${PG_INCLUDEDIR_SERVER}")
 message(STATUS "PG includes:        ${PG_INCLUDEDIR}")
 message(STATUS "PG pkglibdir:       ${PG_PKGLIBDIR}")
+message(STATUS "PG libdir:          ${PG_LIBDIR}")
+
+# ---------- Windows: find postgres import library ----------
+if(WIN32)
+    find_library(POSTGRES_LIB postgres
+        PATHS "${PG_LIBDIR}" "${PG_PKGLIBDIR}"
+        NO_DEFAULT_PATH)
+    if(NOT POSTGRES_LIB)
+        message(FATAL_ERROR "postgres.lib not found in ${PG_LIBDIR} or ${PG_PKGLIBDIR}")
+    endif()
+    message(STATUS "postgres.lib:       ${POSTGRES_LIB}")
+endif()
 
 # ---------- Installation directory ----------
 # By default, install into PG's pkglibdir. Override with -DPG_JITTER_INSTALL_DIR.
@@ -185,11 +199,13 @@ endif()
 function(pg_jitter_configure_target TARGET_NAME)
     target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
     if(WIN32)
-        target_include_directories(${TARGET_NAME} PRIVATE
+        # Our compat headers must come first to provide mmap/sysconf/etc.
+        # that PG's own win32_msvc headers are missing.
+        target_include_directories(${TARGET_NAME} BEFORE PRIVATE
+            ${CMAKE_SOURCE_DIR}/compat/win32
             ${PG_INCLUDEDIR_SERVER}/port/win32_msvc
-            ${PG_INCLUDEDIR_SERVER}/port/win32
-            ${CMAKE_SOURCE_DIR}/compat/win32)
-        target_link_libraries(${TARGET_NAME} PRIVATE ws2_32)
+            ${PG_INCLUDEDIR_SERVER}/port/win32)
+        target_link_libraries(${TARGET_NAME} PRIVATE ${POSTGRES_LIB} ws2_32)
     endif()
     pg_jitter_add_precompiled(${TARGET_NAME})
     set_target_properties(${TARGET_NAME} PROPERTIES
@@ -241,11 +257,11 @@ endif()
 add_library(pg_jitter MODULE src/pg_jitter_meta.c)
 target_include_directories(pg_jitter PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src)
 if(WIN32)
-    target_include_directories(pg_jitter PRIVATE
+    target_include_directories(pg_jitter BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/compat/win32
         ${PG_INCLUDEDIR_SERVER}/port/win32_msvc
-        ${PG_INCLUDEDIR_SERVER}/port/win32
-        ${CMAKE_SOURCE_DIR}/compat/win32)
-    target_link_libraries(pg_jitter PRIVATE ws2_32)
+        ${PG_INCLUDEDIR_SERVER}/port/win32)
+    target_link_libraries(pg_jitter PRIVATE ${POSTGRES_LIB} ws2_32)
 endif()
 set_target_properties(pg_jitter PROPERTIES
     PREFIX ""
