@@ -160,27 +160,37 @@ jobs:
           sleep 1
           psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
 
-      # ---- Build regression test shared library ----
-      - name: Build regression test library
+      # ---- Build regression test shared libraries ----
+      - name: Build regression test libraries
         shell: bash
         run: |
-          cd ${{ github.workspace }}/postgres-src/src/test/regress
+          PGSRC="${{ github.workspace }}/postgres-src"
+          DLPATH="$PGSRC/src/test/regress"
           INCSERVER="$(pg_config --includedir-server)"
           INC="$(pg_config --includedir)"
 
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            INCMSVC="$INCSERVER/port/win32_msvc"
-            INCWIN32="$INCSERVER/port/win32"
-            cl //nologo //c //I"$INCSERVER" //I"$INC" //I"$INCMSVC" //I"$INCWIN32" regress.c
-            link //nologo //DLL //OUT:regress.dll regress.obj
-          else
-            cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} -c regress.c -o regress.o
-            if [[ "$(uname)" == "Darwin" ]]; then
-              cc -bundle -undefined dynamic_lookup regress.o -o regress.dylib
+          # Sources: core regress helper + contrib/spi libraries used by the triggers test
+          SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
+
+          cd "$PGSRC"
+          for src in $SOURCES; do
+            base=$(basename "$src" .c)
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              INCMSVC="$INCSERVER/port/win32_msvc"
+              INCWIN32="$INCSERVER/port/win32"
+              cl //nologo //c //I"$INCSERVER" //I"$INC" //I"$INCMSVC" //I"$INCWIN32" "$src"
+              link //nologo //DLL //OUT:"$DLPATH/$base.dll" "$base.obj"
             else
-              cc -shared regress.o -o regress.so
+              cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} -c "$src" -o "$base.o"
+              if [[ "$(uname)" == "Darwin" ]]; then
+                cc -bundle -undefined dynamic_lookup "$base.o" -o "$DLPATH/$base.dylib"
+              else
+                cc -shared "$base.o" -o "$DLPATH/$base.so"
+              fi
             fi
-          fi
+          done
+          echo "Built libraries:"
+          ls "$DLPATH"/*.so "$DLPATH"/*.dylib "$DLPATH"/*.dll 2>/dev/null || true
 
       # ---- Regression tests for each backend ----
       - name: Run regression tests

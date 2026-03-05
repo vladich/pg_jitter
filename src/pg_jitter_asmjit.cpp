@@ -43,6 +43,23 @@ typedef struct
 #include "pg_jit_mir_blobs.h"
 }
 
+/*
+ * On Windows, PG's win32_port.h redefines socket functions as macros
+ * (e.g. #define bind(s, addr, addrlen) pgwin32_bind(s, addr, addrlen)).
+ * These collide with AsmJIT C++ method names like cc.bind(label).
+ * Undefine them before including AsmJIT headers.
+ */
+#ifdef _WIN32
+#undef bind
+#undef accept
+#undef connect
+#undef select
+#undef socket
+#undef listen
+#undef recv
+#undef send
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <asmjit/a64.h>
 #elif defined(__x86_64__) || defined(_M_X64)
