@@ -5,29 +5,6 @@
  * Architecture-specific code generation is in .inc files.
  */
 
-/*
- * MSVC C++ workaround: PG's port/atomics/generic-msvc.h passes
- * volatile uint64* to _InterlockedCompareExchange64 etc. which expect
- * volatile LONG64* (aka volatile long long*).  In C these pointer types
- * are implicitly compatible; in C++ MSVC treats them as distinct.
- *
- * Fix: redefine the intrinsics as macros that cast to volatile long long*
- * before PG headers pull in generic-msvc.h.
- */
-#if defined(_MSC_VER) && defined(_WIN64)
-#include <intrin.h>
-#pragma intrinsic(_InterlockedCompareExchange64)
-#pragma intrinsic(_InterlockedExchange64)
-#pragma intrinsic(_InterlockedExchangeAdd64)
-
-#define _InterlockedCompareExchange64(dest, exch, comp) \
-	_InterlockedCompareExchange64((volatile long long *)(dest), (exch), (comp))
-#define _InterlockedExchange64(target, val) \
-	_InterlockedExchange64((volatile long long *)(target), (val))
-#define _InterlockedExchangeAdd64(addend, val) \
-	_InterlockedExchangeAdd64((volatile long long *)(addend), (val))
-#endif /* _MSC_VER && _WIN64 */
-
 extern "C" {
 #include "postgres.h"
 #include "fmgr.h"
