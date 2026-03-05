@@ -1,4 +1,4 @@
-name: Build
+name: Build & Test
 
 on: [push, pull_request]
 
@@ -82,6 +82,15 @@ jobs:
           repository: vladich/mir-patched
           path: deps/mir
 
+      # ---- Clone PostgreSQL source for regression tests ----
+      - name: Clone PostgreSQL source
+        uses: actions/checkout@v4
+        with:
+          repository: postgres/postgres
+          ref: REL_17_STABLE
+          path: postgres-src
+          depth: 1
+
       # ---- Configure & Build ----
       - name: Configure (Unix)
         if: runner.os != 'Windows'
@@ -151,28 +160,172 @@ jobs:
           sleep 1
           psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
 
-      # ---- Test ----
-      - name: Smoke test
+      # ---- Build regression test shared library ----
+      - name: Build regression test library
         shell: bash
         run: |
-          FIRST_BACKEND=$(echo "${{ matrix.backends }}" | tr ';' '\n' | head -1)
-          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          cd ${{ github.workspace }}/postgres-src/src/test/regress
+          INCSERVER="$(pg_config --includedir-server)"
+          INC="$(pg_config --includedir)"
 
-          psql "$CONNURI" -c "
-            SET jit = on;
-            SET jit_above_cost = 0;
-            SET jit_inline_above_cost = 0;
-            SET jit_optimize_above_cost = 0;
-            SET pg_jitter.backend = '$FIRST_BACKEND';
-            SELECT sum(i), avg(i), count(*) FROM generate_series(1, 10000) i;
-          "
-          psql "$CONNURI" -c "
-            SET jit = on;
-            SET jit_above_cost = 0;
-            SET pg_jitter.backend = '$FIRST_BACKEND';
-            EXPLAIN (ANALYZE, COSTS OFF, SUMMARY ON)
-            SELECT i % 100 AS bucket, sum(i), avg(i)
-            FROM generate_series(1, 100000) i
-            GROUP BY bucket
-            ORDER BY bucket;
-          " | tail -5
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            INCMSVC="$INCSERVER/port/win32_msvc"
+            INCWIN32="$INCSERVER/port/win32"
+            cl //nologo //c //I"$INCSERVER" //I"$INC" //I"$INCMSVC" //I"$INCWIN32" regress.c
+            link //nologo //DLL //OUT:regress.dll regress.obj
+          else
+            cc -fPIC -I"$INCSERVER" -I"$INC" -c regress.c -o regress.o
+            if [[ "$(uname)" == "Darwin" ]]; then
+              cc -bundle -undefined dynamic_lookup regress.o -o regress.dylib
+            else
+              cc -shared regress.o -o regress.so
+            fi
+          fi
+
+      # ---- Regression tests for each backend ----
+      - name: Run regression tests
+        shell: bash
+        run: |
+          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          BACKENDS=$(echo "${{ matrix.backends }}" | tr ';' ' ')
+          REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
+          PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
+          PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
+
+          # Find pg_regress (with or without .exe suffix)
+          PG_REGRESS=""
+          for candidate in \
+            "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress" \
+            "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress.exe" \
+            "$(pg_config --bindir)/../lib/pgxs/src/test/regress/pg_regress" \
+            "$(pg_config --bindir)/pg_regress" \
+            "$(pg_config --bindir)/pg_regress.exe" \
+            "/usr/lib/postgresql/17/lib/pgxs/src/test/regress/pg_regress" \
+          ; do
+            if [ -f "$candidate" ]; then
+              PG_REGRESS="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$PG_REGRESS" ]; then
+            echo "ERROR: pg_regress not found"
+            exit 1
+          fi
+          echo "Using pg_regress: $PG_REGRESS"
+
+          # Cleanup function for state left by previous test runs
+          cleanup_database() {
+            psql "$CONNURI" -q -X <<'CLEANUP_SQL'
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT evtname FROM pg_event_trigger LOOP
+                  EXECUTE format('DROP EVENT TRIGGER IF EXISTS %I CASCADE', r.evtname);
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT pubname FROM pg_publication LOOP
+                  EXECUTE format('DROP PUBLICATION IF EXISTS %I CASCADE', r.pubname);
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT subname FROM pg_subscription LOOP
+                  BEGIN
+                      EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', r.subname);
+                      EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', r.subname);
+                      EXECUTE format('DROP SUBSCRIPTION IF EXISTS %I', r.subname);
+                  EXCEPTION WHEN OTHERS THEN NULL;
+                  END;
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT srvname FROM pg_foreign_server LOOP
+                  EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', r.srvname);
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT nspname FROM pg_namespace
+                       WHERE nspname NOT IN ('pg_catalog','information_schema','public')
+                         AND nspname NOT LIKE 'pg_temp%'
+                         AND nspname NOT LIKE 'pg_toast%' LOOP
+                  EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', r.nspname);
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT spcname FROM pg_tablespace
+                       WHERE spcname NOT IN ('pg_default','pg_global') LOOP
+                  EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
+              END LOOP;
+          END $$;
+          DO $$ DECLARE r RECORD; BEGIN
+              FOR r IN SELECT rolname FROM pg_roles
+                       WHERE rolname LIKE 'regress_%'
+                         AND rolname NOT IN (SELECT usename FROM pg_stat_activity) LOOP
+                  BEGIN
+                      EXECUTE format('REASSIGN OWNED BY %I TO CURRENT_USER', r.rolname);
+                      EXECUTE format('DROP OWNED BY %I', r.rolname);
+                      EXECUTE format('DROP ROLE IF EXISTS %I', r.rolname);
+                  EXCEPTION WHEN OTHERS THEN NULL;
+                  END;
+              END LOOP;
+          END $$;
+          CLEANUP_SQL
+          }
+
+          PASSED=0
+          FAILED=0
+          RESULTS=""
+
+          for backend in $BACKENDS; do
+            echo "============================================"
+            echo "  Regression tests: $backend"
+            echo "============================================"
+
+            cleanup_database
+
+            psql "$CONNURI" -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';"
+            pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w
+            sleep 1
+
+            ACTIVE=$(psql "$CONNURI" -t -A -c "SHOW jit_provider;")
+            echo "Active provider: $ACTIVE"
+
+            set +e
+            "$PG_REGRESS" \
+              --inputdir="$REGRESS_DIR" \
+              --bindir="$(pg_config --bindir)" \
+              --dlpath="$REGRESS_DIR" \
+              --schedule="$REGRESS_DIR/parallel_schedule" \
+              --port="$PGPORT" \
+              --user=postgres \
+              --dbname=regression 2>&1 | tail -30
+            RC=${PIPESTATUS[0]}
+            set -e
+
+            if [ $RC -eq 0 ]; then
+              echo "  => $backend: PASSED"
+              RESULTS="$RESULTS  $backend: PASSED (all tests)\n"
+              PASSED=$((PASSED + 1))
+            else
+              FAIL_LINE=$(grep -E '[0-9]+ of [0-9]+ tests failed' "$REGRESS_DIR/regression.out" 2>/dev/null | tail -1)
+              echo "  => $backend: FAILED — $FAIL_LINE"
+              RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
+              if [ -f "$REGRESS_DIR/regression.diffs" ]; then
+                echo "--- First 500 lines of regression.diffs ---"
+                head -500 "$REGRESS_DIR/regression.diffs"
+              fi
+              FAILED=$((FAILED + 1))
+            fi
+
+            echo ""
+          done
+
+          echo "============================================"
+          echo "  SUMMARY"
+          echo "============================================"
+          printf "$RESULTS"
+          echo ""
+          echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
+          echo "============================================"
+
+          [ $FAILED -eq 0 ]
+
