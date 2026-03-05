@@ -83,12 +83,27 @@ jobs:
           path: deps/mir
 
       # ---- Clone PostgreSQL source for regression tests (Unix only) ----
+      # Pin to the exact minor version to avoid test expectation mismatches
+      # (e.g., Homebrew may ship 17.8 while REL_17_STABLE is already at 17.9)
+      - name: Determine PostgreSQL version tag
+        if: runner.os != 'Windows'
+        id: pg_version
+        shell: bash
+        run: |
+          PG_FULL=$(pg_config --version)
+          # Extract e.g. "17.8" from "PostgreSQL 17.8 (Homebrew)"
+          PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
+          # Convert "17.8" → "REL_17_8"
+          PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
+          echo "pg_tag=$PG_TAG" >> "$GITHUB_OUTPUT"
+          echo "PostgreSQL version: $PG_FULL → tag: $PG_TAG"
+
       - name: Clone PostgreSQL source
         if: runner.os != 'Windows'
         uses: actions/checkout@v4
         with:
           repository: postgres/postgres
-          ref: REL_17_STABLE
+          ref: ${{ steps.pg_version.outputs.pg_tag }}
           path: postgres-src
           depth: 1
 
@@ -152,11 +167,14 @@ jobs:
           fi
           ls "$PKGLIBDIR"/pg_jitter*
 
-          # Restart with pg_jitter
+          # Restart with pg_jitter meta module (supports runtime backend switching)
           PGDATA=$(psql "${{ steps.postgres.outputs.connection-uri }}" -t -A -c "SHOW data_directory;")
           echo "PGDATA: $PGDATA"
           pg_ctl -D "$PGDATA" stop -m fast
           echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
+          echo "jit_above_cost = 0" >> "$PGDATA/postgresql.conf"
+          echo "jit_inline_above_cost = 0" >> "$PGDATA/postgresql.conf"
+          echo "jit_optimize_above_cost = 0" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
           sleep 1
           psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
@@ -200,7 +218,6 @@ jobs:
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
           BACKENDS=$(echo "${{ matrix.backends }}" | tr ';' ' ')
           REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
-          PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
           PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
 
           # pg_regress spawns psql over TCP — needs password from env
@@ -296,15 +313,13 @@ jobs:
 
             cleanup_database
 
-            psql "$CONNURI" -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';"
-            psql "$CONNURI" -c "ALTER SYSTEM SET jit_above_cost = 0;"
-            psql "$CONNURI" -c "ALTER SYSTEM SET jit_inline_above_cost = 0;"
-            psql "$CONNURI" -c "ALTER SYSTEM SET jit_optimize_above_cost = 0;"
-            pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w
+            # Switch backend via GUC + reload (no server restart needed)
+            psql "$CONNURI" -c "ALTER SYSTEM SET pg_jitter.backend = '$backend';"
+            psql "$CONNURI" -c "SELECT pg_reload_conf();"
             sleep 1
 
-            ACTIVE=$(psql "$CONNURI" -t -A -c "SHOW jit_provider;")
-            echo "Active provider: $ACTIVE"
+            ACTIVE=$(psql "$CONNURI" -t -A -c "SHOW pg_jitter.backend;")
+            echo "Active backend: $ACTIVE"
 
             OUTDIR="${{ github.workspace }}/regress-output-$backend"
             mkdir -p "$OUTDIR"
