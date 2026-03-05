@@ -1,6 +1,22 @@
 name: Build & Test
 
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'tests/**'
+      - 'img/**'
+      - 'bench/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'tests/**'
+      - 'img/**'
+      - 'bench/**'
 
 jobs:
   build:
