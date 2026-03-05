@@ -71,10 +71,8 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         return false;
     if (natts <= 0 || natts > desc->natts)
         return false;
-#ifdef PG18_WIDE_DEFORM_LIMIT
-    if (natts > PG18_WIDE_DEFORM_LIMIT)
+    if (natts > WIDE_DEFORM_LIMIT)
         return false;
-#endif
     /* Wide tables: fall back to slot_getsomeattrs_int */
     if (natts > pg_jitter_deform_threshold())
         return false;

@@ -257,13 +257,12 @@ extern int pg_jitter_get_parallel_mode(void);
 #define DEFORM_BYTES_PER_COL  140
 
 /*
- * On PG18+ the interpreter's tuple deform is fast enough that JIT loop
- * deform for very wide tables is slower.  Skip JIT deform above this
- * column count when building against PG18+.
+ * Hard cap on JIT deform column count.  Above this, JIT deform (both
+ * unrolled and loop-based) is slower than the interpreter due to
+ * compilation overhead and I-cache pressure.  Fall back to
+ * slot_getsomeattrs_int() for tables wider than this.
  */
-#if PG_VERSION_NUM >= 180000
-#define PG18_WIDE_DEFORM_LIMIT 100
-#endif
+#define WIDE_DEFORM_LIMIT 100
 
 /* Per-column descriptor for loop-based deform */
 typedef struct DeformColDesc {
