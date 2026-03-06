@@ -214,4 +214,8 @@ Apache License 2.0. See [LICENSE](LICENSE).
 All copyrights belong to their respective owners.
 
 ## Builds
-[![Build & Test](https://github.com/vladich/pg_jitter/actions/workflows/cmake-multi-platform.yml/badge.svg?branch=master)](https://github.com/vladich/pg_jitter/actions/workflows/cmake-multi-platform.yml)
+  ![PG 14](https://github.com/vladich/pg_jitter/actions/workflows/pg14.yml/badge.svg) |
+  ![PG 15](https://github.com/vladich/pg_jitter/actions/workflows/pg15.yml/badge.svg) | 
+  ![PG 16](https://github.com/vladich/pg_jitter/actions/workflows/pg16.yml/badge.svg) |
+  ![PG 17](https://github.com/vladich/pg_jitter/actions/workflows/pg17.yml/badge.svg) | 
+  ![PG 18](https://github.com/vladich/pg_jitter/actions/workflows/pg18.yml/badge.svg)

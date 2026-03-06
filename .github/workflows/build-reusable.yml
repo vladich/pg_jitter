@@ -1,22 +1,11 @@
-name: Build & Test
+name: Reusable Build & Test
 
 on:
-  push:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'tests/**'
-      - 'img/**'
-      - 'bench/**'
-  pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'tests/**'
-      - 'img/**'
-      - 'bench/**'
+  workflow_call:
+    inputs:
+      postgres-version:
+        required: true
+        type: string
 
 jobs:
   build:
@@ -28,18 +17,11 @@ jobs:
           - ubuntu-24.04-arm      # Linux ARM64
           - macos-15              # macOS ARM64 (Apple Silicon)
           - windows-2022          # Windows x86_64
-#          - windows-11-arm        # Windows ARM64 (no PG installer available)
         backends:
-#          - "sljit"
-#          - "asmjit"
-#          - "mir"
-#          - "sljit;asmjit"
-#          - "sljit;mir"
-#          - "asmjit;mir"
           - "sljit;asmjit;mir"
 
     runs-on: ${{ matrix.os }}
-    name: "${{ matrix.os }} — ${{ matrix.backends }}"
+    name: "${{ matrix.os }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +30,7 @@ jobs:
       - name: Setup PostgreSQL
         uses: ikalnytskyi/action-setup-postgres@v8
         with:
-          postgres-version: "17"
+          postgres-version: "${{ inputs.postgres-version }}"
         id: postgres
 
       # Ubuntu: action provides server but not dev headers
@@ -59,7 +41,7 @@ jobs:
           sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-server-dev-17
+          sudo apt-get install -y -qq postgresql-server-dev-${{ inputs.postgres-version }}
 
       # macOS: PG headers include <libintl.h> which comes from gettext
       - name: Install gettext (macOS)
@@ -121,7 +103,7 @@ jobs:
           repository: postgres/postgres
           ref: ${{ steps.pg_version.outputs.pg_tag }}
           path: postgres-src
-          depth: 1
+          fetch-depth: 1
 
       # ---- Configure & Build ----
       - name: Configure (Unix)
@@ -241,13 +223,14 @@ jobs:
 
           # Find pg_regress (with or without .exe suffix)
           PG_REGRESS=""
+          PG_MAJOR="${{ inputs.postgres-version }}"
           for candidate in \
             "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress" \
             "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress.exe" \
             "$(pg_config --bindir)/../lib/pgxs/src/test/regress/pg_regress" \
             "$(pg_config --bindir)/pg_regress" \
             "$(pg_config --bindir)/pg_regress.exe" \
-            "/usr/lib/postgresql/17/lib/pgxs/src/test/regress/pg_regress" \
+            "/usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/regress/pg_regress" \
           ; do
             if [ -f "$candidate" ]; then
               PG_REGRESS="$candidate"
@@ -384,4 +367,3 @@ jobs:
           echo "============================================"
 
           [ $FAILED -eq 0 ]
-
