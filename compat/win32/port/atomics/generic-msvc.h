@@ -25,7 +25,10 @@
 #define pg_memory_barrier_impl()	MemoryBarrier()
 #endif
 
-#if defined(HAVE_ATOMICS)
+/*
+ * PG 14-17 gate on HAVE_ATOMICS; PG 18 removed it.
+ * Always define -- MSVC on Windows always has atomics.
+ */
 
 #define PG_HAVE_ATOMIC_U32_SUPPORT
 typedef struct pg_atomic_uint32
@@ -108,5 +111,3 @@ pg_atomic_fetch_add_u64_impl(volatile pg_atomic_uint64 *ptr, int64 add_)
 }
 
 #endif /* _WIN64 */
-
-#endif /* HAVE_ATOMICS */
