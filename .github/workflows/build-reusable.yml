@@ -264,6 +264,9 @@ jobs:
           CLEANUP_SQL
           }
 
+          # Force JIT provider to load (GUCs are registered lazily on first JIT)
+          psql "$CONNURI" -c "SELECT 1+1;" > /dev/null
+
           PASSED=0
           FAILED=0
           RESULTS=""
