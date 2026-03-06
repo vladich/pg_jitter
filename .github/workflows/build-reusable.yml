@@ -264,8 +264,7 @@ jobs:
           CLEANUP_SQL
           }
 
-          # Force JIT provider to load (GUCs are registered lazily on first JIT)
-          psql "$CONNURI" -c "SELECT 1+1;" > /dev/null
+          PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
 
           PASSED=0
           FAILED=0
@@ -278,13 +277,15 @@ jobs:
 
             cleanup_database
 
-            # Switch backend via GUC + reload (no server restart needed)
-            psql "$CONNURI" -c "ALTER SYSTEM SET pg_jitter.backend = '$backend';"
+            # Switch backend by writing to config and reloading.
+            # ALTER SYSTEM SET rejects unknown GUCs, but the config file accepts them.
+            grep -v '^pg_jitter\.backend' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
+            mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf"
+            echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
             psql "$CONNURI" -c "SELECT pg_reload_conf();"
             sleep 1
 
-            ACTIVE=$(psql "$CONNURI" -t -A -c "SHOW pg_jitter.backend;")
-            echo "Active backend: $ACTIVE"
+            echo "Active backend: $backend"
 
             OUTDIR="${{ github.workspace }}/regress-output-$backend"
             mkdir -p "$OUTDIR"
