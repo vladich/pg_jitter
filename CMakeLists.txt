@@ -76,6 +76,7 @@ execute_process(COMMAND ${PG_CONFIG} --libdir
     OUTPUT_VARIABLE PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 # Extract CPPFLAGS from pg_config for additional include paths (e.g. libintl)
+# Note: Windows binary installs (PG 14-16) return "not recorded" here.
 execute_process(COMMAND ${PG_CONFIG} --cppflags
     OUTPUT_VARIABLE PG_CPPFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
 if(PG_CPPFLAGS)
@@ -83,7 +84,7 @@ if(PG_CPPFLAGS)
     foreach(_flag IN LISTS _pg_cppflags_list)
         if(_flag MATCHES "^-I(.+)")
             list(APPEND PG_EXTRA_INCLUDE_DIRS "${CMAKE_MATCH_1}")
-        else()
+        elseif(_flag MATCHES "^[-/]")
             string(APPEND CMAKE_C_FLAGS " ${_flag}")
             string(APPEND CMAKE_CXX_FLAGS " ${_flag}")
         endif()
