@@ -33,7 +33,7 @@ int pg_jitter_parallel_mode = 1; /* PARALLEL_JIT_PER_WORKER */
 int pg_jitter_shared_code_max_kb = 4096; /* 4 MB default */
 
 /* GUC: pg_jitter.deform_cache — cache compiled deform functions across queries */
-bool pg_jitter_deform_cache = false;
+bool pg_jitter_deform_cache = true;
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
