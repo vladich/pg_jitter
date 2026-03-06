@@ -209,7 +209,7 @@ static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 /* GUC: pg_jitter.parallel_mode — defined here so it's available before backends load */
 static int meta_parallel_mode = 1;		/* PARALLEL_JIT_PER_WORKER */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
-static bool meta_deform_cache = false;
+static bool meta_deform_cache = true;
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1

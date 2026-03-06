@@ -164,6 +164,8 @@ jobs:
             cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} $EXTRA_CFLAGS -c "$src" -o "$base.o"
             if [[ "$(uname)" == "Darwin" ]]; then
               cc -bundle -undefined dynamic_lookup "$base.o" -o "$DLPATH/$base.dylib"
+              # Some PG versions on macOS use .so instead of .dylib
+              cp "$DLPATH/$base.dylib" "$DLPATH/$base.so"
             else
               cc -shared "$base.o" -o "$DLPATH/$base.so"
             fi
@@ -289,6 +291,10 @@ jobs:
 
             OUTDIR="${{ github.workspace }}/regress-output-$backend"
             mkdir -p "$OUTDIR"
+
+            # PG 14 tablespace test uses @testtablespace@ placeholder
+            # that expands to $OUTDIR/testtablespace — directory must exist
+            mkdir -p "$OUTDIR/testtablespace"
 
             set +e
             "$PG_REGRESS" \

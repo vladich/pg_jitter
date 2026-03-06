@@ -1,5 +1,5 @@
 /*
- * generic-msvc.h — C++-compatible shim for PG's MSVC atomics
+ * generic-msvc.h - C++-compatible shim for PG's MSVC atomics
  *
  * PG's port/atomics/generic-msvc.h passes volatile uint64* to
  * _InterlockedCompareExchange64 etc. which expect volatile LONG64*.
@@ -9,7 +9,7 @@
  * This file shadows PG's version (via compat/win32 BEFORE include
  * priority in CMakeLists.txt) and adds the necessary casts.
  *
- * Copied from PostgreSQL REL_17_STABLE with cast fixes marked [CAST].
+ * Compatible with PostgreSQL 14-18.
  */
 #include <intrin.h>
 
@@ -34,7 +34,8 @@ typedef struct pg_atomic_uint32
 } pg_atomic_uint32;
 
 #define PG_HAVE_ATOMIC_U64_SUPPORT
-typedef struct pg_attribute_aligned(8) pg_atomic_uint64
+/* pg_attribute_aligned was added in PG 17; use __declspec directly for MSVC */
+typedef struct __declspec(align(8)) pg_atomic_uint64
 {
 	volatile uint64 value;
 } pg_atomic_uint64;
