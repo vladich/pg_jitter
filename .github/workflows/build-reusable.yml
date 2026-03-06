@@ -129,7 +129,8 @@ jobs:
           ls "$PKGLIBDIR"/pg_jitter*
 
           # Restart with pg_jitter meta module (supports runtime backend switching)
-          PGDATA=$(psql "${{ steps.postgres.outputs.connection-uri }}" -t -A -c "SHOW data_directory;")
+          # Options must come BEFORE the URI — Windows PG 14-16 psql lacks GNU getopt reordering
+          PGDATA=$(psql -t -A -c "SHOW data_directory;" "${{ steps.postgres.outputs.connection-uri }}")
           echo "PGDATA: $PGDATA"
           pg_ctl -D "$PGDATA" stop -m fast
           echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
@@ -138,7 +139,7 @@ jobs:
           echo "jit_optimize_above_cost = 0" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
           sleep 1
-          psql "${{ steps.postgres.outputs.connection-uri }}" -c "SHOW jit_provider;"
+          psql -c "SHOW jit_provider;" "${{ steps.postgres.outputs.connection-uri }}"
 
       # ---- Build regression test shared libraries (Unix only) ----
       - name: Build regression test libraries

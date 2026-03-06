@@ -33,6 +33,16 @@
 #include "storage/shmem.h"
 #include "port/atomics.h"
 
+/*
+ * PG 14 doesn't mark pkglib_path with PGDLLIMPORT, so it can't be linked
+ * from extension DLLs on Windows.  Derive it from my_exec_path (which IS
+ * exported) at init time.
+ */
+#if PG_VERSION_NUM < 150000 && defined(_WIN32)
+static char meta_pkglib_path[MAXPGPATH];
+#define pkglib_path meta_pkglib_path
+#endif
+
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter");
 
 /* ----------------------------------------------------------------
@@ -455,6 +465,10 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = meta_reset_after_error;
 	cb->release_context = meta_release_context;
 	cb->compile_expr = meta_compile_expr;
+
+#if PG_VERSION_NUM < 150000 && defined(_WIN32)
+	get_pkglib_path(my_exec_path, meta_pkglib_path);
+#endif
 
 	boot_default = meta_detect_default();
 	pg_jitter_backend = boot_default;
