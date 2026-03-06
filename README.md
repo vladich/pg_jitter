@@ -214,8 +214,31 @@ Apache License 2.0. See [LICENSE](LICENSE).
 All copyrights belong to their respective owners.
 
 ## Builds
-  ![PG 14](https://github.com/vladich/pg_jitter/actions/workflows/pg14.yml/badge.svg) |
-  ![PG 15](https://github.com/vladich/pg_jitter/actions/workflows/pg15.yml/badge.svg) | 
-  ![PG 16](https://github.com/vladich/pg_jitter/actions/workflows/pg16.yml/badge.svg) |
-  ![PG 17](https://github.com/vladich/pg_jitter/actions/workflows/pg17.yml/badge.svg) | 
-  ![PG 18](https://github.com/vladich/pg_jitter/actions/workflows/pg18.yml/badge.svg)
+
+|        | Linux x86_64 | Linux ARM64 | macOS ARM64 | Windows x86_64 |
+  |--------|:---:|:---:|:---:|:---:|
+  | PG 14  | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg14-linux.yml/badge.svg?branch=ma
+  ster&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg14-linux-arm.yml/badge.s
+  vg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg14-macos.yml
+  /badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg14-w
+  indows.yml/badge.svg?branch=master&event=push) |
+  | PG 15  | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg15-linux.yml/badge.svg?branch=ma
+  ster&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg15-linux-arm.yml/badge.s
+  vg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg15-macos.yml
+  /badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg15-w
+  indows.yml/badge.svg?branch=master&event=push) |
+  | PG 16  | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-linux.yml/badge.svg?branch=ma
+  ster&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-linux-arm.yml/badge.s
+  vg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-macos.yml
+  /badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-w
+  indows.yml/badge.svg?branch=master&event=push) |
+  | PG 17  | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-linux.yml/badge.svg?branch=ma
+  ster&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-linux-arm.yml/badge.s
+  vg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-macos.yml
+  /badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-w
+  indows.yml/badge.svg?branch=master&event=push) |
+  | PG 18  | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux.yml/badge.svg?branch=ma
+  ster&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux-arm.yml/badge.s
+  vg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-macos.yml
+  /badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-w
+  indows.yml/badge.svg?branch=master&event=push) |

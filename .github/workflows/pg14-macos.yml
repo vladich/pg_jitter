@@ -1,4 +1,4 @@
-name: PG 14
+name: "PG 14 \xB7 macOS ARM64"
 on:
   push:
     branches: [master]
@@ -8,3 +8,4 @@ jobs:
     uses: ./.github/workflows/build-reusable.yml
     with:
       postgres-version: "14"
+      os: macos-15

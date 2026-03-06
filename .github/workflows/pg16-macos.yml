@@ -1,0 +1,11 @@
+name: "PG 16 \xB7 macOS ARM64"
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+jobs:
+  build:
+    uses: ./.github/workflows/build-reusable.yml
+    with:
+      postgres-version: "16"
+      os: macos-15
