@@ -213,7 +213,7 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 All copyrights belong to their respective owners.
 
-## Builds
+## Builds / regression tests
 
 | PG | Linux x86_64 | Linux ARM64 | macOS ARM64 | Windows x86_64 |
 |--------|:---:|:---:|:---:|:---:|
