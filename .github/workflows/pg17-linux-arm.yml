@@ -1,0 +1,13 @@
+name: "PG 17 \xB7 Linux ARM64"
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+jobs:
+  build:
+    uses: ./.github/workflows/build-reusable.yml
+    with:
+      postgres-version: "17"
+      os: ubuntu-24.04-arm

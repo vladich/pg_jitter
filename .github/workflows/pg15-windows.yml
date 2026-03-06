@@ -1,0 +1,11 @@
+name: "PG 15 \xB7 Windows x86_64"
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+jobs:
+  build:
+    uses: ./.github/workflows/build-reusable.yml
+    with:
+      postgres-version: "15"
+      os: windows-2022

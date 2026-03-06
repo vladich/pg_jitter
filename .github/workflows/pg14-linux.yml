@@ -1,4 +1,4 @@
-name: PG 18
+name: "PG 14 \xB7 Linux x86_64"
 on:
   push:
     branches: [master]
@@ -7,4 +7,5 @@ jobs:
   build:
     uses: ./.github/workflows/build-reusable.yml
     with:
-      postgres-version: "18"
+      postgres-version: "14"
+      os: ubuntu-24.04

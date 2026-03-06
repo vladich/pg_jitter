@@ -6,22 +6,13 @@ on:
       postgres-version:
         required: true
         type: string
+      os:
+        required: true
+        type: string
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-24.04          # Linux x86_64
-          - ubuntu-24.04-arm      # Linux ARM64
-          - macos-15              # macOS ARM64 (Apple Silicon)
-          - windows-2022          # Windows x86_64
-        backends:
-          - "sljit;asmjit;mir"
-
-    runs-on: ${{ matrix.os }}
-    name: "${{ matrix.os }}"
+    runs-on: ${{ inputs.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +26,7 @@ jobs:
 
       # Ubuntu: action provides server but not dev headers
       - name: Install PostgreSQL dev headers (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
+        if: startsWith(inputs.os, 'ubuntu')
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
@@ -45,7 +36,7 @@ jobs:
 
       # macOS: PG headers include <libintl.h> which comes from gettext
       - name: Install gettext (macOS)
-        if: startsWith(matrix.os, 'macos')
+        if: startsWith(inputs.os, 'macos')
         run: |
           brew install gettext
           echo "GETTEXT_INCLUDE=-I$(brew --prefix gettext)/include" >> "$GITHUB_ENV"
@@ -60,21 +51,18 @@ jobs:
 
       # ---- Clone dependencies ----
       - name: Clone sljit
-        if: contains(matrix.backends, 'sljit')
         uses: actions/checkout@v4
         with:
           repository: zherczeg/sljit
           path: deps/sljit
 
       - name: Clone AsmJIT
-        if: contains(matrix.backends, 'asmjit')
         uses: actions/checkout@v4
         with:
           repository: asmjit/asmjit
           path: deps/asmjit
 
       - name: Clone MIR
-        if: contains(matrix.backends, 'mir')
         uses: actions/checkout@v4
         with:
           repository: vladich/mir-patched
@@ -106,42 +94,17 @@ jobs:
           fetch-depth: 1
 
       # ---- Configure & Build ----
-      - name: Configure (Unix)
-        if: runner.os != 'Windows'
+      - name: Configure
+        shell: bash
         run: |
-          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
-
-          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
-          fi
-          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
-          fi
-          if [[ "${{ matrix.backends }}" == *mir* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
-          fi
+          CMAKE_ARGS="-DPG_JITTER_BACKENDS=sljit;asmjit;mir"
+          CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
 
           # macOS: PG headers need gettext's libintl.h
           if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
             CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
-          fi
-
-          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
-
-      - name: Configure (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          CMAKE_ARGS="-DPG_JITTER_BACKENDS=${{ matrix.backends }}"
-
-          if [[ "${{ matrix.backends }}" == *sljit* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
-          fi
-          if [[ "${{ matrix.backends }}" == *asmjit* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
-          fi
-          if [[ "${{ matrix.backends }}" == *mir* ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           fi
 
           cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
@@ -214,7 +177,7 @@ jobs:
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
-          BACKENDS=$(echo "${{ matrix.backends }}" | tr ';' ' ')
+          BACKENDS="sljit asmjit mir"
           REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
           PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
 
