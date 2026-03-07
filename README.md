@@ -214,6 +214,8 @@ Apache License 2.0. See [LICENSE](LICENSE).
 All copyrights belong to their respective owners.
 
 ## Builds / regression tests
+Full Postgres regression tests (pg_regress) run on each commit to the master branch for each combination of platform and version of Postgres (20 combinations total).
+For each branch commit, they run for a single version only (PG17). Here is the state of the last master run.
 
 | PG | Linux x86_64 | Linux ARM64 | macOS ARM64 | Windows x86_64 |
 |--------|:---:|:---:|:---:|:---:|
