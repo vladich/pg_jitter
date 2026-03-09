@@ -2252,6 +2252,8 @@ pg_jitter_collation_is_c(Oid collid)
   static Oid cached_collid = InvalidOid;
   static bool cached_result = false;
 
+  if (collid == InvalidOid)
+    return false;       /* unresolved collation — let V1 raise error */
   if (collid == C_COLLATION_OID)
     return true;
   if (collid == cached_collid)
@@ -2282,21 +2284,24 @@ pg_jitter_collation_is_deterministic(Oid collid)
   static Oid cached_collid = InvalidOid;
   static bool cached_result = false;
 
+  /* Unresolved collation — fall through to V1 to raise proper error */
+  if (collid == InvalidOid)
+    return false;
   /* C and POSIX are always deterministic */
   if (collid == C_COLLATION_OID)
     return true;
   if (collid == cached_collid)
     return cached_result;
 
-#if PG_VERSION_NUM >= 180000
+#if PG_VERSION_NUM >= 120000
   {
     pg_locale_t locale = pg_newlocale_from_collation(collid);
-    cached_result = locale->deterministic;
-  }
-#elif PG_VERSION_NUM >= 120000
-  {
-    pg_locale_t locale = pg_newlocale_from_collation(collid);
-    cached_result = locale->deterministic;
+    /*
+     * On PG12-17, pg_newlocale_from_collation() returns NULL for the
+     * default libc collation.  NULL means deterministic (byte-equal).
+     * PG18+ always returns a valid locale struct.
+     */
+    cached_result = (locale == NULL) ? true : locale->deterministic;
   }
 #else
   /* PG < 12 has no non-deterministic collations */
