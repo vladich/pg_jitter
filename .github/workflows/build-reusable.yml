@@ -253,6 +253,9 @@ jobs:
           INCSERVER="$(cygpath -w "$(pg_config --includedir-server)")"
           INC="$(cygpath -w "$(pg_config --includedir)")"
           LIBDIR="$(cygpath -w "$(pg_config --libdir)")"
+          # PG ships stub Unix headers (netinet/in.h, sys/socket.h, etc.) for MSVC
+          INCWIN32="$(cygpath -w "$(pg_config --includedir-server)/port/win32")"
+          INCMSVC="$(cygpath -w "$(pg_config --includedir-server)/port/win32_msvc")"
 
           SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
 
@@ -262,7 +265,9 @@ jobs:
             EXTRA_CFLAGS=""
             [[ "$base" == "refint" ]] && EXTRA_CFLAGS="/DREFINT_VERBOSE"
             # MSYS2_ARG_CONV_EXCL disables MSYS2 auto-conversion of /LD, /link etc. to paths
-            MSYS2_ARG_CONV_EXCL="*" cl.exe /LD /DWIN32 /I"$INCSERVER" /I"$INC" $EXTRA_CFLAGS \
+            MSYS2_ARG_CONV_EXCL="*" cl.exe /LD /DWIN32 \
+              /I"$INCSERVER" /I"$INC" /I"$INCWIN32" /I"$INCMSVC" \
+              $EXTRA_CFLAGS \
               "$(cygpath -w "$src")" \
               /Fe:"$(cygpath -w "$DLPATH/${base}.dll")" \
               /link "$LIBDIR\\postgres.lib"
