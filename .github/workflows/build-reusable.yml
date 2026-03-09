@@ -74,26 +74,46 @@ jobs:
           repository: ashvardanian/StringZilla
           path: deps/stringzilla
 
-      # ---- Vectorscan (SIMD regex/LIKE acceleration, Linux/macOS only) ----
-      - name: Clone Vectorscan
-        if: runner.os != 'Windows'
+      # ---- Vectorscan / Hyperscan (SIMD regex/LIKE acceleration) ----
+      # Strategy: use system packages (fast) where available, build from source otherwise
+      #   Linux x86_64: apt libhyperscan-dev (Intel Hyperscan, pre-built)
+      #   Linux ARM64:  build VectorCamp/vectorscan from source (no apt package for ARM)
+      #   macOS ARM64:  brew vectorscan (pre-built)
+      #   Windows:      not supported
+
+      - name: Install Hyperscan (Ubuntu x86_64)
+        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'X64'
+        run: |
+          sudo apt-get install -y -qq libhyperscan-dev
+
+      - name: Install Vectorscan (macOS)
+        if: startsWith(inputs.os, 'macos')
+        run: |
+          brew install vectorscan
+
+      # ARM64 Linux: no pre-built package, build from source
+      - name: Clone Vectorscan (ARM64 Linux)
+        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64'
         uses: actions/checkout@v4
         with:
           repository: VectorCamp/vectorscan
           path: deps/vectorscan
 
-      - name: Install Vectorscan build deps (Ubuntu)
-        if: startsWith(inputs.os, 'ubuntu')
+      - name: Cache Vectorscan build (ARM64 Linux)
+        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64'
+        id: cache-vectorscan
+        uses: actions/cache@v4
+        with:
+          path: deps/vectorscan/build
+          key: vectorscan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deps/vectorscan/CMakeLists.txt') }}
+
+      - name: Install Vectorscan build deps (ARM64 Linux)
+        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64' && steps.cache-vectorscan.outputs.cache-hit != 'true'
         run: |
           sudo apt-get install -y -qq ragel libboost-dev pkg-config
 
-      - name: Install Vectorscan build deps (macOS)
-        if: startsWith(inputs.os, 'macos')
-        run: |
-          brew install ragel boost pkg-config
-
-      - name: Build Vectorscan
-        if: runner.os != 'Windows'
+      - name: Build Vectorscan (ARM64 Linux)
+        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64' && steps.cache-vectorscan.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cd deps/vectorscan
@@ -104,7 +124,7 @@ jobs:
             -DFAT_RUNTIME=OFF \
             -DBUILD_EXAMPLES=OFF \
             -DBUILD_BENCHMARKS=OFF
-          cmake --build . --target hs --parallel
+          cmake --build . --target hs -j 2
           echo "Vectorscan library:"
           ls -la lib/libhs.a
 
@@ -143,8 +163,9 @@ jobs:
           CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
 
-          # Vectorscan (Linux/macOS only — already built above)
-          if [[ "$RUNNER_OS" != "Windows" ]]; then
+          # Vectorscan: source tree path only for ARM64 Linux (built from source)
+          # x86_64 Linux and macOS use system packages found by CMake find_path/find_library
+          if [[ "$RUNNER_ARCH" == "ARM64" && "$RUNNER_OS" == "Linux" ]]; then
             CMAKE_ARGS="$CMAKE_ARGS -DVECTORSCAN_DIR=${{ github.workspace }}/deps/vectorscan"
           fi
 
