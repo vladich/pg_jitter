@@ -336,6 +336,20 @@ jobs:
 
           PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
 
+          # Show locale/collation info for debugging
+          psql "$CONNURI" -c "SELECT datcollate, datctype, datlocprovider FROM pg_database WHERE datname = current_database();"
+
+          # Enable core dumps and verbose logging for crash diagnosis
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            ulimit -c unlimited 2>/dev/null || true
+            echo '/tmp/core.%p' | sudo tee /proc/sys/kernel/core_pattern || true
+            sudo apt-get install -y -qq gdb 2>/dev/null || true
+          fi
+          # Enable log_statement=all to see which query crashes
+          echo "log_statement = 'all'" >> "$PGDATA/postgresql.auto.conf"
+          echo "log_min_messages = 'INFO'" >> "$PGDATA/postgresql.auto.conf"
+          pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
+
           PASSED=0
           FAILED=0
           RESULTS=""
@@ -345,17 +359,27 @@ jobs:
             echo "  Regression tests: $backend"
             echo "============================================"
 
-            cleanup_database
+            # Ensure server is running (may have crashed from previous backend)
+            if ! pg_isready -h localhost -p "$PGPORT" -q 2>/dev/null; then
+              echo "  Server is down — restarting..."
+              pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w || true
+              sleep 2
+            fi
+
+            cleanup_database || true
 
             # Switch backend by writing to config and reloading.
             # ALTER SYSTEM SET rejects unknown GUCs, but the config file accepts them.
             grep -v '^pg_jitter\.backend' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
             mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf"
             echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
-            psql "$CONNURI" -c "SELECT pg_reload_conf();"
+            pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
             sleep 1
 
             echo "Active backend: $backend"
+
+            # Quick sanity check — basic JIT query
+            psql "$CONNURI" -c "SELECT 1+1 AS jit_test;" || echo "WARNING: basic JIT query failed for $backend"
 
             OUTDIR="${{ github.workspace }}/regress-output-$backend"
             mkdir -p "$OUTDIR"
@@ -394,6 +418,32 @@ jobs:
                 head -500 "$OUTDIR/regression.diffs"
               fi
               FAILED=$((FAILED + 1))
+
+              # Dump last 200 lines of PG server log to capture crash details + query
+              if [ -f "$PGDATA/logfile" ]; then
+                echo "--- Last 200 lines of PostgreSQL server log ---"
+                tail -200 "$PGDATA/logfile"
+              fi
+
+              # Get backtrace from core dumps (Linux)
+              if [ "$RUNNER_OS" = "Linux" ]; then
+                for corefile in /tmp/core.*; do
+                  [ -f "$corefile" ] || continue
+                  echo "--- Backtrace from $corefile ---"
+                  PGBIN=$(pg_config --bindir)/postgres
+                  gdb -batch -ex "thread apply all bt" "$PGBIN" "$corefile" 2>&1 | head -100
+                  rm -f "$corefile"
+                done
+              fi
+
+              # macOS crash reports
+              if [ "$RUNNER_OS" = "macOS" ]; then
+                for report in ~/Library/Logs/DiagnosticReports/postgres*; do
+                  [ -f "$report" ] || continue
+                  echo "--- Crash report: $(basename $report) ---"
+                  head -80 "$report"
+                done
+              fi
             fi
 
             echo ""
