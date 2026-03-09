@@ -261,7 +261,8 @@ jobs:
             base=$(basename "$src" .c)
             EXTRA_CFLAGS=""
             [[ "$base" == "refint" ]] && EXTRA_CFLAGS="/DREFINT_VERBOSE"
-            cl.exe /LD /I"$INCSERVER" /I"$INC" $EXTRA_CFLAGS \
+            # MSYS2_ARG_CONV_EXCL disables MSYS2 auto-conversion of /LD, /link etc. to paths
+            MSYS2_ARG_CONV_EXCL="*" cl.exe /LD /DWIN32 /I"$INCSERVER" /I"$INC" $EXTRA_CFLAGS \
               "$(cygpath -w "$src")" \
               /Fe:"$(cygpath -w "$DLPATH/${base}.dll")" \
               /link "$LIBDIR\\postgres.lib"
