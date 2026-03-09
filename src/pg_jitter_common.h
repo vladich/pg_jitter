@@ -17,6 +17,19 @@
 #include "access/parallel.h"
 #include "storage/dsm.h"
 #include "port/atomics.h"
+/*
+ * pg_jitter_collation_is_c — check if a collation OID resolves to C/POSIX.
+ * Used at JIT compile time to decide whether SIMD text ops are safe.
+ * Handles DEFAULT_COLLATION_OID (100) in addition to C_COLLATION_OID (950).
+ */
+extern bool pg_jitter_collation_is_c(Oid collid);
+
+/*
+ * pg_jitter_collation_is_deterministic — check if a collation is deterministic.
+ * LIKE/regex matching is byte-level and safe for any deterministic collation.
+ * Used to gate StringZilla/Vectorscan LIKE/regex fast paths.
+ */
+extern bool pg_jitter_collation_is_deterministic(Oid collid);
 
 /*
  * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
@@ -233,6 +246,7 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 extern int pg_jitter_parallel_mode;
 extern int pg_jitter_shared_code_max_kb;
 extern bool pg_jitter_deform_cache;
+extern int pg_jitter_min_expr_steps;
 
 /*
  * Read the current parallel mode from the GUC system.
@@ -244,6 +258,7 @@ extern bool pg_jitter_deform_cache;
  * was registered.
  */
 extern int pg_jitter_get_parallel_mode(void);
+extern int pg_jitter_get_min_expr_steps(void);
 
 /*
  * Loop-based deform for wide tables.
@@ -260,10 +275,12 @@ extern int pg_jitter_get_parallel_mode(void);
 /*
  * Hard cap on JIT deform column count.  Above this, JIT deform (both
  * unrolled and loop-based) is slower than the interpreter due to
- * compilation overhead and I-cache pressure.  Fall back to
+ * compilation overhead and data-cache pressure.  Fall back to
  * slot_getsomeattrs_int() for tables wider than this.
+ *
+ * Derived from L1D cache size at runtime via pg_jitter_wide_deform_limit().
  */
-#define WIDE_DEFORM_LIMIT 100
+extern int pg_jitter_wide_deform_limit(void);
 
 /* Per-column descriptor for loop-based deform */
 typedef struct DeformColDesc {
@@ -307,5 +324,159 @@ extern bool pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 											int natts);
 extern bool pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc);
 extern void pg_jitter_reset_shared_deform(void);
+
+/*
+ * CASE expression binary search optimization.
+ *
+ * Detects monotonic CASE patterns at JIT compile time and replaces
+ * linear O(N) branch scanning with O(log N) binary search via helper
+ * functions.  Supports both searched CASE (< / <= / > / >=) and
+ * simple CASE (=) patterns with all ordered types (int2/int4/int8,
+ * float4/float8, date, timestamp, oid, bool, and byref types like
+ * text, numeric, uuid, interval, bpchar, bytea, jsonb, network).
+ *
+ * For shared mode compatibility, array pointers are stored in step
+ * data fields of skipped steps.  Each process (leader + workers) runs
+ * detection independently and allocates its own arrays.  JIT code
+ * loads array pointers from step data at runtime.
+ *
+ * Step fields used for storing runtime pointers:
+ *   steps[start_opno + 1].d.constval.value  →  thresholds array pointer
+ *   steps[start_opno + 4].d.constval.value  →  results array pointer
+ */
+
+/* Minimum branches to trigger binary search (below this, linear is faster) */
+#define CASE_BSEARCH_MIN_BRANCHES  4
+
+/*
+ * CaseBSearchType — discriminator for binary search helper selection.
+ * Determines threshold storage format, comparison semantics, and
+ * which helper function to call at runtime.
+ */
+typedef enum CaseBSearchType {
+	CASE_BS_I32,       /* int4, date — signed int32 */
+	CASE_BS_I64,       /* int8, timestamp/tz, bool — signed int64 / Datum */
+	CASE_BS_U32,       /* oid — unsigned uint32 */
+	CASE_BS_I16,       /* int2 — cast to int16 for comparison */
+	CASE_BS_F4,        /* float4 — NaN-aware float comparison */
+	CASE_BS_F8,        /* float8 — NaN-aware float comparison */
+	CASE_BS_GENERIC,   /* byref types: call PG cmp_fn via V1 */
+} CaseBSearchType;
+
+/* Map bs_type to JIT calling convention var_type.
+ * Returns 0 (JIT_TYPE_32) for 32-bit types, 1 (JIT_TYPE_64) for 64-bit. */
+static inline int8 bs_type_to_var_type(CaseBSearchType t) {
+	switch (t) {
+		case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16:
+			return 0; /* JIT_TYPE_32 */
+		default:
+			return 1; /* JIT_TYPE_64 */
+	}
+}
+
+typedef struct CaseBSearchInfo {
+	int         start_opno;     /* first step of the pattern (VAR/CASE_TESTVAL) */
+	int         end_opno;       /* step AFTER last JUMP (= first step of ELSE) */
+	int         else_end_opno;  /* step AFTER ELSE const (= CASE end) */
+	int         num_branches;
+	bool        is_equality;    /* Pattern B (=) vs Pattern A (</<=/>/>=) */
+	bool        is_less;        /* true for </<=, false for >/>=  */
+	bool        is_inclusive;   /* true for <=/>= */
+	PGFunction  cmp_fn;         /* comparison function address */
+	CaseBSearchType bs_type;    /* type discriminator for helper selection */
+	/* Arrays allocated in CurrentMemoryContext, length = num_branches */
+	Datum      *thresholds;     /* sorted thresholds/values */
+	Datum      *results;        /* corresponding THEN results */
+	Datum       default_result; /* ELSE result */
+	bool        default_is_null;
+	/* For the comparison variable */
+	int         var_opno;       /* step index of representative VAR step */
+	int8        var_type;       /* JIT_TYPE_32 or JIT_TYPE_64 (derived from bs_type) */
+} CaseBSearchInfo;
+
+/* Detect CASE patterns suitable for binary search optimization.
+ * Returns number of detected patterns.  Caller provides pre-allocated array. */
+extern int pg_jitter_detect_case_bsearch(ExprState *state,
+										 ExprEvalStep *steps, int steps_len,
+										 CaseBSearchInfo *out, int max_patterns);
+
+/* Set up binary search arrays for a detected pattern and store pointers
+ * in step data fields for runtime access by JIT code. Called by both
+ * leader (during compilation) and workers (after attaching shared code). */
+extern void pg_jitter_setup_case_bsearch_arrays(ExprState *state,
+												ExprEvalStep *steps,
+												int steps_len);
+
+/*
+ * Compact descriptor for binary search at runtime.
+ * Allocated once per detected pattern, stored in step data for JIT access.
+ * Contains all data needed by the binary search helpers.
+ */
+typedef struct CaseBSearchDesc {
+	int         n;              /* number of branches */
+	uint8       bs_type;        /* CaseBSearchType discriminator */
+	PGFunction  cmp_fn;         /* for CASE_BS_GENERIC: PG comparison function (the operator) */
+	PGFunction  cmp_order_fn;   /* for CASE_BS_GENERIC eq: _lt function for binary search order */
+	Oid         cmp_collation;  /* for CASE_BS_GENERIC: collation OID */
+	Datum       default_val;    /* ELSE result */
+	/* thresholds: int32[n] or int64[n] or Datum[n] immediately after this header */
+	/* results:    Datum[n] after thresholds */
+} CaseBSearchDesc;
+
+/* Binary search helpers called from JIT code.
+ * Take (val, desc_ptr) — desc contains thresholds, results, n, default.
+ * Returns the matching result Datum. */
+
+/* signed int32 (int4, date) */
+extern Datum pg_jitter_case_bsearch_lt_i32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_i32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_i32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_i32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_i32(int32 val, const CaseBSearchDesc *desc);
+
+/* signed int64 (int8, timestamp/tz, bool) */
+extern Datum pg_jitter_case_bsearch_lt_i64(int64 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_i64(int64 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_i64(int64 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_i64(int64 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_i64(int64 val, const CaseBSearchDesc *desc);
+
+/* unsigned int32 (oid) */
+extern Datum pg_jitter_case_bsearch_lt_u32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_u32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_u32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_u32(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_u32(int32 val, const CaseBSearchDesc *desc);
+
+/* int16 (int2) — val passed as int32, cast to int16 for comparison */
+extern Datum pg_jitter_case_bsearch_lt_i16(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_i16(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_i16(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_i16(int32 val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_i16(int32 val, const CaseBSearchDesc *desc);
+
+/* float4 — NaN-aware, val passed as Datum */
+extern Datum pg_jitter_case_bsearch_lt_f4(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_f4(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_f4(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_f4(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_f4(Datum val, const CaseBSearchDesc *desc);
+
+/* float8 — NaN-aware, val passed as Datum */
+extern Datum pg_jitter_case_bsearch_lt_f8(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_f8(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_f8(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_f8(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_f8(Datum val, const CaseBSearchDesc *desc);
+
+/* generic (byref types) — calls PG cmp_fn via V1 */
+extern Datum pg_jitter_case_bsearch_lt_generic(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_le_generic(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_gt_generic(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_ge_generic(Datum val, const CaseBSearchDesc *desc);
+extern Datum pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc *desc);
+
+/* Returns the appropriate helper function for the given pattern. */
+extern void *pg_jitter_select_bsearch_helper(const CaseBSearchInfo *cbi);
 
 #endif /* PG_JITTER_COMMON_H */

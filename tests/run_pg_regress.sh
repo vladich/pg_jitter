@@ -225,7 +225,7 @@ for backend in $BACKENDS; do
     # Run installcheck, capture output
     LOGFILE="$REGRESS_DIR/regression_${backend}.log"
     set +e
-    (cd "$PG_SRC" && make installcheck PGPORT="$PGPORT" 2>&1) | tee "$LOGFILE" | tail -3
+    (cd "$PG_SRC" && make installcheck PGPORT="$PGPORT" bindir="$PGBIN" 2>&1) | tee "$LOGFILE" | tail -3
     RC=${PIPESTATUS[0]}
     set -e
 

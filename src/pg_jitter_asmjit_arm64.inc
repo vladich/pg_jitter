@@ -39,6 +39,148 @@ emit_relocatable_mov(a64::Compiler &cc, a64::Gp dst, uint64_t val)
 	} while (0)
 
 /*
+ * Detect a run of consecutive fixed-width NOT NULL byval columns
+ * suitable for NEON batch loading.  Returns count of batchable columns
+ * (0 if no batch possible).  Requires guaranteed alignment tracking.
+ */
+static int
+asmjit_detect_neon_batch(TupleDesc desc, int start, int natts,
+                         int known_alignment, bool attguaranteedalign,
+                         int *out_attlen)
+{
+    if (!attguaranteedalign || known_alignment < 0)
+        return 0;
+
+    CompactAttribute *first = TupleDescCompactAttr(desc, start);
+    if (!first->attbyval || !JITTER_ATT_IS_NOTNULL(first) ||
+        first->atthasmissing || first->attisdropped)
+        return 0;
+
+    int attlen = first->attlen;
+    if (attlen != 4 && attlen != 8)
+        return 0;
+
+    int count = 1;
+    int ka = known_alignment + attlen;
+
+    for (int j = start + 1; j < natts; j++)
+    {
+        CompactAttribute *att = TupleDescCompactAttr(desc, j);
+        if (!att->attbyval || !JITTER_ATT_IS_NOTNULL(att) ||
+            att->attlen != attlen ||
+            att->atthasmissing || att->attisdropped)
+            break;
+
+        int alignto = JITTER_ATTALIGNBY(att);
+        if (ka != TYPEALIGN(alignto, ka))
+            break;
+
+        count++;
+        ka += attlen;
+    }
+
+    /* Minimum batch: 4 for int32, 2 for int64 */
+    int min_batch = (attlen == 4) ? 4 : 2;
+    if (count < min_batch)
+        return 0;
+
+    /* Round down to multiple of min_batch */
+    count = (count / min_batch) * min_batch;
+
+    *out_attlen = attlen;
+    return count;
+}
+
+/*
+ * Emit NEON batch load/store for a run of consecutive fixed-width
+ * NOT NULL byval columns.  Loads from tuple data using compile-time
+ * known offsets, sign-extends int32->int64 if needed, stores to
+ * tts_values[], and zeros tts_isnull[].
+ */
+static void
+asmjit_emit_neon_batch(a64::Compiler &cc,
+                       a64::Gp v_tupdata_base,
+                       a64::Gp v_tts_values,
+                       a64::Gp v_tts_isnull,
+                       a64::Gp v_off,
+                       int attnum, int count, int attlen,
+                       int known_alignment)
+{
+    if (attlen == 4)
+    {
+        /* int32 batch: load 4 at a time, sign-extend to int64 Datums */
+        for (int i = 0; i < count; i += 4)
+        {
+            int src_off = known_alignment + i * 4;
+            int dst_off = (attnum + i) * (int) sizeof(Datum);
+
+            a64::Vec vi32 = cc.new_vec_q();
+            a64::Vec vlo  = cc.new_vec_q();
+            a64::Vec vhi  = cc.new_vec_q();
+
+            a64::Gp saddr = cc.new_gpx();
+            cc.add(saddr, v_tupdata_base, Imm(src_off));
+            cc.ld1(vi32.s4(), a64::ptr(saddr));
+
+            cc.sxtl(vlo.d2(), vi32.s2());
+            cc.sxtl2(vhi.d2(), vi32.s4());
+
+            a64::Gp daddr = cc.new_gpx();
+            cc.add(daddr, v_tts_values, Imm(dst_off));
+            cc.st1(vlo.d2(), a64::ptr(daddr));
+            cc.add(daddr, daddr, Imm(16));
+            cc.st1(vhi.d2(), a64::ptr(daddr));
+        }
+    }
+    else /* attlen == 8 */
+    {
+        /* int64 batch: load 2 at a time, store directly as Datums */
+        for (int i = 0; i < count; i += 2)
+        {
+            int src_off = known_alignment + i * 8;
+            int dst_off = (attnum + i) * (int) sizeof(Datum);
+
+            a64::Vec vi64 = cc.new_vec_q();
+
+            a64::Gp saddr = cc.new_gpx();
+            cc.add(saddr, v_tupdata_base, Imm(src_off));
+            cc.ld1(vi64.d2(), a64::ptr(saddr));
+
+            a64::Gp daddr = cc.new_gpx();
+            cc.add(daddr, v_tts_values, Imm(dst_off));
+            cc.st1(vi64.d2(), a64::ptr(daddr));
+        }
+    }
+
+    /* Zero tts_isnull[] for the batch columns */
+    int remain = count;
+    int off = 0;
+    while (remain >= 8)
+    {
+        cc.str(a64::xzr, a64::ptr(v_tts_isnull, attnum + off));
+        off += 8;
+        remain -= 8;
+    }
+    if (remain >= 4)
+    {
+        cc.str(a64::wzr, a64::ptr(v_tts_isnull, attnum + off));
+        off += 4;
+        remain -= 4;
+    }
+    if (remain >= 2)
+    {
+        cc.strh(a64::wzr, a64::ptr(v_tts_isnull, attnum + off));
+        off += 2;
+        remain -= 2;
+    }
+    if (remain >= 1)
+        cc.strb(a64::wzr, a64::ptr(v_tts_isnull, attnum + off));
+
+    /* Set v_off for the column after the batch */
+    cc.mov(v_off, known_alignment + count * attlen);
+}
+
+/*
  * Emit deform code inline into the AsmJIT Compiler.
  *
  * Uses virtual registers — the AsmJIT register allocator handles
@@ -71,7 +213,7 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         return false;
     if (natts <= 0 || natts > desc->natts)
         return false;
-    if (natts > WIDE_DEFORM_LIMIT)
+    if (natts > pg_jitter_wide_deform_limit())
         return false;
     /* Wide tables: fall back to slot_getsomeattrs_int */
     if (natts > pg_jitter_deform_threshold())
@@ -208,6 +350,26 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
         /* If attnum == 0: reset offset */
         if (attnum == 0)
             cc.mov(v_off, 0);
+
+        /* ---- NEON batch acceleration ---- */
+        {
+            int neon_attlen = 0;
+            int neon_count = asmjit_detect_neon_batch(desc, attnum, natts,
+                                                       known_alignment,
+                                                       attguaranteedalign,
+                                                       &neon_attlen);
+            if (neon_count > 0)
+            {
+                asmjit_emit_neon_batch(cc, v_tupdata_base, v_tts_values,
+                                       v_tts_isnull, v_off,
+                                       attnum, neon_count, neon_attlen,
+                                       known_alignment);
+                if (attnum + neon_count < natts)
+                    cc.b(att_labels[attnum + neon_count]);
+                else
+                    cc.b(deform_out);
+            }
+        }
 
         /* ---- Availability check ---- */
         if (attnum > guaranteed_column_number)
@@ -414,6 +576,42 @@ asmjit_emit_deform_inline(a64::Compiler &cc,
 }
 
 /*
+ * Map opcode to slot cache index (0=inner, 1=outer, 2=scan, 3=old, 4=new).
+ * Returns -1 for unknown opcodes.
+ */
+static int
+slot_cache_index(ExprEvalOp opcode)
+{
+	switch (opcode)
+	{
+		case EEOP_INNER_FETCHSOME:
+		case EEOP_INNER_VAR:
+		case EEOP_ASSIGN_INNER_VAR:
+			return 0; /* SLOT_CACHE_INNER */
+		case EEOP_OUTER_FETCHSOME:
+		case EEOP_OUTER_VAR:
+		case EEOP_ASSIGN_OUTER_VAR:
+			return 1; /* SLOT_CACHE_OUTER */
+		case EEOP_SCAN_FETCHSOME:
+		case EEOP_SCAN_VAR:
+		case EEOP_ASSIGN_SCAN_VAR:
+			return 2; /* SLOT_CACHE_SCAN */
+#ifdef HAVE_EEOP_OLD_NEW
+		case EEOP_OLD_FETCHSOME:
+		case EEOP_OLD_VAR:
+		case EEOP_ASSIGN_OLD_VAR:
+			return 3; /* SLOT_CACHE_OLD */
+		case EEOP_NEW_FETCHSOME:
+		case EEOP_NEW_VAR:
+		case EEOP_ASSIGN_NEW_VAR:
+			return 4; /* SLOT_CACHE_NEW */
+#endif
+		default:
+			return -1;
+	}
+}
+
+/*
  * Emit all expression steps as ARM64 native code.
  *
  * This is the arch-specific codegen body called from asmjit_compile_expr().
@@ -505,10 +703,267 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 	((int64_t)(opno) * (int64_t)sizeof(ExprEvalStep) + \
 	 (int64_t)offsetof(ExprEvalStep, field))
 
+	/*
+	 * Slot caching: after FETCHSOME, cache the slot's tts_values and
+	 * tts_isnull pointers so subsequent VAR/ASSIGN_VAR ops don't need
+	 * to reload them via econtext->slot->tts_values each time.
+	 *
+	 * Indices: 0=inner, 1=outer, 2=scan, 3=old, 4=new
+	 */
+#define SLOT_CACHE_INNER  0
+#define SLOT_CACHE_OUTER  1
+#define SLOT_CACHE_SCAN   2
+#define SLOT_CACHE_OLD    3
+#define SLOT_CACHE_NEW    4
+#define NUM_SLOT_CACHES   5
+
+	a64::Gp v_cached_vals[NUM_SLOT_CACHES];
+	a64::Gp v_cached_nulls[NUM_SLOT_CACHES];
+	uint32_t slots_cached = 0;
+
+	/* Pre-allocate virtual registers for each slot cache entry */
+	for (int i = 0; i < NUM_SLOT_CACHES; i++)
+	{
+		v_cached_vals[i] = cc.new_gpx();
+		v_cached_nulls[i] = cc.new_gpx();
+	}
+
 	/* Create labels for each step */
 	Label *step_labels = (Label *) palloc(sizeof(Label) * steps_len);
 	for (int i = 0; i < steps_len; i++)
 		step_labels[i] = cc.new_label();
+
+	/*
+	 * Build jump-target bitmap: is_jump_target[i] is true if any other
+	 * step can jump to step i.  Used to prevent batch VAR/ASSIGN_VAR
+	 * from merging steps that are branch targets -- a jump into the
+	 * middle of a batch would skip the batch's load code.
+	 */
+	bool *is_jump_target = (bool *) palloc0(sizeof(bool) * steps_len);
+	for (int i = 0; i < steps_len; i++)
+	{
+		ExprEvalStep *s = &steps[i];
+		ExprEvalOp sop = ExecEvalStepOp(state, s);
+		int tgt = -1;
+
+		switch (sop)
+		{
+			case EEOP_JUMP:
+			case EEOP_JUMP_IF_NULL:
+			case EEOP_JUMP_IF_NOT_NULL:
+			case EEOP_JUMP_IF_NOT_TRUE:
+				tgt = s->d.jump.jumpdone;
+				break;
+			case EEOP_QUAL:
+				tgt = s->d.qualexpr.jumpdone;
+				break;
+			case EEOP_BOOL_AND_STEP:
+			case EEOP_BOOL_AND_STEP_FIRST:
+			case EEOP_BOOL_AND_STEP_LAST:
+			case EEOP_BOOL_OR_STEP:
+			case EEOP_BOOL_OR_STEP_FIRST:
+			case EEOP_BOOL_OR_STEP_LAST:
+				tgt = s->d.boolexpr.jumpdone;
+				break;
+			case EEOP_ROWCOMPARE_STEP:
+				if (s->d.rowcompare_step.jumpnull >= 0 &&
+					s->d.rowcompare_step.jumpnull < steps_len)
+					is_jump_target[s->d.rowcompare_step.jumpnull] = true;
+				tgt = s->d.rowcompare_step.jumpdone;
+				break;
+			case EEOP_SBSREF_SUBSCRIPTS:
+				tgt = s->d.sbsref_subscript.jumpdone;
+				break;
+#ifdef HAVE_EEOP_HASHDATUM
+			case EEOP_HASHDATUM_FIRST:
+			case EEOP_HASHDATUM_FIRST_STRICT:
+			case EEOP_HASHDATUM_NEXT32:
+			case EEOP_HASHDATUM_NEXT32_STRICT:
+				tgt = s->d.hashdatum.jumpdone;
+				break;
+#endif
+			case EEOP_AGG_DESERIALIZE:
+			case EEOP_AGG_STRICT_DESERIALIZE:
+				tgt = s->d.agg_deserialize.jumpnull;
+				break;
+			case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
+			case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+				tgt = s->d.agg_strict_input_check.jumpnull;
+				break;
+			case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
+				tgt = s->d.agg_plain_pergroup_nullcheck.jumpnull;
+				break;
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+			case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
+			case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
+				tgt = s->d.agg_presorted_distinctcheck.jumpdistinct;
+				break;
+#endif
+#ifdef HAVE_EEOP_RETURNINGEXPR
+			case EEOP_RETURNINGEXPR:
+				tgt = s->d.returningexpr.jumpdone;
+				break;
+#endif
+			default:
+				break;
+		}
+		if (tgt >= 0 && tgt < steps_len)
+			is_jump_target[tgt] = true;
+	}
+
+	/*
+	 * Vectorized QUAL batch detection.
+	 *
+	 * Find groups of QUAL steps with the same jumpdone target where:
+	 *   (a) no intermediate step is a jump target
+	 *   (b) all intermediate steps are provably side-effect-free
+	 *
+	 * Eliminating short-circuit evaluation changes observable behavior if
+	 * any intermediate function has side effects (NOTICE, error, etc.).
+	 * We only batch when all steps between QUALs are safe to speculate:
+	 *   - VAR (inner/outer/scan/old/new): pure memory loads
+	 *   - CONST: immediate value
+	 *   - FUNCEXPR_STRICT where jit_find_direct_fn() succeeds: built-in
+	 *     comparison/arithmetic, guaranteed side-effect-free
+	 *   - ASSIGN_*_VAR: pure stores to result slot
+	 *   - FETCHSOME: deform dispatch (reads only)
+	 *
+	 * qual_batch_last[i] = index of last QUAL in the batch containing
+	 * step i (0 if step i is not a QUAL in a batch of size >= 2).
+	 *
+	 * Fast-path: skip the entire scan if fewer than 2 QUALs exist, since
+	 * batching requires at least 2.  This avoids compile-time overhead
+	 * and register pressure for expressions that can't benefit.
+	 */
+	int *qual_batch_last = NULL;
+	bool has_qual_batches = false;
+	{
+		/* Quick count of QUAL steps */
+		int qual_count = 0;
+		for (int i = 0; i < steps_len && qual_count < 2; i++)
+		{
+			if (ExecEvalStepOp(state, &steps[i]) == EEOP_QUAL)
+				qual_count++;
+		}
+
+		if (qual_count >= 2)
+		{
+			qual_batch_last = (int *) palloc0(sizeof(int) * steps_len);
+			int i = 0;
+			while (i < steps_len)
+			{
+				ExprEvalOp sop = ExecEvalStepOp(state, &steps[i]);
+				if (sop != EEOP_QUAL)
+				{
+					i++;
+					continue;
+				}
+
+				/* Found a QUAL — scan forward for more with same jumpdone */
+				int jumpdone = steps[i].d.qualexpr.jumpdone;
+				int first_qual = i;
+				int last_qual = i;
+				bool safe = true;
+
+				for (int j = i + 1; j < steps_len && safe; j++)
+				{
+					if (is_jump_target[j])
+						break;
+					ExprEvalOp jop = ExecEvalStepOp(state, &steps[j]);
+					if (jop == EEOP_QUAL)
+					{
+						if (steps[j].d.qualexpr.jumpdone == jumpdone)
+							last_qual = j;
+						else
+							break;
+					}
+					else
+					{
+						/* Check if this step is safe to speculate */
+						switch (jop)
+						{
+							case EEOP_INNER_VAR:
+							case EEOP_OUTER_VAR:
+							case EEOP_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
+							case EEOP_OLD_VAR:
+							case EEOP_NEW_VAR:
+#endif
+							case EEOP_CONST:
+							case EEOP_ASSIGN_INNER_VAR:
+							case EEOP_ASSIGN_OUTER_VAR:
+							case EEOP_ASSIGN_SCAN_VAR:
+							case EEOP_INNER_FETCHSOME:
+							case EEOP_OUTER_FETCHSOME:
+							case EEOP_SCAN_FETCHSOME:
+								break;  /* safe */
+
+							case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+							case EEOP_FUNCEXPR_STRICT_1:
+							case EEOP_FUNCEXPR_STRICT_2:
+#endif
+							{
+								/* Only safe if it's a known direct-call fn */
+								const JitDirectFn *dfn =
+									jit_find_direct_fn(steps[j].d.func.fn_addr);
+								if (!dfn)
+									safe = false;
+								break;
+							}
+
+							default:
+								safe = false;
+								break;
+						}
+					}
+				}
+
+				if (safe && last_qual > first_qual)
+				{
+					/* Batch of 2+ QUALs with same jumpdone, all steps safe */
+					has_qual_batches = true;
+					for (int q = first_qual; q <= last_qual; q++)
+					{
+						if (ExecEvalStepOp(state, &steps[q]) == EEOP_QUAL)
+							qual_batch_last[q] = last_qual;
+					}
+				}
+
+				i = last_qual + 1;
+			}
+
+			/* If no batches were found, free the array */
+			if (!has_qual_batches)
+			{
+				pfree(qual_batch_last);
+				qual_batch_last = NULL;
+			}
+		}
+	}
+
+	/*
+	 * Register for accumulating QUAL batch failures (branchless).
+	 * Only allocated when qual batching is active — avoids stealing a
+	 * callee-saved register on expressions that don't benefit.
+	 */
+	a64::Gp v_qual_fail;
+	if (has_qual_batches)
+		v_qual_fail = cc.new_gpx("qfail");
+
+	/* CASE binary search pre-scan */
+	CaseBSearchInfo case_bsearch[16];
+	int num_case_bsearch = 0;
+	int next_bsearch_idx = 0;
+
+	num_case_bsearch = pg_jitter_detect_case_bsearch(
+		state, steps, steps_len, case_bsearch, 16);
+
+	if (num_case_bsearch > 0) {
+		pg_jitter_setup_case_bsearch_arrays(state, steps, steps_len);
+		elog(DEBUG1, "pg_jitter[asmjit]: detected %d CASE bsearch pattern(s)",
+			 num_case_bsearch);
+	}
 
 	/* Main loop: emit code for each step */
 	for (int opno = 0; opno < steps_len; opno++)
@@ -517,6 +972,115 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 		ExprEvalOp	opcode = ExecEvalStepOp(state, op);
 
 		cc.bind(step_labels[opno]);
+
+		/* CASE binary search: inject call after VAR step, skip pattern */
+		if (next_bsearch_idx < num_case_bsearch &&
+			opno == case_bsearch[next_bsearch_idx].start_opno + 1)
+		{
+			CaseBSearchInfo *cbi = &case_bsearch[next_bsearch_idx];
+			int var_opno = cbi->start_opno;
+			ExprEvalStep *var_op = &steps[var_opno];
+
+			Label null_path = cc.new_label();
+			Label done_path = cc.new_label();
+
+			/* Load resnull from VAR step */
+			if (var_op->resnull == &state->resnull)
+				cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+			else
+			{
+				cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(var_opno, resnull)));
+				cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+			}
+			cc.cbnz(tmp2, null_path);
+
+			/* Load resvalue from VAR step */
+			if (var_op->resvalue == &state->resvalue)
+				cc.ldr(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+			else
+			{
+				cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(var_opno, resvalue)));
+				cc.ldr(tmp1, a64::ptr(tmp3));
+			}
+
+			/* Load desc pointer from step data (start_opno+2, dead JINT step) */
+			a64::Gp desc_reg = cc.new_gpx("bsdesc");
+			cc.ldr(desc_reg, a64::ptr(v_steps,
+				STEP_OFFSET(cbi->start_opno + 2, d.constval.value)));
+
+			void *helper_fn = pg_jitter_select_bsearch_helper(cbi);
+
+			/* Call helper: (val, desc) -> Datum */
+			a64::Gp fn_reg = cc.new_gpx("bsfn");
+			ASMJIT_MOV_FN(cc, fn_reg, helper_fn);
+
+			InvokeNode *bs_invoke;
+			if (cbi->var_type == JIT_TYPE_32)
+			{
+				cc.invoke(Out(bs_invoke), fn_reg,
+						  FuncSignature::build<int64_t, int32_t, void *>());
+			}
+			else
+			{
+				cc.invoke(Out(bs_invoke), fn_reg,
+						  FuncSignature::build<int64_t, int64_t, void *>());
+			}
+			bs_invoke->set_arg(0, tmp1);
+			bs_invoke->set_arg(1, desc_reg);
+			bs_invoke->set_ret(0, tmp1);
+
+			/* Store result to ELSE step's resvalue, resnull = false */
+			{
+				ExprEvalStep *else_op = &steps[cbi->end_opno];
+				if (else_op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(cbi->end_opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp2));
+				}
+				cc.mov(tmp1, 0);
+				if (else_op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(cbi->end_opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp2));
+				}
+			}
+			cc.b(step_labels[cbi->else_end_opno]);
+
+			/* Null path: use default result */
+			cc.bind(null_path);
+			{
+				ExprEvalStep *else_op = &steps[cbi->end_opno];
+				cc.mov(tmp1, (int64_t)cbi->default_result);
+				if (else_op->resvalue == &state->resvalue)
+					cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(cbi->end_opno, resvalue)));
+					cc.str(tmp1, a64::ptr(tmp2));
+				}
+				cc.mov(tmp1, cbi->default_is_null ? 1 : 0);
+				if (else_op->resnull == &state->resnull)
+					cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(cbi->end_opno, resnull)));
+					cc.strb(tmp1.w(), a64::ptr(tmp2));
+				}
+			}
+			cc.b(step_labels[cbi->else_end_opno]);
+
+			/* Bind labels for skipped steps */
+			for (int skip = opno + 1; skip < cbi->else_end_opno && skip < steps_len; skip++)
+				cc.bind(step_labels[skip]);
+
+			opno = cbi->else_end_opno - 1;
+			next_bsearch_idx++;
+			continue;
+		}
 
 		switch (opcode)
 		{
@@ -610,11 +1174,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!deform_emitted)
 				{
 					/*
-					 * Fallback: call slot_getsomeattrs_int(slot, natts).
-					 * No sljit deform — asmjit backend is self-contained.
+					 * Fallback: call compiled deform dispatch which JIT-compiles
+					 * and caches the deform, falling back to slot_getsomeattrs_int
+					 * only for unsupported slot types.
 					 */
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) slot_getsomeattrs_int);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_compiled_deform_dispatch);
 					InvokeNode *invoke;
 					cc.invoke(Out(invoke), fn_reg,
 							  FuncSignature::build<void, void *, int>());
@@ -623,6 +1188,21 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				}
 
 				cc.bind(skip);
+
+				/*
+				 * Cache slot's tts_values and tts_isnull for subsequent
+				 * VAR/ASSIGN_VAR ops, avoiding redundant pointer chasing.
+				 * slot_reg is already loaded with the slot pointer.
+				 */
+				{
+					int ci = slot_cache_index(opcode);
+					if (ci >= 0)
+					{
+						cc.ldr(v_cached_vals[ci], a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
+						cc.ldr(v_cached_nulls[ci], a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
+						slots_cached |= (1u << ci);
+					}
+				}
 				break;
 			}
 
@@ -634,34 +1214,74 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_NEW_VAR:
 #endif
 			{
-				int attnum = op->d.var.attnum;
 				int64_t soff = slot_offset_for_opcode(opcode);
+				int ci = slot_cache_index(opcode);
+				bool use_cache = (ci >= 0) && (slots_cached & (1u << ci)) != 0;
 
-				cc.ldr(slot_reg, a64::ptr(v_econtext, soff));
+				/*
+				 * Batch lookahead: count consecutive VARs from the same slot.
+				 * Load tts_values/tts_isnull once instead of per-VAR.
+				 * Stop before any step that is a jump target.
+				 */
+				int batch_end = opno;
+				while (batch_end + 1 < steps_len)
+				{
+					if (is_jump_target[batch_end + 1])
+						break;
+					ExprEvalOp next_opc = ExecEvalStepOp(state, &steps[batch_end + 1]);
+					if (next_opc != opcode)
+						break;
+					batch_end++;
+				}
+				int batch_count = batch_end - opno + 1;
 
-				/* values_ptr = slot->tts_values; value = values_ptr[attnum] */
-				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
-				cc.ldr(tmp2, a64::ptr(tmp1, attnum * (int64_t) sizeof(Datum)));
-				/* *op->resvalue = value (steps-relative) */
-				if (op->resvalue == &state->resvalue)
-					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				/* Phase 1: load all values from tts_values */
+				if (use_cache)
+					cc.mov(tmp1, v_cached_vals[ci]);
 				else
 				{
-					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
-					cc.str(tmp2, a64::ptr(tmp3));
+					cc.ldr(slot_reg, a64::ptr(v_econtext, soff));
+					cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
+				}
+				for (int bi = 0; bi < batch_count; bi++)
+				{
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.var.attnum;
+
+					cc.ldr(tmp2, a64::ptr(tmp1, attnum * (int64_t) sizeof(Datum)));
+					if (cur->resvalue == &state->resvalue)
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno + bi, resvalue)));
+						cc.str(tmp2, a64::ptr(tmp3));
+					}
 				}
 
-				/* isnull_ptr = slot->tts_isnull; isnull = isnull_ptr[attnum] */
-				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1, attnum * (int64_t) sizeof(bool)));
-				/* *op->resnull = isnull (steps-relative) */
-				if (op->resnull == &state->resnull)
-					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				/* Phase 2: load all isnulls from tts_isnull */
+				if (use_cache)
+					cc.mov(tmp1, v_cached_nulls[ci]);
 				else
+					cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
+				for (int bi = 0; bi < batch_count; bi++)
 				{
-					cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
-					cc.strb(tmp2.w(), a64::ptr(tmp3));
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.var.attnum;
+
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1, attnum * (int64_t) sizeof(bool)));
+					if (cur->resnull == &state->resnull)
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp3, a64::ptr(v_steps, STEP_OFFSET(opno + bi, resnull)));
+						cc.strb(tmp2.w(), a64::ptr(tmp3));
+					}
 				}
+
+				/* Bind labels for skipped steps */
+				for (int bi = 1; bi < batch_count; bi++)
+					cc.bind(step_labels[opno + bi]);
+				opno = batch_end; /* for-loop will increment past batch */
 				break;
 			}
 
@@ -673,24 +1293,61 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_ASSIGN_NEW_VAR:
 #endif
 			{
-				int attnum = op->d.assign_var.attnum;
-				int resultnum = op->d.assign_var.resultnum;
 				int64_t soff = slot_offset_for_opcode(opcode);
+				int ci = slot_cache_index(opcode);
+				bool use_cache = (ci >= 0) && (slots_cached & (1u << ci)) != 0;
 
-				/* source slot */
-				cc.ldr(slot_reg, a64::ptr(v_econtext, soff));
+				/* Batch lookahead: count consecutive same-slot ASSIGN_VARs.
+				 * Stop before any step that is a jump target. */
+				int batch_end = opno;
+				while (batch_end + 1 < steps_len)
+				{
+					if (is_jump_target[batch_end + 1])
+						break;
+					ExprEvalOp next_opc = ExecEvalStepOp(state, &steps[batch_end + 1]);
+					if (next_opc != opcode)
+						break;
+					batch_end++;
+				}
+				int batch_count = batch_end - opno + 1;
 
-				/* Load value from source */
-				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
-				cc.ldr(tmp2, a64::ptr(tmp1, attnum * (int64_t) sizeof(Datum)));
-				/* Store to result slot */
-				cc.str(tmp2, a64::ptr(v_resultvals, resultnum * (int64_t) sizeof(Datum)));
+				/* Phase 1: load all values from source, store to result */
+				if (use_cache)
+					cc.mov(tmp1, v_cached_vals[ci]);
+				else
+				{
+					cc.ldr(slot_reg, a64::ptr(v_econtext, soff));
+					cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_values)));
+				}
+				for (int bi = 0; bi < batch_count; bi++)
+				{
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.assign_var.attnum;
+					int resultnum = cur->d.assign_var.resultnum;
 
-				/* Load null from source */
-				cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
-				cc.ldrb(tmp2.w(), a64::ptr(tmp1, attnum * (int64_t) sizeof(bool)));
-				/* Store to result slot */
-				cc.strb(tmp2.w(), a64::ptr(v_resultnulls, resultnum * (int64_t) sizeof(bool)));
+					cc.ldr(tmp2, a64::ptr(tmp1, attnum * (int64_t) sizeof(Datum)));
+					cc.str(tmp2, a64::ptr(v_resultvals, resultnum * (int64_t) sizeof(Datum)));
+				}
+
+				/* Phase 2: load all isnulls from source, store to result */
+				if (use_cache)
+					cc.mov(tmp1, v_cached_nulls[ci]);
+				else
+					cc.ldr(tmp1, a64::ptr(slot_reg, offsetof(TupleTableSlot, tts_isnull)));
+				for (int bi = 0; bi < batch_count; bi++)
+				{
+					ExprEvalStep *cur = &steps[opno + bi];
+					int attnum = cur->d.assign_var.attnum;
+					int resultnum = cur->d.assign_var.resultnum;
+
+					cc.ldrb(tmp2.w(), a64::ptr(tmp1, attnum * (int64_t) sizeof(bool)));
+					cc.strb(tmp2.w(), a64::ptr(v_resultnulls, resultnum * (int64_t) sizeof(bool)));
+				}
+
+				/* Bind labels for skipped steps */
+				for (int bi = 1; bi < batch_count; bi++)
+					cc.bind(step_labels[opno + bi]);
+				opno = batch_end; /* for-loop will increment past batch */
 				break;
 			}
 
@@ -835,7 +1492,172 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
-				if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD
+				if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
+				            dfn->inline_op == JIT_INLINE_TEXT_NE))
+				{
+					/*
+					 * TIER 0a — FULLY INLINE TEXT EQ/NE.
+					 * Short varlena ≤ 7 data bytes: zero function calls.
+					 * Longer short varlena: memcmp call only.
+					 * Non-short (toast/compressed): jit_text_datum_eq/ne.
+					 */
+					if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+						bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
+
+						Label lbl_result_eq = cc.new_label();
+						Label lbl_result_ne = cc.new_label();
+						Label lbl_slow = cc.new_label();
+						Label lbl_memcmp = cc.new_label();
+						Label lbl_store = cc.new_label();
+
+						a64::Gp fci_base = cc.new_gpx();
+						a64::Gp ta0 = cc.new_gpx(), ta1 = cc.new_gpx();
+						a64::Gp hdr_a = cc.new_gpx(), hdr_b = cc.new_gpx();
+						a64::Gp data_len = cc.new_gpx();
+
+						int64_t val_off_0 =
+							(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+						int64_t val_off_1 =
+							(int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+
+						/* Load fcinfo, then args */
+						cc.ldr(fci_base, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
+						cc.ldr(ta0, a64::ptr(fci_base, val_off_0));
+						cc.ldr(ta1, a64::ptr(fci_base, val_off_1));
+
+						/* 1. Pointer equality → result_eq */
+						cc.cmp(ta0, ta1);
+						cc.b(a64::CondCode::kEQ, lbl_result_eq);
+
+						/* 2. Load uint8 headers */
+						cc.ldrb(hdr_a.w(), a64::ptr(ta0));
+						cc.ldrb(hdr_b.w(), a64::ptr(ta1));
+
+						/* 3. Check both short: bit 0 set, != 1 */
+						cc.tbz(hdr_a.w(), 0, lbl_slow);
+						cc.cmp(hdr_a.w(), 1);
+						cc.b(a64::CondCode::kEQ, lbl_slow);
+						cc.tbz(hdr_b.w(), 0, lbl_slow);
+						cc.cmp(hdr_b.w(), 1);
+						cc.b(a64::CondCode::kEQ, lbl_slow);
+
+						/* 4. Headers equal? */
+						cc.cmp(hdr_a.w(), hdr_b.w());
+						cc.b(a64::CondCode::kNE, lbl_result_ne);
+
+						/* 5. data_len = (hdr >> 1) - 1 */
+						cc.lsr(data_len.w(), hdr_a.w(), 1);
+						cc.sub(data_len.w(), data_len.w(), 1);
+
+						/* data_len == 0 → result_eq */
+						cc.cbz(data_len.w(), lbl_result_eq);
+
+						/* 6. data_len > 7 → memcmp */
+						cc.cmp(data_len.w(), 7);
+						cc.b(a64::CondCode::kGT, lbl_memcmp);
+
+						/* 7. Inline word comparison (data_len 1-7):
+						 *    Load 8 bytes, shift left by (7-dl)*8, compare */
+						{
+							a64::Gp wa = cc.new_gpx(), wb = cc.new_gpx();
+							a64::Gp shift = cc.new_gpx();
+							cc.ldr(wa, a64::ptr(ta0));
+							cc.ldr(wb, a64::ptr(ta1));
+							/* shift = (7 - data_len) * 8 */
+							cc.mov(shift.w(), 7);
+							cc.sub(shift.w(), shift.w(), data_len.w());
+							cc.lsl(shift.w(), shift.w(), 3);
+							/* Zero-extend shift to 64-bit for LSL */
+							cc.mov(shift.w(), shift.w());
+							cc.lsl(wa, wa, shift);
+							cc.lsl(wb, wb, shift);
+							cc.cmp(wa, wb);
+							cc.b(a64::CondCode::kEQ, lbl_result_eq);
+							cc.b(lbl_result_ne);
+						}
+
+						/* 8. memcmp path (data_len > 7) */
+						cc.bind(lbl_memcmp);
+						{
+							a64::Gp ma0 = cc.new_gpx(), ma1 = cc.new_gpx();
+							a64::Gp mlen = cc.new_gpx();
+							cc.add(ma0, ta0, 1);
+							cc.add(ma1, ta1, 1);
+							/* Zero-extend data_len for memcmp size_t */
+							cc.mov(mlen.w(), data_len.w());
+
+							a64::Gp fn_mc = cc.new_gpx();
+							ASMJIT_MOV_FN(cc, fn_mc, (void *)memcmp);
+							InvokeNode *inv_mc;
+							cc.invoke(Out(inv_mc), fn_mc,
+									  FuncSignature::build<int32_t, const void *, const void *, uint64_t>());
+							inv_mc->set_arg(0, ma0);
+							inv_mc->set_arg(1, ma1);
+							inv_mc->set_arg(2, mlen);
+							inv_mc->set_ret(0, tmp1);
+						}
+						cc.cbz(tmp1.w(), lbl_result_eq);
+						cc.b(lbl_result_ne);
+
+						/* result_ne */
+						cc.bind(lbl_result_ne);
+						cc.mov(tmp1, is_eq ? 0 : 1);
+						cc.b(lbl_store);
+
+						/* result_eq */
+						cc.bind(lbl_result_eq);
+						cc.mov(tmp1, is_eq ? 1 : 0);
+						cc.b(lbl_store);
+
+						/* slow path: call jit_text_datum_eq/ne */
+						cc.bind(lbl_slow);
+						{
+							a64::Gp fci2 = cc.new_gpx();
+							a64::Gp sa0 = cc.new_gpx(), sa1 = cc.new_gpx();
+							cc.ldr(fci2, a64::ptr(v_steps, STEP_OFFSET(opno, d.func.fcinfo_data)));
+							cc.ldr(sa0, a64::ptr(fci2, val_off_0));
+							cc.ldr(sa1, a64::ptr(fci2, val_off_1));
+
+							a64::Gp fn_tc = cc.new_gpx();
+							ASMJIT_MOV_FN(cc, fn_tc,
+										  is_eq ? (void *)jit_text_datum_eq
+										        : (void *)jit_text_datum_ne);
+							InvokeNode *inv_tc;
+							cc.invoke(Out(inv_tc), fn_tc,
+									  FuncSignature::build<int32_t, int64_t, int64_t>());
+							inv_tc->set_arg(0, sa0);
+							inv_tc->set_arg(1, sa1);
+							inv_tc->set_ret(0, tmp1);
+							cc.sxtw(tmp1, tmp1.w());
+						}
+
+						/* store_result */
+						cc.bind(lbl_store);
+					} else {
+						/* Non-deterministic collation → V1 fallback */
+						goto asmjit_funcexpr_v1_fallback;
+					}
+
+					/* Store *op->resvalue = tmp1 (steps-relative) */
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp1, a64::ptr(tmp2));
+					}
+
+					/* *op->resnull = false (steps-relative) */
+					cc.mov(tmp1, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
+				}
+				else if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD
 					&& dfn->inline_op <= JIT_INLINE_INT8_GE)
 				{
 					/*
@@ -1128,12 +1950,24 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.ldr(args[i], a64::ptr(fci_base, val_off));
 					}
 
+					/* Load collation if this function needs it */
+					bool has_coll = (dfn->flags & JIT_FN_FLAG_COLLATION) != 0;
+					a64::Gp coll_reg;
+					if (has_coll)
+					{
+						coll_reg = cc.new_gpx();
+						cc.ldr(coll_reg.w(), a64::ptr(fci_base,
+							   (int64_t)offsetof(FunctionCallInfoBaseData, fncollation)));
+						cc.sxtw(coll_reg, coll_reg.w());
+					}
+
 					/* Direct call */
 					a64::Gp fn_reg = cc.new_gpx();
 					ASMJIT_MOV_FN(cc, fn_reg, call_target);
 
 					InvokeNode *invoke;
-					switch (dfn->nargs) {
+					int native_nargs = jit_native_nargs(dfn);
+					switch (native_nargs) {
 					case 0:
 						cc.invoke(Out(invoke), fn_reg,
 								  FuncSignature::build<int64_t>());
@@ -1147,7 +1981,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.invoke(Out(invoke), fn_reg,
 								  FuncSignature::build<int64_t, int64_t, int64_t>());
 						invoke->set_arg(0, args[0]);
+						invoke->set_arg(1, has_coll ? coll_reg : args[1]);
+						break;
+					case 3:
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int64_t, int64_t, int64_t, int64_t>());
+						invoke->set_arg(0, args[0]);
 						invoke->set_arg(1, args[1]);
+						invoke->set_arg(2, has_coll ? coll_reg : args[2]);
 						break;
 					default:
 						cc.invoke(Out(invoke), fn_reg,
@@ -1179,6 +2020,273 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					}
 				}
 				else
+				{
+				asmjit_funcexpr_v1_fallback:
+				/*
+				 * TIER 2 — V1 FALLBACK (or Vectorscan LIKE/regex).
+				 */
+				bool vs_handled = false;
+
+				/*
+				 * LIKE/regex FAST PATH: StringZilla + Vectorscan.
+				 * Detects textlike, textnlike, texticlike, texticnlike,
+				 * textregexeq, textregexne, texticregexeq, texticregexne
+				 * with a compile-time constant pattern.  Only in non-shared
+				 * mode (embedded pointers are process-local).
+				 */
+				if (!asmjit_shared_code_mode)
+				{
+					PGFunction fn = op->d.func.fn_addr;
+					bool is_like_fn = (fn == textlike || fn == textnlike);
+					bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
+					bool is_regex_fn = (fn == textregexeq || fn == textregexne);
+					bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
+					bool vs_negate = (fn == textnlike || fn == texticnlike ||
+									  fn == textregexne || fn == texticregexne);
+
+					if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+						fcinfo->nargs == 2)
+					{
+						/*
+						 * Check if args[1] (the pattern) is a compile-time constant.
+						 * PG's ExecInitFunc directly assigns Const values into
+						 * fcinfo->args[argno] without generating an EEOP_CONST step.
+						 * So if no step writes to args[1], it was pre-initialized
+						 * from a Const node — treat it as constant.
+						 */
+						bool pat_const = true;
+						for (int j = opno - 1; j >= 0; j--)
+						{
+							if (steps[j].resvalue == &fcinfo->args[1].value)
+							{
+								pat_const = (steps[j].opcode == EEOP_CONST);
+								break;
+							}
+						}
+
+						/*
+						 * LIKE/regex matching is byte-level in PG for deterministic
+						 * collations. StringZilla/Vectorscan are also byte-level.
+						 */
+						if (pat_const && !fcinfo->args[1].isnull &&
+							pg_jitter_collation_is_deterministic(fcinfo->fncollation))
+						{
+							text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
+							char *pat_str = VARDATA_ANY(pat_text);
+							int pat_len = VARSIZE_ANY_EXHDR(pat_text);
+
+							/*
+							 * StringZilla fast path for simple LIKE patterns.
+							 * Only for LIKE/NOT LIKE (not ILIKE/regex).
+							 */
+							if (is_like_fn)
+							{
+								const char *literal;
+								int literal_len;
+								int match_type = simd_like_classify(
+									pat_str, pat_len, &literal, &literal_len);
+
+								if (match_type >= 0 && literal != NULL)
+								{
+									a64::Gp fci_base = cc.new_gpx();
+									cc.ldr(fci_base, a64::ptr(v_steps,
+										   STEP_OFFSET(opno, d.func.fcinfo_data)));
+									int64_t val_off_0 =
+										(int64_t)((char *)&fcinfo->args[0].value -
+												  (char *)fcinfo);
+									a64::Gp arg0 = cc.new_gpx();
+									cc.ldr(arg0, a64::ptr(fci_base, val_off_0));
+
+									a64::Gp arg1 = cc.new_gpx();
+									cc.mov(arg1, (uint64_t)(uintptr_t)literal);
+									a64::Gp arg2 = cc.new_gpx();
+									cc.mov(arg2, (uint64_t)literal_len);
+									a64::Gp arg3 = cc.new_gpx();
+									cc.mov(arg3, (uint64_t)match_type);
+
+									a64::Gp fn_reg = cc.new_gpx();
+									ASMJIT_MOV_FN(cc, fn_reg,
+												   (void *)simd_like_match_text);
+
+									InvokeNode *invoke;
+									cc.invoke(Out(invoke), fn_reg,
+											  FuncSignature::build<int32_t,
+											  int64_t, int64_t, int32_t,
+											  int32_t>());
+									invoke->set_arg(0, arg0);
+									invoke->set_arg(1, arg1);
+									invoke->set_arg(2, arg2);
+									invoke->set_arg(3, arg3);
+									invoke->set_ret(0, tmp1);
+
+									cc.sxtw(tmp1, tmp1.w());
+
+									if (vs_negate)
+										cc.eor(tmp1, tmp1, Imm(1));
+
+									if (op->resvalue == &state->resvalue)
+										cc.str(tmp1, a64::ptr(v_state,
+											   offsetof(ExprState, resvalue)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resvalue)));
+										cc.str(tmp1, a64::ptr(tmp2));
+									}
+
+									cc.mov(tmp1, 0);
+									if (op->resnull == &state->resnull)
+										cc.strb(tmp1.w(), a64::ptr(v_state,
+											    offsetof(ExprState, resnull)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resnull)));
+										cc.strb(tmp1.w(), a64::ptr(tmp2));
+									}
+
+									vs_handled = true;
+								}
+							}
+
+							/* Compiled LIKE path for anchored patterns */
+							bool skip_vectorscan = false;
+							if (!vs_handled && is_like_fn)
+							{
+								SzLikeCompiled *compiled =
+									simd_like_compile(pat_str, pat_len);
+								if (compiled == SIMD_LIKE_USE_V1)
+								{
+									skip_vectorscan = true;
+								}
+								else if (compiled)
+								{
+									a64::Gp fci_base = cc.new_gpx();
+									cc.ldr(fci_base, a64::ptr(v_steps,
+										   STEP_OFFSET(opno, d.func.fcinfo_data)));
+									int64_t val_off_0 =
+										(int64_t)((char *)&fcinfo->args[0].value -
+												  (char *)fcinfo);
+									a64::Gp arg0 = cc.new_gpx();
+									cc.ldr(arg0, a64::ptr(fci_base, val_off_0));
+
+									a64::Gp comp_reg = cc.new_gpx();
+									cc.mov(comp_reg, (uint64_t)(uintptr_t)compiled);
+
+									a64::Gp fn_reg = cc.new_gpx();
+									ASMJIT_MOV_FN(cc, fn_reg,
+												   (void *)simd_like_match_compiled);
+
+									InvokeNode *invoke;
+									cc.invoke(Out(invoke), fn_reg,
+											  FuncSignature::build<int32_t,
+											  int64_t, int64_t>());
+									invoke->set_arg(0, arg0);
+									invoke->set_arg(1, comp_reg);
+									invoke->set_ret(0, tmp1);
+
+									cc.sxtw(tmp1, tmp1.w());
+
+									if (vs_negate)
+										cc.eor(tmp1, tmp1, Imm(1));
+
+									if (op->resvalue == &state->resvalue)
+										cc.str(tmp1, a64::ptr(v_state,
+											   offsetof(ExprState, resvalue)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resvalue)));
+										cc.str(tmp1, a64::ptr(tmp2));
+									}
+
+									cc.mov(tmp1, 0);
+									if (op->resnull == &state->resnull)
+										cc.strb(tmp1.w(), a64::ptr(v_state,
+											    offsetof(ExprState, resnull)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resnull)));
+										cc.strb(tmp1.w(), a64::ptr(tmp2));
+									}
+
+									vs_handled = true;
+								}
+							}
+
+#ifdef PG_JITTER_HAVE_VECTORSCAN
+							/* Vectorscan path for complex LIKE or regex */
+							if (!vs_handled && !skip_vectorscan)
+							{
+								bool is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
+								VsCacheEntry *entry = pg_jitter_vs_compile(
+									pat_str, pat_len,
+									is_like_fn || is_ilike_fn,
+									is_ilike_fn || is_iregex_fn,
+									is_utf8);
+
+								if (entry)
+								{
+									a64::Gp fci_base = cc.new_gpx();
+									cc.ldr(fci_base, a64::ptr(v_steps,
+										   STEP_OFFSET(opno, d.func.fcinfo_data)));
+									int64_t val_off_0 =
+										(int64_t)((char *)&fcinfo->args[0].value -
+												  (char *)fcinfo);
+									a64::Gp arg0 = cc.new_gpx();
+									cc.ldr(arg0, a64::ptr(fci_base, val_off_0));
+
+									a64::Gp entry_reg = cc.new_gpx();
+									cc.mov(entry_reg, (uint64_t)(uintptr_t)entry);
+
+									a64::Gp fn_reg = cc.new_gpx();
+									ASMJIT_MOV_FN(cc, fn_reg,
+												   (void *)pg_jitter_vs_match_text);
+
+									InvokeNode *invoke;
+									cc.invoke(Out(invoke), fn_reg,
+											  FuncSignature::build<int32_t,
+											  int64_t, int64_t>());
+									invoke->set_arg(0, arg0);
+									invoke->set_arg(1, entry_reg);
+									invoke->set_ret(0, tmp1);
+
+									cc.sxtw(tmp1, tmp1.w());
+
+									if (vs_negate)
+										cc.eor(tmp1, tmp1, Imm(1));
+
+									if (op->resvalue == &state->resvalue)
+										cc.str(tmp1, a64::ptr(v_state,
+											   offsetof(ExprState, resvalue)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resvalue)));
+										cc.str(tmp1, a64::ptr(tmp2));
+									}
+
+									cc.mov(tmp1, 0);
+									if (op->resnull == &state->resnull)
+										cc.strb(tmp1.w(), a64::ptr(v_state,
+											    offsetof(ExprState, resnull)));
+									else
+									{
+										cc.ldr(tmp2, a64::ptr(v_steps,
+											   STEP_OFFSET(opno, resnull)));
+										cc.strb(tmp1.w(), a64::ptr(tmp2));
+									}
+
+									vs_handled = true;
+								}
+							}
+#endif /* PG_JITTER_HAVE_VECTORSCAN */
+						}
+					}
+				}
+
+				if (!vs_handled)
 				{
 				/* Fallback: generic fcinfo path (steps-relative) */
 				{
@@ -1228,7 +2336,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.strb(tmp2.w(), a64::ptr(tmp1));
 					}
 				}
-				} /* end else fallback */
+				} /* end if (!vs_handled) */
+				} /* end else fallback / vectorscan */
 				} /* end direct-call dispatch */
 
 				cc.bind(done_label);
@@ -1433,51 +2542,142 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			case EEOP_QUAL:
 			{
-				Label qualfail = cc.new_label();
-				Label cont = cc.new_label();
+				int batch_last = qual_batch_last ? qual_batch_last[opno] : 0;
 
-				/* Load resnull (steps-relative) */
-				if (op->resnull == &state->resnull)
-					cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				if (batch_last > 0)
+				{
+					/*
+					 * Vectorized QUAL: this QUAL is part of a batch with same
+					 * jumpdone.  Instead of branching per-predicate, accumulate
+					 * failure flags branchlessly and branch once at the end.
+					 *
+					 * For each QUAL: fail if resnull OR resvalue==0
+					 *   orr  qfail, qfail, resnull
+					 *   cmp  resvalue, #0
+					 *   cset t, eq
+					 *   orr  qfail, qfail, t
+					 *
+					 * First QUAL initializes v_qual_fail; last QUAL branches.
+					 */
+					bool is_first = true;
+					/* Check if a prior QUAL in the same batch already ran */
+					for (int q = opno - 1; q >= 0; q--)
+					{
+						if (qual_batch_last[q] == batch_last &&
+							ExecEvalStepOp(state, &steps[q]) == EEOP_QUAL)
+						{
+							is_first = false;
+							break;
+						}
+					}
+
+					if (is_first)
+						cc.mov(v_qual_fail, 0);
+
+					/* Load resnull */
+					if (op->resnull == &state->resnull)
+						cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+					}
+					cc.orr(v_qual_fail, v_qual_fail, tmp2);
+
+					/* Load resvalue, fail if zero */
+					if (op->resvalue == &state->resvalue)
+						cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.ldr(tmp2, a64::ptr(tmp1));
+					}
+					cc.cmp(tmp2, 0);
+					a64::Gp fail_bit = cc.new_gpx();
+					cc.cset(fail_bit, arm::CondCode::kEQ);
+					cc.orr(v_qual_fail, v_qual_fail, fail_bit);
+
+					if (opno == batch_last)
+					{
+						/* Last QUAL in batch: emit single branch */
+						Label qualfail = cc.new_label();
+						Label cont = cc.new_label();
+
+						cc.cbnz(v_qual_fail, qualfail);
+						cc.b(cont);
+
+						cc.bind(qualfail);
+						/* Set resvalue=0, resnull=false for THIS step */
+						cc.mov(tmp2, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp2.w(), a64::ptr(tmp1));
+						}
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp2, a64::ptr(tmp1));
+						}
+						cc.b(step_labels[op->d.qualexpr.jumpdone]);
+
+						cc.bind(cont);
+					}
+					/* Non-last QUALs: no branch, just accumulate */
+				}
 				else
 				{
-					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
-					cc.ldrb(tmp2.w(), a64::ptr(tmp1));
-				}
-				cc.cbnz(tmp2, qualfail);
+					/* Non-batched QUAL: original sequential logic */
+					Label qualfail = cc.new_label();
+					Label cont = cc.new_label();
 
-				/* Load resvalue (steps-relative) */
-				if (op->resvalue == &state->resvalue)
-					cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
-				else
-				{
-					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
-					cc.ldr(tmp2, a64::ptr(tmp1));
-				}
-				cc.cbz(tmp2, qualfail);
+					/* Load resnull (steps-relative) */
+					if (op->resnull == &state->resnull)
+						cc.ldrb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.ldrb(tmp2.w(), a64::ptr(tmp1));
+					}
+					cc.cbnz(tmp2, qualfail);
 
-				cc.b(cont);
+					/* Load resvalue (steps-relative) */
+					if (op->resvalue == &state->resvalue)
+						cc.ldr(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.ldr(tmp2, a64::ptr(tmp1));
+					}
+					cc.cbz(tmp2, qualfail);
 
-				cc.bind(qualfail);
-				/* Set resvalue=0, resnull=false (steps-relative), jump to done */
-				cc.mov(tmp2, 0);
-				if (op->resnull == &state->resnull)
-					cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
-				else
-				{
-					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
-					cc.strb(tmp2.w(), a64::ptr(tmp1));
-				}
-				if (op->resvalue == &state->resvalue)
-					cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
-				else
-				{
-					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
-					cc.str(tmp2, a64::ptr(tmp1));
-				}
-				cc.b(step_labels[op->d.qualexpr.jumpdone]);
+					cc.b(cont);
 
-				cc.bind(cont);
+					cc.bind(qualfail);
+					/* Set resvalue=0, resnull=false (steps-relative), jump to done */
+					cc.mov(tmp2, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp2.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp2.w(), a64::ptr(tmp1));
+					}
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp2, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp2, a64::ptr(tmp1));
+					}
+					cc.b(step_labels[op->d.qualexpr.jumpdone]);
+
+					cc.bind(cont);
+				}
 				break;
 			}
 
@@ -3431,6 +4631,80 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			}
 
 			/*
+			 * ---- PARAM_EXEC (inlined) ----
+			 * Fast path: load value/isnull directly from econtext->ecxt_param_exec_vals.
+			 * Slow path (execPlan != NULL, i.e. lazy InitPlan): call ExecEvalParamExec.
+			 */
+			case EEOP_PARAM_EXEC:
+			{
+				int paramid = op->d.param.paramid;
+				Label slow_path = cc.new_label();
+				Label done = cc.new_label();
+
+				/* prm = econtext->ecxt_param_exec_vals[paramid] */
+				a64::Gp prm = cc.new_gpx();
+				cc.ldr(prm, a64::ptr(v_econtext,
+						offsetof(ExprContext, ecxt_param_exec_vals)));
+				cc.add(prm, prm,
+						(int64_t)(paramid * sizeof(ParamExecData)));
+
+				/* if (unlikely(prm->execPlan != NULL)) goto slow_path */
+				a64::Gp exec_plan = cc.new_gpx();
+				cc.ldr(exec_plan, a64::ptr(prm,
+						offsetof(ParamExecData, execPlan)));
+				cc.cbnz(exec_plan, slow_path);
+
+				/* Fast path: *resvalue = prm->value; *resnull = prm->isnull */
+				{
+					a64::Gp val = cc.new_gpx();
+					a64::Gp null_flag = cc.new_gpx();
+					cc.ldr(val, a64::ptr(prm, offsetof(ParamExecData, value)));
+					cc.ldrb(null_flag.w(), a64::ptr(prm,
+							offsetof(ParamExecData, isnull)));
+
+					if (op->resvalue == &state->resvalue)
+						cc.str(val, a64::ptr(v_state,
+								offsetof(ExprState, resvalue)));
+					else
+					{
+						a64::Gp dst = cc.new_gpx();
+						cc.ldr(dst, a64::ptr(v_steps,
+								STEP_OFFSET(opno, resvalue)));
+						cc.str(val, a64::ptr(dst));
+					}
+					if (op->resnull == &state->resnull)
+						cc.strb(null_flag.w(), a64::ptr(v_state,
+								offsetof(ExprState, resnull)));
+					else
+					{
+						a64::Gp dst = cc.new_gpx();
+						cc.ldr(dst, a64::ptr(v_steps,
+								STEP_OFFSET(opno, resnull)));
+						cc.strb(null_flag.w(), a64::ptr(dst));
+					}
+				}
+				cc.b(done);
+
+				/* Slow path: execPlan set — call ExecEvalParamExec */
+				cc.bind(slow_path);
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalParamExec);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps,
+							(int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							FuncSignature::build<void, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+				}
+				cc.bind(done);
+				break;
+			}
+
+			/*
 			 * ---- DIRECT-CALL OPCODES ----
 			 * These opcodes have PG-exported functions with matching signatures.
 			 * Instead of going through fallback_step's switch, we call the
@@ -3463,7 +4737,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_WHOLEROW:
 			case EEOP_AGG_ORDERED_TRANS_DATUM:
 			case EEOP_AGG_ORDERED_TRANS_TUPLE:
-			case EEOP_PARAM_EXEC:
 			case EEOP_PARAM_EXTERN:
 			{
 				void *fn;
@@ -3512,8 +4785,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						fn = (void *) ExecEvalAggOrderedTransDatum; break;
 					case EEOP_AGG_ORDERED_TRANS_TUPLE:
 						fn = (void *) ExecEvalAggOrderedTransTuple; break;
-					case EEOP_PARAM_EXEC:
-						fn = (void *) ExecEvalParamExec; break;
 					case EEOP_PARAM_EXTERN:
 						fn = (void *) ExecEvalParamExtern; break;
 					default:
@@ -3533,19 +4804,372 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
+			/*
+			 * ---- DOMAIN_NOTNULL (inlined) ----
+			 * Fast path: if *op->resnull is false, done.
+			 * Slow path: call ExecEvalConstraintNotNull(state, op).
+			 */
+			case EEOP_DOMAIN_NOTNULL:
+			{
+				Label lbl_ok = cc.new_label();
+
+				/* tmp1 = *op->resnull */
+				if (op->resnull == &state->resnull)
+					cc.ldrb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp1.w(), a64::ptr(tmp2));
+				}
+				cc.cbz(tmp1, lbl_ok);  /* not null → done */
+
+				/* Slow path: call ExecEvalConstraintNotNull(state, op) */
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalConstraintNotNull);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				}
+
+				cc.bind(lbl_ok);
+				break;
+			}
+
+			/*
+			 * ---- DOMAIN_CHECK (inlined) ----
+			 * Fast path: if *checknull → done (NULL input bypasses check).
+			 *            else if DatumGetBool(*checkvalue) → done.
+			 * Slow path: call ExecEvalConstraintCheck(state, op).
+			 */
+			case EEOP_DOMAIN_CHECK:
+			{
+				Label lbl_done = cc.new_label();
+
+				/* tmp1 = *op->d.domaincheck.checknull */
+				cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, d.domaincheck.checknull)));
+				cc.ldrb(tmp1.w(), a64::ptr(tmp2));
+				cc.cbnz(tmp1, lbl_done);  /* checknull → done */
+
+				/* tmp1 = DatumGetBool(*op->d.domaincheck.checkvalue) */
+				cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, d.domaincheck.checkvalue)));
+				cc.ldr(tmp1, a64::ptr(tmp2));
+				cc.cbnz(tmp1, lbl_done);  /* check passed → done */
+
+				/* Slow path: call ExecEvalConstraintCheck(state, op) */
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalConstraintCheck);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				}
+
+				cc.bind(lbl_done);
+				break;
+			}
+
+			/*
+			 * ---- GROUPING_FUNC (inlined) ----
+			 * Unroll the clause loop at compile time (cap at 8).
+			 */
+			case EEOP_GROUPING_FUNC:
+			{
+				List *clauses = op->d.grouping_func.clauses;
+				int nclauses = list_length(clauses);
+
+				if (nclauses > 8) {
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalGroupingFunc);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				} else {
+					a64::Gp v_result = cc.new_gpx("grp_result");
+					a64::Gp v_grouped_cols = cc.new_gpx("grouped_cols");
+					a64::Gp v_parent = cc.new_gpx("parent");
+
+					/* v_parent = state->parent (AggState*) */
+					cc.ldr(v_parent, a64::ptr(v_state, offsetof(ExprState, parent)));
+					/* v_grouped_cols = aggstate->grouped_cols */
+					cc.ldr(v_grouped_cols, a64::ptr(v_parent, offsetof(AggState, grouped_cols)));
+					cc.mov(v_result, 0);
+
+					ListCell *lc;
+					foreach (lc, clauses) {
+						int attnum = lfirst_int(lc);
+						Label lbl_is_member = cc.new_label();
+
+						/* result <<= 1 */
+						cc.lsl(v_result, v_result, 1);
+
+						/* call bms_is_member(attnum, grouped_cols) */
+						{
+							a64::Gp bms_fn = cc.new_gpx();
+							ASMJIT_MOV_FN(cc, bms_fn, (void *) bms_is_member);
+							InvokeNode *invoke;
+							cc.invoke(Out(invoke), bms_fn,
+									  FuncSignature::build<int32_t, int32_t, void *>());
+							invoke->set_arg(0, Imm(attnum));
+							invoke->set_arg(1, v_grouped_cols);
+							invoke->set_ret(0, tmp1);
+						}
+
+						/* if (bms_is_member) skip OR */
+						cc.cbnz(tmp1, lbl_is_member);
+						cc.orr(v_result, v_result, 1);
+						cc.bind(lbl_is_member);
+					}
+
+					/* *op->resvalue = Int32GetDatum(result) */
+					if (op->resvalue == &state->resvalue)
+						cc.str(v_result, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(v_result, a64::ptr(tmp2));
+					}
+					/* *op->resnull = false */
+					cc.mov(tmp1, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- MINMAX (GREATEST/LEAST, partially inlined) ----
+			 * For nelems <= 4: unroll the loop.
+			 * For nelems > 4: fall back to C call.
+			 */
+			case EEOP_MINMAX:
+			{
+				int nelems = op->d.minmax.nelems;
+
+				if (nelems > 4) {
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalMinMax);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				} else {
+					/* Set *op->resnull = true initially */
+					cc.mov(tmp1, 1);
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
+
+					for (int i = 0; i < nelems; i++) {
+						Label lbl_null = cc.new_label();
+						Label lbl_skip_cmp = cc.new_label();
+						Label lbl_not_first = cc.new_label();
+
+						/* tmp1 = op->d.minmax.nulls[i] */
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, d.minmax.nulls)));
+						cc.ldrb(tmp1.w(), a64::Mem(tmp2, (int32_t)(i * sizeof(bool))));
+						cc.cbnz(tmp1, lbl_null);
+
+						/* tmp1 = op->d.minmax.values[i] */
+						a64::Gp v_newval = cc.new_gpx("newval");
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, d.minmax.values)));
+						cc.ldr(v_newval, a64::Mem(tmp2, (int32_t)(i * sizeof(Datum))));
+
+						/* Check if *resnull */
+						if (op->resnull == &state->resnull)
+							cc.ldrb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.ldrb(tmp1.w(), a64::ptr(tmp2));
+						}
+						cc.cbz(tmp1, lbl_not_first);
+
+						/* First non-null: adopt value */
+						if (op->resvalue == &state->resvalue)
+							cc.str(v_newval, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(v_newval, a64::ptr(tmp2));
+						}
+						cc.mov(tmp1, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp2));
+						}
+						cc.b(lbl_skip_cmp);
+
+						/* Not first: compare */
+						cc.bind(lbl_not_first);
+						{
+							/* Load fcinfo */
+							a64::Gp v_fcinfo = cc.new_gpx("mm_fcinfo");
+							cc.ldr(v_fcinfo, a64::ptr(v_steps, STEP_OFFSET(opno, d.minmax.fcinfo_data)));
+							/* fcinfo->args[0].value = *resvalue */
+							a64::Gp v_curval = cc.new_gpx("curval");
+							if (op->resvalue == &state->resvalue)
+								cc.ldr(v_curval, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+							else
+							{
+								cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+								cc.ldr(v_curval, a64::ptr(tmp2));
+							}
+							cc.str(v_curval, a64::Mem(v_fcinfo, (int32_t)offsetof(FunctionCallInfoBaseData, args[0].value)));
+							cc.str(v_newval, a64::Mem(v_fcinfo, (int32_t)offsetof(FunctionCallInfoBaseData, args[1].value)));
+							/* fcinfo->isnull = false */
+							cc.mov(tmp1, 0);
+							cc.strb(tmp1.w(), a64::Mem(v_fcinfo, (int32_t)offsetof(FunctionCallInfoBaseData, isnull)));
+
+							/* Load fn_addr from fcinfo->flinfo->fn_addr */
+							a64::Gp v_flinfo = cc.new_gpx();
+							cc.ldr(v_flinfo, a64::Mem(v_fcinfo, (int32_t)offsetof(FunctionCallInfoBaseData, flinfo)));
+							a64::Gp v_fn_addr = cc.new_gpx();
+							cc.ldr(v_fn_addr, a64::Mem(v_flinfo, (int32_t)offsetof(FmgrInfo, fn_addr)));
+
+							/* Call comparison: cmpresult = fn_addr(fcinfo) */
+							InvokeNode *invoke;
+							cc.invoke(Out(invoke), v_fn_addr,
+									  FuncSignature::build<int64_t, void *>());
+							invoke->set_arg(0, v_fcinfo);
+							invoke->set_ret(0, tmp1);
+
+							/* Check cmpresult */
+							Label lbl_no_update = cc.new_label();
+							if (op->d.minmax.op == IS_LEAST) {
+								/* LEAST: update if cmpresult > 0 */
+								cc.cmp(tmp1, 0);
+								cc.b_le(lbl_no_update);
+							} else {
+								/* GREATEST: update if cmpresult < 0 */
+								cc.cmp(tmp1, 0);
+								cc.b_ge(lbl_no_update);
+							}
+							if (op->resvalue == &state->resvalue)
+								cc.str(v_newval, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+							else
+							{
+								cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+								cc.str(v_newval, a64::ptr(tmp2));
+							}
+							cc.bind(lbl_no_update);
+						}
+
+						cc.bind(lbl_skip_cmp);
+						cc.bind(lbl_null);
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- SCALARARRAYOP (partially inlined) ----
+			 * Inline the NULL-array check, then call helper with SIMD dispatch.
+			 */
+			case EEOP_SCALARARRAYOP:
+			{
+				Label lbl_done = cc.new_label();
+
+				/* 1. Check *op->resnull — if true, array is NULL → skip */
+				if (op->resnull == &state->resnull) {
+					cc.ldrb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				} else {
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(tmp1.w(), a64::ptr(tmp1, 0));
+				}
+				cc.cbnz(tmp1, lbl_done);
+
+				/* 2. Load *op->resvalue → call DatumGetArrayTypeP */
+				if (op->resvalue == &state->resvalue) {
+					cc.ldr(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				} else {
+					cc.ldr(tmp1, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.ldr(tmp1, a64::ptr(tmp1, 0));
+				}
+				{
+					a64::Gp fn_detoast = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_detoast, (void *) pg_detoast_datum);
+					InvokeNode *inv_detoast;
+					cc.invoke(Out(inv_detoast), fn_detoast,
+							  FuncSignature::build<void *, void *>());
+					inv_detoast->set_arg(0, tmp1);
+					inv_detoast->set_ret(0, tmp1);
+				}
+				/* tmp1 = arr pointer — save it */
+				a64::Gp v_arr = cc.new_gpx("arr");
+				cc.mov(v_arr, tmp1);
+
+				/* 3. Load scalar value and null from fcinfo->args[0] */
+				a64::Gp v_scalar_val = cc.new_gpx("scalar_val");
+				a64::Gp v_scalar_null = cc.new_gpx("scalar_null");
+				{
+					a64::Gp v_fcinfo = cc.new_gpx("fcinfo");
+					cc.ldr(v_fcinfo, a64::ptr(v_steps,
+						STEP_OFFSET(opno, d.scalararrayop.fcinfo_data)));
+					cc.ldr(v_scalar_val, a64::ptr(v_fcinfo,
+						(int64_t)offsetof(FunctionCallInfoBaseData, args[0].value)));
+					cc.ldrb(v_scalar_null.w(), a64::ptr(v_fcinfo,
+						(int64_t)offsetof(FunctionCallInfoBaseData, args[0].isnull)));
+				}
+
+				/* 4. Call pg_jitter_scalararrayop_loop(op, arr, scalar_value, scalar_null) */
+				{
+					a64::Gp op_reg = cc.new_gpx("sao_op");
+					cc.add(op_reg, v_steps,
+						   (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					a64::Gp fn_loop = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_loop,
+								  (void *) pg_jitter_scalararrayop_loop);
+					InvokeNode *inv_loop;
+					cc.invoke(Out(inv_loop), fn_loop,
+							  FuncSignature::build<void, void *, void *,
+													int64_t, int32_t>());
+					inv_loop->set_arg(0, op_reg);
+					inv_loop->set_arg(1, v_arr);
+					inv_loop->set_arg(2, v_scalar_val);
+					inv_loop->set_arg(3, v_scalar_null);
+				}
+
+				cc.bind(lbl_done);
+				break;
+			}
+
 			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
 #ifdef HAVE_EEOP_IOCOERCE_SAFE
 			case EEOP_IOCOERCE_SAFE:
 #endif
-			case EEOP_SCALARARRAYOP:
 			case EEOP_SQLVALUEFUNCTION:
 			case EEOP_CURRENTOFEXPR:
 			case EEOP_NEXTVALUEEXPR:
 			case EEOP_ARRAYEXPR:
 			case EEOP_ROW:
-			case EEOP_MINMAX:
-			case EEOP_DOMAIN_NOTNULL:
-			case EEOP_DOMAIN_CHECK:
 			case EEOP_XMLEXPR:
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 			case EEOP_IS_JSON:
@@ -3553,7 +5177,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #ifdef HAVE_EEOP_JSONEXPR
 			case EEOP_JSONEXPR_COERCION_FINISH:
 #endif
-			case EEOP_GROUPING_FUNC:
 			{
 				void *fn;
 
@@ -3563,8 +5186,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					case EEOP_IOCOERCE_SAFE:
 						fn = (void *) ExecEvalCoerceViaIOSafe; break;
 #endif
-					case EEOP_SCALARARRAYOP:
-						fn = (void *) ExecEvalScalarArrayOp; break;
+					/* SCALARARRAYOP moved to dedicated inline case */
 					case EEOP_SQLVALUEFUNCTION:
 						fn = (void *) ExecEvalSQLValueFunction; break;
 					case EEOP_CURRENTOFEXPR:
@@ -3575,12 +5197,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						fn = (void *) ExecEvalArrayExpr; break;
 					case EEOP_ROW:
 						fn = (void *) ExecEvalRow; break;
-					case EEOP_MINMAX:
-						fn = (void *) ExecEvalMinMax; break;
-					case EEOP_DOMAIN_NOTNULL:
-						fn = (void *) ExecEvalConstraintNotNull; break;
-					case EEOP_DOMAIN_CHECK:
-						fn = (void *) ExecEvalConstraintCheck; break;
 					case EEOP_XMLEXPR:
 						fn = (void *) ExecEvalXmlExpr; break;
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
@@ -3591,8 +5207,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					case EEOP_JSONEXPR_COERCION_FINISH:
 						fn = (void *) ExecEvalJsonCoercionFinish; break;
 #endif
-					case EEOP_GROUPING_FUNC:
-						fn = (void *) ExecEvalGroupingFunc; break;
 					default:
 						pg_unreachable();
 				}
@@ -3625,7 +5239,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
-			/* SYSVAR: 4-arg call to ExecEvalSysVar(state, op, econtext, slot) */
+			/* SYSVAR (partially inlined): tableoid and ctid inline, rest C call */
 			case EEOP_INNER_SYSVAR:
 			case EEOP_OUTER_SYSVAR:
 			case EEOP_SCAN_SYSVAR:
@@ -3635,6 +5249,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #endif
 			{
 				int64_t slot_offset;
+				int attnum = op->d.var.attnum;
 				switch (opcode)
 				{
 					case EEOP_INNER_SYSVAR:
@@ -3653,19 +5268,56 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						pg_unreachable();
 				}
 
-				a64::Gp fn_reg = cc.new_gpx();
-				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalSysVar);
-				a64::Gp op_reg = cc.new_gpx();
-				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
-				a64::Gp slot_reg = cc.new_gpx();
-				cc.ldr(slot_reg, a64::Mem(v_econtext, (int32_t) slot_offset));
-				InvokeNode *invoke;
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<void, void *, void *, void *, void *>());
-				invoke->set_arg(0, v_state);
-				invoke->set_arg(1, op_reg);
-				invoke->set_arg(2, v_econtext);
-				invoke->set_arg(3, slot_reg);
+				bool can_inline = (attnum == TableOidAttributeNumber ||
+								   attnum == SelfItemPointerAttributeNumber);
+#ifdef HAVE_EEOP_OLD_NEW
+				if (opcode == EEOP_OLD_SYSVAR || opcode == EEOP_NEW_SYSVAR)
+					can_inline = false;
+#endif
+				if (!can_inline) {
+					/* Fall back to C call */
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalSysVar);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					a64::Gp slot_reg2 = cc.new_gpx();
+					cc.ldr(slot_reg2, a64::Mem(v_econtext, (int32_t) slot_offset));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+					invoke->set_arg(3, slot_reg2);
+				} else {
+					/* Inline: slot = econtext->ecxt_*tuple */
+					cc.ldr(slot_reg, a64::Mem(v_econtext, (int32_t) slot_offset));
+
+					if (attnum == TableOidAttributeNumber) {
+						/* *resvalue = (Datum)slot->tts_tableOid */
+						cc.ldr(tmp1.w(), a64::Mem(slot_reg, (int32_t)offsetof(TupleTableSlot, tts_tableOid)));
+						/* zero-extend w register to x is implicit in AsmJIT */
+					} else {
+						/* ctid: *resvalue = PointerGetDatum(&slot->tts_tid) */
+						cc.add(tmp1, slot_reg, (int64_t)offsetof(TupleTableSlot, tts_tid));
+					}
+					if (op->resvalue == &state->resvalue)
+						cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(tmp1, a64::ptr(tmp2));
+					}
+					/* *resnull = false */
+					cc.mov(tmp1, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						cc.ldr(tmp2, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(tmp1.w(), a64::ptr(tmp2));
+					}
+				}
 				break;
 			}
 

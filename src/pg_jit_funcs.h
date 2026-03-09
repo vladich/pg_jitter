@@ -55,6 +55,9 @@ typedef enum JitInlineOp
 	/* hash functions (1-arg, inline hash_bytes_uint32) */
 	JIT_INLINE_HASHINT4,	/* hash_bytes_uint32((uint32) arg) */
 	JIT_INLINE_HASHINT8,	/* fold int64 → uint32, then hash_bytes_uint32 */
+	/* text equality (short-varlena fast path + memcmp, slow path calls jit_fn) */
+	JIT_INLINE_TEXT_EQ,
+	JIT_INLINE_TEXT_NE,
 } JitInlineOp;
 
 /*
@@ -173,6 +176,10 @@ extern int32 jit_text_ge(int64 a, int64 b, int32 collid);
 extern int32 jit_bttextcmp(int64 a, int64 b, int32 collid);
 extern int64 jit_text_larger(int64 a, int64 b, int32 collid);
 extern int64 jit_text_smaller(int64 a, int64 b, int32 collid);
+
+/* Lean 2-arg text equality (deterministic collation, no locale lookup) */
+extern int32 jit_text_datum_eq(int64 a, int64 b);
+extern int32 jit_text_datum_ne(int64 a, int64 b);
 
 /* Text functions (no collation needed) */
 extern int32 jit_textlen(int64 a);

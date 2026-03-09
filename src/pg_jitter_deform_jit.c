@@ -19,10 +19,15 @@
 #include "utils/memutils.h"
 
 #include "pg_jitter_common.h"
+#include "pg_jitter_simd.h"
 #include "sljitLir.h"
 
 #include <sys/mman.h>
 #include <unistd.h>            /* sysconf, _SC_PAGESIZE */
+
+#ifdef __ARM_FEATURE_CRC32
+#include <arm_acle.h>
+#endif
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE
@@ -793,42 +798,84 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
 						 SLJIT_IMM, (sljit_sw) memset);
 
-		/* Tight inner loop — pointer-based do-while */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
-		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-					   SLJIT_R3, 0, SLJIT_IMM, 3);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-					   SLJIT_S1, 0, SLJIT_R1, 0);
+		if (attlen == 4)
+		{
+			/*
+			 * SIMD batch extraction for uniform int32 columns.
+			 * Processes 4 columns at a time using NEON: load 4×int32,
+			 * sign-extend to 4×Datum (int64), store.
+			 */
+			/* R2 = count = min(natts, maxatt) - S5 */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
+						   SLJIT_R2, 0, SLJIT_S5, 0);
+			j_fast_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
-		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-					   SLJIT_R2, 0, SLJIT_IMM, 3);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
-					   SLJIT_S1, 0, SLJIT_R2, 0);
+			/* R0 = tupdata + offset (S3 + S4) */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			/* R1 = values + attnum*8 (S1 + S5*8) */
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
+			/* R2 = count (already set) */
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+							 SLJIT_IMM,
+							 (sljit_sw) simd_extract_int32_values);
 
-		j_fast_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
-									 SLJIT_R1, 0, SLJIT_R2, 0);
+			/* Update S4 (offset): S4 += count * 4 */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SUB, SLJIT_R0, 0,
+						   SLJIT_R0, 0, SLJIT_S5, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+						   SLJIT_R0, 0, SLJIT_IMM, 2);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_R0, 0);
 
-		l_fast_top = sljit_emit_label(C);
+			sljit_set_label(j_fast_done, sljit_emit_label(C));
+		}
+		else
+		{
+			/* Tight inner loop — pointer-based do-while (non-int32 attlen) */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_R3, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
 
-		sljit_emit_op1(C, mov_op, SLJIT_R0, 0,
-					   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
-		sljit_emit_op1(C, SLJIT_MOV,
-					   SLJIT_MEM1(SLJIT_R1), 0,
-					   SLJIT_R0, 0);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
-					   SLJIT_S4, 0, SLJIT_IMM, attlen);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-					   SLJIT_R1, 0, SLJIT_IMM, sizeof(Datum));
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_R2, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+						   SLJIT_S1, 0, SLJIT_R2, 0);
 
-		sljit_set_label(
-			sljit_emit_cmp(C, SLJIT_LESS,
-						   SLJIT_R1, 0, SLJIT_R2, 0),
-			l_fast_top);
+			j_fast_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
+										 SLJIT_R1, 0, SLJIT_R2, 0);
 
-		/* EPILOGUE */
-		sljit_set_label(j_fast_done, sljit_emit_label(C));
+			l_fast_top = sljit_emit_label(C);
+
+			sljit_emit_op1(C, mov_op, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM1(SLJIT_R1), 0,
+						   SLJIT_R0, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, attlen);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_R1, 0, SLJIT_IMM, sizeof(Datum));
+
+			sljit_set_label(
+				sljit_emit_cmp(C, SLJIT_LESS,
+							   SLJIT_R1, 0, SLJIT_R2, 0),
+				l_fast_top);
+
+			sljit_set_label(j_fast_done, sljit_emit_label(C));
+		}
 	}
 	else if (all_fixed_byval && uniform_attlen && first_attlen > 0)
 	{
@@ -848,13 +895,39 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			default: mov_op = SLJIT_MOV; break;  /* 8 */
 		}
 
-		/* Check hasnulls — if nulls present, fall to general loop */
+		/*
+		 * Check hasnulls — two-stage fast path:
+		 * 1) HEAP_HASNULL not set → fast path (no null bitmap at all)
+		 * 2) HEAP_HASNULL set → SIMD bulk-check bitmap; if all non-null
+		 *    for the columns we need, still take the fast path
+		 * 3) Otherwise → fall to general loop
+		 */
+		struct sljit_jump *j_no_hasnulls, *j_simd_all_notnull;
+
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 					   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
-		j_has_nulls_general = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
-											  SLJIT_R0, 0, SLJIT_IMM, 0);
+		j_no_hasnulls = sljit_emit_cmp(C, SLJIT_EQUAL,
+									   SLJIT_R0, 0, SLJIT_IMM, 0);
 
-		/* No nulls! Bulk-clear isnull, then tight loop */
+		/* HEAP_HASNULL is set — call simd_nullbitmap_all_notnull(t_bits, natts) */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+					   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, natts);
+		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2(32, P, 32),
+						 SLJIT_IMM, (sljit_sw) simd_nullbitmap_all_notnull);
+		j_simd_all_notnull = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+											SLJIT_R0, 0, SLJIT_IMM, 0);
+		/* Bitmap has actual nulls — fall to general loop */
+		j_has_nulls_general = sljit_emit_jump(C, SLJIT_JUMP);
+
+		/* Fast path target: either no HEAP_HASNULL or SIMD confirmed all non-null */
+		{
+			struct sljit_label *l_fast = sljit_emit_label(C);
+			sljit_set_label(j_no_hasnulls, l_fast);
+			sljit_set_label(j_simd_all_notnull, l_fast);
+		}
+
+		/* All columns non-null for this row — bulk-clear isnull, then tight loop */
 
 		/* Compute loop limit: min(natts, maxatt) */
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
@@ -878,41 +951,75 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
 						 SLJIT_IMM, (sljit_sw) memset);
 
-		/* Pointer-based do-while loop */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
-		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-					   SLJIT_R3, 0, SLJIT_IMM, 3);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-					   SLJIT_S1, 0, SLJIT_R1, 0);
+		if (attlen == 4)
+		{
+			/* SIMD batch extraction for uniform int32 columns */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
+						   SLJIT_R2, 0, SLJIT_S5, 0);
+			j_semi_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
-		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-					   SLJIT_R2, 0, SLJIT_IMM, 3);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
-					   SLJIT_S1, 0, SLJIT_R2, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+							 SLJIT_IMM,
+							 (sljit_sw) simd_extract_int32_values);
 
-		j_semi_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
-									 SLJIT_R1, 0, SLJIT_R2, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SUB, SLJIT_R0, 0,
+						   SLJIT_R0, 0, SLJIT_S5, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+						   SLJIT_R0, 0, SLJIT_IMM, 2);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_R0, 0);
 
-		l_semi_top = sljit_emit_label(C);
+			sljit_set_label(j_semi_done, sljit_emit_label(C));
+		}
+		else
+		{
+			/* Pointer-based do-while loop (non-int32 attlen) */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_S5, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_R3, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
 
-		sljit_emit_op1(C, mov_op, SLJIT_R0, 0,
-					   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
-		sljit_emit_op1(C, SLJIT_MOV,
-					   SLJIT_MEM1(SLJIT_R1), 0,
-					   SLJIT_R0, 0);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
-					   SLJIT_S4, 0, SLJIT_IMM, attlen);
-		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-					   SLJIT_R1, 0, SLJIT_IMM, sizeof(Datum));
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_R2, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+						   SLJIT_S1, 0, SLJIT_R2, 0);
 
-		sljit_set_label(
-			sljit_emit_cmp(C, SLJIT_LESS,
-						   SLJIT_R1, 0, SLJIT_R2, 0),
-			l_semi_top);
+			j_semi_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
+										 SLJIT_R1, 0, SLJIT_R2, 0);
 
-		sljit_set_label(j_semi_done, sljit_emit_label(C));
+			l_semi_top = sljit_emit_label(C);
+
+			sljit_emit_op1(C, mov_op, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM1(SLJIT_R1), 0,
+						   SLJIT_R0, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, attlen);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_R1, 0, SLJIT_IMM, sizeof(Datum));
+
+			sljit_set_label(
+				sljit_emit_cmp(C, SLJIT_LESS,
+							   SLJIT_R1, 0, SLJIT_R2, 0),
+				l_semi_top);
+
+			sljit_set_label(j_semi_done, sljit_emit_label(C));
+		}
 
 		/* Skip over the general loop if we used the fast path */
 		{
@@ -1353,6 +1460,42 @@ typedef struct DeformDispatchEntry
 static uint32
 deform_attrs_hash(TupleDesc desc, int natts)
 {
+#ifdef __ARM_FEATURE_CRC32
+	/*
+	 * ARM64 hardware CRC32C: single-cycle __crc32cd processes 8 bytes at a
+	 * time vs byte-at-a-time FNV-1a.  For a 10-column table with 8-byte
+	 * CompactAttribute, this is ~10x fewer instructions.
+	 */
+	uint32 crc = 0xFFFFFFFF;
+	for (int i = 0; i < natts; i++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
+		const unsigned char *p = (const unsigned char *) att;
+		size_t len = sizeof(CompactAttribute);
+		size_t off = 0;
+
+		/* Process 8 bytes at a time */
+		for (; off + 8 <= len; off += 8)
+		{
+			uint64 val;
+			memcpy(&val, p + off, 8);
+			crc = __crc32cd(crc, val);
+		}
+		/* Process 4 bytes */
+		if (off + 4 <= len)
+		{
+			uint32 val;
+			memcpy(&val, p + off, 4);
+			crc = __crc32cw(crc, val);
+			off += 4;
+		}
+		/* Process remaining bytes */
+		for (; off < len; off++)
+			crc = __crc32cb(crc, p[off]);
+	}
+	return crc ^ 0xFFFFFFFF;
+#else
+	/* FNV-1a fallback for non-ARM/non-CRC platforms */
 	uint32 h = 0x811c9dc5;  /* FNV-1a offset basis */
 	for (int i = 0; i < natts; i++)
 	{
@@ -1365,6 +1508,7 @@ deform_attrs_hash(TupleDesc desc, int natts)
 		}
 	}
 	return h;
+#endif
 }
 
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
@@ -1388,6 +1532,7 @@ static int n_deform_dispatch = 0;
 typedef struct DispatchFastEntry
 {
 	TupleDesc	desc;		/* TupleDesc pointer — fast match key */
+	const TupleTableSlotOps *ops;  /* slot type — must match exactly */
 	int			natts;
 	uint32		attrs_hash;	/* FNV hash for cross-query validation */
 	void	   *fn;
@@ -1411,6 +1556,7 @@ pg_jitter_deform_dispatch_reset_fastpath(void)
 	n_dispatch_fast = 0;
 }
 
+
 void
 pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 {
@@ -1420,7 +1566,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	uint32 ahash = 0;
 	int i;
 
-	if (natts > WIDE_DEFORM_LIMIT)
+	if (natts > pg_jitter_wide_deform_limit())
 	{
 		slot_getsomeattrs_int(slot, natts);
 		return;
@@ -1441,7 +1587,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		for (i = 0; i < n_dispatch_fast; i++)
 		{
 			DispatchFastEntry *fe = &dispatch_fast[i];
-			if (fe->desc == desc && fe->natts == natts)
+			if (fe->desc == desc && fe->ops == ops && fe->natts == natts)
 			{
 				/* Move to front (MRU) for hot-path O(1) */
 				if (i > 0)
@@ -1497,6 +1643,7 @@ found:
 					memmove(&dispatch_fast[1], &dispatch_fast[0],
 							slot_idx * sizeof(DispatchFastEntry));
 				dispatch_fast[0].desc = desc;
+				dispatch_fast[0].ops = ops;
 				dispatch_fast[0].natts = natts;
 				dispatch_fast[0].attrs_hash = ahash;
 				dispatch_fast[0].fn = fn;

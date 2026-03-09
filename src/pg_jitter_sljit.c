@@ -18,11 +18,16 @@
 #include "pg_jit_deform_templates.h"
 #include "pg_jit_funcs.h"
 #include "pg_jitter_common.h"
+#include "pg_jitter_simd.h"
+#include "pg_jitter_vectorscan.h"
 #include "sljitLir.h"
 #include "utils/fmgrprotos.h"
+#include "mb/pg_wchar.h"
+#include "catalog/pg_collation_d.h"
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
+#include "access/sysattr.h"
 #include "access/tupdesc_details.h"
 #include "common/hashfn.h"
 #include "utils/array.h"
@@ -128,6 +133,19 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
                              PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
                              NULL, NULL, NULL);
   }
+
+  if (!GetConfigOption("pg_jitter.min_expr_steps", true, false)) {
+    DefineCustomIntVariable(
+        "pg_jitter.min_expr_steps",
+        "Minimum expression step count for JIT compilation. "
+        "Expressions with fewer steps use the interpreter.",
+        NULL, &pg_jitter_min_expr_steps,
+        0,    /* 0 = no threshold (compile everything) */
+        0,    /* minimum */
+        1000, /* maximum */
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
 }
 
 /*
@@ -189,7 +207,9 @@ static void sljit_code_free(void *data) {
 #define SOFF_NEW_VALS 128
 #define SOFF_NEW_NULLS 136
 #define SOFF_STEPS 144 /* state->steps pointer (for steps-relative addr) */
-#define SOFF_TOTAL 152
+#define SOFF_TMP1 152  /* general-purpose scratch across calls */
+#define SOFF_TMP2 160  /* general-purpose scratch across calls */
+#define SOFF_TOTAL 168
 
 /*
  * Inline deform temporaries — reuse AGG stack slots (no temporal overlap:
@@ -461,7 +481,7 @@ static void *find_or_compile_deform(PgJitterContext *ctx,
       return cache[i].code;
   }
 
-  if (natts > WIDE_DEFORM_LIMIT)
+  if (natts > pg_jitter_wide_deform_limit())
     return NULL;
 
   /* Compile new deform function */
@@ -580,7 +600,7 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
   if (natts <= 0 || natts > desc->natts)
     return false;
 
-  if (natts > WIDE_DEFORM_LIMIT)
+  if (natts > pg_jitter_wide_deform_limit())
     return false;
 
   /* Wide tables: skip inline deform, fall through to compiled loop deform */
@@ -2068,6 +2088,139 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
 }
 
 /*
+ * emit_inline_text_cmp — fully inline text equality comparison.
+ *
+ * Fast path (zero function calls for short strings ≤ 7 data bytes):
+ *   1. Pointer equality → done
+ *   2. Load 1-byte varlena headers, check both are short
+ *   3. Compare headers (lengths equal?) → done if different
+ *   4. data_len ≤ 7: 8-byte word load + shift-mask comparison
+ *   5. data_len > 7: call memcmp
+ * Slow path (non-short varlena): call jit_text_datum_eq/ne
+ */
+static void
+emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
+                     ExprEvalStep *op, FunctionCallInfo fcinfo, bool is_eq)
+{
+  struct sljit_jump *j_ptr_eq;
+  struct sljit_jump *j_slow1, *j_slow2, *j_slow3, *j_slow4;
+  struct sljit_jump *j_len_ne, *j_empty, *j_big, *j_small_eq;
+  struct sljit_jump *j_to_ne, *j_to_store, *j_to_store2;
+  struct sljit_jump *j_memcmp_eq;
+  struct sljit_label *l_result_eq, *l_result_ne, *l_slow, *l_store;
+
+  sljit_sw off0 = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+  sljit_sw off1 = (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+
+  /* Load fcinfo → R2, args → R0 (datum_a), R1 (datum_b) */
+  emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data),
+                       SLJIT_R2);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R2), off0);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R2), off1);
+
+  /* 1. Pointer equality → result_eq */
+  j_ptr_eq = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_R1, 0);
+
+  /* 2. Load uint8 headers: hdr_a → R2, hdr_b → R3 */
+  sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0), 0);
+  sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_R1), 0);
+
+  /* 3. Check both headers are short varlena: (hdr & 1) && hdr != 1 */
+  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z, SLJIT_R2, 0, SLJIT_IMM, 1);
+  j_slow1 = sljit_emit_jump(C, SLJIT_ZERO);      /* hdr_a even → slow */
+  j_slow2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 1);
+  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z, SLJIT_R3, 0, SLJIT_IMM, 1);
+  j_slow3 = sljit_emit_jump(C, SLJIT_ZERO);      /* hdr_b even → slow */
+  j_slow4 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R3, 0, SLJIT_IMM, 1);
+
+  /* 4. Headers equal → same length? */
+  j_len_ne = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R2, 0, SLJIT_R3, 0);
+
+  /* 5. data_len = (hdr_a >> 1) - 1 → R2 */
+  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_IMM, 1);
+  sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_IMM, 1);
+
+  /* 6. data_len == 0 → both empty → result_eq */
+  j_empty = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 0);
+
+  /* 7. data_len > 7 → memcmp path */
+  j_big = sljit_emit_cmp(C, SLJIT_GREATER, SLJIT_R2, 0, SLJIT_IMM, 7);
+
+  /*
+   * 8. Inline word comparison (data_len 1-7, zero function calls).
+   *    Load 8 bytes from each datum, shift left to clear trailing
+   *    garbage, compare the meaningful prefix.
+   *    On little-endian, byte 0 (header) is in the LSB.  Shifting
+   *    left by (7 - data_len) * 8 bits pushes meaningful bytes to
+   *    the MSB and zeros out the garbage in the LSB.
+   */
+  sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0, SLJIT_IMM, 7,
+                 SLJIT_R2, 0);                            /* 7 - data_len */
+  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+                 SLJIT_R2, 0, SLJIT_IMM, 3);             /* × 8 bits */
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                 SLJIT_MEM1(SLJIT_R0), 0);               /* word_a */
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                 SLJIT_MEM1(SLJIT_R1), 0);               /* word_b */
+  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+                 SLJIT_R3, 0, SLJIT_R2, 0);              /* word_a <<= shift */
+  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+                 SLJIT_R0, 0, SLJIT_R2, 0);              /* word_b <<= shift */
+  j_small_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
+                               SLJIT_R3, 0, SLJIT_R0, 0);
+  j_to_ne = sljit_emit_jump(C, SLJIT_JUMP);              /* not equal */
+
+  /* 9. memcmp path (data_len > 7) */
+  sljit_set_label(j_big, sljit_emit_label(C));
+  sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                 SLJIT_R0, 0, SLJIT_IMM, 1);             /* skip header */
+  sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                 SLJIT_R1, 0, SLJIT_IMM, 1);
+  EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, W, W), memcmp);
+  j_memcmp_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
+                                SLJIT_R0, 0, SLJIT_IMM, 0);
+  /* memcmp != 0 → fall through to result_ne */
+
+  /* --- result_ne --- */
+  l_result_ne = sljit_emit_label(C);
+  sljit_set_label(j_len_ne, l_result_ne);
+  sljit_set_label(j_to_ne, l_result_ne);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 0 : 1);
+  j_to_store = sljit_emit_jump(C, SLJIT_JUMP);
+
+  /* --- result_eq --- */
+  l_result_eq = sljit_emit_label(C);
+  sljit_set_label(j_ptr_eq, l_result_eq);
+  sljit_set_label(j_empty, l_result_eq);
+  sljit_set_label(j_small_eq, l_result_eq);
+  sljit_set_label(j_memcmp_eq, l_result_eq);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 1 : 0);
+  j_to_store2 = sljit_emit_jump(C, SLJIT_JUMP);
+
+  /* --- slow path: non-short varlena → call lean helper --- */
+  l_slow = sljit_emit_label(C);
+  sljit_set_label(j_slow1, l_slow);
+  sljit_set_label(j_slow2, l_slow);
+  sljit_set_label(j_slow3, l_slow);
+  sljit_set_label(j_slow4, l_slow);
+  /* Reload args from fcinfo (R0/R1 clobbered by header loads) */
+  emit_load_step_field(C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data),
+                       SLJIT_R2);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R2), off0);
+  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R2), off1);
+  EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+             is_eq ? jit_text_datum_eq : jit_text_datum_ne);
+  /* R0 = result, fall through to store */
+
+  /* --- store_result --- */
+  l_store = sljit_emit_label(C);
+  sljit_set_label(j_to_store, l_store);
+  sljit_set_label(j_to_store2, l_store);
+
+  emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+}
+
+/*
  * Pre-compiled inline blob support.
  *
  * When PG_JITTER_HAVE_PRECOMPILED is defined, we can emit clang-optimized
@@ -2311,6 +2464,7 @@ static bool sljit_compile_expr(ExprState *state) {
   uint32 slots_cached = 0;
 
   struct sljit_label **step_labels;
+  bool *is_jump_target;
   instr_time starttime, endtime;
 
   /* Pending jumps for fixup after all code is emitted */
@@ -2345,6 +2499,13 @@ static bool sljit_compile_expr(ExprState *state) {
   /* Let PG's hand-optimized fast-path evalfuncs handle tiny expressions */
   if (expr_has_fast_path(state))
     return false;
+
+  /* Skip JIT for expressions below the minimum step threshold */
+  {
+    int min_steps = pg_jitter_get_min_expr_steps();
+    if (min_steps > 0 && state->steps_len < min_steps)
+      return false;
+  }
 
   /* Skip expression JIT in parallel workers if mode is 'off' */
   if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_OFF && IsParallelWorker())
@@ -2427,6 +2588,12 @@ static bool sljit_compile_expr(ExprState *state) {
              shared_node_id, shared_expr_idx, code_size, npatched);
 
         pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+
+        /* Worker: set up binary search arrays for CASE optimization.
+         * Leader stored desc pointers in step data; worker needs its own. */
+        pg_jitter_setup_case_bsearch_arrays(state, state->steps,
+                                             state->steps_len);
+
         pg_jitter_install_expr(state, (ExprStateEvalFunc)code_ptr);
 
         sljit_shared_code_mode = false;
@@ -2550,6 +2717,82 @@ static bool sljit_compile_expr(ExprState *state) {
     pending_jumps = palloc(sizeof(*pending_jumps) * steps_len * 4);
 
     /*
+     * Build jump-target bitmap: is_jump_target[i] is true if any other
+     * step can jump to step i.  Used to prevent batch VAR/ASSIGN_VAR
+     * from merging steps that are branch targets -- a jump into the
+     * middle of a batch would skip the batch's load code.
+     */
+    is_jump_target = palloc0(sizeof(bool) * steps_len);
+    for (int i = 0; i < steps_len; i++) {
+      ExprEvalStep *s = &steps[i];
+      ExprEvalOp sop = ExecEvalStepOp(state, s);
+      int tgt = -1;
+
+      switch (sop) {
+      case EEOP_JUMP:
+      case EEOP_JUMP_IF_NULL:
+      case EEOP_JUMP_IF_NOT_NULL:
+      case EEOP_JUMP_IF_NOT_TRUE:
+        tgt = s->d.jump.jumpdone;
+        break;
+      case EEOP_QUAL:
+        tgt = s->d.qualexpr.jumpdone;
+        break;
+      case EEOP_BOOL_AND_STEP:
+      case EEOP_BOOL_AND_STEP_FIRST:
+      case EEOP_BOOL_AND_STEP_LAST:
+      case EEOP_BOOL_OR_STEP:
+      case EEOP_BOOL_OR_STEP_FIRST:
+      case EEOP_BOOL_OR_STEP_LAST:
+        tgt = s->d.boolexpr.jumpdone;
+        break;
+      case EEOP_ROWCOMPARE_STEP:
+        if (s->d.rowcompare_step.jumpnull >= 0 &&
+            s->d.rowcompare_step.jumpnull < steps_len)
+          is_jump_target[s->d.rowcompare_step.jumpnull] = true;
+        tgt = s->d.rowcompare_step.jumpdone;
+        break;
+      case EEOP_SBSREF_SUBSCRIPTS:
+        tgt = s->d.sbsref_subscript.jumpdone;
+        break;
+#ifdef HAVE_EEOP_HASHDATUM
+      case EEOP_HASHDATUM_FIRST:
+      case EEOP_HASHDATUM_FIRST_STRICT:
+      case EEOP_HASHDATUM_NEXT32:
+      case EEOP_HASHDATUM_NEXT32_STRICT:
+        tgt = s->d.hashdatum.jumpdone;
+        break;
+#endif
+      case EEOP_AGG_DESERIALIZE:
+      case EEOP_AGG_STRICT_DESERIALIZE:
+        tgt = s->d.agg_deserialize.jumpnull;
+        break;
+      case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
+      case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+        tgt = s->d.agg_strict_input_check.jumpnull;
+        break;
+      case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
+        tgt = s->d.agg_plain_pergroup_nullcheck.jumpnull;
+        break;
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+      case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
+      case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
+        tgt = s->d.agg_presorted_distinctcheck.jumpdistinct;
+        break;
+#endif
+#ifdef HAVE_EEOP_RETURNINGEXPR
+      case EEOP_RETURNINGEXPR:
+        tgt = s->d.returningexpr.jumpdone;
+        break;
+#endif
+      default:
+        break;
+      }
+      if (tgt >= 0 && tgt < steps_len)
+        is_jump_target[tgt] = true;
+    }
+
+    /*
      * Function prologue.
      * Saved regs: S0=state, S1=econtext, S2=isNull,
      *             S3=resultvals, S4=resultnulls
@@ -2606,6 +2849,25 @@ static bool sljit_compile_expr(ExprState *state) {
   }
 
   /*
+   * CASE binary search pre-scan: detect monotonic CASE patterns that can
+   * be replaced with O(log N) binary search instead of O(N) linear scan.
+   */
+  CaseBSearchInfo case_bsearch[16];
+  int num_case_bsearch = 0;
+  int next_bsearch_idx = 0;
+
+  num_case_bsearch = pg_jitter_detect_case_bsearch(
+      state, steps, steps_len, case_bsearch, 16);
+
+  if (num_case_bsearch > 0) {
+    /* Store desc pointers in step data for runtime access (shared mode) */
+    pg_jitter_setup_case_bsearch_arrays(state, steps, steps_len);
+
+    elog(DEBUG1, "pg_jitter[sljit]: detected %d CASE bsearch pattern(s)",
+         num_case_bsearch);
+  }
+
+  /*
    * Main loop: emit code for each step.
    */
   for (opno = 0; opno < steps_len; opno++) {
@@ -2613,6 +2875,90 @@ static bool sljit_compile_expr(ExprState *state) {
 
     step_labels[opno] = sljit_emit_label(C);
     opcode = ExecEvalStepOp(state, op);
+
+    /*
+     * CASE binary search: if we've just emitted the VAR/CASE_TESTVAL step
+     * at start_opno, the next step (start_opno+1) is where we inject the
+     * binary search call and skip the remaining pattern steps.
+     */
+    if (next_bsearch_idx < num_case_bsearch &&
+        opno == case_bsearch[next_bsearch_idx].start_opno + 1) {
+      CaseBSearchInfo *cbi = &case_bsearch[next_bsearch_idx];
+      ExprEvalStep *var_op = &steps[cbi->start_opno];
+
+      /* The VAR/CASE_TESTVAL step at start_opno already executed and wrote
+       * the variable value to var_op->resvalue, var_op->resnull.
+       * Load them now. */
+
+      /* Load resnull → R0 for null check */
+      emit_load_resnull(C, state, cbi->start_opno, var_op, SLJIT_R0);
+      struct sljit_jump *null_jump =
+          sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+      /* Load resvalue → R0 (the variable value for comparison) */
+      emit_load_resvalue(C, state, cbi->start_opno, var_op, SLJIT_R0);
+
+      /* R1 = desc pointer — load from step data (shared-mode safe).
+       * Stored in start_opno+2 (dead JUMP_IF_NOT_TRUE step). */
+      emit_load_step_field(C, cbi->start_opno + 2,
+                           offsetof(ExprEvalStep, d.constval.value),
+                           SLJIT_R1);
+      /* In non-shared mode, step field was set by setup_case_bsearch_arrays.
+       * In shared mode, workers call setup independently. */
+
+      /* Select the right helper function */
+      void *helper_fn = pg_jitter_select_bsearch_helper(cbi);
+      sljit_sw call_type = (cbi->var_type == JIT_TYPE_32)
+          ? SLJIT_ARGS2(W, 32, P) : SLJIT_ARGS2(W, W, P);
+
+      /* Call helper: R0=val, R1=desc → returns Datum in R0 */
+      EMIT_ICALL(C, SLJIT_CALL, call_type, helper_fn);
+
+      /* Store result to the ELSE step's resvalue/resnull (= CASE output).
+       * The ELSE CONST step at end_opno is the last CONST before else_end_opno. */
+      {
+        ExprEvalStep *else_op = &steps[cbi->end_opno];
+        /* R0 has the result from helper. emit_store_resvalue clobbers R1. */
+        emit_store_resvalue(C, state, cbi->end_opno, else_op, SLJIT_R0);
+        emit_store_resnull_false(C, state, cbi->end_opno, else_op);
+      }
+
+      /* Jump to else_end_opno (after the CASE) */
+      struct sljit_jump *done_jump = sljit_emit_jump(C, SLJIT_JUMP);
+      pending_jumps[npending].jump = done_jump;
+      pending_jumps[npending].target = cbi->else_end_opno;
+      npending++;
+
+      /* Null path: variable was NULL → use default result */
+      sljit_set_label(null_jump, sljit_emit_label(C));
+      {
+        ExprEvalStep *else_op = &steps[cbi->end_opno];
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM,
+                       (sljit_sw)cbi->default_result);
+        emit_store_resvalue(C, state, cbi->end_opno, else_op, SLJIT_R0);
+        if (cbi->default_is_null)
+          emit_store_resnull_true(C, state, cbi->end_opno, else_op);
+        else
+          emit_store_resnull_false(C, state, cbi->end_opno, else_op);
+      }
+
+      struct sljit_jump *null_done = sljit_emit_jump(C, SLJIT_JUMP);
+      pending_jumps[npending].jump = null_done;
+      pending_jumps[npending].target = cbi->else_end_opno;
+      npending++;
+
+      /* Skip the remaining steps of this pattern.
+       * Bind labels for skipped steps so jumps from other patterns
+       * (or the pattern's own JINTs) can still resolve. */
+      for (int skip = opno + 1; skip < cbi->else_end_opno && skip < steps_len; skip++) {
+        step_labels[skip] = sljit_emit_label(C);
+      }
+
+      /* Advance opno past the pattern (loop will increment) */
+      opno = cbi->else_end_opno - 1;
+      next_bsearch_idx++;
+      continue;
+    }
 
     /*
      * For each opcode, emit either: (a) inline native code for hot-path
@@ -2739,7 +3085,7 @@ static bool sljit_compile_expr(ExprState *state) {
          */
         if (!IsParallelWorker() && op->d.fetch.known_desc &&
             op->d.fetch.last_var > pg_jitter_deform_threshold() &&
-            op->d.fetch.last_var <= WIDE_DEFORM_LIMIT &&
+            op->d.fetch.last_var <= pg_jitter_wide_deform_limit() &&
             ctx->share_state.sjc) {
           pg_jitter_compile_shared_deform(
               ctx->share_state.sjc, op->d.fetch.known_desc, op->d.fetch.kind,
@@ -2815,9 +3161,12 @@ static bool sljit_compile_expr(ExprState *state) {
       /*
        * Look ahead: count consecutive VARs from the same slot.
        * We batch them to avoid reloading tts_values/tts_isnull.
+       * Stop before any step that is a jump target.
        */
       int batch_end = opno;
       while (batch_end + 1 < steps_len) {
+        if (is_jump_target[batch_end + 1])
+          break;
         ExprEvalStep *next_op = &steps[batch_end + 1];
         ExprEvalOp next_opc = ExecEvalStepOp(state, next_op);
         if (next_opc != opcode)
@@ -2931,9 +3280,12 @@ static bool sljit_compile_expr(ExprState *state) {
       sljit_sw vals_off = slot_cache_offset(opcode);
       bool use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
 
-      /* Look ahead for consecutive same-slot ASSIGN_VARs */
+      /* Look ahead for consecutive same-slot ASSIGN_VARs.
+       * Stop before any step that is a jump target. */
       int batch_end = opno;
       while (batch_end + 1 < steps_len) {
+        if (is_jump_target[batch_end + 1])
+          break;
         ExprEvalStep *next_op = &steps[batch_end + 1];
         ExprEvalOp next_opc = ExecEvalStepOp(state, next_op);
         if (next_opc != opcode)
@@ -3338,7 +3690,21 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (dfn && dfn->inline_op != JIT_INLINE_NONE) {
+          if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
+                      dfn->inline_op == JIT_INLINE_TEXT_NE)) {
+            /*
+             * TIER 0a — INLINE TEXT EQ/NE: short-varlena fast path
+             * with memcmp, slow path calls jit_texteq/jit_textne.
+             * Only for deterministic collations; non-deterministic
+             * falls through to V1.
+             */
+            if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+              bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
+              emit_inline_text_cmp(C, state, opno, op, fcinfo, is_eq);
+            } else {
+              goto sljit_funcexpr_v1_fallback;
+            }
+          } else if (dfn && dfn->inline_op != JIT_INLINE_NONE) {
             /*
              * TIER 0 — INLINE: emit the operation as sljit
              * instructions, no function call at all.
@@ -3413,48 +3779,222 @@ static bool sljit_compile_expr(ExprState *state) {
             /* Store *op->resvalue = R0, *op->resnull = false */
             emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
           } else {
+            sljit_funcexpr_v1_fallback: ;
             /*
-             * TIER 2 — V1 FALLBACK: generic fcinfo path.
-             * If strict, R1 already holds fcinfo from null checks.
+             * TIER 2 — V1 FALLBACK (or Vectorscan LIKE/regex).
              */
+            bool vs_handled = false;
 
-            /* fcinfo->isnull = false (must reset before each call;
-             * PG_RETURN_* macros don't clear it) */
-            if (r1_has_fcinfo)
-              sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
-            else
-              emit_load_step_field(C, opno,
-                                   offsetof(ExprEvalStep, d.func.fcinfo_data),
-                                   SLJIT_R0);
-            sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
-                           offsetof(FunctionCallInfoBaseData, isnull),
-                           SLJIT_IMM, 0);
+            /*
+             * LIKE/regex FAST PATH: StringZilla + Vectorscan.
+             * Detects textlike, textnlike, texticlike, texticnlike,
+             * textregexeq, textregexne, texticregexeq, texticregexne
+             * with a compile-time constant pattern.  Only in non-shared
+             * mode (embedded pointers are process-local).
+             */
+            if (!sljit_shared_code_mode) {
+              PGFunction fn = op->d.func.fn_addr;
+              bool is_like_fn = (fn == textlike || fn == textnlike);
+              bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
+              bool is_regex_fn = (fn == textregexeq || fn == textregexne);
+              bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
+              bool vs_negate = (fn == textnlike || fn == texticnlike ||
+                                fn == textregexne || fn == texticregexne);
 
-            /* Call fn_addr(fcinfo) */
-            /* R0 still = fcinfo */
-            if (sljit_shared_code_mode) {
+              if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+                  fcinfo->nargs == 2) {
+                /*
+                 * Check if args[1] (the pattern) is a compile-time constant.
+                 * PG's ExecInitFunc directly assigns Const values into
+                 * fcinfo->args[argno] without generating an EEOP_CONST step.
+                 * So if no step writes to args[1], it was pre-initialized
+                 * from a Const node — treat it as constant.
+                 */
+                bool pat_const = true;
+                for (int j = opno - 1; j >= 0; j--) {
+                  if (steps[j].resvalue == &fcinfo->args[1].value) {
+                    /* A step writes to args[1] — only constant if EEOP_CONST */
+                    pat_const = (steps[j].opcode == EEOP_CONST);
+                    break;
+                  }
+                }
+
+                /*
+                 * LIKE/regex matching is byte-level in PG for deterministic
+                 * collations. StringZilla/Vectorscan are also byte-level,
+                 * so they're safe for any deterministic collation.
+                 */
+                if (pat_const && !fcinfo->args[1].isnull &&
+                    pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+                  text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
+                  char *pat_str = VARDATA_ANY(pat_text);
+                  int pat_len = VARSIZE_ANY_EXHDR(pat_text);
+
+                  /*
+                   * StringZilla fast path for simple LIKE patterns.
+                   * Faster than Vectorscan (no regex compilation).
+                   * Only for LIKE/NOT LIKE (not ILIKE/regex).
+                   */
+                  if (is_like_fn) {
+                    const char *literal;
+                    int literal_len;
+                    int match_type = simd_like_classify(
+                        pat_str, pat_len, &literal, &literal_len);
+
+                    if (match_type >= 0 && literal != NULL) {
+                      /* Load args[0].value (text datum) */
+                      sljit_sw off0 =
+                          (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                      if (r1_has_fcinfo)
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R1), off0);
+                      else {
+                        emit_load_step_field(
+                            C, opno,
+                            offsetof(ExprEvalStep, d.func.fcinfo_data),
+                            SLJIT_R2);
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R2), off0);
+                      }
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                     SLJIT_IMM, (sljit_sw)literal);
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                                     SLJIT_IMM, literal_len);
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                                     SLJIT_IMM, match_type);
+                      EMIT_ICALL(C, SLJIT_CALL,
+                                 SLJIT_ARGS4(32, W, W, 32, 32),
+                                 simd_like_match_text);
+
+                      if (vs_negate)
+                        sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
+                                       SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                      emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                      vs_handled = true;
+                    }
+                  }
+
+                  /* Compiled LIKE path for anchored patterns */
+                  bool skip_vectorscan = false;
+                  if (!vs_handled && is_like_fn) {
+                    SzLikeCompiled *compiled =
+                        simd_like_compile(pat_str, pat_len);
+                    if (compiled == SIMD_LIKE_USE_V1) {
+                      /* Floating underscore pattern — V1 is faster */
+                      skip_vectorscan = true;
+                    } else if (compiled) {
+                      sljit_sw off0 =
+                          (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                      if (r1_has_fcinfo)
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R1), off0);
+                      else {
+                        emit_load_step_field(
+                            C, opno,
+                            offsetof(ExprEvalStep, d.func.fcinfo_data),
+                            SLJIT_R2);
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R2), off0);
+                      }
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                     SLJIT_IMM, (sljit_sw)compiled);
+                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                                 simd_like_match_compiled);
+
+                      if (vs_negate)
+                        sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
+                                       SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                      emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                      vs_handled = true;
+                    }
+                  }
+
+#ifdef PG_JITTER_HAVE_VECTORSCAN
+                  /* Vectorscan path for complex LIKE or regex patterns */
+                  if (!vs_handled && !skip_vectorscan) {
+                    bool is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
+                    VsCacheEntry *entry = pg_jitter_vs_compile(
+                        pat_str, pat_len,
+                        is_like_fn || is_ilike_fn, /* is_like */
+                        is_ilike_fn || is_iregex_fn, /* case_insensitive */
+                        is_utf8);
+
+                    if (entry) {
+                      sljit_sw off0 =
+                          (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                      if (r1_has_fcinfo)
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R1), off0);
+                      else {
+                        emit_load_step_field(
+                            C, opno,
+                            offsetof(ExprEvalStep, d.func.fcinfo_data),
+                            SLJIT_R2);
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R2), off0);
+                      }
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                     SLJIT_IMM, (sljit_sw)entry);
+                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                                 pg_jitter_vs_match_text);
+
+                      if (vs_negate)
+                        sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
+                                       SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                      emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                      vs_handled = true;
+                    }
+                  }
+#endif /* PG_JITTER_HAVE_VECTORSCAN */
+                }
+              }
+            }
+
+            if (!vs_handled) {
               /*
-               * In shared mode, fn_addr may point into a dynamically-
-               * loaded library (e.g. plpgsql.dylib) whose load address
-               * differs between leader and worker processes.  Load from
-               * step data at runtime instead of embedding.
+               * Generic V1 fcinfo path.
+               * If strict, R1 already holds fcinfo from null checks.
                */
+
+              /* fcinfo->isnull = false (must reset before each call;
+               * PG_RETURN_* macros don't clear it) */
+              if (r1_has_fcinfo)
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
+              else
+                emit_load_step_field(C, opno,
+                                     offsetof(ExprEvalStep, d.func.fcinfo_data),
+                                     SLJIT_R0);
+              sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                             offsetof(FunctionCallInfoBaseData, isnull),
+                             SLJIT_IMM, 0);
+
+              /* Call fn_addr(fcinfo) */
+              /* R0 still = fcinfo */
+              if (sljit_shared_code_mode) {
+                emit_load_step_field(
+                    C, opno, offsetof(ExprEvalStep, d.func.fn_addr), SLJIT_R1);
+                sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+                                 SLJIT_R1, 0);
+              } else
+                EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+                           op->d.func.fn_addr);
+
+              /* *op->resvalue = R0 (return value) */
+              emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+
+              /* *op->resnull = fcinfo->isnull */
               emit_load_step_field(
-                  C, opno, offsetof(ExprEvalStep, d.func.fn_addr), SLJIT_R1);
-              sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P), SLJIT_R1, 0);
-            } else
-              EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), op->d.func.fn_addr);
-
-            /* *op->resvalue = R0 (return value) */
-            emit_store_resvalue(C, state, opno, op, SLJIT_R0);
-
-            /* *op->resnull = fcinfo->isnull */
-            emit_load_step_field(
-                C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data), SLJIT_R0);
-            sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
-                           offsetof(FunctionCallInfoBaseData, isnull));
-            emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
-          } /* end V1 fallback */
+                  C, opno, offsetof(ExprEvalStep, d.func.fcinfo_data),
+                  SLJIT_R0);
+              sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+                             SLJIT_MEM1(SLJIT_R0),
+                             offsetof(FunctionCallInfoBaseData, isnull));
+              emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
+            }
+          } /* end V1 fallback / vectorscan */
 #ifdef PG_JITTER_HAVE_INLINE_BLOBS
         } /* end if (!used_precompiled) */
 #endif
@@ -4846,9 +5386,9 @@ static bool sljit_compile_expr(ExprState *state) {
 #endif
 
     /*
-     * ---- SYSVAR ----
-     * Direct call to ExecEvalSysVar(state, op, econtext, slot).
-     * 4-arg call; slot determined by opcode variant.
+     * ---- SYSVAR (partially inlined) ----
+     * For tableoid (-6) and ctid (-1): inline the load.
+     * For OLD/NEW variants and other attnums: fall back to ExecEvalSysVar.
      */
     case EEOP_INNER_SYSVAR:
     case EEOP_OUTER_SYSVAR:
@@ -4859,6 +5399,7 @@ static bool sljit_compile_expr(ExprState *state) {
 #endif
     {
       sljit_sw slot_offset;
+      int attnum = op->d.var.attnum;
 
       switch (opcode) {
       case EEOP_INNER_SYSVAR:
@@ -4870,7 +5411,6 @@ static bool sljit_compile_expr(ExprState *state) {
       case EEOP_SCAN_SYSVAR:
         slot_offset = offsetof(ExprContext, ecxt_scantuple);
         break;
-
 #ifdef HAVE_EEOP_OLD_NEW
       case EEOP_OLD_SYSVAR:
         slot_offset = offsetof(ExprContext, ecxt_oldtuple);
@@ -4882,13 +5422,42 @@ static bool sljit_compile_expr(ExprState *state) {
       default:
         pg_unreachable();
       }
-      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
-      emit_load_step_addr(C, opno, SLJIT_R1);
-      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_S1, 0);
-      /* R3 = econtext->ecxt_*tuple (slot) */
-      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_S1),
-                     slot_offset);
-      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, P, P), ExecEvalSysVar);
+
+#ifdef HAVE_EEOP_OLD_NEW
+      if (opcode == EEOP_OLD_SYSVAR || opcode == EEOP_NEW_SYSVAR ||
+          (attnum != TableOidAttributeNumber &&
+           attnum != SelfItemPointerAttributeNumber))
+#else
+      if (attnum != TableOidAttributeNumber &&
+          attnum != SelfItemPointerAttributeNumber)
+#endif
+      {
+        /* Fall back to C call for rare attnums and OLD/NEW */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+        emit_load_step_addr(C, opno, SLJIT_R1);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_S1, 0);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_S1),
+                       slot_offset);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, P, P), ExecEvalSysVar);
+      } else {
+        /* R0 = slot = econtext->ecxt_*tuple */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                       slot_offset);
+
+        if (attnum == TableOidAttributeNumber) {
+          /* *resvalue = slot->tts_tableOid (Oid, zero-extended to Datum) */
+          sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_tableOid));
+        } else {
+          /* attnum == SelfItemPointerAttributeNumber (-1) = ctid */
+          /* *resvalue = PointerGetDatum(&slot->tts_tid) */
+          sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM,
+                         offsetof(TupleTableSlot, tts_tid));
+        }
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+        /* *resnull = false */
+        emit_store_resnull_false(C, state, opno, op);
+      }
       break;
     }
 
@@ -5106,14 +5675,48 @@ static bool sljit_compile_expr(ExprState *state) {
     }
 
     /*
-     * ---- PARAM_EXEC / PARAM_EXTERN ----
-     * Direct call to ExecEvalParamExec/Extern instead of fallback.
+     * ---- PARAM_EXEC (inlined) ----
+     * Fast path: load value/isnull from econtext->ecxt_param_exec_vals[paramid].
+     * Slow path (execPlan != NULL, i.e. lazy InitPlan): call ExecEvalParamExec.
      */
     case EEOP_PARAM_EXEC: {
+      int paramid = op->d.param.paramid;
+      struct sljit_jump *slow_jump;
+      struct sljit_jump *done_jump;
+
+      /* R0 = econtext->ecxt_param_exec_vals */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S1),
+                     offsetof(ExprContext, ecxt_param_exec_vals));
+      /* R0 = &ecxt_param_exec_vals[paramid] */
+      if (paramid != 0)
+        sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM,
+                       paramid * (sljit_sw)sizeof(ParamExecData));
+
+      /* if (prm->execPlan != NULL) goto slow_path */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                     offsetof(ParamExecData, execPlan));
+      slow_jump = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R1, 0,
+                                 SLJIT_IMM, 0);
+
+      /* Fast path: load both value and isnull into R2/R3 first,
+       * since emit_store_* helpers clobber R0/R1 */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+                     offsetof(ParamExecData, value));
+      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_R0),
+                     offsetof(ParamExecData, isnull));
+      emit_store_resvalue(C, state, opno, op, SLJIT_R2);
+      emit_store_resnull_reg(C, state, opno, op, SLJIT_R3);
+
+      done_jump = sljit_emit_jump(C, SLJIT_JUMP);
+
+      /* Slow path: call ExecEvalParamExec(state, op, econtext) */
+      sljit_set_label(slow_jump, sljit_emit_label(C));
       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
       emit_load_step_addr(C, opno, SLJIT_R1);
       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_S1, 0);
       EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, P), ExecEvalParamExec);
+
+      sljit_set_label(done_jump, sljit_emit_label(C));
       break;
     }
 
@@ -5911,19 +6514,306 @@ static bool sljit_compile_expr(ExprState *state) {
       break;
     }
 
+    /*
+     * ---- DOMAIN_NOTNULL (inlined) ----
+     * Fast path: if *op->resnull is false, done (no violation).
+     * Slow path: call ExecEvalConstraintNotNull(state, op).
+     */
+    case EEOP_DOMAIN_NOTNULL: {
+      struct sljit_jump *j_ok;
+
+      /* R0 = *op->resnull */
+      emit_load_resnull(C, state, opno, op, SLJIT_R0);
+      /* if (!resnull) skip the error call */
+      j_ok = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+      /* Slow path: call ExecEvalConstraintNotNull(state, op) */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+      emit_load_step_addr(C, opno, SLJIT_R1);
+      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), ExecEvalConstraintNotNull);
+
+      sljit_set_label(j_ok, sljit_emit_label(C));
+      break;
+    }
+
+    /*
+     * ---- DOMAIN_CHECK (inlined) ----
+     * Fast path: if *checknull is true (NULL input), done.
+     *            else if DatumGetBool(*checkvalue), done.
+     * Slow path: call ExecEvalConstraintCheck(state, op).
+     */
+    case EEOP_DOMAIN_CHECK: {
+      struct sljit_jump *j_done_null, *j_done_pass;
+
+      /* R0 = *op->d.domaincheck.checknull */
+      emit_load_step_field(C, opno,
+                           offsetof(ExprEvalStep, d.domaincheck.checknull),
+                           SLJIT_R0);
+      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+      /* if (checknull) → done (NULL input bypasses check) */
+      j_done_null =
+          sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+      /* R0 = DatumGetBool(*op->d.domaincheck.checkvalue) */
+      emit_load_step_field(C, opno,
+                           offsetof(ExprEvalStep, d.domaincheck.checkvalue),
+                           SLJIT_R0);
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0), 0);
+      /* if (checkvalue != 0) → done (constraint passed) */
+      j_done_pass =
+          sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+      /* Slow path: call ExecEvalConstraintCheck(state, op) */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+      emit_load_step_addr(C, opno, SLJIT_R1);
+      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), ExecEvalConstraintCheck);
+
+      sljit_set_label(j_done_null, sljit_emit_label(C));
+      sljit_set_label(j_done_pass, sljit_emit_label(C));
+      break;
+    }
+
+    /*
+     * ---- GROUPING_FUNC (inlined) ----
+     * Unroll the clause loop at compile time (cap at 8 clauses).
+     * For each clause: result <<= 1; if !bms_is_member(attnum, grouped_cols)
+     *                  result |= 1.
+     * grouped_cols loaded at runtime from aggstate->grouped_cols.
+     */
+    case EEOP_GROUPING_FUNC: {
+      List *clauses = op->d.grouping_func.clauses;
+      int nclauses = list_length(clauses);
+
+      if (nclauses > 8) {
+        /* Too many clauses — fall back to C call */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+        emit_load_step_addr(C, opno, SLJIT_R1);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), ExecEvalGroupingFunc);
+      } else {
+        /* R2 = state->parent (AggState*) */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_S0),
+                       offsetof(ExprState, parent));
+        /* R2 = aggstate->grouped_cols (Bitmapset*) */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                       offsetof(AggState, grouped_cols));
+        /* R0 = result = 0 */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        ListCell *lc;
+        foreach (lc, clauses) {
+          int attnum = lfirst_int(lc);
+
+          /* result <<= 1 */
+          sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM,
+                         1);
+          /* Save result and grouped_cols across call */
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TMP1,
+                         SLJIT_R0, 0);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TMP2,
+                         SLJIT_R2, 0);
+
+          /* call bms_is_member(attnum, grouped_cols) */
+          sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, attnum);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_R2, 0);
+          EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, P), bms_is_member);
+
+          /* Restore result and grouped_cols */
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_SP),
+                         SOFF_TMP2);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_SP),
+                         SOFF_TMP1);
+          /* if (!bms_is_member) result |= 1 */
+          {
+            struct sljit_jump *j_is_member;
+            j_is_member = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0,
+                                         SLJIT_IMM, 0);
+            sljit_emit_op2(C, SLJIT_OR, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM,
+                           1);
+            sljit_set_label(j_is_member, sljit_emit_label(C));
+          }
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R1, 0);
+        }
+
+        /* *op->resvalue = Int32GetDatum(result); *op->resnull = false */
+        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+        emit_store_resnull_false(C, state, opno, op);
+      }
+      break;
+    }
+
+    /*
+     * ---- MINMAX (GREATEST/LEAST, partially inlined) ----
+     * For nelems <= 4: unroll the loop. For each element, load
+     * value/null, skip NULLs, adopt first non-null, then compare.
+     * For nelems > 4: fall back to C call.
+     */
+    case EEOP_MINMAX: {
+      int nelems = op->d.minmax.nelems;
+
+      if (nelems > 4) {
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+        emit_load_step_addr(C, opno, SLJIT_R1);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), ExecEvalMinMax);
+      } else {
+        /* Set *op->resnull = true initially */
+        emit_store_resnull_true(C, state, opno, op);
+
+        for (int i = 0; i < nelems; i++) {
+          struct sljit_jump *j_null;
+
+          /* R0 = op->d.minmax.nulls[i] */
+          emit_load_step_field(C, opno,
+                               offsetof(ExprEvalStep, d.minmax.nulls),
+                               SLJIT_R0);
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                         i * (sljit_sw)sizeof(bool));
+          /* if null, skip this element */
+          j_null = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM,
+                                  0);
+
+          /* R0 = op->d.minmax.values[i] */
+          emit_load_step_field(C, opno,
+                               offsetof(ExprEvalStep, d.minmax.values),
+                               SLJIT_R0);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                         i * (sljit_sw)sizeof(Datum));
+
+          /* Check if *resnull — if so, this is the first non-null */
+          {
+            struct sljit_jump *j_not_first;
+            emit_load_resnull(C, state, opno, op, SLJIT_R1);
+            j_not_first = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0,
+                                         SLJIT_IMM, 0);
+
+            /* First non-null: adopt value, clear resnull */
+            emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+            emit_store_resnull_false(C, state, opno, op);
+            {
+              struct sljit_jump *j_skip_cmp = sljit_emit_jump(C, SLJIT_JUMP);
+              sljit_set_label(j_not_first, sljit_emit_label(C));
+
+              /* Not first: compare with current result */
+              sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TMP1,
+                             SLJIT_R0, 0);
+
+              /* Load fcinfo */
+              emit_load_step_field(
+                  C, opno, offsetof(ExprEvalStep, d.minmax.fcinfo_data),
+                  SLJIT_R2);
+              /* fcinfo->args[0].value = *resvalue (current best) */
+              emit_load_resvalue(C, state, opno, op, SLJIT_R1);
+              sljit_emit_op1(C, SLJIT_MOV,
+                             SLJIT_MEM1(SLJIT_R2),
+                             offsetof(FunctionCallInfoBaseData, args[0].value),
+                             SLJIT_R1, 0);
+              /* fcinfo->args[1].value = new value */
+              sljit_emit_op1(C, SLJIT_MOV,
+                             SLJIT_MEM1(SLJIT_R2),
+                             offsetof(FunctionCallInfoBaseData, args[1].value),
+                             SLJIT_R0, 0);
+              /* fcinfo->isnull = false */
+              sljit_emit_op1(C, SLJIT_MOV_U8,
+                             SLJIT_MEM1(SLJIT_R2),
+                             offsetof(FunctionCallInfoBaseData, isnull),
+                             SLJIT_IMM, 0);
+
+              /* Save fcinfo, call comparison function */
+              sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R2, 0);
+              sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R2),
+                             offsetof(FunctionCallInfoBaseData, flinfo));
+              sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                             offsetof(FmgrInfo, fn_addr));
+              sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P), SLJIT_R1, 0);
+              /* R0 = cmpresult (Datum → int32) */
+
+              if (op->d.minmax.op == IS_LEAST) {
+                struct sljit_jump *j_no_update;
+                j_no_update = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+                                             SLJIT_R0, 0, SLJIT_IMM, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_TMP1);
+                emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+                sljit_set_label(j_no_update, sljit_emit_label(C));
+              } else {
+                struct sljit_jump *j_no_update;
+                j_no_update = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+                                             SLJIT_R0, 0, SLJIT_IMM, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), SOFF_TMP1);
+                emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+                sljit_set_label(j_no_update, sljit_emit_label(C));
+              }
+
+              sljit_set_label(j_skip_cmp, sljit_emit_label(C));
+            }
+          }
+
+          sljit_set_label(j_null, sljit_emit_label(C));
+        }
+      }
+      break;
+    }
+
+    /*
+     * ---- SCALARARRAYOP (partially inlined) ----
+     * Inline the NULL-array check, then call helper with SIMD dispatch.
+     */
+    case EEOP_SCALARARRAYOP: {
+      FunctionCallInfo fcinfo = op->d.scalararrayop.fcinfo_data;
+      struct sljit_jump *j_null_arr;
+
+      /* 1. Check *op->resnull — if true, array is NULL → keep NULL result */
+      emit_load_resnull(C, state, opno, op, SLJIT_R0);
+      j_null_arr =
+          sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+      /* 2. Load *op->resvalue (array datum) → R0 for pg_detoast_datum */
+      emit_load_resvalue(C, state, opno, op, SLJIT_R0);
+      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P), pg_detoast_datum);
+      /* arr in SLJIT_R0 (return value) — save to stack */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TMP1, SLJIT_R0,
+                     0);
+
+      /* 3. Load scalar value and null from fcinfo->args[0] */
+      emit_load_step_field(C, opno,
+                           offsetof(ExprEvalStep, d.scalararrayop.fcinfo_data),
+                           SLJIT_R2);
+      /* R2 = fcinfo pointer */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                     SLJIT_MEM1(SLJIT_R2),
+                     (sljit_sw)offsetof(FunctionCallInfoBaseData, args[0].value));
+      /* R2 now has scalar_value; load scalar_null into R3 */
+      emit_load_step_field(C, opno,
+                           offsetof(ExprEvalStep, d.scalararrayop.fcinfo_data),
+                           SLJIT_R3);
+      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0,
+                     SLJIT_MEM1(SLJIT_R3),
+                     (sljit_sw)offsetof(FunctionCallInfoBaseData,
+                                        args[0].isnull));
+
+      /* 4. Call pg_jitter_scalararrayop_loop(op, arr, scalar_value,
+       * scalar_null) */
+      /* R0 = op (step pointer) */
+      emit_load_step_addr(C, opno, SLJIT_R0);
+      /* R1 = arr (from stack) */
+      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_SP),
+                     SOFF_TMP1);
+      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS4V(P, P, W, 32),
+                 pg_jitter_scalararrayop_loop);
+
+      sljit_set_label(j_null_arr, sljit_emit_label(C));
+      break;
+    }
+
     /* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
 #ifdef HAVE_EEOP_IOCOERCE_SAFE
     case EEOP_IOCOERCE_SAFE:
 #endif
-    case EEOP_SCALARARRAYOP:
     case EEOP_SQLVALUEFUNCTION:
     case EEOP_CURRENTOFEXPR:
     case EEOP_NEXTVALUEEXPR:
     case EEOP_ARRAYEXPR:
     case EEOP_ROW:
-    case EEOP_MINMAX:
-    case EEOP_DOMAIN_NOTNULL:
-    case EEOP_DOMAIN_CHECK:
     case EEOP_XMLEXPR:
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
     case EEOP_IS_JSON:
@@ -5931,7 +6821,7 @@ static bool sljit_compile_expr(ExprState *state) {
 #ifdef HAVE_EEOP_JSONEXPR
     case EEOP_JSONEXPR_COERCION_FINISH:
 #endif
-    case EEOP_GROUPING_FUNC: {
+    {
       void *fn;
 
       switch (opcode) {
@@ -5941,9 +6831,7 @@ static bool sljit_compile_expr(ExprState *state) {
         fn = ExecEvalCoerceViaIOSafe;
         break;
 #endif
-      case EEOP_SCALARARRAYOP:
-        fn = ExecEvalScalarArrayOp;
-        break;
+      /* SCALARARRAYOP moved to dedicated inline case */
       case EEOP_SQLVALUEFUNCTION:
         fn = ExecEvalSQLValueFunction;
         break;
@@ -5959,15 +6847,7 @@ static bool sljit_compile_expr(ExprState *state) {
       case EEOP_ROW:
         fn = ExecEvalRow;
         break;
-      case EEOP_MINMAX:
-        fn = ExecEvalMinMax;
-        break;
-      case EEOP_DOMAIN_NOTNULL:
-        fn = ExecEvalConstraintNotNull;
-        break;
-      case EEOP_DOMAIN_CHECK:
-        fn = ExecEvalConstraintCheck;
-        break;
+      /* DOMAIN_NOTNULL/DOMAIN_CHECK/MINMAX/GROUPING_FUNC moved to dedicated inline cases */
       case EEOP_XMLEXPR:
         fn = ExecEvalXmlExpr;
         break;
@@ -5982,9 +6862,6 @@ static bool sljit_compile_expr(ExprState *state) {
         fn = ExecEvalJsonCoercionFinish;
         break;
 #endif
-      case EEOP_GROUPING_FUNC:
-        fn = ExecEvalGroupingFunc;
-        break;
       default:
         pg_unreachable();
       }

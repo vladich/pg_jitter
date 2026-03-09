@@ -220,6 +220,7 @@ static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 static int meta_parallel_mode = 1;		/* PARALLEL_JIT_PER_WORKER */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
 static bool meta_deform_cache = true;
+static int meta_min_expr_steps = 4;
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
@@ -524,6 +525,19 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 PGC_USERSET,
 							 GUC_ALLOW_IN_PARALLEL,
 							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_jitter.min_expr_steps",
+		"Minimum expression step count for JIT compilation. "
+		"Expressions with fewer steps use the interpreter.",
+		NULL,
+		&meta_min_expr_steps,
+		4,			/* skip JIT for expressions with fewer than 4 steps */
+		0,			/* minimum */
+		1000,		/* maximum */
+		PGC_USERSET,
+		GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("pg_jitter.backend",
 							 "Selects the active pg_jitter JIT backend.",

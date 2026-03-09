@@ -120,6 +120,12 @@ set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir-patched" CACHE PATH
     "Path to MIR source directory")
 set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
+set(STRINGZILLA_DIR "${CMAKE_SOURCE_DIR}/../stringzilla" CACHE PATH
+    "Path to StringZilla source directory (header-only)")
+set(VECTORSCAN_DIR "${CMAKE_SOURCE_DIR}/../vectorscan" CACHE PATH
+    "Path to Vectorscan source directory")
+option(WITH_VECTORSCAN "Enable Vectorscan SIMD regex/LIKE acceleration" ON)
+
 
 # Validate dependency directories (only for enabled backends)
 if(PG_JITTER_BUILD_SLJIT)
@@ -187,6 +193,26 @@ if(PG_JITTER_BUILD_ASMJIT)
     add_subdirectory(${ASMJIT_DIR} ${CMAKE_BINARY_DIR}/asmjit)
 endif()
 
+# ---------- Vectorscan (optional, static library) ----------
+set(PG_JITTER_HAVE_VECTORSCAN OFF)
+if(WITH_VECTORSCAN AND NOT WIN32)
+    set(_vs_lib "${VECTORSCAN_DIR}/build/lib/libhs.a")
+    set(_vs_hdr "${VECTORSCAN_DIR}/src/hs.h")
+    if(EXISTS "${_vs_lib}" AND EXISTS "${_vs_hdr}")
+        set(PG_JITTER_HAVE_VECTORSCAN ON)
+        set(VECTORSCAN_INCLUDE_DIR "${VECTORSCAN_DIR}/src")
+        add_library(vectorscan_lib STATIC IMPORTED)
+        set_target_properties(vectorscan_lib PROPERTIES
+            IMPORTED_LOCATION "${_vs_lib}")
+        # Vectorscan requires C++ standard library
+        find_library(LIBCXX c++ PATHS /opt/homebrew/lib /usr/lib)
+        message(STATUS "Vectorscan:         ${_vs_lib}")
+    else()
+        message(STATUS "Vectorscan:         not found (build with: cd ${VECTORSCAN_DIR}/build && cmake .. && make hs)")
+    endif()
+endif()
+
+
 # ==========================================================================
 # Pre-compilation infrastructure (LLVM / c2mir)
 # ==========================================================================
@@ -221,7 +247,17 @@ endif()
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
-    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS})
+    target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS}
+        ${STRINGZILLA_DIR}/include)
+    if(PG_JITTER_HAVE_VECTORSCAN)
+        target_include_directories(${TARGET_NAME} PRIVATE
+            ${VECTORSCAN_INCLUDE_DIR} ${VECTORSCAN_DIR}/build)
+        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_VECTORSCAN)
+        target_link_libraries(${TARGET_NAME} PRIVATE vectorscan_lib)
+        if(LIBCXX)
+            target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
+        endif()
+    endif()
     if(WIN32)
         # Our compat headers must come first to provide mmap/sysconf/etc.
         # that PG's own win32_msvc headers are missing.
@@ -243,7 +279,7 @@ endfunction()
 # ==========================================================================
 # Backend targets
 # ==========================================================================
-set(COMMON_SRC src/pg_jitter_common.c src/pg_jit_funcs.c src/pg_jit_tier2_wrappers.c)
+set(COMMON_SRC src/pg_jitter_common.c src/pg_jit_funcs.c src/pg_jit_tier2_wrappers.c src/pg_jitter_simd.c src/pg_jitter_vectorscan.c)
 
 # Collect targets for install
 set(PG_JITTER_TARGETS "")
@@ -264,8 +300,9 @@ endif()
 # ---------- pg_jitter_asmjit ----------
 if(PG_JITTER_BUILD_ASMJIT)
     add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
-                src/pg_jit_deform_templates.c)
-    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit)
+                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
+    target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
+    target_compile_definitions(pg_jitter_asmjit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
     if(TARGET generate_deform_templates)
@@ -277,8 +314,9 @@ endif()
 # ---------- pg_jitter_mir ----------
 if(PG_JITTER_BUILD_MIR)
     add_library(pg_jitter_mir MODULE ${COMMON_SRC} src/pg_jitter_mir.c
-                src/pg_jit_deform_templates.c)
-    target_link_libraries(pg_jitter_mir PRIVATE mir_lib)
+                src/pg_jitter_deform_jit.c)
+    target_link_libraries(pg_jitter_mir PRIVATE mir_lib sljit)
+    target_compile_definitions(pg_jitter_mir PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_mir)
     if(TARGET generate_deform_templates)
         add_dependencies(pg_jitter_mir generate_deform_templates)

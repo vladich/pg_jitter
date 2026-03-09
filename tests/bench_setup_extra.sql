@@ -301,5 +301,31 @@ END $$;
 
 ANALYZE ultra_wide;
 
+-- text_long: 200K rows with long strings (200-600 chars) for extreme LIKE/regex benchmarks
+CREATE TABLE IF NOT EXISTS text_long (
+    id          integer,
+    long_text   text,
+    mixed_text  text
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM text_long LIMIT 1) THEN
+        RAISE NOTICE 'Populating text_long (200K rows, 200-600 char strings)...';
+        INSERT INTO text_long
+        SELECT i,
+               md5(i::text) || md5((i+1)::text) || md5((i+2)::text) ||
+               md5((i+3)::text) || md5((i+4)::text) || md5((i+5)::text) ||
+               md5((i+6)::text) || md5((i+7)::text) || md5((i+8)::text) ||
+               md5((i+9)::text) || md5((i+10)::text) || md5((i+11)::text) ||
+               repeat(chr(97 + (i % 26)), (i % 200) + 1),
+               'pfx_' || (i % 1000) || '_' || md5(i::text) || '_' ||
+               md5((i*7)::text) || '_sfx'
+        FROM generate_series(1, 200000) i;
+    END IF;
+END $$;
+
+ANALYZE text_long;
+
 \echo 'Extra setup complete.'
 \timing off

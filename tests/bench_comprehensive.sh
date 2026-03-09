@@ -94,7 +94,7 @@ TABLES_NEEDED=$(psql_cmd -t -A -c "
 SELECT string_agg(t, ',') FROM (VALUES
     ('bench_data'),('join_left'),('join_right'),('date_data'),
     ('text_data'),('numeric_data'),('jsonb_data'),('array_data'),
-    ('ultra_wide'),('wide_100'),('wide_300'),('wide_1000')
+    ('ultra_wide'),('wide_100'),('wide_300'),('wide_1000'),('text_long')
 ) AS v(t)
 WHERE NOT EXISTS (
     SELECT 1 FROM pg_class c
@@ -332,7 +332,6 @@ add_query "CASE_searched_4way"  "SELECT SUM(CASE WHEN val < 1000 THEN 1 WHEN val
 add_query "COALESCE_NULLIF"     "SELECT SUM(COALESCE(NULLIF(val, 0), -1)) FROM join_left"
 add_query "Bool_AND_OR"         "SELECT COUNT(*) FROM join_left WHERE (val > 1000 AND val < 9000) OR (key1 > 100 AND key2 < 400)"
 add_query "Arith_expr"          "SELECT SUM(val + key1 * 3 - key2) FROM join_left"
-add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
 
 # --- Subqueries & Lateral ---
 add_section "Subqueries"
@@ -353,6 +352,53 @@ add_query "Text_EQ_filter"      "SELECT COUNT(*) FROM text_data WHERE grp_text =
 add_query "Text_LIKE"           "SELECT COUNT(*) FROM text_data WHERE word LIKE 'word_1%'"
 add_query "Text_concat_agg"     "SELECT grp_text, string_agg(word, ',') FROM text_data WHERE id <= 10000 GROUP BY grp_text"
 add_query "Text_length_expr"    "SELECT SUM(length(varlen_text) + length(word)) FROM text_data"
+add_query "Text_EQ_c_coll"     "SELECT COUNT(*) FROM text_data WHERE grp_text = 'prefix_42' COLLATE \"C\""
+add_query "Text_NE_c_coll"     "SELECT COUNT(*) FROM text_data WHERE grp_text <> 'prefix_42' COLLATE \"C\""
+add_query "Text_LT_c_coll"     "SELECT COUNT(*) FROM text_data WHERE grp_text < 'prefix_50' COLLATE \"C\""
+add_query "Text_sort_c"        "SELECT grp_text FROM text_data ORDER BY grp_text COLLATE \"C\" LIMIT 10"
+
+# --- LIKE (StringZilla fast path) ---
+# Each pattern type exercises a different StringZilla code path.
+# Only LIKE/NOT LIKE (not ILIKE) trigger StringZilla; pattern must be constant.
+add_section "LIKE (StringZilla)"
+add_query "LIKE_prefix"         "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE 'c4ca%'"
+add_query "LIKE_suffix"         "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%ff'"
+add_query "LIKE_interior"       "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%abc%'"
+add_query "LIKE_exact"          "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix_42'"
+add_query "NOT_LIKE_prefix"     "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE 'c4ca%'"
+add_query "NOT_LIKE_interior"   "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE '%abc%'"
+
+# --- LIKE with _ wildcard (falls through to Vectorscan or PG fallback) ---
+add_section "LIKE (underscore)"
+add_query "LIKE_under_prefix"   "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE 'c4c_4%'"
+add_query "LIKE_under_mid"      "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a_c%'"
+add_query "LIKE_under_only"     "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix___'"
+add_query "LIKE_pct_under_mix"  "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '_4%a_b%'"
+
+# --- LIKE complex + ILIKE (Vectorscan fast path) ---
+# Multi-wildcard LIKE and all ILIKE/regex go through Vectorscan SIMD regex engine.
+add_section "ILIKE/Regex (Vectorscan)"
+add_query "LIKE_multi"          "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%'"
+add_query "LIKE_3wild"          "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%c%'"
+add_query "ILIKE_prefix"        "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE 'C4CA%'"
+add_query "ILIKE_interior"      "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%ABC%'"
+add_query "ILIKE_suffix"        "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%FF'"
+add_query "ILIKE_exact"         "SELECT COUNT(*) FROM text_data WHERE grp_text ILIKE 'PREFIX_42'"
+add_query "NOT_ILIKE_int"       "SELECT COUNT(*) FROM text_data WHERE hash_text NOT ILIKE '%ABC%'"
+add_query "Regex_anchor"        "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^[0-9a-f]{4}'"
+add_query "Regex_mid"           "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '[0-9]{3}[a-f]{3}'"
+add_query "Regex_neg"           "SELECT COUNT(*) FROM text_data WHERE hash_text !~ '^[0-9]'"
+add_query "Regex_icase"         "SELECT COUNT(*) FROM text_data WHERE hash_text ~* '^C4CA'"
+add_query "Regex_neg_icase"     "SELECT COUNT(*) FROM text_data WHERE hash_text !~* '^C4CA'"
+add_query "Regex_charclass"     "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '[a-f]{5,}'"
+add_query "Regex_alternation"   "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^(c4|e4|a8)'"
+
+# --- IN list / Sort ---
+add_section "IN list / Sort"
+add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
+add_query "IN_list_small"       "SELECT COUNT(*) FROM join_left WHERE key1 + 0 IN (1,2,3,4,5,6,7,8,9,10)"
+add_query "Sort_int_500k"       "SELECT key1 FROM join_left ORDER BY key1 + 0 LIMIT 10"
+add_query "Sort_int_grpby"      "SELECT key1 % 100, COUNT(*) FROM join_left GROUP BY key1 % 100 ORDER BY COUNT(*) DESC LIMIT 10"
 
 # --- Numeric ---
 add_section "Numeric"
@@ -403,6 +449,88 @@ add_section "Partitioned"
 add_query "PartScan_filter"     "SELECT COUNT(*), SUM(val) FROM part_data WHERE grp BETWEEN 10 AND 30"
 add_query "PartScan_agg_all"    "SELECT grp, COUNT(*), SUM(val) FROM part_data GROUP BY grp"
 
+# --- Extreme Expressions ---
+# These queries stress JIT expression evaluation with many operations per row.
+add_section "Extreme Expressions"
+
+# 20-way searched CASE — deep branch evaluation, JIT eliminates dispatch per branch
+add_query "CASE_20way"         "SELECT SUM(CASE WHEN val < 500 THEN 1 WHEN val < 1000 THEN 2 WHEN val < 1500 THEN 3 WHEN val < 2000 THEN 4 WHEN val < 2500 THEN 5 WHEN val < 3000 THEN 6 WHEN val < 3500 THEN 7 WHEN val < 4000 THEN 8 WHEN val < 4500 THEN 9 WHEN val < 5000 THEN 10 WHEN val < 5500 THEN 11 WHEN val < 6000 THEN 12 WHEN val < 6500 THEN 13 WHEN val < 7000 THEN 14 WHEN val < 7500 THEN 15 WHEN val < 8000 THEN 16 WHEN val < 8500 THEN 17 WHEN val < 9000 THEN 18 WHEN val < 9500 THEN 19 ELSE 20 END) FROM join_left"
+
+# 20 boolean conditions — lots of AND/OR evaluation
+add_query "Bool_20cond"        "SELECT COUNT(*) FROM join_left WHERE (val > 100 AND val < 9900 AND key1 > 10 AND key1 < 99990 AND key2 > 5 AND key2 < 49995) OR (val > 200 AND val < 9800 AND key1 > 20 AND key1 < 99980) OR (val > 300 AND val < 9700 AND key1 > 30 AND key1 < 99970) OR (val > 500 AND val < 9500 AND key2 > 100 AND key2 < 49900)"
+
+# 10 aggregates with mixed expressions (COUNT, SUM, AVG, MIN, MAX, CASE, ABS)
+add_query "Agg_complex_10"    "SELECT grp, COUNT(*), SUM(val1*val1), AVG(val2+val3), MIN(val1-val2+val3), MAX(val4*2-val5), SUM(CASE WHEN val1>5000 THEN val2 ELSE val3 END), AVG(ABS(val1-val2)), SUM(val1%100+val2%100), COUNT(NULLIF(val3,0)) FROM bench_data GROUP BY grp"
+
+# --- Extreme LIKE/Regex on Long Strings ---
+# These test Vectorscan SIMD advantage on 400-600 char strings (200K rows).
+# PG's regex engine must scan each position; Vectorscan compiles to SIMD DFA.
+add_section "Long String LIKE/Regex"
+
+# Interior LIKE on long strings — Vectorscan SIMD substring search
+add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
+
+# ILIKE on long strings — case-insensitive Vectorscan (~6x faster)
+add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
+
+# NOT ILIKE on long strings
+add_query "Long_NOT_ILIKE"     "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
+
+# Regex with 3 alternations on long strings (~10x faster)
+add_query "Long_Regex_alt"     "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
+
+# Regex with 8 alternations — more alternatives = more SIMD advantage (~12x faster)
+add_query "Long_Regex_8alt"    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
+
+# Case-insensitive regex on long strings (~10x faster)
+add_query "Long_Regex_icase"   "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
+
+# Regex char class on long strings
+add_query "Long_Regex_class"   "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
+
+# Combined ILIKE + regex — both accelerated by Vectorscan
+add_query "Long_combined"      "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
+
+# --- CASE Binary Search ---
+# These test O(log N) binary search optimization for large CASE expressions.
+# JIT detects monotonic CASE patterns and replaces linear O(N) evaluation.
+# Uses bench_data (narrow, 1M rows, val1 range 0-10000) to isolate CASE cost.
+add_section "CASE Binary Search"
+
+# Pattern A: searched CASE with < (monotonic thresholds)
+add_query "CASE_lt_20"         "$(python3 -c "
+branches = [f'WHEN val1 < {i*500+250} THEN {i+1}' for i in range(20)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 21 END) FROM bench_data\")
+")"
+add_query "CASE_lt_50"         "$(python3 -c "
+branches = [f'WHEN val1 < {i*200+100} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 51 END) FROM bench_data\")
+")"
+add_query "CASE_lt_100"        "$(python3 -c "
+branches = [f'WHEN val1 < {i*100+50} THEN {i+1}' for i in range(100)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 101 END) FROM bench_data\")
+")"
+
+# Pattern B: simple CASE with = (equality, sorted by optimizer)
+add_query "CASE_eq_20"         "$(python3 -c "
+branches = [f'WHEN {i*500} THEN {i+1}' for i in range(20)]
+print(f\"SELECT SUM(CASE val1 {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+add_query "CASE_eq_50"         "$(python3 -c "
+branches = [f'WHEN {i*200} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE val1 {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+add_query "CASE_eq_100"        "$(python3 -c "
+branches = [f'WHEN {i*100} THEN {i+1}' for i in range(100)]
+print(f\"SELECT SUM(CASE val1 {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# Text type: generic binary search via PG comparison functions
+add_query "CASE_txt_eq_50"     "$(python3 -c "
+branches = [f\"WHEN 'row_{i*20000+1}' THEN {i+1}\" for i in range(50)]
+print(f\"SELECT SUM(CASE txt {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
 NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""
@@ -440,7 +568,7 @@ SELECT COUNT(*) FROM text_data; SELECT COUNT(*) FROM numeric_data;
 SELECT COUNT(*) FROM array_data; SELECT COUNT(*) FROM ultra_wide;
 SELECT COUNT(*) FROM jsonb_data; SELECT COUNT(*) FROM part_data;
 SELECT COUNT(*) FROM wide_100; SELECT COUNT(*) FROM wide_300;
-SELECT COUNT(*) FROM wide_1000;
+SELECT COUNT(*) FROM wide_1000; SELECT COUNT(*) FROM text_long;
 " > /dev/null 2>&1
 echo ""
 
@@ -866,6 +994,144 @@ FOOTER
 
     echo "BENCHMARKS.md generated at: $MD_FILE"
 fi
+
+# ================================================================
+# Correctness verification: LIKE / ILIKE / Regex
+# ================================================================
+# Compare JIT results against interpreter (jit=off) for a comprehensive
+# set of pattern matching queries covering all wildcard types, regex
+# features, edge cases and negation variants.
+
+if [ "$MD_ONLY" -eq 0 ]; then
+
+echo ""
+echo "=== Correctness Verification: LIKE / ILIKE / Regex ==="
+echo ""
+
+VERIFY_QUERIES=(
+    # --- LIKE with % wildcard ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE 'c4ca%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%ff'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%abc%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%c%'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix_42'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE ''"
+
+    # --- LIKE with _ wildcard ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE 'c4c_4%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a_c%'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix___'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '_4%a_b%'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix__'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '________________________________'"
+
+    # --- NOT LIKE ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE 'c4ca%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE '%abc%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE '%a_c%'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text NOT LIKE 'prefix_42'"
+
+    # --- ILIKE (case-insensitive) ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE 'C4CA%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%ABC%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%FF'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text ILIKE 'PREFIX_42'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%A_C%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE '%A%B%C%'"
+
+    # --- NOT ILIKE ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text NOT ILIKE '%ABC%'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text NOT ILIKE 'C4CA%'"
+
+    # --- Regex ~ (case-sensitive match) ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^[0-9a-f]{4}'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '[0-9]{3}[a-f]{3}'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^c4ca'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ 'abc'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '[a-f]{5,}'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^(c4|e4|a8)'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '(.)\\1'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '^[0-9].*[a-f]\$'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ '.{30,}'"
+
+    # --- Regex !~ (negated case-sensitive) ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text !~ '^[0-9]'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text !~ 'abc'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text !~ '^(c4|e4|a8)'"
+
+    # --- Regex ~* (case-insensitive match) ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~* '^C4CA'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~* 'ABC'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~* '^[A-F]{2}'"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text ~* '^PREFIX_4'"
+
+    # --- Regex !~* (negated case-insensitive) ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text !~* '^C4CA'"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text !~* 'ABC'"
+
+    # --- Edge cases ---
+    "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE hash_text"
+    "SELECT COUNT(*) FROM text_data WHERE hash_text ~ hash_text"
+    "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix\_%' ESCAPE '\\'"
+
+    # --- Long strings (text_long: 400-600 char strings) ---
+    "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
+    "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
+    "SELECT COUNT(*) FROM text_long WHERE mixed_text LIKE '%pfx_42_%'"
+)
+
+VERIFY_PASS=0
+VERIFY_FAIL=0
+VERIFY_ERRORS=""
+
+for bname in "${NAMES[@]}"; do
+    [ "$bname" = "interp" ] && continue
+
+    echo "  Verifying $bname ..."
+    switch_backend "$bname"
+
+    for vq in "${VERIFY_QUERIES[@]}"; do
+        # Get interpreter result (strip SET lines, take last non-empty line)
+        interp_result=$(psql_cmd -t -A -c "
+SET jit = off;
+SET max_parallel_workers_per_gather = 0;
+$vq;" 2>&1 | grep -v '^SET$' | grep -v '^$' | tail -1)
+
+        # Get JIT result (strip SET lines, take last non-empty line)
+        jit_settings="SET jit = on; SET jit_above_cost = 0; SET jit_inline_above_cost = 0; SET jit_optimize_above_cost = 0;"
+        [ "$META_MODE" -eq 1 ] && [ "$bname" != "llvmjit" ] && jit_settings="$jit_settings SET pg_jitter.backend = '$bname';"
+        jit_result=$(psql_cmd -t -A -c "
+$jit_settings
+SET max_parallel_workers_per_gather = 0;
+$vq;" 2>&1 | grep -v '^SET$' | grep -v '^$' | tail -1)
+
+        if [ "$interp_result" = "$jit_result" ]; then
+            VERIFY_PASS=$((VERIFY_PASS + 1))
+        else
+            VERIFY_FAIL=$((VERIFY_FAIL + 1))
+            short_q="${vq:0:70}"
+            VERIFY_ERRORS="${VERIFY_ERRORS}  FAIL [$bname]: $short_q...\n    interp=$interp_result  jit=$jit_result\n"
+        fi
+    done
+done
+
+echo ""
+echo "  Correctness: $VERIFY_PASS passed, $VERIFY_FAIL failed"
+if [ "$VERIFY_FAIL" -gt 0 ]; then
+    echo ""
+    echo "  Failures:"
+    echo -e "$VERIFY_ERRORS"
+fi
+
+fi  # end MD_ONLY check
 
 echo ""
 echo "=== Done ==="

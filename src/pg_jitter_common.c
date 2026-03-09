@@ -5,7 +5,9 @@
  */
 #include "postgres.h"
 #include "pg_jitter_common.h"
+#include "pg_jit_funcs.h"
 
+#include "catalog/pg_collation_d.h"
 #include "executor/execExpr.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -13,8 +15,13 @@
 #include "nodes/execnodes.h"
 #include "storage/shmem.h"
 #include "utils/expandeddatum.h"
+#include "utils/fmgrprotos.h"
+#include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/pg_locale.h"
+#include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
+#include "access/detoast.h"    /* DatumGetTextPP */
 #include "utils/resowner.h"
 
 #include <stdlib.h> /* for atoi */
@@ -34,6 +41,9 @@ int pg_jitter_shared_code_max_kb = 4096; /* 4 MB default */
 
 /* GUC: pg_jitter.deform_cache — cache compiled deform functions across queries */
 bool pg_jitter_deform_cache = true;
+
+/* GUC: pg_jitter.min_expr_steps — skip JIT for expressions with fewer steps */
+int pg_jitter_min_expr_steps = 4;
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
@@ -141,6 +151,18 @@ int pg_jitter_get_parallel_mode(void) {
     return PARALLEL_JIT_SHARED;
 
   return pg_jitter_parallel_mode; /* unknown value, use local */
+}
+
+/*
+ * Read pg_jitter.min_expr_steps from the GUC system.
+ */
+int pg_jitter_get_min_expr_steps(void) {
+  const char *val = GetConfigOption("pg_jitter.min_expr_steps", true, false);
+
+  if (val != NULL)
+    return atoi(val);
+
+  return pg_jitter_min_expr_steps;
 }
 
 /*
@@ -2054,13 +2076,34 @@ void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx) {
  * pg_jitter_deform_threshold — column count above which loop-based deform
  * is used instead of unrolled deform.
  *
- * Unrolled deform emits ~140 bytes per column. When the total exceeds half
- * the L1I cache, instruction cache thrashing makes JIT slower than the
- * interpreter. The loop-based deform emits ~530 bytes of code regardless
- * of column count.
+ * Unrolled deform emits ~140 bytes per column.  When the total code
+ * exceeds the L1I budget, instruction-cache thrashing makes JIT slower
+ * than the interpreter.  The loop-based deform emits ~530 bytes
+ * regardless of column count.
  *
- * Threshold = L1I_cache_size / DEFORM_BYTES_PER_COL / 2
- * On a typical 32KB L1I CPU this gives ~117 columns.
+ * Architecture-specific tuning:
+ *
+ *   ARM64 (Apple M1–M3)     — 192 KB L1I, 64 KB L1D
+ *     Unrolled threshold: 192K / 140 / 2 ≈ 468 columns.
+ *     Wide tables benefit from the large I-cache; unrolled deform
+ *     stays profitable up to ~460 columns.
+ *
+ *   ARM64 (Apple M4+)       — 192 KB L1I, 128 KB L1D
+ *     Unrolled threshold: same ≈ 468 columns.
+ *
+ *   ARM64 (Graviton 2/3)    — 64 KB L1I, 64 KB L1D
+ *     Unrolled threshold: 64K / 140 / 2 ≈ 234 columns.
+ *
+ *   ARM64 (Ampere Altra)    — 64 KB L1I, 64 KB L1D
+ *     Unrolled threshold: 64K / 140 / 2 ≈ 234 columns.
+ *
+ *   ARM64 (AmpereOne)       — 16 KB L1I, 64 KB L1D
+ *     Unrolled threshold: 16K / 140 / 2 ≈ 57 columns.
+ *     Tiny I-cache forces early switch to loop-based deform.
+ *
+ *   x86-64 (Intel/AMD)      — 32 KB L1I, 32–48 KB L1D
+ *     Unrolled threshold: 32K / 140 / 2 ≈ 117 columns.
+ *     Smaller I-cache means unrolled code hurts sooner.
  */
 int pg_jitter_deform_threshold(void) {
   static int threshold = 0;
@@ -2091,5 +2134,1702 @@ int pg_jitter_deform_threshold(void) {
 
     return threshold;
   }
+}
+
+/*
+ * pg_jitter_wide_deform_limit — hard cap on JIT deform column count.
+ *
+ * Above this limit, JIT deform (both unrolled and loop-based) is
+ * slower than the interpreter's slot_getsomeattrs_int().  The
+ * crossover depends on per-tuple iteration cost, which scales with
+ * the number of columns and is bounded by data-cache capacity.
+ *
+ * Architecture-specific limits (benchmarked):
+ *
+ *   ARM64 (Apple M1–M3)     — 64 KB L1D, 192 KB L1I
+ *     L1D / 128 = 512 columns.  Benchmarks show 300-col tables
+ *     are 1.3× faster with JIT deform; 1000-col is 1.5× slower.
+ *
+ *   ARM64 (Apple M4+)       — 128 KB L1D, 192 KB L1I
+ *     L1D / 128 = 1024 columns.  Larger L1D pushes the crossover
+ *     higher — 1000-col tables should benefit.
+ *
+ *   ARM64 (Graviton 2/3, Ampere Altra) — 64 KB L1D
+ *     L1D / 128 = 512 columns.
+ *
+ *   ARM64 (AmpereOne)       — 64 KB L1D, 16 KB L1I
+ *     L1D / 128 = 512 columns.  Same L1D as Altra despite the
+ *     much smaller L1I (which affects unrolled threshold, not this).
+ *
+ *   x86-64 (Skylake, Zen 3) — 32 KB L1D, 32 KB L1I
+ *     L1D / 64 = 512 columns.  x86 has higher per-iteration
+ *     overhead (variable-length encoding, fewer registers) so
+ *     we use a smaller divisor to keep the limit reasonable.
+ *
+ *   x86-64 (Ice Lake+, Zen 4+) — 48 KB L1D, 32 KB L1I
+ *     L1D / 64 = 768 columns.
+ */
+int pg_jitter_wide_deform_limit(void) {
+  static int limit = 0;
+
+  if (limit > 0)
+    return limit;
+
+  {
+    long l1d_size = 0;
+
+#ifdef __linux__
+    l1d_size = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+#elif defined(__APPLE__)
+    {
+      size_t len = sizeof(l1d_size);
+      sysctlbyname("hw.l1dcachesize", &l1d_size, &len, NULL, 0);
+    }
+#elif defined(_WIN32)
+    {
+      SYSTEM_LOGICAL_PROCESSOR_INFORMATION *buf = NULL;
+      DWORD sz = 0;
+      GetLogicalProcessorInformation(NULL, &sz);
+      buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc(sz);
+      if (buf && GetLogicalProcessorInformation(buf, &sz)) {
+        DWORD n = sz / sizeof(*buf);
+        for (DWORD i = 0; i < n; i++) {
+          if (buf[i].Relationship == RelationCache &&
+              buf[i].Cache.Level == 1 &&
+              buf[i].Cache.Type == CacheData) {
+            l1d_size = buf[i].Cache.Size;
+            break;
+          }
+        }
+      }
+      free(buf);
+    }
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    /*
+     * ARM64: efficient fixed-width instructions, generous caches.
+     * Apple M1-M3: 64 KB → 512,  M4+: 128 KB → 1024.
+     * Graviton: 64 KB → 512.
+     */
+    if (l1d_size <= 0)
+      l1d_size = 65536;           /* assume 64 KB if detection fails */
+    limit = l1d_size / 128;
+#elif defined(__x86_64__) || defined(_M_X64)
+    /*
+     * x86-64: variable-length encoding, more register pressure.
+     * Skylake/Zen3: 32 KB → 512,  Ice Lake/Zen4+: 48 KB → 768.
+     */
+    if (l1d_size <= 0)
+      l1d_size = 32768;           /* assume 32 KB if detection fails */
+    limit = l1d_size / 64;
+#else
+    if (l1d_size <= 0)
+      l1d_size = 32768;
+    limit = l1d_size / 128;
+#endif
+
+    if (limit < 100)
+      limit = 100;                /* never go below 100 columns */
+
+    return limit;
+  }
+}
+
+/*
+ * pg_jitter_collation_is_c — check if a collation OID resolves to C/POSIX.
+ *
+ * Returns true for C_COLLATION_OID (950), and also for DEFAULT_COLLATION_OID
+ * (100) when the database default collation is C.  This is needed because
+ * expressions like `col ILIKE 'pattern'` use DEFAULT_COLLATION_OID even on
+ * databases created with --no-locale (C collation).
+ */
+bool
+pg_jitter_collation_is_c(Oid collid)
+{
+  static Oid cached_collid = InvalidOid;
+  static bool cached_result = false;
+
+  if (collid == C_COLLATION_OID)
+    return true;
+  if (collid == cached_collid)
+    return cached_result;
+
+#if PG_VERSION_NUM >= 180000
+  {
+    pg_locale_t locale = pg_newlocale_from_collation(collid);
+    cached_result = locale->collate_is_c;
+  }
+#else
+  cached_result = lc_collate_is_c(collid);
+#endif
+  cached_collid = collid;
+  return cached_result;
+}
+
+/*
+ * pg_jitter_collation_is_deterministic — check if collation is deterministic.
+ *
+ * LIKE and regex matching in PostgreSQL are byte-level operations that produce
+ * correct results for any deterministic collation. This is used to gate the
+ * StringZilla/Vectorscan LIKE/regex fast paths, which are also byte-level.
+ */
+bool
+pg_jitter_collation_is_deterministic(Oid collid)
+{
+  static Oid cached_collid = InvalidOid;
+  static bool cached_result = false;
+
+  /* C and POSIX are always deterministic */
+  if (collid == C_COLLATION_OID)
+    return true;
+  if (collid == cached_collid)
+    return cached_result;
+
+#if PG_VERSION_NUM >= 180000
+  {
+    pg_locale_t locale = pg_newlocale_from_collation(collid);
+    cached_result = locale->deterministic;
+  }
+#elif PG_VERSION_NUM >= 120000
+  {
+    pg_locale_t locale = pg_newlocale_from_collation(collid);
+    cached_result = locale->deterministic;
+  }
+#else
+  /* PG < 12 has no non-deterministic collations */
+  cached_result = true;
+#endif
+  cached_collid = collid;
+  return cached_result;
+}
+
+/* ----------------------------------------------------------------
+ * CASE expression binary search optimization
+ *
+ * Detects monotonic CASE patterns and replaces linear O(N) branch
+ * scanning with O(log N) binary search.
+ * ---------------------------------------------------------------- */
+
+/*
+ * Comparison kind enumeration for classify_cmp_fn.
+ */
+typedef enum CmpKind {
+  CMP_EQ, CMP_LT, CMP_LE, CMP_GT, CMP_GE
+} CmpKind;
+
+/*
+ * Static table entry mapping PGFunction address to (CmpKind, CaseBSearchType).
+ * Built lazily on first call to classify_cmp_fn.
+ */
+typedef struct CmpClassEntry {
+  PGFunction      fn;
+  CmpKind         kind;
+  CaseBSearchType bs_type;
+} CmpClassEntry;
+
+static CmpClassEntry *cmp_class_entries = NULL;
+static int cmp_class_nentries = 0;
+
+/*
+ * Helper: add one entry to the classification table.
+ */
+static inline void
+add_cmp_entry(CmpClassEntry *e, int *n, PGFunction fn,
+              CmpKind kind, CaseBSearchType bs_type)
+{
+  e[*n].fn = fn;
+  e[*n].kind = kind;
+  e[*n].bs_type = bs_type;
+  (*n)++;
+}
+
+/*
+ * Helper: add a 5-entry {eq, lt, le, gt, ge} group.
+ */
+static void
+add_cmp_group(CmpClassEntry *e, int *n,
+              PGFunction eq_fn, PGFunction lt_fn, PGFunction le_fn,
+              PGFunction gt_fn, PGFunction ge_fn, CaseBSearchType bs_type)
+{
+  if (eq_fn) add_cmp_entry(e, n, eq_fn, CMP_EQ, bs_type);
+  if (lt_fn) add_cmp_entry(e, n, lt_fn, CMP_LT, bs_type);
+  if (le_fn) add_cmp_entry(e, n, le_fn, CMP_LE, bs_type);
+  if (gt_fn) add_cmp_entry(e, n, gt_fn, CMP_GT, bs_type);
+  if (ge_fn) add_cmp_entry(e, n, ge_fn, CMP_GE, bs_type);
+}
+
+/*
+ * Build the classification table using PG function addresses directly.
+ * Called once, results cached in static variables.
+ */
+static void
+build_cmp_class_table(void)
+{
+  CmpClassEntry *e = malloc(sizeof(CmpClassEntry) * 128);
+  int n = 0;
+
+  /* --- Tier 1: byval types --- */
+
+  /* int4 → CASE_BS_I32 */
+  add_cmp_group(e, &n, (PGFunction)int4eq, (PGFunction)int4lt,
+                (PGFunction)int4le, (PGFunction)int4gt,
+                (PGFunction)int4ge, CASE_BS_I32);
+
+  /* int8 → CASE_BS_I64 */
+  add_cmp_group(e, &n, (PGFunction)int8eq, (PGFunction)int8lt,
+                (PGFunction)int8le, (PGFunction)int8gt,
+                (PGFunction)int8ge, CASE_BS_I64);
+
+  /* int2 → CASE_BS_I16 */
+  add_cmp_group(e, &n, (PGFunction)int2eq, (PGFunction)int2lt,
+                (PGFunction)int2le, (PGFunction)int2gt,
+                (PGFunction)int2ge, CASE_BS_I16);
+
+  /* date → CASE_BS_I32 (DateADT = signed int32) */
+  add_cmp_group(e, &n, (PGFunction)date_eq, (PGFunction)date_lt,
+                (PGFunction)date_le, (PGFunction)date_gt,
+                (PGFunction)date_ge, CASE_BS_I32);
+
+  /* oid → CASE_BS_U32 */
+  add_cmp_group(e, &n, (PGFunction)oideq, (PGFunction)oidlt,
+                (PGFunction)oidle, (PGFunction)oidgt,
+                (PGFunction)oidge, CASE_BS_U32);
+
+  /* timestamp → CASE_BS_I64 */
+  add_cmp_group(e, &n, (PGFunction)timestamp_eq, (PGFunction)timestamp_lt,
+                (PGFunction)timestamp_le, (PGFunction)timestamp_gt,
+                (PGFunction)timestamp_ge, CASE_BS_I64);
+
+  /* float4 → CASE_BS_F4 */
+  add_cmp_group(e, &n, (PGFunction)float4eq, (PGFunction)float4lt,
+                (PGFunction)float4le, (PGFunction)float4gt,
+                (PGFunction)float4ge, CASE_BS_F4);
+
+  /* float8 → CASE_BS_F8 */
+  add_cmp_group(e, &n, (PGFunction)float8eq, (PGFunction)float8lt,
+                (PGFunction)float8le, (PGFunction)float8gt,
+                (PGFunction)float8ge, CASE_BS_F8);
+
+  /* bool → CASE_BS_I64 */
+  add_cmp_group(e, &n, (PGFunction)booleq, (PGFunction)boollt,
+                (PGFunction)boolle, (PGFunction)boolgt,
+                (PGFunction)boolge, CASE_BS_I64);
+
+  /* --- Tier 2: byref types → CASE_BS_GENERIC --- */
+
+  /* text */
+  add_cmp_group(e, &n, (PGFunction)texteq, (PGFunction)text_lt,
+                (PGFunction)text_le, (PGFunction)text_gt,
+                (PGFunction)text_ge, CASE_BS_GENERIC);
+
+  /* numeric */
+  add_cmp_group(e, &n, (PGFunction)numeric_eq, (PGFunction)numeric_lt,
+                (PGFunction)numeric_le, (PGFunction)numeric_gt,
+                (PGFunction)numeric_ge, CASE_BS_GENERIC);
+
+  /* uuid */
+  add_cmp_group(e, &n, (PGFunction)uuid_eq, (PGFunction)uuid_lt,
+                (PGFunction)uuid_le, (PGFunction)uuid_gt,
+                (PGFunction)uuid_ge, CASE_BS_GENERIC);
+
+  /* interval */
+  add_cmp_group(e, &n, (PGFunction)interval_eq, (PGFunction)interval_lt,
+                (PGFunction)interval_le, (PGFunction)interval_gt,
+                (PGFunction)interval_ge, CASE_BS_GENERIC);
+
+  /* bpchar */
+  add_cmp_group(e, &n, (PGFunction)bpchareq, (PGFunction)bpcharlt,
+                (PGFunction)bpcharle, (PGFunction)bpchargt,
+                (PGFunction)bpcharge, CASE_BS_GENERIC);
+
+  /* bytea */
+  add_cmp_group(e, &n, (PGFunction)byteaeq, (PGFunction)bytealt,
+                (PGFunction)byteale, (PGFunction)byteagt,
+                (PGFunction)byteage, CASE_BS_GENERIC);
+
+  /* jsonb */
+  add_cmp_group(e, &n, (PGFunction)jsonb_eq, (PGFunction)jsonb_lt,
+                (PGFunction)jsonb_le, (PGFunction)jsonb_gt,
+                (PGFunction)jsonb_ge, CASE_BS_GENERIC);
+
+  /* network */
+  add_cmp_group(e, &n, (PGFunction)network_eq, (PGFunction)network_lt,
+                (PGFunction)network_le, (PGFunction)network_gt,
+                (PGFunction)network_ge, CASE_BS_GENERIC);
+
+  /* array */
+  add_cmp_group(e, &n, (PGFunction)array_eq, (PGFunction)array_lt,
+                (PGFunction)array_le, (PGFunction)array_gt,
+                (PGFunction)array_ge, CASE_BS_GENERIC);
+
+  cmp_class_entries = e;
+  cmp_class_nentries = n;
+}
+
+/*
+ * find_generic_lt_fn — for a CASE_BS_GENERIC equality function, find the
+ * corresponding _lt function for binary search ordering.
+ * Returns NULL if no lt function is found (fallback to linear scan).
+ */
+static PGFunction
+find_generic_lt_fn(PGFunction eq_fn)
+{
+  static struct { PGFunction eq; PGFunction lt; } map[] = {
+    {(PGFunction)texteq,       (PGFunction)text_lt},
+    {(PGFunction)numeric_eq,   (PGFunction)numeric_lt},
+    {(PGFunction)uuid_eq,      (PGFunction)uuid_lt},
+    {(PGFunction)interval_eq,  (PGFunction)interval_lt},
+    {(PGFunction)bpchareq,     (PGFunction)bpcharlt},
+    {(PGFunction)byteaeq,      (PGFunction)bytealt},
+    {(PGFunction)jsonb_eq,     (PGFunction)jsonb_lt},
+    {(PGFunction)network_eq,   (PGFunction)network_lt},
+    {(PGFunction)array_eq,     (PGFunction)array_lt},
+  };
+  for (int i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++)
+    if (map[i].eq == eq_fn)
+      return map[i].lt;
+  return NULL;
+}
+
+/*
+ * classify_cmp_fn — classify a comparison function for CASE binary search.
+ *
+ * Matches against known PG comparison functions.  Returns true if the
+ * function is a supported comparison, filling out the category fields.
+ */
+static bool
+classify_cmp_fn(PGFunction fn, const JitDirectFn *dfn,
+                bool *is_equality, bool *is_less, bool *is_inclusive,
+                CaseBSearchType *bs_type)
+{
+  if (cmp_class_entries == NULL)
+    build_cmp_class_table();
+
+  /* Linear scan — table is small (~90 entries), called once per CASE branch */
+  for (int i = 0; i < cmp_class_nentries; i++)
+  {
+    if (cmp_class_entries[i].fn == fn)
+    {
+      CmpKind k = cmp_class_entries[i].kind;
+      *bs_type = cmp_class_entries[i].bs_type;
+      *is_equality = (k == CMP_EQ);
+      *is_less = (k == CMP_LT || k == CMP_LE);
+      *is_inclusive = (k == CMP_LE || k == CMP_GE);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+ * Check if an opcode is a VAR load (INNER_VAR, OUTER_VAR, SCAN_VAR).
+ */
+static bool
+is_var_opcode(ExprEvalOp op)
+{
+  return op == EEOP_INNER_VAR || op == EEOP_OUTER_VAR || op == EEOP_SCAN_VAR;
+}
+
+/*
+ * Check if two VAR steps load the same variable (same opcode + same attnum).
+ */
+static bool
+same_var(ExprState *state, ExprEvalStep *a, ExprEvalStep *b)
+{
+  ExprEvalOp opa = ExecEvalStepOp(state, a);
+  ExprEvalOp opb = ExecEvalStepOp(state, b);
+  if (opa != opb)
+    return false;
+  return a->d.var.attnum == b->d.var.attnum;
+}
+
+/*
+ * Check if an opcode is FUNCEXPR_STRICT (including PG18 _1/_2 variants).
+ */
+static bool
+is_funcexpr_strict(ExprEvalOp op)
+{
+  if (op == EEOP_FUNCEXPR_STRICT)
+    return true;
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+  if (op == EEOP_FUNCEXPR_STRICT_1 || op == EEOP_FUNCEXPR_STRICT_2)
+    return true;
+#endif
+  return false;
+}
+
+/*
+ * Comparator for qsort: sort (threshold, result) pairs by threshold for
+ * Pattern B (equality). Operates on parallel arrays via index permutation.
+ */
+typedef struct {
+  Datum threshold;
+  Datum result;
+} ThresholdResult;
+
+static int
+cmp_threshold_result_i32(const void *a, const void *b)
+{
+  int32 va = DatumGetInt32(((const ThresholdResult *)a)->threshold);
+  int32 vb = DatumGetInt32(((const ThresholdResult *)b)->threshold);
+  return (va > vb) - (va < vb);
+}
+
+static int
+cmp_threshold_result_i64(const void *a, const void *b)
+{
+  int64 va = DatumGetInt64(((const ThresholdResult *)a)->threshold);
+  int64 vb = DatumGetInt64(((const ThresholdResult *)b)->threshold);
+  return (va > vb) - (va < vb);
+}
+
+static int
+cmp_threshold_result_u32(const void *a, const void *b)
+{
+  uint32 va = DatumGetUInt32(((const ThresholdResult *)a)->threshold);
+  uint32 vb = DatumGetUInt32(((const ThresholdResult *)b)->threshold);
+  return (va > vb) - (va < vb);
+}
+
+static int
+cmp_threshold_result_f4(const void *a, const void *b)
+{
+  float4 va = DatumGetFloat4(((const ThresholdResult *)a)->threshold);
+  float4 vb = DatumGetFloat4(((const ThresholdResult *)b)->threshold);
+  /* NaN-aware: NaN sorts after everything */
+  if (isnan(va)) return isnan(vb) ? 0 : 1;
+  if (isnan(vb)) return -1;
+  return (va > vb) - (va < vb);
+}
+
+static int
+cmp_threshold_result_f8(const void *a, const void *b)
+{
+  float8 va = DatumGetFloat8(((const ThresholdResult *)a)->threshold);
+  float8 vb = DatumGetFloat8(((const ThresholdResult *)b)->threshold);
+  if (isnan(va)) return isnan(vb) ? 0 : 1;
+  if (isnan(vb)) return -1;
+  return (va > vb) - (va < vb);
+}
+
+/* Context for generic threshold comparator */
+typedef struct {
+  PGFunction  lt_fn;
+  Oid         collation;
+} GenericCmpCtx;
+
+static int
+cmp_threshold_result_generic(const void *a, const void *b, void *arg)
+{
+  GenericCmpCtx *ctx = (GenericCmpCtx *)arg;
+  Datum da = ((const ThresholdResult *)a)->threshold;
+  Datum db = ((const ThresholdResult *)b)->threshold;
+  LOCAL_FCINFO(fcinfo, 2);
+  InitFunctionCallInfoData(*fcinfo, NULL, 2, ctx->collation, NULL, NULL);
+  fcinfo->args[0].value = da;
+  fcinfo->args[0].isnull = false;
+  fcinfo->args[1].value = db;
+  fcinfo->args[1].isnull = false;
+  /* a < b → -1 */
+  if (DatumGetBool(ctx->lt_fn(fcinfo)))
+    return -1;
+  /* b < a → +1 */
+  fcinfo->args[0].value = db;
+  fcinfo->args[1].value = da;
+  if (DatumGetBool(ctx->lt_fn(fcinfo)))
+    return 1;
+  return 0;
+}
+
+/* memcmp-based comparator for text Datums — used for deterministic non-C
+ * collations where we only need a consistent total order for binary search. */
+static int
+cmp_threshold_result_text_memcmp(const void *a, const void *b)
+{
+  Datum da = ((const ThresholdResult *)a)->threshold;
+  Datum db = ((const ThresholdResult *)b)->threshold;
+  text *t1 = DatumGetTextPP(da);
+  text *t2 = DatumGetTextPP(db);
+  int len1 = VARSIZE_ANY_EXHDR(t1);
+  int len2 = VARSIZE_ANY_EXHDR(t2);
+  int minlen = (len1 < len2) ? len1 : len2;
+  int cmp = memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), minlen);
+  if (cmp == 0)
+    cmp = (len1 > len2) - (len1 < len2);
+  return cmp;
+}
+
+/*
+ * pg_jitter_detect_case_bsearch — scan ExprEvalStep array for CASE patterns
+ * suitable for binary search optimization.
+ *
+ * Detects two patterns:
+ *   Pattern A: searched CASE with monotonic < / <= / > / >= comparisons
+ *   Pattern B: simple CASE with = comparisons (values sorted at detect time)
+ *
+ * Each pattern has 5 steps per branch:
+ *   [i+0] VAR or CASE_TESTVAL
+ *   [i+1] EEOP_FUNCEXPR_STRICT (comparison; threshold baked into fcinfo->args[1])
+ *   [i+2] EEOP_JUMP_IF_NOT_TRUE (→ next branch)
+ *   [i+3] EEOP_CONST (result)
+ *   [i+4] EEOP_JUMP (→ end of CASE)
+ *
+ * Note: PG's ExecInitFunc() assigns Const argument values directly into
+ * fcinfo->args[] WITHOUT generating EEOP_CONST steps. The threshold for
+ * comparison is therefore in steps[i+1].d.func.fcinfo_data->args[1].value.
+ *
+ * Returns number of detected patterns.
+ */
+int
+pg_jitter_detect_case_bsearch(ExprState *state,
+                               ExprEvalStep *steps, int steps_len,
+                               CaseBSearchInfo *out, int max_patterns)
+{
+  int nfound = 0;
+  int i = 0;
+  const int STRIDE = 5;  /* steps per branch */
+
+  while (i < steps_len - STRIDE && nfound < max_patterns)
+  {
+    ExprEvalOp op0 = ExecEvalStepOp(state, &steps[i]);
+    ExprEvalOp op1, op2, op3, op4;
+    bool is_var_pattern, is_case_testval;
+    const JitDirectFn *dfn;
+    bool is_equality, is_less, is_inclusive;
+    CaseBSearchType bs_type;
+    int8 var_type;
+    PGFunction cmp_fn;
+    int branch_count;
+    int end_jump_target;
+    int j;
+
+    /* Step 0 must be a VAR load or CASE_TESTVAL */
+    is_var_pattern = is_var_opcode(op0);
+    is_case_testval = (op0 == EEOP_CASE_TESTVAL);
+    if (!is_var_pattern && !is_case_testval)
+    {
+      i++;
+      continue;
+    }
+
+    /* Check remaining 4 steps of first branch exist */
+    if (i + 4 >= steps_len)
+      break;
+
+    op1 = ExecEvalStepOp(state, &steps[i + 1]);
+    op2 = ExecEvalStepOp(state, &steps[i + 2]);
+    op3 = ExecEvalStepOp(state, &steps[i + 3]);
+    op4 = ExecEvalStepOp(state, &steps[i + 4]);
+
+    /* Verify first branch structure:
+     * [+1] FUNCEXPR_STRICT, [+2] JINT, [+3] CONST(result), [+4] JUMP */
+    if (!is_funcexpr_strict(op1) ||
+        op2 != EEOP_JUMP_IF_NOT_TRUE || op3 != EEOP_CONST ||
+        op4 != EEOP_JUMP)
+    {
+      i++;
+      continue;
+    }
+
+    /* Result CONST at i+3 must be non-null */
+    if (steps[i + 3].d.constval.isnull)
+    {
+      i++;
+      continue;
+    }
+
+    /* Threshold is baked into fcinfo->args[1] — must be non-null */
+    if (steps[i + 1].d.func.fcinfo_data->args[1].isnull)
+    {
+      i++;
+      continue;
+    }
+
+    /* Identify comparison function */
+    cmp_fn = steps[i + 1].d.func.fn_addr;
+    dfn = jit_find_direct_fn(cmp_fn);
+    if (!dfn || dfn->nargs != 2)
+    {
+      i++;
+      continue;
+    }
+
+    /* Classify the comparison */
+    if (!classify_cmp_fn(cmp_fn, dfn, &is_equality, &is_less,
+                         &is_inclusive, &bs_type))
+    {
+      i++;
+      continue;
+    }
+    var_type = bs_type_to_var_type(bs_type);
+
+    /* Record end-of-CASE jump target from first branch */
+    end_jump_target = steps[i + 4].d.jump.jumpdone;
+
+    /* Count consecutive branches with same structure */
+    branch_count = 1;
+    j = i + STRIDE;
+
+    while (j + STRIDE - 1 < steps_len)
+    {
+      ExprEvalOp bop0 = ExecEvalStepOp(state, &steps[j]);
+      ExprEvalOp bop1 = ExecEvalStepOp(state, &steps[j + 1]);
+      ExprEvalOp bop2 = ExecEvalStepOp(state, &steps[j + 2]);
+      ExprEvalOp bop3 = ExecEvalStepOp(state, &steps[j + 3]);
+      ExprEvalOp bop4 = ExecEvalStepOp(state, &steps[j + 4]);
+
+      /* Same 5-step structure */
+      if (!is_funcexpr_strict(bop1) ||
+          bop2 != EEOP_JUMP_IF_NOT_TRUE || bop3 != EEOP_CONST ||
+          bop4 != EEOP_JUMP)
+        break;
+
+      /* Step 0: same kind of load */
+      if (is_var_pattern)
+      {
+        if (!is_var_opcode(bop0) || !same_var(state, &steps[i], &steps[j]))
+          break;
+      }
+      else
+      {
+        if (bop0 != EEOP_CASE_TESTVAL)
+          break;
+      }
+
+      /* Same comparison function */
+      if (steps[j + 1].d.func.fn_addr != cmp_fn)
+        break;
+
+      /* Threshold must be non-null */
+      if (steps[j + 1].d.func.fcinfo_data->args[1].isnull)
+        break;
+
+      /* Result CONST must be non-null */
+      if (steps[j + 3].d.constval.isnull)
+        break;
+
+      /* Same end-of-CASE jump target */
+      if (steps[j + 4].d.jump.jumpdone != end_jump_target)
+        break;
+
+      /* JUMP_IF_NOT_TRUE must point to next branch (j + STRIDE) */
+      if (steps[j + 2].d.jump.jumpdone != j + STRIDE)
+        break;
+
+      branch_count++;
+      j += STRIDE;
+    }
+
+    /* Verify JUMP_IF_NOT_TRUE of each branch except last points to next */
+    {
+      bool valid = true;
+      for (int k = 0; k < branch_count - 1; k++)
+      {
+        int step_idx = i + k * STRIDE + 2;
+        if (steps[step_idx].d.jump.jumpdone != i + (k + 1) * STRIDE)
+        {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid)
+      {
+        i++;
+        continue;
+      }
+    }
+
+    /* Last branch's JUMP_IF_NOT_TRUE should point to j (= the ELSE part) */
+    {
+      int last_jint = i + (branch_count - 1) * STRIDE + 2;
+      if (steps[last_jint].d.jump.jumpdone != j)
+      {
+        i++;
+        continue;
+      }
+    }
+
+    /* Check for ELSE: step at j should be EEOP_CONST (the ELSE result) */
+    {
+      int else_start = j;
+
+      if (else_start >= steps_len)
+      {
+        i++;
+        continue;
+      }
+
+      ExprEvalOp else_op = ExecEvalStepOp(state, &steps[else_start]);
+      if (else_op != EEOP_CONST)
+      {
+        i++;
+        continue;
+      }
+
+      /* The ELSE CONST is followed by end_jump_target or is end_jump_target-1 */
+      if (else_start + 1 != end_jump_target)
+      {
+        /* Maybe there's a JUMP after the ELSE CONST */
+        if (else_start + 1 < steps_len &&
+            ExecEvalStepOp(state, &steps[else_start + 1]) == EEOP_JUMP &&
+            steps[else_start + 1].d.jump.jumpdone == end_jump_target)
+        {
+          /* OK — ELSE const + JUMP to end */
+        }
+        else
+        {
+          i++;
+          continue;
+        }
+      }
+    }
+
+    /* Minimum branch count check */
+    if (branch_count < CASE_BSEARCH_MIN_BRANCHES)
+    {
+      i = j;
+      continue;
+    }
+
+    /* For Pattern A (non-equality): verify monotonicity of thresholds */
+    if (!is_equality)
+    {
+      bool monotonic = true;
+      for (int k = 1; k < branch_count; k++)
+      {
+        Datum prev = steps[i + (k - 1) * STRIDE + 1].d.func.fcinfo_data->args[1].value;
+        Datum curr = steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value;
+        int cmp_result;
+
+        switch (bs_type)
+        {
+          case CASE_BS_I32:
+          {
+            int32 pv = DatumGetInt32(prev);
+            int32 cv = DatumGetInt32(curr);
+            cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_I64:
+          {
+            int64 pv = DatumGetInt64(prev);
+            int64 cv = DatumGetInt64(curr);
+            cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_U32:
+          {
+            uint32 pv = (uint32)DatumGetInt32(prev);
+            uint32 cv = (uint32)DatumGetInt32(curr);
+            cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_I16:
+          {
+            int16 pv = (int16)DatumGetInt32(prev);
+            int16 cv = (int16)DatumGetInt32(curr);
+            cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_F4:
+          {
+            float4 pv = DatumGetFloat4(prev);
+            float4 cv = DatumGetFloat4(curr);
+            /* NaN-aware: NaN > all other values */
+            if (isnan(cv))
+              cmp_result = isnan(pv) ? 0 : 1;
+            else if (isnan(pv))
+              cmp_result = -1;
+            else
+              cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_F8:
+          {
+            float8 pv = DatumGetFloat8(prev);
+            float8 cv = DatumGetFloat8(curr);
+            if (isnan(cv))
+              cmp_result = isnan(pv) ? 0 : 1;
+            else if (isnan(pv))
+              cmp_result = -1;
+            else
+              cmp_result = (cv > pv) - (cv < pv);
+            break;
+          }
+          case CASE_BS_GENERIC:
+          {
+            /* Call PG comparison function to determine ordering.
+             * We use the lt function: if lt(prev, curr) → ascending. */
+            LOCAL_FCINFO(mono_fcinfo, 2);
+            Oid collation = steps[i + 1].d.func.fcinfo_data->fncollation;
+            InitFunctionCallInfoData(*mono_fcinfo, NULL, 2, collation, NULL, NULL);
+            mono_fcinfo->args[0].value = prev;
+            mono_fcinfo->args[0].isnull = false;
+            mono_fcinfo->args[1].value = curr;
+            mono_fcinfo->args[1].isnull = false;
+
+            /* Use the same comparison function — if is_less, we expect
+             * thresholds in ascending order; otherwise descending. */
+            bool lt_result = DatumGetBool(cmp_fn(mono_fcinfo));
+            if (is_less)
+              cmp_result = lt_result ? 1 : -1;
+            else
+              cmp_result = lt_result ? -1 : 1;
+
+            /* Check for equality (not strictly monotonic) */
+            if (!lt_result)
+            {
+              /* Check if they're equal */
+              mono_fcinfo->args[0].value = curr;
+              mono_fcinfo->args[1].value = prev;
+              bool reverse = DatumGetBool(cmp_fn(mono_fcinfo));
+              if (!reverse)
+                cmp_result = 0;  /* equal: not monotonic */
+            }
+            break;
+          }
+        }
+
+        if (is_less)
+        {
+          if (cmp_result <= 0) { monotonic = false; break; }
+        }
+        else
+        {
+          if (cmp_result >= 0) { monotonic = false; break; }
+        }
+      }
+
+      if (!monotonic)
+      {
+        i = j;
+        continue;
+      }
+    }
+
+    /* Build the CaseBSearchInfo */
+    {
+      CaseBSearchInfo *cbi = &out[nfound];
+
+      cbi->start_opno = i;
+      cbi->end_opno = j;  /* first step of ELSE result */
+      cbi->else_end_opno = end_jump_target;
+      cbi->num_branches = branch_count;
+      cbi->is_equality = is_equality;
+      cbi->is_less = is_less;
+      cbi->is_inclusive = is_inclusive;
+      cbi->cmp_fn = cmp_fn;
+      cbi->bs_type = bs_type;
+      cbi->var_opno = i;  /* representative VAR step */
+      cbi->var_type = var_type;
+
+      /* ELSE result */
+      cbi->default_result = steps[j].d.constval.value;
+      cbi->default_is_null = steps[j].d.constval.isnull;
+
+      /* Build CaseBSearchDesc: header + thresholds[n] + results[n] */
+      {
+        Size thresh_elem;
+        switch (bs_type)
+        {
+          case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16:
+            thresh_elem = sizeof(int32);
+            break;
+          case CASE_BS_I64:
+            thresh_elem = sizeof(int64);
+            break;
+          default: /* F4, F8, GENERIC */
+            thresh_elem = sizeof(Datum);
+            break;
+        }
+        Size desc_size = sizeof(CaseBSearchDesc) +
+                         thresh_elem * branch_count +
+                         sizeof(Datum) * branch_count;
+        CaseBSearchDesc *desc = palloc(desc_size);
+        char *ptr = (char *)desc + sizeof(CaseBSearchDesc);
+
+        desc->n = branch_count;
+        desc->bs_type = (uint8)bs_type;
+        desc->cmp_fn = (bs_type == CASE_BS_GENERIC) ? cmp_fn : NULL;
+        desc->cmp_order_fn = NULL;
+        if (bs_type == CASE_BS_GENERIC && is_equality)
+          desc->cmp_order_fn = find_generic_lt_fn(cmp_fn);
+        desc->cmp_collation = (bs_type == CASE_BS_GENERIC)
+            ? steps[i + 1].d.func.fcinfo_data->fncollation : InvalidOid;
+        desc->default_val = steps[j].d.constval.value;
+
+        /* Copy thresholds from fcinfo->args[1].value */
+        switch (bs_type)
+        {
+          case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16:
+          {
+            int32 *thresh = (int32 *)ptr;
+            for (int k = 0; k < branch_count; k++)
+              thresh[k] = DatumGetInt32(
+                steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value);
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          case CASE_BS_I64:
+          {
+            int64 *thresh = (int64 *)ptr;
+            for (int k = 0; k < branch_count; k++)
+              thresh[k] = DatumGetInt64(
+                steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value);
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          default: /* F4, F8, GENERIC — store as Datum */
+          {
+            Datum *thresh = (Datum *)ptr;
+            for (int k = 0; k < branch_count; k++)
+              thresh[k] = steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value;
+            cbi->thresholds = thresh;
+            break;
+          }
+        }
+        ptr += thresh_elem * branch_count;
+
+        /* Copy results from CONST at +3 */
+        {
+          Datum *res = (Datum *)ptr;
+          for (int k = 0; k < branch_count; k++)
+            res[k] = steps[i + k * STRIDE + 3].d.constval.value;
+          cbi->results = res;
+        }
+
+        /* For Pattern B (equality): sort by threshold, reorder results */
+        if (is_equality && bs_type != CASE_BS_GENERIC)
+        {
+          ThresholdResult *pairs = palloc(sizeof(ThresholdResult) * branch_count);
+          int (*cmp_func)(const void *, const void *) = NULL;
+
+          for (int k = 0; k < branch_count; k++)
+          {
+            switch (bs_type)
+            {
+              case CASE_BS_I32:
+                pairs[k].threshold = Int32GetDatum(((int32 *)cbi->thresholds)[k]);
+                break;
+              case CASE_BS_I64:
+                pairs[k].threshold = Int64GetDatum(((int64 *)cbi->thresholds)[k]);
+                break;
+              case CASE_BS_U32:
+                pairs[k].threshold = UInt32GetDatum(((uint32 *)cbi->thresholds)[k]);
+                break;
+              case CASE_BS_I16:
+                pairs[k].threshold = Int32GetDatum(((int32 *)cbi->thresholds)[k]);
+                break;
+              default:
+                pairs[k].threshold = ((Datum *)cbi->thresholds)[k];
+                break;
+            }
+            pairs[k].result = cbi->results[k];
+          }
+
+          switch (bs_type)
+          {
+            case CASE_BS_I32: case CASE_BS_I16:
+              cmp_func = cmp_threshold_result_i32;
+              break;
+            case CASE_BS_I64:
+              cmp_func = cmp_threshold_result_i64;
+              break;
+            case CASE_BS_U32:
+              cmp_func = cmp_threshold_result_u32;
+              break;
+            case CASE_BS_F4:
+              cmp_func = cmp_threshold_result_f4;
+              break;
+            case CASE_BS_F8:
+              cmp_func = cmp_threshold_result_f8;
+              break;
+            default:
+              break;
+          }
+
+          if (cmp_func)
+          {
+            qsort(pairs, branch_count, sizeof(ThresholdResult), cmp_func);
+
+            for (int k = 0; k < branch_count; k++)
+            {
+              switch (bs_type)
+              {
+                case CASE_BS_I32: case CASE_BS_I16:
+                  ((int32 *)cbi->thresholds)[k] = DatumGetInt32(pairs[k].threshold);
+                  break;
+                case CASE_BS_I64:
+                  ((int64 *)cbi->thresholds)[k] = DatumGetInt64(pairs[k].threshold);
+                  break;
+                case CASE_BS_U32:
+                  ((int32 *)cbi->thresholds)[k] = (int32)DatumGetUInt32(pairs[k].threshold);
+                  break;
+                default:
+                  ((Datum *)cbi->thresholds)[k] = pairs[k].threshold;
+                  break;
+              }
+              cbi->results[k] = pairs[k].result;
+            }
+          }
+          pfree(pairs);
+        }
+        /* For generic equality: sort thresholds for binary search.
+         * For deterministic non-C collations, use memcmp sort (fast)
+         * instead of locale-aware text_lt (pg_strncoll is expensive). */
+        if (is_equality && bs_type == CASE_BS_GENERIC && desc->cmp_order_fn != NULL)
+        {
+          ThresholdResult *pairs = palloc(sizeof(ThresholdResult) * branch_count);
+          for (int k = 0; k < branch_count; k++)
+          {
+            pairs[k].threshold = ((Datum *)cbi->thresholds)[k];
+            pairs[k].result = cbi->results[k];
+          }
+
+          bool use_memcmp_sort = false;
+          if (OidIsValid(desc->cmp_collation) &&
+              desc->cmp_collation != C_COLLATION_OID)
+          {
+            pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
+            if (locale->deterministic && !locale->collate_is_c)
+              use_memcmp_sort = true;
+          }
+
+          if (use_memcmp_sort)
+          {
+            qsort(pairs, branch_count, sizeof(ThresholdResult),
+                  cmp_threshold_result_text_memcmp);
+          }
+          else
+          {
+            GenericCmpCtx cmp_ctx;
+            cmp_ctx.lt_fn = desc->cmp_order_fn;
+            cmp_ctx.collation = desc->cmp_collation;
+            qsort_arg(pairs, branch_count, sizeof(ThresholdResult),
+                      cmp_threshold_result_generic, &cmp_ctx);
+          }
+
+          for (int k = 0; k < branch_count; k++)
+          {
+            ((Datum *)cbi->thresholds)[k] = pairs[k].threshold;
+            cbi->results[k] = pairs[k].result;
+          }
+          pfree(pairs);
+        }
+      }
+
+      nfound++;
+    }
+
+    /* Skip past this pattern */
+    i = end_jump_target;
+  }
+
+  return nfound;
+}
+
+/*
+ * pg_jitter_setup_case_bsearch_arrays — detect patterns and store desc
+ * pointers in step data fields for runtime access by JIT code.
+ *
+ * Called by:
+ *  - Leader/single backend: during compilation, after detection
+ *  - Workers: after attaching shared code, before first execution
+ *
+ * For each detected pattern, stores the CaseBSearchDesc pointer in:
+ *   steps[start_opno + 1].d.constval.value = (Datum)desc_ptr
+ */
+void
+pg_jitter_setup_case_bsearch_arrays(ExprState *state,
+                                     ExprEvalStep *steps, int steps_len)
+{
+  CaseBSearchInfo patterns[16];
+  int n = pg_jitter_detect_case_bsearch(state, steps, steps_len, patterns, 16);
+
+  for (int i = 0; i < n; i++)
+  {
+    CaseBSearchInfo *cbi = &patterns[i];
+
+    /* Compute desc pointer from thresholds (which points into the desc).
+     * The desc was allocated as: header | thresholds[n] | results[n]
+     * So: desc = thresholds - sizeof(CaseBSearchDesc) */
+    CaseBSearchDesc *desc = (CaseBSearchDesc *)
+        ((char *)cbi->thresholds - sizeof(CaseBSearchDesc));
+
+    /* Store desc pointer in step data field of a skipped step.
+     * Use start_opno+2 (JUMP_IF_NOT_TRUE) which is dead in JIT mode.
+     * We avoid start_opno+1 (FUNCEXPR_STRICT) because workers need its
+     * d.func data intact for re-detection. */
+    steps[cbi->start_opno + 2].d.constval.value = PointerGetDatum(desc);
+  }
+}
+
+/* ----------------------------------------------------------------
+ * Binary search helper functions
+ *
+ * Called from JIT code.  Each takes (val, desc_ptr) where desc contains
+ * the thresholds, results, count, and default value.
+ *
+ * Memory layout of CaseBSearchDesc:
+ *   { int n; Datum default_val; int32[n] OR int64[n] thresholds; Datum[n] results; }
+ * ---------------------------------------------------------------- */
+
+/* Accessor macros for CaseBSearchDesc inline arrays.
+ * Arrays start immediately after the CaseBSearchDesc header. */
+#define BSEARCH_THRESH_I32(desc) \
+  ((const int32 *)((const char *)(desc) + sizeof(CaseBSearchDesc)))
+#define BSEARCH_THRESH_I64(desc) \
+  ((const int64 *)((const char *)(desc) + sizeof(CaseBSearchDesc)))
+#define BSEARCH_THRESH_DATUM(desc) \
+  ((const Datum *)((const char *)(desc) + sizeof(CaseBSearchDesc)))
+#define BSEARCH_RESULTS_I32(desc) \
+  ((const Datum *)(BSEARCH_THRESH_I32(desc) + (desc)->n))
+#define BSEARCH_RESULTS_I64(desc) \
+  ((const Datum *)(BSEARCH_THRESH_I64(desc) + (desc)->n))
+#define BSEARCH_RESULTS_DATUM(desc) \
+  (BSEARCH_THRESH_DATUM(desc) + (desc)->n)
+
+/* Pattern A: searched CASE with < (strictly less than).
+ * Finds first i where val < thresholds[i], returns results[i]. */
+Datum
+pg_jitter_case_bsearch_lt_i32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val < thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_le_i32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val <= thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_lt_i64(int64 val, const CaseBSearchDesc *desc)
+{
+  const int64 *thresholds = BSEARCH_THRESH_I64(desc);
+  const Datum *results = BSEARCH_RESULTS_I64(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val < thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_le_i64(int64 val, const CaseBSearchDesc *desc)
+{
+  const int64 *thresholds = BSEARCH_THRESH_I64(desc);
+  const Datum *results = BSEARCH_RESULTS_I64(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val <= thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+/* Pattern A: searched CASE with > (strictly greater than).
+ * Thresholds are strictly decreasing.  Finds first i where val > thresholds[i]. */
+Datum
+pg_jitter_case_bsearch_gt_i32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val > thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_ge_i32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val >= thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_gt_i64(int64 val, const CaseBSearchDesc *desc)
+{
+  const int64 *thresholds = BSEARCH_THRESH_I64(desc);
+  const Datum *results = BSEARCH_RESULTS_I64(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val > thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_ge_i64(int64 val, const CaseBSearchDesc *desc)
+{
+  const int64 *thresholds = BSEARCH_THRESH_I64(desc);
+  const Datum *results = BSEARCH_RESULTS_I64(desc);
+  int n = desc->n;
+  int lo = 0, hi = n;
+  while (lo < hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (val >= thresholds[mid])
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo < n ? results[lo] : desc->default_val;
+}
+
+/* Pattern B: simple CASE with = comparison.
+ * sorted_vals is sorted ascending.  Binary search for exact match. */
+Datum
+pg_jitter_case_bsearch_eq_i32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *sorted_vals = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (sorted_vals[mid] == val)
+      return results[mid];
+    else if (sorted_vals[mid] < val)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+Datum
+pg_jitter_case_bsearch_eq_i64(int64 val, const CaseBSearchDesc *desc)
+{
+  const int64 *sorted_vals = BSEARCH_THRESH_I64(desc);
+  const Datum *results = BSEARCH_RESULTS_I64(desc);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (sorted_vals[mid] == val)
+      return results[mid];
+    else if (sorted_vals[mid] < val)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+/* ---- Unsigned 32-bit (OID) helpers ---- */
+
+#define BSEARCH_BODY_U32(OP) \
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc); \
+  const Datum *results = BSEARCH_RESULTS_I32(desc); \
+  int n = desc->n; \
+  int lo = 0, hi = n; \
+  while (lo < hi) { \
+    int mid = lo + (hi - lo) / 2; \
+    if ((uint32)val OP (uint32)thresholds[mid]) hi = mid; \
+    else lo = mid + 1; \
+  } \
+  return lo < n ? results[lo] : desc->default_val;
+
+Datum pg_jitter_case_bsearch_lt_u32(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_U32(<) }
+Datum pg_jitter_case_bsearch_le_u32(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_U32(<=) }
+Datum pg_jitter_case_bsearch_gt_u32(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_U32(>) }
+Datum pg_jitter_case_bsearch_ge_u32(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_U32(>=) }
+
+Datum
+pg_jitter_case_bsearch_eq_u32(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *sorted_vals = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if ((uint32)sorted_vals[mid] == (uint32)val)
+      return results[mid];
+    else if ((uint32)sorted_vals[mid] < (uint32)val)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+#undef BSEARCH_BODY_U32
+
+/* ---- Int16 helpers ---- */
+
+#define BSEARCH_BODY_I16(OP) \
+  const int32 *thresholds = BSEARCH_THRESH_I32(desc); \
+  const Datum *results = BSEARCH_RESULTS_I32(desc); \
+  int n = desc->n; \
+  int lo = 0, hi = n; \
+  while (lo < hi) { \
+    int mid = lo + (hi - lo) / 2; \
+    if ((int16)val OP (int16)thresholds[mid]) hi = mid; \
+    else lo = mid + 1; \
+  } \
+  return lo < n ? results[lo] : desc->default_val;
+
+Datum pg_jitter_case_bsearch_lt_i16(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_I16(<) }
+Datum pg_jitter_case_bsearch_le_i16(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_I16(<=) }
+Datum pg_jitter_case_bsearch_gt_i16(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_I16(>) }
+Datum pg_jitter_case_bsearch_ge_i16(int32 val, const CaseBSearchDesc *desc) { BSEARCH_BODY_I16(>=) }
+
+Datum
+pg_jitter_case_bsearch_eq_i16(int32 val, const CaseBSearchDesc *desc)
+{
+  const int32 *sorted_vals = BSEARCH_THRESH_I32(desc);
+  const Datum *results = BSEARCH_RESULTS_I32(desc);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if ((int16)sorted_vals[mid] == (int16)val)
+      return results[mid];
+    else if ((int16)sorted_vals[mid] < (int16)val)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+#undef BSEARCH_BODY_I16
+
+/* ---- Float4 helpers (NaN-aware) ---- */
+
+static inline int
+float4_cmp_jit(float4 a, float4 b)
+{
+  if (isnan(a)) return isnan(b) ? 0 : 1;
+  if (isnan(b)) return -1;
+  return (a > b) - (a < b);
+}
+
+#define BSEARCH_BODY_F4(OP_CHECK) \
+  const Datum *thresholds = BSEARCH_THRESH_DATUM(desc); \
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc); \
+  float4 fval = DatumGetFloat4(val); \
+  int n = desc->n; \
+  int lo = 0, hi = n; \
+  while (lo < hi) { \
+    int mid = lo + (hi - lo) / 2; \
+    int c = float4_cmp_jit(fval, DatumGetFloat4(thresholds[mid])); \
+    if (OP_CHECK) hi = mid; \
+    else lo = mid + 1; \
+  } \
+  return lo < n ? results[lo] : desc->default_val;
+
+Datum pg_jitter_case_bsearch_lt_f4(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F4(c < 0) }
+Datum pg_jitter_case_bsearch_le_f4(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F4(c <= 0) }
+Datum pg_jitter_case_bsearch_gt_f4(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F4(c > 0) }
+Datum pg_jitter_case_bsearch_ge_f4(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F4(c >= 0) }
+
+Datum
+pg_jitter_case_bsearch_eq_f4(Datum val, const CaseBSearchDesc *desc)
+{
+  const Datum *sorted_vals = BSEARCH_THRESH_DATUM(desc);
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc);
+  float4 fval = DatumGetFloat4(val);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    int c = float4_cmp_jit(fval, DatumGetFloat4(sorted_vals[mid]));
+    if (c == 0) return results[mid];
+    else if (c > 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+#undef BSEARCH_BODY_F4
+
+/* ---- Float8 helpers (NaN-aware) ---- */
+
+static inline int
+float8_cmp_jit(float8 a, float8 b)
+{
+  if (isnan(a)) return isnan(b) ? 0 : 1;
+  if (isnan(b)) return -1;
+  return (a > b) - (a < b);
+}
+
+#define BSEARCH_BODY_F8(OP_CHECK) \
+  const Datum *thresholds = BSEARCH_THRESH_DATUM(desc); \
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc); \
+  float8 fval = DatumGetFloat8(val); \
+  int n = desc->n; \
+  int lo = 0, hi = n; \
+  while (lo < hi) { \
+    int mid = lo + (hi - lo) / 2; \
+    int c = float8_cmp_jit(fval, DatumGetFloat8(thresholds[mid])); \
+    if (OP_CHECK) hi = mid; \
+    else lo = mid + 1; \
+  } \
+  return lo < n ? results[lo] : desc->default_val;
+
+Datum pg_jitter_case_bsearch_lt_f8(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F8(c < 0) }
+Datum pg_jitter_case_bsearch_le_f8(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F8(c <= 0) }
+Datum pg_jitter_case_bsearch_gt_f8(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F8(c > 0) }
+Datum pg_jitter_case_bsearch_ge_f8(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_F8(c >= 0) }
+
+Datum
+pg_jitter_case_bsearch_eq_f8(Datum val, const CaseBSearchDesc *desc)
+{
+  const Datum *sorted_vals = BSEARCH_THRESH_DATUM(desc);
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc);
+  float8 fval = DatumGetFloat8(val);
+  int lo = 0, hi = desc->n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    int c = float8_cmp_jit(fval, DatumGetFloat8(sorted_vals[mid]));
+    if (c == 0) return results[mid];
+    else if (c > 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return desc->default_val;
+}
+
+#undef BSEARCH_BODY_F8
+
+/* ---- Generic (byref) helpers — call PG cmp_fn via V1 ---- */
+
+#define BSEARCH_BODY_GENERIC(CMP_FN_IS_OP) \
+  const Datum *thresholds = BSEARCH_THRESH_DATUM(desc); \
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc); \
+  int n = desc->n; \
+  int lo = 0, hi = n; \
+  LOCAL_FCINFO(fcinfo, 2); \
+  InitFunctionCallInfoData(*fcinfo, NULL, 2, desc->cmp_collation, NULL, NULL); \
+  fcinfo->args[0].value = val; \
+  fcinfo->args[0].isnull = false; \
+  while (lo < hi) { \
+    int mid = lo + (hi - lo) / 2; \
+    fcinfo->args[1].value = thresholds[mid]; \
+    fcinfo->args[1].isnull = false; \
+    Datum result = desc->cmp_fn(fcinfo); \
+    if (CMP_FN_IS_OP) hi = mid; \
+    else lo = mid + 1; \
+  } \
+  return lo < n ? results[lo] : desc->default_val;
+
+/* For lt/le/gt/ge: the comparison function IS the operator (e.g., text_lt).
+ * DatumGetBool(result) == true means the comparison holds. */
+Datum pg_jitter_case_bsearch_lt_generic(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_GENERIC(DatumGetBool(result)) }
+Datum pg_jitter_case_bsearch_le_generic(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_GENERIC(DatumGetBool(result)) }
+Datum pg_jitter_case_bsearch_gt_generic(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_GENERIC(DatumGetBool(result)) }
+Datum pg_jitter_case_bsearch_ge_generic(Datum val, const CaseBSearchDesc *desc) { BSEARCH_BODY_GENERIC(DatumGetBool(result)) }
+
+/* For equality: binary search using cmp_order_fn (_lt function) for direction,
+ * then verify with cmp_fn (_eq function). Falls back to linear scan if
+ * cmp_order_fn is NULL (unknown type). */
+Datum
+pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc *desc)
+{
+  const Datum *thresholds = BSEARCH_THRESH_DATUM(desc);
+  const Datum *results = BSEARCH_RESULTS_DATUM(desc);
+  LOCAL_FCINFO(fcinfo, 2);
+  InitFunctionCallInfoData(*fcinfo, NULL, 2, desc->cmp_collation, NULL, NULL);
+  fcinfo->args[0].isnull = false;
+  fcinfo->args[1].isnull = false;
+
+  if (desc->cmp_order_fn != NULL)
+  {
+    bool use_memcmp = false;
+
+    /*
+     * For deterministic non-C collations, the _lt ordering function uses
+     * pg_strncoll (very expensive).  Since we only need to find an equal
+     * element, any consistent total order works — use memcmp instead.
+     * Thresholds are pre-sorted by memcmp at setup time for this case.
+     */
+    if (OidIsValid(desc->cmp_collation) &&
+        desc->cmp_collation != C_COLLATION_OID)
+    {
+      pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
+      if (locale->deterministic && !locale->collate_is_c)
+        use_memcmp = true;
+    }
+
+    /* Binary search: thresholds are sorted ascending */
+    int lo = 0, hi = desc->n - 1;
+    while (lo <= hi)
+    {
+      int mid = lo + (hi - lo) / 2;
+      int cmp;
+
+      if (use_memcmp)
+      {
+        text *t1 = DatumGetTextPP(val);
+        text *t2 = DatumGetTextPP(thresholds[mid]);
+        int len1 = VARSIZE_ANY_EXHDR(t1);
+        int len2 = VARSIZE_ANY_EXHDR(t2);
+        int minlen = (len1 < len2) ? len1 : len2;
+        cmp = memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), minlen);
+        if (cmp == 0)
+          cmp = (len1 > len2) - (len1 < len2);
+        if ((Pointer)t1 != DatumGetPointer(val))
+          pfree(t1);
+        if ((Pointer)t2 != DatumGetPointer(thresholds[mid]))
+          pfree(t2);
+      }
+      else
+      {
+        /* Check val < thresholds[mid] */
+        fcinfo->args[0].value = val;
+        fcinfo->args[1].value = thresholds[mid];
+        if (DatumGetBool(desc->cmp_order_fn(fcinfo)))
+          cmp = -1;
+        else
+        {
+          /* Check thresholds[mid] < val */
+          fcinfo->args[0].value = thresholds[mid];
+          fcinfo->args[1].value = val;
+          cmp = DatumGetBool(desc->cmp_order_fn(fcinfo)) ? 1 : 0;
+        }
+      }
+
+      if (cmp < 0)
+        hi = mid - 1;
+      else if (cmp > 0)
+        lo = mid + 1;
+      else
+        return results[mid];
+    }
+    return desc->default_val;
+  }
+
+  /* Fallback: linear scan with eq function */
+  fcinfo->args[0].value = val;
+  for (int i = 0; i < desc->n; i++)
+  {
+    fcinfo->args[1].value = thresholds[i];
+    if (DatumGetBool(desc->cmp_fn(fcinfo)))
+      return results[i];
+  }
+  return desc->default_val;
+}
+
+#undef BSEARCH_BODY_GENERIC
+
+/* ---- Helper selection function ---- */
+
+void *
+pg_jitter_select_bsearch_helper(const CaseBSearchInfo *cbi)
+{
+  /* Table indexed by [bs_type][op_idx], where op_idx:
+   * 0=eq, 1=lt, 2=le, 3=gt, 4=ge */
+  static void *table[7][5] = {
+    [CASE_BS_I32]    = { (void *)pg_jitter_case_bsearch_eq_i32,
+                         (void *)pg_jitter_case_bsearch_lt_i32,
+                         (void *)pg_jitter_case_bsearch_le_i32,
+                         (void *)pg_jitter_case_bsearch_gt_i32,
+                         (void *)pg_jitter_case_bsearch_ge_i32 },
+    [CASE_BS_I64]    = { (void *)pg_jitter_case_bsearch_eq_i64,
+                         (void *)pg_jitter_case_bsearch_lt_i64,
+                         (void *)pg_jitter_case_bsearch_le_i64,
+                         (void *)pg_jitter_case_bsearch_gt_i64,
+                         (void *)pg_jitter_case_bsearch_ge_i64 },
+    [CASE_BS_U32]    = { (void *)pg_jitter_case_bsearch_eq_u32,
+                         (void *)pg_jitter_case_bsearch_lt_u32,
+                         (void *)pg_jitter_case_bsearch_le_u32,
+                         (void *)pg_jitter_case_bsearch_gt_u32,
+                         (void *)pg_jitter_case_bsearch_ge_u32 },
+    [CASE_BS_I16]    = { (void *)pg_jitter_case_bsearch_eq_i16,
+                         (void *)pg_jitter_case_bsearch_lt_i16,
+                         (void *)pg_jitter_case_bsearch_le_i16,
+                         (void *)pg_jitter_case_bsearch_gt_i16,
+                         (void *)pg_jitter_case_bsearch_ge_i16 },
+    [CASE_BS_F4]     = { (void *)pg_jitter_case_bsearch_eq_f4,
+                         (void *)pg_jitter_case_bsearch_lt_f4,
+                         (void *)pg_jitter_case_bsearch_le_f4,
+                         (void *)pg_jitter_case_bsearch_gt_f4,
+                         (void *)pg_jitter_case_bsearch_ge_f4 },
+    [CASE_BS_F8]     = { (void *)pg_jitter_case_bsearch_eq_f8,
+                         (void *)pg_jitter_case_bsearch_lt_f8,
+                         (void *)pg_jitter_case_bsearch_le_f8,
+                         (void *)pg_jitter_case_bsearch_gt_f8,
+                         (void *)pg_jitter_case_bsearch_ge_f8 },
+    [CASE_BS_GENERIC]= { (void *)pg_jitter_case_bsearch_eq_generic,
+                         (void *)pg_jitter_case_bsearch_lt_generic,
+                         (void *)pg_jitter_case_bsearch_le_generic,
+                         (void *)pg_jitter_case_bsearch_gt_generic,
+                         (void *)pg_jitter_case_bsearch_ge_generic },
+  };
+
+  int op_idx;
+  if (cbi->is_equality)
+    op_idx = 0;
+  else if (cbi->is_less)
+    op_idx = cbi->is_inclusive ? 2 : 1;
+  else
+    op_idx = cbi->is_inclusive ? 4 : 3;
+
+  return table[cbi->bs_type][op_idx];
 }
 

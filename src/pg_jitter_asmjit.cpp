@@ -17,9 +17,14 @@ extern "C" {
 #include "utils/array.h"
 #include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
+#include "pg_jitter_simd.h"
+#include "pg_jitter_vectorscan.h"
+#include "mb/pg_wchar.h"
+#include "catalog/pg_collation_d.h"
 #include "pg_jit_funcs.h"
 #include "pg_jit_deform_templates.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/tupdesc_details.h"
 #include "access/parallel.h"
 #include "utils/lsyscache.h"
@@ -173,6 +178,21 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			NULL, NULL, NULL);
 	}
 
+	if (!GetConfigOption("pg_jitter.min_expr_steps", true, false))
+	{
+		DefineCustomIntVariable(
+			"pg_jitter.min_expr_steps",
+			"Minimum expression step count for JIT compilation. "
+			"Expressions with fewer steps use the interpreter.",
+			NULL,
+			&pg_jitter_min_expr_steps,
+			0,			/* 0 = no threshold (compile everything) */
+			0,			/* minimum */
+			1000,		/* maximum */
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
 }
 
 /*
@@ -338,6 +358,13 @@ asmjit_compile_expr(ExprState *state)
 	if (expr_has_fast_path(state))
 		return false;
 
+	/* Skip JIT for expressions below the minimum step threshold */
+	{
+		int min_steps = pg_jitter_get_min_expr_steps();
+		if (min_steps > 0 && state->steps_len < min_steps)
+			return false;
+	}
+
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
 	/* Lazy-load MIR precompiled blobs on first compile */
 	mir_load_precompiled_blobs(NULL);
@@ -423,6 +450,11 @@ asmjit_compile_expr(ExprState *state)
 					 npatched);
 
 				pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+
+				/* Worker: set up binary search arrays for CASE optimization */
+				pg_jitter_setup_case_bsearch_arrays(state, state->steps,
+													 state->steps_len);
+
 				pg_jitter_install_expr(state,
 									  (ExprStateEvalFunc) code_ptr);
 

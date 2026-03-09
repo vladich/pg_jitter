@@ -28,11 +28,13 @@
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
 #endif
 #include "utils/varlena.h"     /* varstr_cmp */
+#include "utils/pg_locale.h"   /* pg_newlocale_from_collation, pg_locale_t */
 #include "access/detoast.h"    /* toast_raw_datum_size */
 #include "mb/pg_wchar.h"       /* pg_mbstrlen_with_len */
 
 #include "pg_jit_funcs.h"
 #include "pg_jit_tier2_wrappers.h"
+#include "pg_jitter_simd.h"
 
 /* ================================================================
  * Error handlers — cold path, never inlined
@@ -883,9 +885,14 @@ int32 jit_interval_hash(int64 a_ptr) {
 
 /* ================================================================
  * TIER 1: Interval / timestamp arithmetic (4 functions)
- * These are pass-through wrappers that bypass V1 fcinfo overhead
- * while delegating to PG's complex interval arithmetic.
+ *
+ * For intervals with month=0, arithmetic is just:
+ *   result = timestamp + (day * USECS_PER_DAY + time)
+ * We inline this fast path. For month != 0, delegate to PG's
+ * complex calendar arithmetic (handles variable month lengths).
  * ================================================================ */
+
+#define USECS_PER_DAY_CONST INT64CONST(86400000000)
 
 int64 jit_interval_pl(int64 a, int64 b) {
   return (int64)DirectFunctionCall2(interval_pl, (Datum)a, (Datum)b);
@@ -895,14 +902,34 @@ int64 jit_interval_mi(int64 a, int64 b) {
   return (int64)DirectFunctionCall2(interval_mi, (Datum)a, (Datum)b);
 }
 
-int64 jit_timestamp_pl_interval(int64 ts, int64 span) {
+int64 jit_timestamp_pl_interval(int64 ts, int64 span_ptr) {
+  const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
+
+  /* Fast path: no month component — pure arithmetic */
+  if (span->month == 0) {
+    int64 result = ts;
+    result += (int64)span->day * USECS_PER_DAY_CONST;
+    result += span->time;
+    return result;
+  }
+
   return (int64)DirectFunctionCall2(timestamp_pl_interval, (Datum)ts,
-                                    (Datum)span);
+                                    (Datum)span_ptr);
 }
 
-int64 jit_timestamp_mi_interval(int64 ts, int64 span) {
+int64 jit_timestamp_mi_interval(int64 ts, int64 span_ptr) {
+  const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
+
+  /* Fast path: no month component — pure arithmetic */
+  if (span->month == 0) {
+    int64 result = ts;
+    result -= (int64)span->day * USECS_PER_DAY_CONST;
+    result -= span->time;
+    return result;
+  }
+
   return (int64)DirectFunctionCall2(timestamp_mi_interval, (Datum)ts,
-                                    (Datum)span);
+                                    (Datum)span_ptr);
 }
 
 /* ================================================================
@@ -966,22 +993,98 @@ static inline int jit_text_cmp_internal(Datum a, Datum b, Oid collid) {
 
 int32 jit_texteq(int64 a, int64 b, int32 collid) {
   Datum da = (Datum)a, db = (Datum)b;
+  Size len1, len2;
 
   /*
-   * Deterministic collation fast path: if lengths differ, not equal.
-   * toast_raw_datum_size includes VARHDRSZ but cancels out in comparison.
+   * For deterministic collations (including C, en_US.UTF-8, etc.), equality
+   * can be determined by raw byte comparison — no need for the expensive
+   * locale-aware varstr_cmp / pg_strncoll.  This mirrors PG's texteq().
    */
-  if (toast_raw_datum_size(da) != toast_raw_datum_size(db))
+  len1 = toast_raw_datum_size(da);
+  len2 = toast_raw_datum_size(db);
+  if (len1 != len2)
     return 0;
 
+  {
+    pg_locale_t locale = pg_newlocale_from_collation((Oid)collid);
+    if (locale->deterministic) {
+      text *t1 = DatumGetTextPP(da);
+      text *t2 = DatumGetTextPP(db);
+      int result = (memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2),
+                           len1 - VARHDRSZ) == 0) ? 1 : 0;
+      JIT_FREE_IF_COPY(t1, da);
+      JIT_FREE_IF_COPY(t2, db);
+      return result;
+    }
+  }
   return jit_text_cmp_internal(da, db, (Oid)collid) == 0 ? 1 : 0;
 }
 
 int32 jit_textne(int64 a, int64 b, int32 collid) {
   Datum da = (Datum)a, db = (Datum)b;
-  if (toast_raw_datum_size(da) != toast_raw_datum_size(db))
+  Size len1, len2;
+
+  len1 = toast_raw_datum_size(da);
+  len2 = toast_raw_datum_size(db);
+  if (len1 != len2)
     return 1;
+
+  {
+    pg_locale_t locale = pg_newlocale_from_collation((Oid)collid);
+    if (locale->deterministic) {
+      text *t1 = DatumGetTextPP(da);
+      text *t2 = DatumGetTextPP(db);
+      int result = (memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2),
+                           len1 - VARHDRSZ) != 0) ? 1 : 0;
+      JIT_FREE_IF_COPY(t1, da);
+      JIT_FREE_IF_COPY(t2, db);
+      return result;
+    }
+  }
   return jit_text_cmp_internal(da, db, (Oid)collid) != 0 ? 1 : 0;
+}
+
+/*
+ * jit_text_datum_eq / jit_text_datum_ne — lean 2-arg text equality.
+ *
+ * Called from JIT inline path when collation is known-deterministic at
+ * compile time.  Skips pg_newlocale_from_collation (the biggest overhead
+ * in jit_texteq for short strings) and takes only 2 args (no collation).
+ * Caller already checked pointer inequality (a != b).
+ */
+int32 jit_text_datum_eq(int64 a, int64 b) {
+  uint8 ha = *(uint8 *)a, hb = *(uint8 *)b;
+
+  /* Fast path: both short 1-byte header */
+  if ((ha & 1) && ha > 1 && (hb & 1) && hb > 1) {
+    uint32 len;
+    if (ha != hb)
+      return 0; /* different lengths */
+    len = (ha >> 1) - 1;
+    return len == 0 || memcmp((char *)a + 1, (char *)b + 1, len) == 0;
+  }
+
+  /* Slow path: 4-byte header, toasted, or compressed.
+   * Deterministic collation → raw byte comparison is correct. */
+  {
+    Size len1 = toast_raw_datum_size((Datum)a);
+    Size len2 = toast_raw_datum_size((Datum)b);
+    if (len1 != len2)
+      return 0;
+    {
+      text *t1 = DatumGetTextPP((Datum)a);
+      text *t2 = DatumGetTextPP((Datum)b);
+      int32 result =
+          memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), len1 - VARHDRSZ) == 0;
+      JIT_FREE_IF_COPY(t1, (Datum)a);
+      JIT_FREE_IF_COPY(t2, (Datum)b);
+      return result;
+    }
+  }
+}
+
+int32 jit_text_datum_ne(int64 a, int64 b) {
+  return !jit_text_datum_eq(a, b);
 }
 
 int32 jit_text_lt(int64 a, int64 b, int32 collid) {
@@ -1082,6 +1185,10 @@ int32 jit_bttext_pattern_cmp(int64 a, int64 b) {
 #define EC2(pg, jf, rt, a0, a1)                                                \
   {(PGFunction)(pg),      (void *)(jf), 2, rt, {a0, a1}, 0,                    \
    JIT_FN_FLAG_COLLATION, #jf}
+/* EIC2: 2-arg collation-aware entry with inline_op tag (jit_fn = DEFERRED) */
+#define EIC2(pg, rt, a0, a1, iop)                                              \
+  {(PGFunction)(pg), DEFERRED, 2, rt, {a0, a1}, iop,                           \
+   JIT_FN_FLAG_COLLATION, "DEFERRED"}
 
 /* NULL means no native implementation yet — fall through to fcinfo path */
 #define DEFERRED NULL
@@ -1287,13 +1394,13 @@ const JitDirectFn jit_direct_fns[] = {
     E2(booland_statefunc, jit_booland_statefunc, T64, T64, T64),
     E2(boolor_statefunc, jit_boolor_statefunc, T64, T64, T64),
 
-    /* ---- timestamp comparison ---- */
-    E2(timestamp_eq, jit_timestamp_eq, T32, T64, T64),
-    E2(timestamp_ne, jit_timestamp_ne, T32, T64, T64),
-    E2(timestamp_lt, jit_timestamp_lt, T32, T64, T64),
-    E2(timestamp_le, jit_timestamp_le, T32, T64, T64),
-    E2(timestamp_gt, jit_timestamp_gt, T32, T64, T64),
-    E2(timestamp_ge, jit_timestamp_ge, T32, T64, T64),
+    /* ---- timestamp comparison (same repr as int8) ---- */
+    EI2(timestamp_eq, jit_timestamp_eq, T32, T64, T64, JIT_INLINE_INT8_EQ),
+    EI2(timestamp_ne, jit_timestamp_ne, T32, T64, T64, JIT_INLINE_INT8_NE),
+    EI2(timestamp_lt, jit_timestamp_lt, T32, T64, T64, JIT_INLINE_INT8_LT),
+    EI2(timestamp_le, jit_timestamp_le, T32, T64, T64, JIT_INLINE_INT8_LE),
+    EI2(timestamp_gt, jit_timestamp_gt, T32, T64, T64, JIT_INLINE_INT8_GT),
+    EI2(timestamp_ge, jit_timestamp_ge, T32, T64, T64, JIT_INLINE_INT8_GE),
     E2(timestamp_cmp, jit_timestamp_cmp, T32, T64, T64),
 
     /*
@@ -1312,17 +1419,17 @@ const JitDirectFn jit_direct_fns[] = {
     EI1(timestamptz_hash, jit_timestamptz_hash, T64, T64, JIT_INLINE_HASHINT8),
 #endif
 
-    /* ---- timestamp/interval arithmetic ---- */
+    /* ---- timestamp/interval arithmetic (fast path for month=0) ---- */
     E2(timestamp_pl_interval, jit_timestamp_pl_interval, T64, T64, T64),
     E2(timestamp_mi_interval, jit_timestamp_mi_interval, T64, T64, T64),
 
-    /* ---- date comparison ---- */
-    E2(date_eq, jit_date_eq, T32, T32, T32),
-    E2(date_ne, jit_date_ne, T32, T32, T32),
-    E2(date_lt, jit_date_lt, T32, T32, T32),
-    E2(date_le, jit_date_le, T32, T32, T32),
-    E2(date_gt, jit_date_gt, T32, T32, T32),
-    E2(date_ge, jit_date_ge, T32, T32, T32),
+    /* ---- date comparison (same repr as int4) ---- */
+    EI2(date_eq, jit_date_eq, T32, T32, T32, JIT_INLINE_INT4_EQ),
+    EI2(date_ne, jit_date_ne, T32, T32, T32, JIT_INLINE_INT4_NE),
+    EI2(date_lt, jit_date_lt, T32, T32, T32, JIT_INLINE_INT4_LT),
+    EI2(date_le, jit_date_le, T32, T32, T32, JIT_INLINE_INT4_LE),
+    EI2(date_gt, jit_date_gt, T32, T32, T32, JIT_INLINE_INT4_GT),
+    EI2(date_ge, jit_date_ge, T32, T32, T32, JIT_INLINE_INT4_GE),
     E2(date_larger, jit_date_larger, T32, T32, T32),
     E2(date_smaller, jit_date_smaller, T32, T32, T32),
     E2(date_pli, jit_date_pli, T32, T32, T32),
@@ -1381,22 +1488,32 @@ const JitDirectFn jit_direct_fns[] = {
     E1(interval_um, DEFERRED, T64, T64),
 
     /*
-     * Text/varchar comparison — DEFERRED for now.
-     * PG's texteq has a specialized memcmp fast path for C/default collation
-     * that our jit_texteq wrapper misses (it uses varstr_cmp instead).
-     * Re-enable with EC2 once jit_texteq gets the C-collation fast path.
+     * Text/varchar comparison — SIMD-accelerated via StringZilla.
+     * Uses sz_order/sz_equal for C/POSIX collation, falls back to
+     * varstr_cmp for non-C/non-deterministic collations.
+     * hashtext uses PG's hash_any (Jenkins lookup3) for hash join
+     * correctness — must match PG's built-in hash exactly.
      */
-    E2(texteq, DEFERRED, T32, T64, T64),
-    E2(textne, DEFERRED, T32, T64, T64),
-    E2(text_lt, DEFERRED, T32, T64, T64),
-    E2(text_le, DEFERRED, T32, T64, T64),
-    E2(text_gt, DEFERRED, T32, T64, T64),
-    E2(text_ge, DEFERRED, T32, T64, T64),
-    E2(bttextcmp, DEFERRED, T32, T64, T64),
-    E2(text_larger, DEFERRED, T64, T64, T64),
-    E2(text_smaller, DEFERRED, T64, T64, T64),
-    E1(hashtext, DEFERRED, T32,
-       T64), /* keep DEFERRED: needs hash-specific collation handling */
+    /*
+     * texteq/textne: inline fast path for short 1-byte-header varlena
+     * (pointer eq → header check → length compare → memcmp).
+     * Slow path (toasted/compressed/long header) calls jit_texteq/jit_textne.
+     * Non-deterministic collations: inline_op is ignored, falls to V1.
+     */
+    EIC2(texteq, T32, T64, T64, JIT_INLINE_TEXT_EQ),
+    EIC2(textne, T32, T64, T64, JIT_INLINE_TEXT_NE),
+    EC2(text_lt, DEFERRED, T32, T64, T64),
+    EC2(text_le, DEFERRED, T32, T64, T64),
+    EC2(text_gt, DEFERRED, T32, T64, T64),
+    EC2(text_ge, DEFERRED, T32, T64, T64),
+    EC2(bttextcmp, DEFERRED, T32, T64, T64),
+    EC2(text_larger, DEFERRED, T64, T64, T64),
+    EC2(text_smaller, DEFERRED, T64, T64, T64),
+#ifdef PG_JITTER_HAVE_SIMD
+    E1(hashtext, simd_hashtext, T32, T64),
+#else
+    E1(hashtext, DEFERRED, T32, T64),
+#endif
     /* text_pattern_*: raw byte comparison, no collation needed */
     E2(text_pattern_lt, jit_text_pattern_lt, T32, T64, T64),
     E2(text_pattern_le, jit_text_pattern_le, T32, T64, T64),
