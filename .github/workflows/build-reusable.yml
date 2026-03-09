@@ -337,8 +337,8 @@ jobs:
 
           PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
 
-          # Show locale/collation info for debugging
-          psql "$CONNURI" -c "SELECT datcollate, datctype, datlocprovider FROM pg_database WHERE datname = current_database();"
+          # Show locale/collation info for debugging (datlocprovider added in PG15)
+          psql "$CONNURI" -c "SELECT datcollate, datctype FROM pg_database WHERE datname = current_database();" || true
 
           # Enable core dumps and verbose logging for crash diagnosis
           if [ "$RUNNER_OS" = "Linux" ]; then
