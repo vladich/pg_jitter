@@ -1852,14 +1852,17 @@ static bool mir_compile_expr(ExprState *state) {
         const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
         if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
-                    dfn->inline_op == JIT_INLINE_TEXT_NE)) {
+                    dfn->inline_op == JIT_INLINE_TEXT_NE) &&
+            pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
           /*
            * TIER 0a — FULLY INLINE TEXT EQ/NE.
            * Short varlena (≤ 7 data bytes): zero function calls.
            * Longer short varlena: memcmp call only.
            * Non-short (toast/compressed): call jit_text_datum_eq/ne.
+           * Only for deterministic collations; non-deterministic falls
+           * through to V1.
            */
-          if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+          {
             bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
 
             MIR_insn_t lbl_result_eq = MIR_new_label(ctx);
@@ -2137,7 +2140,6 @@ static bool mir_compile_expr(ExprState *state) {
                              MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
                              MIR_new_int_op(ctx, 0)));
           }
-          /* else: non-deterministic collation → fall through to V1 */
         } else if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD &&
             dfn->inline_op <= JIT_INLINE_INT8_GE) {
           /*
@@ -2583,11 +2585,11 @@ static bool mir_compile_expr(ExprState *state) {
               }
 
               /*
-               * LIKE/regex matching is byte-level in PG for deterministic
-               * collations. StringZilla/Vectorscan are also byte-level.
+               * LIKE/regex: Vectorscan/StringZilla use POSIX character
+               * classes, not ICU.  Only safe for C/POSIX collation.
                */
               if (pat_const && !fcinfo->args[1].isnull &&
-                  pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+                  pg_jitter_collation_is_c(fcinfo->fncollation)) {
                 text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
                 char *pat_str = VARDATA_ANY(pat_text);
                 int pat_len = VARSIZE_ANY_EXHDR(pat_text);

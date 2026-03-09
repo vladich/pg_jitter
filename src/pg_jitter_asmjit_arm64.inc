@@ -1493,15 +1493,18 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
 
 				if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
-				            dfn->inline_op == JIT_INLINE_TEXT_NE))
+				            dfn->inline_op == JIT_INLINE_TEXT_NE) &&
+				    pg_jitter_collation_is_deterministic(fcinfo->fncollation))
 				{
 					/*
 					 * TIER 0a — FULLY INLINE TEXT EQ/NE.
 					 * Short varlena ≤ 7 data bytes: zero function calls.
 					 * Longer short varlena: memcmp call only.
 					 * Non-short (toast/compressed): jit_text_datum_eq/ne.
+					 * Only for deterministic collations; non-deterministic
+					 * falls through to V1.
 					 */
-					if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+					{
 						bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
 
 						Label lbl_result_eq = cc.new_label();
@@ -1633,9 +1636,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 						/* store_result */
 						cc.bind(lbl_store);
-					} else {
-						/* Non-deterministic collation → V1 fallback */
-						goto asmjit_funcexpr_v1_fallback;
 					}
 
 					/* Store *op->resvalue = tmp1 (steps-relative) */
@@ -2065,11 +2065,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						}
 
 						/*
-						 * LIKE/regex matching is byte-level in PG for deterministic
-						 * collations. StringZilla/Vectorscan are also byte-level.
+						 * LIKE/regex: Vectorscan/StringZilla use POSIX character
+						 * classes, not ICU.  Only safe for C/POSIX collation.
 						 */
 						if (pat_const && !fcinfo->args[1].isnull &&
-							pg_jitter_collation_is_deterministic(fcinfo->fncollation))
+							pg_jitter_collation_is_c(fcinfo->fncollation))
 						{
 							text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
 							char *pat_str = VARDATA_ANY(pat_text);
