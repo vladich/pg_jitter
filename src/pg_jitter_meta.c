@@ -234,6 +234,7 @@ typedef struct BackendEntry
 	bool				attempted;	/* tried to load */
 	bool				available;	/* successfully loaded */
 	JitProviderCallbacks cb;
+	void			  (*deform_reset)(void);	/* pg_jitter_deform_dispatch_reset_fastpath */
 } BackendEntry;
 
 static BackendEntry backends[PG_JITTER_NUM_BACKENDS];
@@ -278,6 +279,12 @@ meta_load_backend(int idx)
 
 	init_fn(&backends[idx].cb);
 	backends[idx].available = true;
+
+	/* Look up the deform cache reset function (each backend has its own copy) */
+	backends[idx].deform_reset = (void (*)(void))
+		load_external_function(path,
+							   "pg_jitter_deform_dispatch_reset_fastpath",
+							   false, NULL);
 
 	elog(DEBUG1, "pg_jitter: loaded backend %s", backend_libnames[idx]);
 	return true;
@@ -373,6 +380,19 @@ meta_release_context(JitContext *context)
 {
 	MetaJitterContext *ctx = (MetaJitterContext *) context;
 	MetaCompiledCode *cc, *next;
+
+	/*
+	 * Reset deform dispatch fast-path cache in all loaded backends.
+	 * Each backend .dylib has its own static dispatch_fast[] cache keyed
+	 * by TupleDesc pointer.  After context release, TupleDesc pointers may
+	 * be reused by palloc for different table layouts, causing stale cache
+	 * hits that return deform functions compiled for wrong column types.
+	 */
+	for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
+	{
+		if (backends[idx].available && backends[idx].deform_reset)
+			backends[idx].deform_reset();
+	}
 
 	/* Clean up DSM shared code state */
 	if (ctx->share_state.initialized && ctx->share_state.dsm_seg)
