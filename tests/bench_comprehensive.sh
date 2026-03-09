@@ -557,20 +557,19 @@ fi
 
 if [ "$MD_ONLY" -eq 0 ]; then
 # ================================================================
-# Warmup buffer cache
+# Prewarm buffer cache (pg_prewarm loads all pages into shared_buffers)
 # ================================================================
-echo "Warming up buffer cache..."
-psql_cmd -q -c "
-SET max_parallel_workers_per_gather = 0;
-SELECT COUNT(*) FROM bench_data; SELECT COUNT(*) FROM join_left;
-SELECT COUNT(*) FROM join_right; SELECT COUNT(*) FROM date_data;
-SELECT COUNT(*) FROM text_data; SELECT COUNT(*) FROM numeric_data;
-SELECT COUNT(*) FROM array_data; SELECT COUNT(*) FROM ultra_wide;
-SELECT COUNT(*) FROM jsonb_data; SELECT COUNT(*) FROM part_data;
-SELECT COUNT(*) FROM wide_100; SELECT COUNT(*) FROM wide_300;
-SELECT COUNT(*) FROM wide_1000; SELECT COUNT(*) FROM text_long;
+prewarm_tables() {
+    echo -n "  Prewarming buffer cache..."
+    psql_cmd -q -c "
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+SELECT pg_prewarm(c.oid::regclass, 'buffer')
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i');
 " > /dev/null 2>&1
-echo ""
+    echo " done."
+}
+prewarm_tables
 
 # ================================================================
 # CSV header
@@ -594,12 +593,14 @@ for bi in "${!BACKENDS[@]}"; do
         if [ "$backend" = "llvmjit" ]; then
             echo "Switching to $bname (ALTER SYSTEM + restart)..."
             switch_backend "$backend"
+            prewarm_tables
             SWITCHED_AWAY=1
         elif [ "$META_MODE" -eq 1 ]; then
             echo "Running $bname (SET pg_jitter.backend)..."
         else
             echo "Switching to $bname (ALTER SYSTEM + restart)..."
             switch_backend "$backend"
+            prewarm_tables
             SWITCHED_AWAY=1
         fi
     fi
@@ -619,7 +620,7 @@ for bi in "${!BACKENDS[@]}"; do
         query="${QUERIES[$qi]}"
         ensure_pg_running
 
-        # Warmup runs (use simple EXPLAIN, not JSON — faster)
+        # Warmup runs (JIT compilation + icache warm, buffers already prewarmed)
         for w in $(seq 1 "$NWARMUP"); do
             get_exec_time "$query" "$jit_on" "$backend" > /dev/null 2>&1 || true
             ensure_pg_running
@@ -667,6 +668,7 @@ for bi in "${!BACKENDS[@]}"; do
     if [ "$backend" = "llvmjit" ] && [ "$META_MODE" -eq 1 ]; then
         echo "Restoring pg_jitter meta-provider..."
         restore_provider
+        prewarm_tables
         SWITCHED_AWAY=0
     fi
 done

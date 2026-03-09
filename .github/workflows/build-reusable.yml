@@ -129,11 +129,10 @@ jobs:
           echo "Vectorscan library:"
           ls -la lib/libhs.a
 
-      # ---- Clone PostgreSQL source for regression tests (Unix only) ----
+      # ---- Clone PostgreSQL source for regression tests ----
       # Pin to the exact minor version to avoid test expectation mismatches
       # (e.g., Homebrew may ship 17.8 while REL_17_STABLE is already at 17.9)
       - name: Determine PostgreSQL version tag
-        if: runner.os != 'Windows'
         id: pg_version
         shell: bash
         run: |
@@ -146,7 +145,6 @@ jobs:
           echo "PostgreSQL version: $PG_FULL → tag: $PG_TAG"
 
       - name: Clone PostgreSQL source
-        if: runner.os != 'Windows'
         uses: actions/checkout@v4
         with:
           repository: postgres/postgres
@@ -209,7 +207,7 @@ jobs:
           sleep 1
           psql -c "SHOW jit_provider;" "${{ steps.postgres.outputs.connection-uri }}"
 
-      # ---- Build regression test shared libraries (Unix only) ----
+      # ---- Build regression test shared libraries ----
       - name: Build regression test libraries
         if: runner.os != 'Windows'
         shell: bash
@@ -242,9 +240,37 @@ jobs:
           echo "Built libraries:"
           ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
 
-      # ---- Regression tests for each backend (Unix only) ----
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build regression test libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          PGSRC="${{ github.workspace }}/postgres-src"
+          DLPATH="$PGSRC/src/test/regress"
+          INCSERVER="$(cygpath -w "$(pg_config --includedir-server)")"
+          INC="$(cygpath -w "$(pg_config --includedir)")"
+          LIBDIR="$(cygpath -w "$(pg_config --libdir)")"
+
+          SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
+
+          cd "$PGSRC"
+          for src in $SOURCES; do
+            base=$(basename "$src" .c)
+            EXTRA_CFLAGS=""
+            [[ "$base" == "refint" ]] && EXTRA_CFLAGS="/DREFINT_VERBOSE"
+            cl.exe /LD /I"$INCSERVER" /I"$INC" $EXTRA_CFLAGS \
+              "$(cygpath -w "$src")" \
+              /Fe:"$(cygpath -w "$DLPATH/${base}.dll")" \
+              /link "$LIBDIR\\postgres.lib"
+          done
+          echo "Built libraries:"
+          ls "$DLPATH"/*.dll 2>/dev/null || true
+
+      # ---- Regression tests for each backend ----
       - name: Run regression tests
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
