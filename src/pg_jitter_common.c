@@ -20,7 +20,9 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
+#if PG_VERSION_NUM >= 160000
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
+#endif
 #include "access/detoast.h"    /* DatumGetTextPP */
 #include "utils/resowner.h"
 
@@ -3193,7 +3195,7 @@ pg_jitter_detect_case_bsearch(ExprState *state,
               desc->cmp_collation != C_COLLATION_OID)
           {
             pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-            if (locale->deterministic && !locale->collate_is_c)
+            if (locale->deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
               use_memcmp_sort = true;
           }
 
@@ -3712,7 +3714,7 @@ pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc *desc)
         desc->cmp_collation != C_COLLATION_OID)
     {
       pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-      if (locale->deterministic && !locale->collate_is_c)
+      if (locale->deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
         use_memcmp = true;
     }
 
