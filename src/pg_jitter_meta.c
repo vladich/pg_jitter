@@ -37,7 +37,6 @@
 #include "portability/instr_time.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"
-#include "executor/spi.h"
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
 #endif
@@ -260,7 +259,7 @@ typedef struct BackendEntry
 static BackendEntry backends[PG_JITTER_NUM_BACKENDS];
 
 /* ----------------------------------------------------------------
- * Adaptive statistics — shared memory expression profile stats
+ * Adaptive statistics — expression profile stats
  *
  * Collects per-(expression_profile, backend) timing data across all
  * backends in the cluster.  Each expression is profiled by its opcode
@@ -268,13 +267,15 @@ static BackendEntry backends[PG_JITTER_NUM_BACKENDS];
  * with CRC32C.  Timing data is collected via a self-removing wrapper
  * around evalfunc that measures the first N calls, then disappears.
  *
- * The stats table lives in PG shared memory (lazy ShmemInitStruct)
- * and uses lock-free atomics for concurrent reads/writes.
+ * The stats table lives in process-local memory (TopMemoryContext).
+ * Each backend learns independently — convergence is fast since
+ * expression profiles are deterministic.
  * ---------------------------------------------------------------- */
 #define ADAPTIVE_STATS_MAX_ENTRIES  256
-#define ADAPTIVE_NUM_BACKENDS       2   /* sljit=0, asmjit=1 */
+#define ADAPTIVE_NUM_BACKENDS       3   /* sljit=0, asmjit=1, mir=2 */
 #define ADAPTIVE_IDX_SLJIT          0
 #define ADAPTIVE_IDX_ASMJIT         1
+#define ADAPTIVE_IDX_MIR            2
 
 /* Expression profile — captures the "shape" of an expression */
 typedef struct ExprProfile
@@ -287,29 +288,29 @@ typedef struct ExprProfile
 	uint8	n_agg;
 } ExprProfile;
 
-/* Per-profile, per-backend timing stats (shared memory) */
+/* Per-profile, per-backend timing stats (process-local) */
 typedef struct AdaptiveStatsEntry
 {
-	pg_atomic_uint32	profile_hash;	/* 0 = empty slot */
+	uint32		profile_hash;		/* 0 = empty slot */
 
 	/* Expression profile details (set once at insertion, never updated) */
-	uint16				nsteps;
-	uint16				fetchsome_natts;
-	uint8				n_hashdatum;
-	uint8				n_funcexpr;
-	uint8				n_qual;
-	uint8				n_agg;
+	uint16		nsteps;
+	uint16		fetchsome_natts;
+	uint8		n_hashdatum;
+	uint8		n_funcexpr;
+	uint8		n_qual;
+	uint8		n_agg;
 
 	/* Per-backend stats */
-	pg_atomic_uint32	call_count[ADAPTIVE_NUM_BACKENDS];
-	pg_atomic_uint64	compile_ns[ADAPTIVE_NUM_BACKENDS];	/* compilation time */
-	pg_atomic_uint64	exec_ns[ADAPTIVE_NUM_BACKENDS];		/* execution time */
+	uint32		call_count[ADAPTIVE_NUM_BACKENDS];
+	uint64		compile_ns[ADAPTIVE_NUM_BACKENDS];	/* compilation time */
+	uint64		exec_ns[ADAPTIVE_NUM_BACKENDS];		/* execution time */
 } AdaptiveStatsEntry;
 
 typedef struct AdaptiveStatsTable
 {
-	pg_atomic_uint32	num_entries;
-	int					max_entries;
+	int			num_entries;
+	int			max_entries;
 	AdaptiveStatsEntry	entries[FLEXIBLE_ARRAY_MEMBER];
 } AdaptiveStatsTable;
 
@@ -323,7 +324,7 @@ typedef struct AdaptiveTimingCtx
 	void			   *original_evalfunc_priv;
 	uint32				profile_hash;
 	ExprProfile			profile;		/* expression profile for stats insertion */
-	int					backend_idx;	/* ADAPTIVE_IDX_SLJIT or _ASMJIT */
+	int					backend_idx;	/* ADAPTIVE_IDX_SLJIT, _ASMJIT, or _MIR */
 	int					call_count;
 	int64				exec_ns;		/* accumulated execution time */
 	int64				compile_ns;		/* compilation time (set once) */
@@ -453,12 +454,12 @@ meta_ensure_context(ExprState *state)
 }
 
 /* ----------------------------------------------------------------
- * Adaptive statistics — shared memory management
+ * Adaptive statistics — management
  * ---------------------------------------------------------------- */
 
 /*
- * Convert backend enum (PG_JITTER_BACKEND_*) to adaptive index (0/1).
- * Returns -1 for mir or invalid backends.
+ * Convert backend enum (PG_JITTER_BACKEND_*) to adaptive index (0/1/2).
+ * Returns -1 for invalid backends.
  */
 static inline int
 adaptive_backend_to_idx(int backend)
@@ -467,6 +468,7 @@ adaptive_backend_to_idx(int backend)
 	{
 		case PG_JITTER_BACKEND_SLJIT:	return ADAPTIVE_IDX_SLJIT;
 		case PG_JITTER_BACKEND_ASMJIT:	return ADAPTIVE_IDX_ASMJIT;
+		case PG_JITTER_BACKEND_MIR:		return ADAPTIVE_IDX_MIR;
 		default:						return -1;
 	}
 }
@@ -474,18 +476,27 @@ adaptive_backend_to_idx(int backend)
 static inline int
 adaptive_idx_to_backend(int idx)
 {
-	return idx == ADAPTIVE_IDX_SLJIT ? PG_JITTER_BACKEND_SLJIT
-									 : PG_JITTER_BACKEND_ASMJIT;
+	switch (idx)
+	{
+		case ADAPTIVE_IDX_SLJIT:	return PG_JITTER_BACKEND_SLJIT;
+		case ADAPTIVE_IDX_ASMJIT:	return PG_JITTER_BACKEND_ASMJIT;
+		case ADAPTIVE_IDX_MIR:		return PG_JITTER_BACKEND_MIR;
+		default:					return PG_JITTER_BACKEND_SLJIT;
+	}
 }
 
 /*
- * Initialize or attach to the adaptive stats shared memory table.
- * Uses lazy ShmemInitStruct with PG_TRY, same pattern as the DSM slot table.
+ * Initialize the adaptive stats table in process-local memory.
+ *
+ * The JIT provider is loaded lazily (not via shared_preload_libraries),
+ * so we cannot use ShmemInitStruct.  Each backend process maintains its
+ * own stats table in TopMemoryContext.  Stats are per-process but
+ * expressions are deterministic — same query structure → same profile
+ * hash → converges quickly within a single session.
  */
 static void
 adaptive_stats_init(void)
 {
-	bool	found;
 	Size	size;
 
 	if (adaptive_stats != NULL || adaptive_shmem_attempted)
@@ -496,41 +507,11 @@ adaptive_stats_init(void)
 	size = offsetof(AdaptiveStatsTable, entries) +
 		   sizeof(AdaptiveStatsEntry) * ADAPTIVE_STATS_MAX_ENTRIES;
 
-	PG_TRY();
-	{
-		adaptive_stats = (AdaptiveStatsTable *)
-			ShmemInitStruct("pg_jitter_adaptive_stats", size, &found);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-		adaptive_stats = NULL;
-		return;
-	}
-	PG_END_TRY();
+	adaptive_stats = (AdaptiveStatsTable *)
+		MemoryContextAllocZero(TopMemoryContext, size);
 
-	if (!found)
-	{
-		/* First backend to arrive — initialize the table */
-		pg_atomic_init_u32(&adaptive_stats->num_entries, 0);
-		adaptive_stats->max_entries = ADAPTIVE_STATS_MAX_ENTRIES;
-		for (int i = 0; i < ADAPTIVE_STATS_MAX_ENTRIES; i++)
-		{
-			pg_atomic_init_u32(&adaptive_stats->entries[i].profile_hash, 0);
-			adaptive_stats->entries[i].nsteps = 0;
-			adaptive_stats->entries[i].fetchsome_natts = 0;
-			adaptive_stats->entries[i].n_hashdatum = 0;
-			adaptive_stats->entries[i].n_funcexpr = 0;
-			adaptive_stats->entries[i].n_qual = 0;
-			adaptive_stats->entries[i].n_agg = 0;
-			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
-			{
-				pg_atomic_init_u32(&adaptive_stats->entries[i].call_count[b], 0);
-				pg_atomic_init_u64(&adaptive_stats->entries[i].compile_ns[b], 0);
-				pg_atomic_init_u64(&adaptive_stats->entries[i].exec_ns[b], 0);
-			}
-		}
-	}
+	adaptive_stats->num_entries = 0;
+	adaptive_stats->max_entries = ADAPTIVE_STATS_MAX_ENTRIES;
 }
 
 /*
@@ -616,10 +597,10 @@ adaptive_stats_lookup(uint32 profile_hash)
 	if (adaptive_stats == NULL)
 		return -1;
 
-	n = (int) pg_atomic_read_u32(&adaptive_stats->num_entries);
+	n = adaptive_stats->num_entries;
 	for (int i = 0; i < n; i++)
 	{
-		if (pg_atomic_read_u32(&adaptive_stats->entries[i].profile_hash) == profile_hash)
+		if (adaptive_stats->entries[i].profile_hash == profile_hash)
 			return i;
 	}
 	return -1;
@@ -628,50 +609,38 @@ adaptive_stats_lookup(uint32 profile_hash)
 /*
  * Insert a new profile hash into the stats table, storing the profile details.
  * Returns the entry index, or -1 if the table is full.
- * Uses CAS to avoid races with other backends inserting the same hash.
  */
 static int
 adaptive_stats_insert(uint32 profile_hash, const ExprProfile *profile)
 {
-	uint32	old_n, new_n;
+	int		slot;
+	AdaptiveStatsEntry *e;
 
 	if (adaptive_stats == NULL)
 		return -1;
 
-	/* First check if someone else already inserted it */
+	/* Check if already inserted */
 	{
 		int existing = adaptive_stats_lookup(profile_hash);
 		if (existing >= 0)
 			return existing;
 	}
 
-	/* Try to claim a slot */
-	for (;;)
-	{
-		old_n = pg_atomic_read_u32(&adaptive_stats->num_entries);
-		if (old_n >= (uint32) adaptive_stats->max_entries)
-			return -1;		/* table full */
+	if (adaptive_stats->num_entries >= adaptive_stats->max_entries)
+		return -1;		/* table full */
 
-		new_n = old_n + 1;
-		if (pg_atomic_compare_exchange_u32(&adaptive_stats->num_entries,
-										   &old_n, new_n))
-		{
-			/* We claimed slot old_n — store profile details */
-			AdaptiveStatsEntry *e = &adaptive_stats->entries[old_n];
+	slot = adaptive_stats->num_entries++;
+	e = &adaptive_stats->entries[slot];
 
-			e->nsteps = profile->nsteps;
-			e->fetchsome_natts = profile->fetchsome_natts;
-			e->n_hashdatum = profile->n_hashdatum;
-			e->n_funcexpr = profile->n_funcexpr;
-			e->n_qual = profile->n_qual;
-			e->n_agg = profile->n_agg;
+	e->nsteps = profile->nsteps;
+	e->fetchsome_natts = profile->fetchsome_natts;
+	e->n_hashdatum = profile->n_hashdatum;
+	e->n_funcexpr = profile->n_funcexpr;
+	e->n_qual = profile->n_qual;
+	e->n_agg = profile->n_agg;
+	e->profile_hash = profile_hash;
 
-			/* Write profile_hash last — readers use it as the "slot occupied" flag */
-			pg_atomic_write_u32(&e->profile_hash, profile_hash);
-			return (int) old_n;
-		}
-		/* CAS failed — another backend raced us, retry */
-	}
+	return slot;
 }
 
 /*
@@ -697,82 +666,113 @@ adaptive_stats_record(uint32 profile_hash, int adaptive_idx,
 	if (slot < 0)
 		return;		/* table full, discard stats */
 
-	pg_atomic_fetch_add_u32(&adaptive_stats->entries[slot].call_count[adaptive_idx],
-							(uint32) call_count);
+	adaptive_stats->entries[slot].call_count[adaptive_idx] += (uint32) call_count;
 	if (compile_ns > 0)
-		pg_atomic_fetch_add_u64(&adaptive_stats->entries[slot].compile_ns[adaptive_idx],
-								(uint64) compile_ns);
+		adaptive_stats->entries[slot].compile_ns[adaptive_idx] += (uint64) compile_ns;
 	if (exec_ns > 0)
-		pg_atomic_fetch_add_u64(&adaptive_stats->entries[slot].exec_ns[adaptive_idx],
-								(uint64) exec_ns);
+		adaptive_stats->entries[slot].exec_ns[adaptive_idx] += (uint64) exec_ns;
 }
 
 /*
- * Select a backend using adaptive stats (epsilon-greedy).
+ * Select a backend using adaptive stats.
  *
- * Returns PG_JITTER_BACKEND_SLJIT or PG_JITTER_BACKEND_ASMJIT,
- * or -1 if insufficient data (caller should use static heuristic).
+ * Cost model: total_cost = compile_ns + exec_ns (over the sample window).
+ * This amortizes compilation overhead over the observed invocations —
+ * backends with high compilation cost (MIR) need proportionally faster
+ * per-call execution to win.
+ *
+ * Default priority: sljit > asmjit > mir.  A non-default backend is
+ * selected only if its total cost is strictly lower than sljit's.
+ *
+ * Returns a PG_JITTER_BACKEND_* value, or -1 if insufficient data
+ * (caller should use the default: sljit).
  */
 static int
 adaptive_select(uint32 profile_hash)
 {
 	int		slot;
-	uint32	count_s, count_a;
-	uint64	ns_s, ns_a;
-	double	avg_s, avg_a;
-	int		best_idx, other_idx;
+	uint32	counts[ADAPTIVE_NUM_BACKENDS];
+	double	costs[ADAPTIVE_NUM_BACKENDS];
+	int		n_measured = 0;
+	int		best_idx = ADAPTIVE_IDX_SLJIT;
+	double	best_cost;
+	AdaptiveStatsEntry *e;
 
 	slot = adaptive_stats_lookup(profile_hash);
 	if (slot < 0)
 		return -1;
 
-	count_s = pg_atomic_read_u32(&adaptive_stats->entries[slot].call_count[ADAPTIVE_IDX_SLJIT]);
-	count_a = pg_atomic_read_u32(&adaptive_stats->entries[slot].call_count[ADAPTIVE_IDX_ASMJIT]);
+	e = &adaptive_stats->entries[slot];
 
-	/* Need minimum samples from both backends */
-	if (count_s < (uint32) meta_adaptive_samples ||
-		count_a < (uint32) meta_adaptive_samples)
+	/* Read stats for all backends */
+	for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+	{
+		counts[b] = e->call_count[b];
+		if (counts[b] >= (uint32) meta_adaptive_samples)
+		{
+			uint64 comp = e->compile_ns[b];
+			uint64 exec = e->exec_ns[b];
+			costs[b] = (double) comp + (double) exec;
+			n_measured++;
+		}
+		else
+			costs[b] = -1.0;	/* not yet measured */
+	}
+
+	/* Need sljit measured plus at least one other */
+	if (costs[ADAPTIVE_IDX_SLJIT] < 0.0 || n_measured < 2)
 	{
 		/*
-		 * Bootstrap exploration: if one backend has data but the other
-		 * doesn't, occasionally pick the unmeasured backend to collect
-		 * initial data.  Use a higher exploration rate during bootstrap.
+		 * Bootstrap exploration: sljit has data (it's always the default),
+		 * occasionally try an unmeasured backend to collect initial data.
+		 * 10% chance, uniformly distributed among unmeasured backends.
 		 */
-		if ((count_s > 0 && count_a == 0) ||
-			(count_a > 0 && count_s == 0))
+		if (counts[ADAPTIVE_IDX_SLJIT] > 0)
 		{
+			int unmeasured[ADAPTIVE_NUM_BACKENDS];
+			int n_unmeasured = 0;
 			uint32 rand_val;
-			int unmeasured_idx = (count_s == 0) ? ADAPTIVE_IDX_SLJIT
-												: ADAPTIVE_IDX_ASMJIT;
 
-#if PG_VERSION_NUM >= 150000
-			rand_val = pg_prng_uint32(&pg_global_prng_state);
-#else
-			rand_val = (uint32) random();
-#endif
-			/* 25% chance to explore the unmeasured backend */
-			if ((rand_val % 4) == 0)
+			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
 			{
-				elog(DEBUG1, "pg_jitter adaptive: bootstrap explore %s "
-					 "(profile 0x%08x)",
-					 backend_libnames[adaptive_idx_to_backend(unmeasured_idx)],
-					 profile_hash);
-				return adaptive_idx_to_backend(unmeasured_idx);
+				if (counts[b] == 0 && backends[adaptive_idx_to_backend(b)].available)
+					unmeasured[n_unmeasured++] = b;
+			}
+
+			if (n_unmeasured > 0)
+			{
+#if PG_VERSION_NUM >= 150000
+				rand_val = pg_prng_uint32(&pg_global_prng_state);
+#else
+				rand_val = (uint32) random();
+#endif
+				/* 10% chance to explore */
+				if ((rand_val % 10) == 0)
+				{
+					int pick = unmeasured[rand_val / 10 % n_unmeasured];
+					elog(DEBUG1, "pg_jitter adaptive: bootstrap explore %s "
+						 "(profile 0x%08x)",
+						 backend_libnames[adaptive_idx_to_backend(pick)],
+						 profile_hash);
+					return adaptive_idx_to_backend(pick);
+				}
 			}
 		}
 		return -1;
 	}
 
-	ns_s = pg_atomic_read_u64(&adaptive_stats->entries[slot].exec_ns[ADAPTIVE_IDX_SLJIT]);
-	ns_a = pg_atomic_read_u64(&adaptive_stats->entries[slot].exec_ns[ADAPTIVE_IDX_ASMJIT]);
+	/* Find the backend with lowest total cost */
+	best_cost = costs[ADAPTIVE_IDX_SLJIT];
+	for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+	{
+		if (costs[b] >= 0.0 && costs[b] < best_cost)
+		{
+			best_cost = costs[b];
+			best_idx = b;
+		}
+	}
 
-	avg_s = (double) ns_s / (double) count_s;
-	avg_a = (double) ns_a / (double) count_a;
-
-	best_idx = (avg_s <= avg_a) ? ADAPTIVE_IDX_SLJIT : ADAPTIVE_IDX_ASMJIT;
-	other_idx = 1 - best_idx;
-
-	/* Epsilon-greedy exploration */
+	/* Epsilon-greedy exploration among measured backends */
 	if (meta_adaptive_epsilon > 0.0)
 	{
 		uint32 rand_val;
@@ -785,17 +785,33 @@ adaptive_select(uint32 profile_hash)
 
 		if ((double)(rand_val % 10000) / 10000.0 < meta_adaptive_epsilon)
 		{
-			elog(DEBUG2, "pg_jitter adaptive: explore %s (profile 0x%08x)",
-				 backend_libnames[adaptive_idx_to_backend(other_idx)],
-				 profile_hash);
-			return adaptive_idx_to_backend(other_idx);
+			/* Pick a random measured backend that isn't the best */
+			int candidates[ADAPTIVE_NUM_BACKENDS];
+			int n_cand = 0;
+
+			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+			{
+				if (b != best_idx && costs[b] >= 0.0)
+					candidates[n_cand++] = b;
+			}
+			if (n_cand > 0)
+			{
+				int pick = candidates[rand_val / 10000 % n_cand];
+				elog(DEBUG2, "pg_jitter adaptive: explore %s (profile 0x%08x)",
+					 backend_libnames[adaptive_idx_to_backend(pick)],
+					 profile_hash);
+				return adaptive_idx_to_backend(pick);
+			}
 		}
 	}
 
 	elog(DEBUG2, "pg_jitter adaptive: exploit %s (profile 0x%08x, "
-		 "sljit %.0fns/%u, asmjit %.0fns/%u)",
+		 "costs: sljit=%.0f asmjit=%.0f mir=%.0f)",
 		 backend_libnames[adaptive_idx_to_backend(best_idx)],
-		 profile_hash, avg_s, count_s, avg_a, count_a);
+		 profile_hash,
+		 costs[ADAPTIVE_IDX_SLJIT],
+		 costs[ADAPTIVE_IDX_ASMJIT] >= 0 ? costs[ADAPTIVE_IDX_ASMJIT] : -1.0,
+		 costs[ADAPTIVE_IDX_MIR] >= 0 ? costs[ADAPTIVE_IDX_MIR] : -1.0);
 
 	return adaptive_idx_to_backend(best_idx);
 }
@@ -889,7 +905,7 @@ meta_install_timing_wrapper(ExprState *state, int backend_enum,
 
 	adaptive_idx = adaptive_backend_to_idx(backend_enum);
 	if (adaptive_idx < 0)
-		return;		/* mir — don't time */
+		return;		/* invalid backend */
 
 	/* Only wrap if the expression was actually compiled */
 	if (state->evalfunc == NULL)
@@ -900,18 +916,25 @@ meta_install_timing_wrapper(ExprState *state, int backend_enum,
 		return;
 
 	/*
-	 * Skip wrapping if we already have sufficient data for both backends
-	 * on this profile.  No point collecting more data if the adaptive
-	 * selector already has enough to make a decision.
+	 * Skip wrapping if all available backends already have sufficient data
+	 * for this profile.  No point collecting more samples.
 	 */
 	{
 		int slot = adaptive_stats_lookup(profile_hash);
 		if (slot >= 0)
 		{
-			uint32 sc = pg_atomic_read_u32(&adaptive_stats->entries[slot].call_count[ADAPTIVE_IDX_SLJIT]);
-			uint32 ac = pg_atomic_read_u32(&adaptive_stats->entries[slot].call_count[ADAPTIVE_IDX_ASMJIT]);
-			if (sc >= (uint32) meta_adaptive_samples &&
-				ac >= (uint32) meta_adaptive_samples)
+			bool all_measured = true;
+			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+			{
+				if (backends[adaptive_idx_to_backend(b)].available &&
+					adaptive_stats->entries[slot].call_count[b]
+						< (uint32) meta_adaptive_samples)
+				{
+					all_measured = false;
+					break;
+				}
+			}
+			if (all_measured)
 				return;		/* already have enough data */
 		}
 	}
@@ -947,119 +970,47 @@ meta_install_timing_wrapper(ExprState *state, int backend_enum,
 	}
 }
 
-/* ----------------------------------------------------------------
- * Auto-creation of SQL functions via SPI
+/*
+ * SQL function registration is handled manually:
  *
- * Creates pg_jitter_current_backend(), pg_jitter_adaptive_stats(),
- * and pg_jitter_adaptive_stats_reset() if they don't already exist.
- * Called once per backend from meta_compile_expr (guarantees we're
- * in a transaction context).  Uses PL/pgSQL DO block with EXCEPTION
- * handlers to silently skip if the functions already exist.
- * ---------------------------------------------------------------- */
-static void
-meta_ensure_sql_functions(void)
-{
-	static bool done = false;
-
-	if (done || IsParallelWorker())
-		return;
-	done = true;
-
-	PG_TRY();
-	{
-		if (SPI_connect() == SPI_OK_CONNECT)
-		{
-			SPI_execute(
-				"DO $body$ "
-				"BEGIN "
-				"  BEGIN "
-				"    CREATE FUNCTION pg_jitter_current_backend() RETURNS text "
-				"      LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_current_backend'; "
-				"  EXCEPTION WHEN OTHERS THEN NULL; "
-				"  END; "
-				"  BEGIN "
-				"    CREATE FUNCTION pg_jitter_adaptive_stats("
-				"      OUT profile_hash text, "
-				"      OUT nsteps int, "
-				"      OUT fetchsome_natts int, "
-				"      OUT n_hashdatum int, "
-				"      OUT n_funcexpr int, "
-				"      OUT n_qual int, "
-				"      OUT n_agg int, "
-				"      OUT sljit_calls int, "
-				"      OUT sljit_compile_ns float8, "
-				"      OUT sljit_avg_ns float8, "
-				"      OUT asmjit_calls int, "
-				"      OUT asmjit_compile_ns float8, "
-				"      OUT asmjit_avg_ns float8, "
-				"      OUT selected text, "
-				"      OUT margin_pct float8"
-				"    ) RETURNS SETOF record "
-				"      LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats'; "
-				"  EXCEPTION WHEN OTHERS THEN NULL; "
-				"  END; "
-				"  BEGIN "
-				"    CREATE FUNCTION pg_jitter_adaptive_stats_reset() RETURNS void "
-				"      LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats_reset'; "
-				"  EXCEPTION WHEN OTHERS THEN NULL; "
-				"  END; "
-				"END; "
-				"$body$",
-				false, 0);
-			SPI_finish();
-		}
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-	}
-	PG_END_TRY();
-}
+ *   CREATE FUNCTION pg_jitter_current_backend() RETURNS text
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_current_backend';
+ *
+ *   CREATE FUNCTION pg_jitter_adaptive_stats(
+ *     OUT profile_hash text, OUT nsteps int, OUT fetchsome_natts int,
+ *     OUT n_hashdatum int, OUT n_funcexpr int, OUT n_qual int, OUT n_agg int,
+ *     OUT sljit_calls int, OUT sljit_compile_ns float8, OUT sljit_avg_ns float8,
+ *     OUT asmjit_calls int, OUT asmjit_compile_ns float8, OUT asmjit_avg_ns float8,
+ *     OUT mir_calls int, OUT mir_compile_ns float8, OUT mir_avg_ns float8,
+ *     OUT selected text, OUT margin_pct float8
+ *   ) RETURNS SETOF record
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats';
+ *
+ *   CREATE FUNCTION pg_jitter_adaptive_stats_reset() RETURNS void
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats_reset';
+ */
 
 /* ----------------------------------------------------------------
  * Provider callbacks — dispatch to loaded backend
  * ---------------------------------------------------------------- */
 
 /*
- * Static heuristic backend selection based on expression profile.
+ * Default backend priority: sljit > asmjit > mir.
  *
- * Heuristic based on benchmark data (ARM64 + x86_64):
- *
- * 1. HASHDATUM present → asmjit.  Hash computation is always faster with
- *    asmjit (hash joins: asmjit 483ms vs sljit 563ms).
- *
- * 2. Deform present (fetchsome_natts > 0) and not computation-dominated
- *    → asmjit.  asmjit wins for join quals, deform, and outer-join
- *    expressions where tuple processing is a meaningful fraction of work.
- *
- * 3. Everything else → sljit.  Pure computation expressions (CASE, IN-list,
- *    numeric arithmetic, interval math) are 3-23% faster with sljit.
- *
- * Only considers sljit and asmjit — mir excluded due to 15-100x compilation
- * overhead that rarely justifies its execution gains.
+ * Always returns sljit as the default.  The adaptive statistics system
+ * may override this if runtime data shows a different backend is faster
+ * (considering both compilation cost and per-invocation execution time).
  */
 static int
-meta_heuristic_select(const ExprProfile *profile)
+meta_default_backend(void)
 {
-	int		nsteps = profile->nsteps;
-	int		fetchsome_natts = profile->fetchsome_natts;
-	int		n_hashdatum = profile->n_hashdatum;
-
-#ifdef _WIN32
-	return PG_JITTER_BACKEND_SLJIT;
-#else
-	if (n_hashdatum > 0)
+	if (backends[PG_JITTER_BACKEND_SLJIT].available)
+		return PG_JITTER_BACKEND_SLJIT;
+	if (backends[PG_JITTER_BACKEND_ASMJIT].available)
 		return PG_JITTER_BACKEND_ASMJIT;
-
-	if (fetchsome_natts > 0 &&
-		(nsteps <= 5 || nsteps <= fetchsome_natts * 3))
-		return PG_JITTER_BACKEND_ASMJIT;
-
-	if (fetchsome_natts == 0 && nsteps <= 6)
-		return PG_JITTER_BACKEND_ASMJIT;
-
-	return PG_JITTER_BACKEND_SLJIT;
-#endif
+	if (backends[PG_JITTER_BACKEND_MIR].available)
+		return PG_JITTER_BACKEND_MIR;
+	return PG_JITTER_BACKEND_SLJIT;	/* nominal fallback */
 }
 
 /*
@@ -1083,29 +1034,15 @@ meta_auto_select_backend(ExprState *state, uint32 *profile_hash_out,
 	*profile_hash_out = profile_hash;
 	*profile_out = profile;
 
+	/* Default: sljit > asmjit > mir */
+	selected = meta_default_backend();
+
 	/* Try adaptive selection if enabled and initialized */
 	if (meta_adaptive && adaptive_stats != NULL)
 	{
-		selected = adaptive_select(profile_hash);
-		if (selected >= 0)
-		{
-			/* Adaptive has enough data — use its decision */
-			if (!backends[selected].available)
-				selected = meta_heuristic_select(&profile);
-			return selected;
-		}
-	}
-
-	/* Fall back to static heuristic */
-	selected = meta_heuristic_select(&profile);
-
-	/* Fall back if the selected backend is not available */
-	if (!backends[selected].available)
-	{
-		if (backends[PG_JITTER_BACKEND_SLJIT].available)
-			selected = PG_JITTER_BACKEND_SLJIT;
-		else if (backends[PG_JITTER_BACKEND_ASMJIT].available)
-			selected = PG_JITTER_BACKEND_ASMJIT;
+		int adaptive_choice = adaptive_select(profile_hash);
+		if (adaptive_choice >= 0 && backends[adaptive_choice].available)
+			selected = adaptive_choice;
 	}
 
 	elog(DEBUG1, "pg_jitter auto: steps=%d natts=%d hashdatum=%d -> %s",
@@ -1124,9 +1061,6 @@ meta_compile_expr(ExprState *state)
 	ExprProfile	profile;
 
 	memset(&profile, 0, sizeof(ExprProfile));
-
-	/* Auto-create SQL functions on first compile (once per backend) */
-	meta_ensure_sql_functions();
 
 	/*
 	 * Pre-create the context with our resowner desc before the backend
@@ -1312,7 +1246,7 @@ pg_jitter_current_backend(PG_FUNCTION_ARGS)
 /* ----------------------------------------------------------------
  * SQL function: pg_jitter_adaptive_stats() returns SETOF record
  *
- * Returns the contents of the adaptive stats shared memory table
+ * Returns the contents of the adaptive stats table
  * with profile details and separate compilation/execution timing.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats);
@@ -1327,7 +1261,7 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 	MemoryContext	oldcontext;
 	int				n_entries;
 
-#define ADAPTIVE_STATS_NCOLS 15
+#define ADAPTIVE_STATS_NCOLS 18
 
 	/* Switch to per-query memory context for tuplestore */
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
@@ -1348,8 +1282,11 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "asmjit_calls",     INT4OID,   -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "asmjit_compile_ns",FLOAT8OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 13, "asmjit_avg_ns",    FLOAT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 14, "selected",         TEXTOID,   -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 15, "margin_pct",       FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 14, "mir_calls",        INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 15, "mir_compile_ns",   FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 16, "mir_avg_ns",       FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 17, "selected",         TEXTOID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 18, "margin_pct",       FLOAT8OID, -1, 0);
 
 	tupstore = tuplestore_begin_heap(true, false, work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
@@ -1362,7 +1299,7 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 
 	if (adaptive_stats != NULL)
 	{
-		n_entries = (int) pg_atomic_read_u32(&adaptive_stats->num_entries);
+		n_entries = adaptive_stats->num_entries;
 
 		for (int i = 0; i < n_entries; i++)
 		{
@@ -1377,50 +1314,98 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 
 			memset(nulls, false, sizeof(nulls));
 
-			hash_val = pg_atomic_read_u32(&e->profile_hash);
+			hash_val = e->profile_hash;
 			if (hash_val == 0)
 				continue;
 
-			sc = pg_atomic_read_u32(&e->call_count[ADAPTIVE_IDX_SLJIT]);
-			ac = pg_atomic_read_u32(&e->call_count[ADAPTIVE_IDX_ASMJIT]);
-			s_compile = pg_atomic_read_u64(&e->compile_ns[ADAPTIVE_IDX_SLJIT]);
-			a_compile = pg_atomic_read_u64(&e->compile_ns[ADAPTIVE_IDX_ASMJIT]);
-			s_exec = pg_atomic_read_u64(&e->exec_ns[ADAPTIVE_IDX_SLJIT]);
-			a_exec = pg_atomic_read_u64(&e->exec_ns[ADAPTIVE_IDX_ASMJIT]);
+			sc = e->call_count[ADAPTIVE_IDX_SLJIT];
+			ac = e->call_count[ADAPTIVE_IDX_ASMJIT];
+			s_compile = e->compile_ns[ADAPTIVE_IDX_SLJIT];
+			a_compile = e->compile_ns[ADAPTIVE_IDX_ASMJIT];
+			s_exec = e->exec_ns[ADAPTIVE_IDX_SLJIT];
+			a_exec = e->exec_ns[ADAPTIVE_IDX_ASMJIT];
 
 			savg = sc > 0 ? (double) s_exec / sc : 0.0;
 			aavg = ac > 0 ? (double) a_exec / ac : 0.0;
 
-			snprintf(hashbuf, sizeof(hashbuf), "0x%08x", hash_val);
-			values[0]  = CStringGetTextDatum(hashbuf);
-			values[1]  = Int32GetDatum((int32) e->nsteps);
-			values[2]  = Int32GetDatum((int32) e->fetchsome_natts);
-			values[3]  = Int32GetDatum((int32) e->n_hashdatum);
-			values[4]  = Int32GetDatum((int32) e->n_funcexpr);
-			values[5]  = Int32GetDatum((int32) e->n_qual);
-			values[6]  = Int32GetDatum((int32) e->n_agg);
-			values[7]  = Int32GetDatum((int32) sc);
-			values[8]  = Float8GetDatum((double) s_compile);
-			values[9]  = Float8GetDatum(savg);
-			values[10] = Int32GetDatum((int32) ac);
-			values[11] = Float8GetDatum((double) a_compile);
-			values[12] = Float8GetDatum(aavg);
-
-			if (sc >= (uint32) meta_adaptive_samples &&
-				ac >= (uint32) meta_adaptive_samples)
+			/* MIR stats */
 			{
-				const char *winner = savg <= aavg ? "sljit" : "asmjit";
-				double faster = savg <= aavg ? savg : aavg;
-				double slower = savg <= aavg ? aavg : savg;
-				double margin = slower > 0 ? ((slower - faster) / slower) * 100.0 : 0.0;
+				uint32	mc = e->call_count[ADAPTIVE_IDX_MIR];
+				uint64	m_compile = e->compile_ns[ADAPTIVE_IDX_MIR];
+				uint64	m_exec = e->exec_ns[ADAPTIVE_IDX_MIR];
+				double	mavg = mc > 0 ? (double) m_exec / mc : 0.0;
 
-				values[13] = CStringGetTextDatum(winner);
-				values[14] = Float8GetDatum(margin);
-			}
-			else
-			{
-				values[13] = CStringGetTextDatum("pending");
-				values[14] = Float8GetDatum(0.0);
+				snprintf(hashbuf, sizeof(hashbuf), "0x%08x", hash_val);
+				values[0]  = CStringGetTextDatum(hashbuf);
+				values[1]  = Int32GetDatum((int32) e->nsteps);
+				values[2]  = Int32GetDatum((int32) e->fetchsome_natts);
+				values[3]  = Int32GetDatum((int32) e->n_hashdatum);
+				values[4]  = Int32GetDatum((int32) e->n_funcexpr);
+				values[5]  = Int32GetDatum((int32) e->n_qual);
+				values[6]  = Int32GetDatum((int32) e->n_agg);
+				values[7]  = Int32GetDatum((int32) sc);
+				values[8]  = Float8GetDatum((double) s_compile);
+				values[9]  = Float8GetDatum(savg);
+				values[10] = Int32GetDatum((int32) ac);
+				values[11] = Float8GetDatum((double) a_compile);
+				values[12] = Float8GetDatum(aavg);
+				values[13] = Int32GetDatum((int32) mc);
+				values[14] = Float8GetDatum((double) m_compile);
+				values[15] = Float8GetDatum(mavg);
+
+				/*
+				 * Determine winner using total cost = compile_ns + exec_ns.
+				 * Need at least 2 backends with sufficient samples.
+				 */
+				{
+					double	total_costs[ADAPTIVE_NUM_BACKENDS];
+					uint32	call_counts[ADAPTIVE_NUM_BACKENDS];
+					int		n_measured = 0;
+					int		best_b = -1;
+					double	best_cost = 0;
+					double	second_cost = 0;
+
+					call_counts[ADAPTIVE_IDX_SLJIT] = sc;
+					call_counts[ADAPTIVE_IDX_ASMJIT] = ac;
+					call_counts[ADAPTIVE_IDX_MIR] = mc;
+					total_costs[ADAPTIVE_IDX_SLJIT] = (double) s_compile + (double) s_exec;
+					total_costs[ADAPTIVE_IDX_ASMJIT] = (double) a_compile + (double) a_exec;
+					total_costs[ADAPTIVE_IDX_MIR] = (double) m_compile + (double) m_exec;
+
+					for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+					{
+						if (call_counts[b] >= (uint32) meta_adaptive_samples)
+						{
+							if (best_b < 0 || total_costs[b] < best_cost)
+							{
+								second_cost = best_cost;
+								best_cost = total_costs[b];
+								best_b = b;
+							}
+							else if (n_measured == 1 || total_costs[b] < second_cost)
+							{
+								second_cost = total_costs[b];
+							}
+							n_measured++;
+						}
+					}
+
+					if (n_measured >= 2 && best_b >= 0)
+					{
+						static const char *idx_names[] = {"sljit", "asmjit", "mir"};
+						double margin = second_cost > 0
+							? ((second_cost - best_cost) / second_cost) * 100.0
+							: 0.0;
+
+						values[16] = CStringGetTextDatum(idx_names[best_b]);
+						values[17] = Float8GetDatum(margin);
+					}
+					else
+					{
+						values[16] = CStringGetTextDatum("pending");
+						values[17] = Float8GetDatum(0.0);
+					}
+				}
 			}
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
@@ -1434,7 +1419,7 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 /* ----------------------------------------------------------------
  * SQL function: pg_jitter_adaptive_stats_reset() returns void
  *
- * Resets all adaptive statistics counters in shared memory.
+ * Resets all adaptive statistics counters.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats_reset);
 
@@ -1447,19 +1432,13 @@ pg_jitter_adaptive_stats_reset(PG_FUNCTION_ARGS)
 
 	if (adaptive_stats != NULL)
 	{
-		int n = (int) pg_atomic_read_u32(&adaptive_stats->num_entries);
+		int n = adaptive_stats->num_entries;
 
 		for (int i = 0; i < n; i++)
 		{
-			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
-			{
-				pg_atomic_write_u32(&adaptive_stats->entries[i].call_count[b], 0);
-				pg_atomic_write_u64(&adaptive_stats->entries[i].compile_ns[b], 0);
-				pg_atomic_write_u64(&adaptive_stats->entries[i].exec_ns[b], 0);
-			}
-			pg_atomic_write_u32(&adaptive_stats->entries[i].profile_hash, 0);
+			memset(&adaptive_stats->entries[i], 0, sizeof(AdaptiveStatsEntry));
 		}
-		pg_atomic_write_u32(&adaptive_stats->num_entries, 0);
+		adaptive_stats->num_entries = 0;
 	}
 
 	PG_RETURN_VOID();
