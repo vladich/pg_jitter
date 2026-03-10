@@ -25,9 +25,7 @@
 #include <sys/mman.h>
 #include <unistd.h>            /* sysconf, _SC_PAGESIZE */
 
-#ifdef __ARM_FEATURE_CRC32
-#include <arm_acle.h>
-#endif
+#include "port/pg_crc32c.h"
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE
@@ -1460,55 +1458,16 @@ typedef struct DeformDispatchEntry
 static uint32
 deform_attrs_hash(TupleDesc desc, int natts)
 {
-#ifdef __ARM_FEATURE_CRC32
-	/*
-	 * ARM64 hardware CRC32C: single-cycle __crc32cd processes 8 bytes at a
-	 * time vs byte-at-a-time FNV-1a.  For a 10-column table with 8-byte
-	 * CompactAttribute, this is ~10x fewer instructions.
-	 */
-	uint32 crc = 0xFFFFFFFF;
-	for (int i = 0; i < natts; i++)
-	{
-		CompactAttribute *att = TupleDescCompactAttr(desc, i);
-		const unsigned char *p = (const unsigned char *) att;
-		size_t len = sizeof(CompactAttribute);
-		size_t off = 0;
+	pg_crc32c crc;
 
-		/* Process 8 bytes at a time */
-		for (; off + 8 <= len; off += 8)
-		{
-			uint64 val;
-			memcpy(&val, p + off, 8);
-			crc = __crc32cd(crc, val);
-		}
-		/* Process 4 bytes */
-		if (off + 4 <= len)
-		{
-			uint32 val;
-			memcpy(&val, p + off, 4);
-			crc = __crc32cw(crc, val);
-			off += 4;
-		}
-		/* Process remaining bytes */
-		for (; off < len; off++)
-			crc = __crc32cb(crc, p[off]);
-	}
-	return crc ^ 0xFFFFFFFF;
-#else
-	/* FNV-1a fallback for non-ARM/non-CRC platforms */
-	uint32 h = 0x811c9dc5;  /* FNV-1a offset basis */
+	INIT_CRC32C(crc);
 	for (int i = 0; i < natts; i++)
 	{
 		CompactAttribute *att = TupleDescCompactAttr(desc, i);
-		const unsigned char *p = (const unsigned char *) att;
-		for (size_t j = 0; j < sizeof(CompactAttribute); j++)
-		{
-			h ^= p[j];
-			h *= 0x01000193;  /* FNV-1a prime */
-		}
+		COMP_CRC32C(crc, att, sizeof(CompactAttribute));
 	}
-	return h;
-#endif
+	FIN_CRC32C(crc);
+	return (uint32) crc;
 }
 
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
@@ -1516,7 +1475,7 @@ static int n_deform_dispatch = 0;
 
 /*
  * Multi-entry fast-path cache for deform dispatch.  Avoids recomputing the
- * O(natts) FNV hash on every row.
+ * O(natts) CRC32C hash on every row.
  *
  * Uses (TupleDesc pointer, natts) as the cache key.  Within a single query,
  * a given slot always has the same TupleDesc pointer, so this is safe for

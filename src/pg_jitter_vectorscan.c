@@ -20,6 +20,7 @@
 #include "varatt.h"
 #endif
 
+#include "port/pg_crc32c.h"
 #include "hs.h"
 
 /* ================================================================
@@ -46,13 +47,15 @@ static int vs_lru_clock = 0;
 static uint32
 vs_hash_key(const char *pattern, int patlen, uint32 flags)
 {
-	uint32 h = 0x811c9dc5; /* FNV-1a */
+	pg_crc32c crc;
 	int len = patlen < 256 ? patlen : 256;
-	for (int i = 0; i < len; i++)
-		h = (h ^ (uint8)pattern[i]) * 0x01000193;
-	h = (h ^ flags) * 0x01000193;
-	h = (h ^ (uint32)patlen) * 0x01000193;
-	return h;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, pattern, len);
+	COMP_CRC32C(crc, &flags, sizeof(flags));
+	COMP_CRC32C(crc, &patlen, sizeof(patlen));
+	FIN_CRC32C(crc);
+	return (uint32) crc;
 }
 
 /* ================================================================
