@@ -139,6 +139,12 @@ for b in sljit asmjit mir; do
     fi
 done
 
+# "auto" is available when the meta-provider is loaded
+if [ "$META_MODE" -eq 1 ]; then
+    ALL_BACKENDS+=("auto")
+    ALL_NAMES+=("auto")
+fi
+
 # Filter to requested backends if specified
 if [ -n "$REQUESTED_BACKENDS" ]; then
     BACKENDS=()
