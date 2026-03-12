@@ -549,21 +549,69 @@ pg_jitter_compile_deform(TupleDesc desc,
  *   - all_notnull + uniform byval: hasnulls-gated fast path
  *   - general: full null/alignment/byval/varlena handling
  *
- * Register allocation (offset in register, not stack):
+ * Register allocation:
  *   S0 = slot (input arg)
  *   S1 = tts_values
  *   S2 = tts_isnull
  *   S3 = tupdata_base
- *   S4 = byte offset into tuple data (kept in register!)
- *   S5 = attnum (column counter, kept in register!)
+ *   S4 = byte offset into tuple data
+ *   S5 = attnum (column counter)
  *   R0-R3 = scratch
+ *
+ * ARM64 (10 callee-saved GPRs available, S6/S7 are free):
+ *   S6 = dispatch array base pointer
+ *   S7 = loop_limit (= min(natts, maxatt))
+ *   8 saved regs, smaller stack (no DLOFF_DISPATCH/DLOFF_JUMPTBL)
+ *
+ * x86-64 (6 callee-saved GPRs: rbx,rbp,r12-r15):
+ *   dispatch base + loop_limit on stack (SLJIT would spill S6/S7 anyway)
+ *   6 saved regs, full stack layout
  * ================================================================ */
+
+/*
+ * Platform-conditional register allocation.
+ * ARM64 has 10 callee-saved GPRs (x19-x28) so S6/S7 are real registers.
+ * x86-64 has only 6 (rbx,rbp,r12-r15) so S6/S7 would be spilled to stack
+ * by SLJIT — we skip them and use explicit stack slots instead.
+ */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define DEFORM_USE_REG_DISPATCH  1
+#define DEFORM_NSAVED            8
+#else
+#define DEFORM_USE_REG_DISPATCH  0
+#define DEFORM_NSAVED            6
+#endif
 
 /* Stack layout for loop-based deform */
 #define DLOFF_HASNULLS   0
 #define DLOFF_MAXATT     8
 #define DLOFF_TBITS      16
+#if DEFORM_USE_REG_DISPATCH
+/* ARM64: dispatch base in S6, loop_limit in S7 — no stack slots needed */
 #define DLOFF_TOTAL      24
+#else
+/* x86-64: dispatch base + jump table on stack */
+#define DLOFF_DISPATCH   24		/* dispatch byte array base */
+#define DLOFF_JUMPTBL    32		/* jump table base */
+#define DLOFF_TOTAL      40
+#endif
+
+/* Dispatch handler indices (bits 0-6 of dispatch byte) */
+#define DHANDLER_BOOL     0		/* attlen=1, byval, align=1 */
+#define DHANDLER_INT2     1		/* attlen=2, byval, align=2 */
+#define DHANDLER_INT4     2		/* attlen=4, byval, align=4 */
+#define DHANDLER_INT8     3		/* attlen=8, byval, align=8 */
+#define DHANDLER_VARLENA  4		/* attlen=-1, byref, align=4 */
+#define DHANDLER_CSTRING  5		/* attlen=-2, byref, align=1 */
+#define DHANDLER_GENERIC  6		/* fixed byref, variable align */
+#define DHANDLER_COUNT    7
+#define DHANDLER_NULLABLE_BIT 0x80	/* bit 7: column is nullable */
+
+/*
+ * Dispatch byte layout (local dispatch loop):
+ *   bits 0-6: handler index (0-6)
+ *   bit 7:    nullable flag
+ */
 
 void *
 pg_jitter_compile_deform_loop(TupleDesc desc,
@@ -580,6 +628,10 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	int		guaranteed_column_number = -1;
 	DeformColDesc *descriptors;
 	bool	all_notnull = true;
+
+	/* Dispatch table state (local mode only, patched after code gen) */
+	struct sljit_label *dispatch_handler_labels[DHANDLER_COUNT];
+	sljit_uw *dispatch_jump_table = NULL;
 	bool	all_fixed_byval = true;
 	bool	uniform_attlen = true;
 	int16	first_attlen = 0;
@@ -652,7 +704,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	 */
 	sljit_emit_enter(C, 0,
 					 SLJIT_ARGS1V(P),
-					 4, 6, DLOFF_TOTAL);
+					 4, DEFORM_NSAVED, DLOFF_TOTAL);
 
 	/* S1 = slot->tts_values */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_S1, 0,
@@ -1119,10 +1171,15 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_set_label(j_skip_general, sljit_emit_label(C));
 		}
 	}
-	else
+	else if (gen_buf)
 	{
 		/* ============================================================
-		 * GENERAL LOOP (handles nulls, varlena, mixed types)
+		 * GENERAL LOOP — shared mode (descriptor-based)
+		 *
+		 * In shared mode, dispatch/jump_table arrays are process-local
+		 * and can't be embedded as immediates.  Use the existing
+		 * descriptor-based loop which accesses the shared descriptors
+		 * array via embedded pointer (valid across workers in DSM).
 		 * ============================================================ */
 		struct sljit_label *l_loop_top;
 		struct sljit_label *l_epilogue;
@@ -1130,7 +1187,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 		l_loop_top = sljit_emit_label(C);
 
-		/* S5 = attnum (in register), check bounds */
 		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
 								SLJIT_S5, 0, SLJIT_IMM, natts);
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -1138,32 +1194,28 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		j_avail_out = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
 									 SLJIT_S5, 0, SLJIT_R0, 0);
 
-		/* R3 = desc_ptr = &descriptors[S5] (computed on the fly) */
+		/* R3 = desc_ptr = &descriptors[S5] */
 		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
 					   SLJIT_S5, 0, SLJIT_IMM, 3);
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
 					   SLJIT_R3, 0, SLJIT_IMM, (sljit_sw) descriptors);
 
-		/* ---- NULL CHECK ---- */
 		if (!all_notnull)
 		{
 			struct sljit_jump *j_notnull_attr, *j_no_tuple_nulls;
 			struct sljit_jump *j_bit_set;
 			struct sljit_label *l_not_null;
 
-			/* if desc->attnotnull -> skip (uses R0 only, R3 preserved) */
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attnotnull));
 			j_notnull_attr = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* if !hasnulls -> skip (uses R0 only, R3 preserved) */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
 			j_no_tuple_nulls = sljit_emit_cmp(C, SLJIT_EQUAL,
 											  SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* byte = t_bits[attnum >> 3] (uses R0, R1, R2 — R3 preserved) */
 			sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
@@ -1171,19 +1223,16 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
 						   SLJIT_MEM2(SLJIT_R1, SLJIT_R0), 0);
 
-			/* bit = 1 << (attnum & 7) */
 			sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 7);
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, 1);
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
 						   SLJIT_R2, 0, SLJIT_R1, 0);
 
-			/* if (byte & bit) -> not null */
 			sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
 						   SLJIT_R0, 0, SLJIT_R2, 0);
 			j_bit_set = sljit_emit_jump(C, SLJIT_NOT_ZERO);
 
-			/* IS NULL: tts_values[attnum] = 0, tts_isnull[attnum] = true */
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV,
@@ -1193,7 +1242,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 						   SLJIT_IMM, 1);
 
-			/* Advance attnum and loop (register-only, no stack ops) */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 1);
 			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
@@ -1204,12 +1252,10 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_set_label(j_bit_set, l_not_null);
 		}
 
-		/* ---- ALIGNMENT ---- */
-		/* R3 = desc_ptr (still live from loop top or null check) */
+		/* ALIGNMENT */
 		{
 			struct sljit_jump *j_no_align;
 
-			/* R1 = attlen, R0 = attalign (from R3 = desc_ptr) */
 			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0,
 						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attlen));
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
@@ -1218,21 +1264,17 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_no_align = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										SLJIT_R0, 0, SLJIT_IMM, 1);
 
-			/* Varlena short-header check (uses R2 scratch, R3 preserved) */
 			{
 				struct sljit_jump *j_not_varlena, *j_is_short;
 
 				j_not_varlena = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											   SLJIT_R1, 0, SLJIT_IMM, -1);
-
 				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
 							   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 				j_is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
 											SLJIT_R2, 0, SLJIT_IMM, 0);
-
 				sljit_set_label(j_not_varlena, sljit_emit_label(C));
 
-				/* TYPEALIGN: S4 = (S4 + (align-1)) & ~(align-1) */
 				sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
 							   SLJIT_R0, 0, SLJIT_IMM, 1);
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
@@ -1250,16 +1292,12 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			}
 		}
 
-		/* ---- EXTRACT VALUE ---- */
-		/* R3 = desc_ptr (still live), R1 = attlen (still live from alignment) */
+		/* EXTRACT VALUE */
 		{
 			struct sljit_jump *j_not_byval, *j_byval_done;
 
-			/* R0 = attbyval (from R3, no reload needed) */
 			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attbyval));
-
-			/* tts_isnull[attnum] = false (using S5 directly) */
 			sljit_emit_op1(C, SLJIT_MOV_U8,
 						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 						   SLJIT_IMM, 0);
@@ -1267,7 +1305,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_not_byval = sljit_emit_cmp(C, SLJIT_EQUAL,
 										 SLJIT_R0, 0, SLJIT_IMM, 0);
 
-			/* BYVAL: switch on attlen (R1, still live) */
 			{
 				struct sljit_jump *j_len1, *j_len2, *j_len4;
 				struct sljit_jump *j_s8, *j_s1, *j_s2;
@@ -1277,7 +1314,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				j_len2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 2);
 				j_len4 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 4);
 
-				/* attlen == 8 */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 							   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 				j_s8 = sljit_emit_jump(C, SLJIT_JUMP);
@@ -1296,7 +1332,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
 							   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 
-				/* Store: tts_values[attnum] = R0 (using S5 for index) */
 				l_store = sljit_emit_label(C);
 				sljit_set_label(j_s8, l_store);
 				sljit_set_label(j_s1, l_store);
@@ -1311,7 +1346,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				j_byval_done = sljit_emit_jump(C, SLJIT_JUMP);
 			}
 
-			/* NOT BYVAL: tts_values[attnum] = base + offset */
 			sljit_set_label(j_not_byval, sljit_emit_label(C));
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 						   SLJIT_S3, 0, SLJIT_S4, 0);
@@ -1324,8 +1358,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_set_label(j_byval_done, sljit_emit_label(C));
 		}
 
-		/* ---- ADVANCE OFFSET ---- */
-		/* R1 = attlen (still live from alignment, never clobbered) */
+		/* ADVANCE OFFSET */
 		{
 			struct sljit_jump *j_fixedlen, *j_varlena;
 			struct sljit_label *l_next;
@@ -1335,7 +1368,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_varlena = sljit_emit_cmp(C, SLJIT_EQUAL,
 									   SLJIT_R1, 0, SLJIT_IMM, -1);
 
-			/* CSTRING: S4 += strlen(base + S4) + 1 */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 						   SLJIT_S3, 0, SLJIT_S4, 0);
 			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
@@ -1347,14 +1379,12 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			{
 				struct sljit_jump *j_cstr_done = sljit_emit_jump(C, SLJIT_JUMP);
 
-				/* FIXED: S4 += attlen (R1 still live) */
 				sljit_set_label(j_fixedlen, sljit_emit_label(C));
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 							   SLJIT_S4, 0, SLJIT_R1, 0);
 				{
 					struct sljit_jump *j_fixed_done = sljit_emit_jump(C, SLJIT_JUMP);
 
-					/* VARLENA: S4 += varsize_any(base + S4) */
 					sljit_set_label(j_varlena, sljit_emit_label(C));
 					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 								   SLJIT_S3, 0, SLJIT_S4, 0);
@@ -1370,7 +1400,6 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			}
 		}
 
-		/* Advance attnum and loop (register-only, no stack ops) */
 		sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
 					   SLJIT_S5, 0, SLJIT_IMM, 1);
 		sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
@@ -1378,6 +1407,521 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		l_epilogue = sljit_emit_label(C);
 		sljit_set_label(j_done, l_epilogue);
 		sljit_set_label(j_avail_out, l_epilogue);
+	}
+	else
+	{
+		/* ============================================================
+		 * DISPATCH-TABLE GENERAL LOOP — local mode
+		 *
+		 * Each column maps to one of 7 specialized handlers compiled
+		 * with ALL properties as immediates.  Zero per-column metadata
+		 * reads at runtime — alignment masks, load widths, and offset
+		 * advances are baked into each handler's machine code.
+		 *
+		 * Dispatch byte per column: bits 0-6 = handler index,
+		 *                           bit 7    = nullable flag.
+		 *
+		 * ~14 instructions per not-null column vs ~30 in the
+		 * descriptor-based loop.
+		 * ============================================================ */
+		struct sljit_label *l_loop_top;
+		struct sljit_label *l_epilogue;
+		struct sljit_jump *j_done;
+		struct sljit_jump *j_is_int4 = NULL, *j_is_int8 = NULL;
+		uint8	*dispatch;
+		MemoryContext old;
+
+		/* Allocate dispatch and jump_table in TopMemoryContext */
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		dispatch = palloc(natts);
+		dispatch_jump_table = palloc(DHANDLER_COUNT * sizeof(sljit_uw));
+		MemoryContextSwitchTo(old);
+
+		/* Build dispatch array: 1 byte per column */
+		for (int i = 0; i < natts; i++)
+		{
+			CompactAttribute *att = TupleDescCompactAttr(desc, i);
+			uint8 d;
+
+			if (att->attbyval)
+			{
+				switch (att->attlen)
+				{
+					case 1: d = DHANDLER_BOOL; break;
+					case 2: d = DHANDLER_INT2; break;
+					case 4: d = DHANDLER_INT4; break;
+					case 8: d = DHANDLER_INT8; break;
+					default: d = DHANDLER_GENERIC; break;
+				}
+			}
+			else if (att->attlen == -1)
+				d = DHANDLER_VARLENA;
+			else if (att->attlen == -2)
+				d = DHANDLER_CSTRING;
+			else
+				d = DHANDLER_GENERIC;
+
+			if (!JITTER_ATT_IS_NOTNULL(att))
+				d |= DHANDLER_NULLABLE_BIT;
+
+			dispatch[i] = d;
+		}
+
+#if DEFORM_USE_REG_DISPATCH
+		/* ARM64: dispatch base in S6, loop_limit in S7 */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_S6, 0,
+					   SLJIT_IMM, (sljit_sw) dispatch);
+
+		/* S7 = min(maxatt, natts) — single loop limit register */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_S7, 0,
+					   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+		{
+			struct sljit_jump *j_maxatt_ok;
+			j_maxatt_ok = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+										 SLJIT_S7, 0, SLJIT_IMM, natts);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_S7, 0, SLJIT_IMM, natts);
+			sljit_set_label(j_maxatt_ok, sljit_emit_label(C));
+		}
+#else
+		/* x86-64: dispatch base + jump table on stack */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_DISPATCH,
+					   SLJIT_IMM, (sljit_sw) dispatch);
+
+		/* Clamp maxatt on stack: DLOFF_MAXATT = min(maxatt, natts) */
+		{
+			struct sljit_jump *j_maxatt_ok;
+			j_maxatt_ok = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+										 SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT,
+										 SLJIT_IMM, natts);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT,
+						   SLJIT_IMM, natts);
+			sljit_set_label(j_maxatt_ok, sljit_emit_label(C));
+		}
+
+		/* Store jump table base on stack */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_JUMPTBL,
+					   SLJIT_IMM, (sljit_sw) dispatch_jump_table);
+#endif
+
+		/* Bulk-clear isnull when all columns are NOT NULL */
+		if (all_notnull)
+		{
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S2, 0, SLJIT_S5, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
+			sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
+						   SLJIT_IMM, natts, SLJIT_S5, 0);
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
+							 SLJIT_IMM, (sljit_sw) memset);
+		}
+
+		/* === LOOP TOP === */
+		l_loop_top = sljit_emit_label(C);
+
+#if DEFORM_USE_REG_DISPATCH
+		/* ARM64: bounds check against S7 register, dispatch from S6 */
+		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+								SLJIT_S5, 0, SLJIT_S7, 0);
+
+		/* Load dispatch byte: R0 = S6[S5] (single indexed load) */
+		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+					   SLJIT_MEM2(SLJIT_S6, SLJIT_S5), 0);
+#else
+		/* x86-64: bounds check against stack, dispatch from stack */
+		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+								SLJIT_S5, 0,
+								SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+
+		/* Load dispatch byte: load base from stack, then index */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+					   SLJIT_MEM1(SLJIT_SP), DLOFF_DISPATCH);
+		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+					   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+#endif
+
+		/* R3 = handler index (bits 0-6) */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R0, 0, SLJIT_IMM, 0x7F);
+
+		/* === NULL CHECK === */
+		if (!all_notnull)
+		{
+			struct sljit_jump *j_not_nullable, *j_no_nulls, *j_bit_set;
+
+			/* Check bit 7 (nullable flag) — skip if column is NOT NULL */
+			sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
+						   SLJIT_R0, 0, SLJIT_IMM, DHANDLER_NULLABLE_BIT);
+			j_not_nullable = sljit_emit_jump(C, SLJIT_ZERO);
+
+			/* Column is nullable — check if tuple has nulls */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
+			j_no_nulls = sljit_emit_cmp(C, SLJIT_EQUAL,
+										SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* Bitmap check: byte = t_bits[S5 >> 3] */
+			sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
+			sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_R1, SLJIT_R0), 0);
+
+			/* bit = 1 << (S5 & 7) */
+			sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 7);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, 1);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_R2, 0, SLJIT_R1, 0);
+
+			/* if (byte & bit) → not null */
+			sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
+						   SLJIT_R0, 0, SLJIT_R2, 0);
+			j_bit_set = sljit_emit_jump(C, SLJIT_NOT_ZERO);
+
+			/* IS NULL: values[attnum] = 0, isnull[attnum] = true */
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R0), 0,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV_U8,
+						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+						   SLJIT_IMM, 1);
+
+			/* Advance attnum and loop */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+
+			/* Not null target */
+			{
+				struct sljit_label *l_not_null = sljit_emit_label(C);
+				sljit_set_label(j_not_nullable, l_not_null);
+				sljit_set_label(j_no_nulls, l_not_null);
+				sljit_set_label(j_bit_set, l_not_null);
+			}
+		}
+
+		/* === HANDLER DISPATCH: direct branches for common types ===
+		 * INT4 and INT8 cover ~40% of analytics columns.  Direct
+		 * conditional branches are well-predicted by the CPU; rare
+		 * types fall through to the jump table. */
+		j_is_int4 = sljit_emit_cmp(C, SLJIT_EQUAL,
+								   SLJIT_R3, 0, SLJIT_IMM, DHANDLER_INT4);
+		j_is_int8 = sljit_emit_cmp(C, SLJIT_EQUAL,
+								   SLJIT_R3, 0, SLJIT_IMM, DHANDLER_INT8);
+
+		/* Fallback: jump table for other types */
+#if DEFORM_USE_REG_DISPATCH
+		/* ARM64: jump table address as immediate (no stack slot needed) */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+					   SLJIT_IMM, (sljit_sw) dispatch_jump_table);
+#else
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+					   SLJIT_MEM1(SLJIT_SP), DLOFF_JUMPTBL);
+#endif
+		sljit_emit_ijump(C, SLJIT_JUMP,
+						 SLJIT_MEM2(SLJIT_R0, SLJIT_R3), SLJIT_WORD_SHIFT);
+
+		/* === HANDLER: BOOL (attlen=1, byval, align=1) === */
+		dispatch_handler_labels[DHANDLER_BOOL] = sljit_emit_label(C);
+		{
+			/* No alignment needed (align=1) */
+			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 1);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: INT2 (attlen=2, byval, align=2) === */
+		dispatch_handler_labels[DHANDLER_INT2] = sljit_emit_label(C);
+		{
+			/* Align to 2: S4 = (S4 + 1) & ~1 */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 1);
+			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)1);
+			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 2);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: INT4 (attlen=4, byval, align=4) === */
+		dispatch_handler_labels[DHANDLER_INT4] = sljit_emit_label(C);
+		if (j_is_int4)
+			sljit_set_label(j_is_int4, dispatch_handler_labels[DHANDLER_INT4]);
+		{
+			/* Align to 4: S4 = (S4 + 3) & ~3 */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)3);
+			sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 4);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: INT8 (attlen=8, byval, align=8) === */
+		dispatch_handler_labels[DHANDLER_INT8] = sljit_emit_label(C);
+		if (j_is_int8)
+			sljit_set_label(j_is_int8, dispatch_handler_labels[DHANDLER_INT8]);
+		{
+			/* Align to 8: S4 = (S4 + 7) & ~7 */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 7);
+			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)7);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 8);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: VARLENA (attlen=-1, byref, align=4) === */
+		dispatch_handler_labels[DHANDLER_VARLENA] = sljit_emit_label(C);
+		{
+			struct sljit_jump *j_is_short;
+
+			/* Short varlena check: if *(base+offset) != 0 → skip align */
+			sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+			j_is_short = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+										SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* Full varlena: align to 4 */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)3);
+
+			sljit_set_label(j_is_short, sljit_emit_label(C));
+
+			/* Store pointer: values[attnum] = base + offset */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+
+			/* Advance: S4 += varsize_any(base + offset)
+			 * R0 still = S3 + S4 from pointer store above */
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+							 SLJIT_IMM, (sljit_sw) varsize_any);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_R0, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: CSTRING (attlen=-2, byref, align=1) === */
+		dispatch_handler_labels[DHANDLER_CSTRING] = sljit_emit_label(C);
+		{
+			/* No alignment needed (align=1) */
+			/* Store pointer: values[attnum] = base + offset */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV,
+						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+						   SLJIT_R0, 0);
+			if (!all_notnull)
+				sljit_emit_op1(C, SLJIT_MOV_U8,
+							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+							   SLJIT_IMM, 0);
+
+			/* Advance: S4 += strlen(base + offset) + 1
+			 * R0 still = S3 + S4 */
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+							 SLJIT_IMM, (sljit_sw) strlen);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_R0, 0, SLJIT_IMM, 1);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+						   SLJIT_S4, 0, SLJIT_R0, 0);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 1);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+		}
+
+		/* === HANDLER: GENERIC (fixed byref, variable attlen/attalign) ===
+		 * Falls back to descriptor array for rare column types. */
+		dispatch_handler_labels[DHANDLER_GENERIC] = sljit_emit_label(C);
+		{
+			/* R3 = &descriptors[S5] */
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+						   SLJIT_R3, 0, SLJIT_IMM, (sljit_sw) descriptors);
+
+			/* R1 = attlen, R0 = attalign */
+			sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0,
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attlen));
+			sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attalign));
+
+			/* Alignment: S4 = (S4 + (align-1)) & ~(align-1)
+			 * Skip if align <= 1 */
+			{
+				struct sljit_jump *j_no_align;
+
+				j_no_align = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+											SLJIT_R0, 0, SLJIT_IMM, 1);
+
+				sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0,
+							   SLJIT_R0, 0, SLJIT_IMM, 1);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+							   SLJIT_S4, 0, SLJIT_R2, 0);
+				sljit_emit_op2(C, SLJIT_XOR, SLJIT_R2, 0,
+							   SLJIT_R2, 0, SLJIT_IMM, -1);
+				sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
+							   SLJIT_S4, 0, SLJIT_R2, 0);
+
+				sljit_set_label(j_no_align, sljit_emit_label(C));
+			}
+
+			/* Check byval for load type */
+			{
+				struct sljit_jump *j_generic_byref;
+
+				sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
+							   SLJIT_MEM1(SLJIT_R3), offsetof(DeformColDesc, attbyval));
+				j_generic_byref = sljit_emit_cmp(C, SLJIT_EQUAL,
+												 SLJIT_R0, 0, SLJIT_IMM, 0);
+
+				/* Byval: load by attlen (R1 still live) */
+				{
+					struct sljit_jump *j_gl1, *j_gl2, *j_gl4;
+					struct sljit_jump *j_gs8, *j_gs1, *j_gs2;
+					struct sljit_label *l_gstore;
+
+					j_gl1 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 1);
+					j_gl2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 2);
+					j_gl4 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 4);
+
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+					j_gs8 = sljit_emit_jump(C, SLJIT_JUMP);
+
+					sljit_set_label(j_gl1, sljit_emit_label(C));
+					sljit_emit_op1(C, SLJIT_MOV_S8, SLJIT_R0, 0,
+								   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+					j_gs1 = sljit_emit_jump(C, SLJIT_JUMP);
+
+					sljit_set_label(j_gl2, sljit_emit_label(C));
+					sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0,
+								   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+					j_gs2 = sljit_emit_jump(C, SLJIT_JUMP);
+
+					sljit_set_label(j_gl4, sljit_emit_label(C));
+					sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+								   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
+
+					l_gstore = sljit_emit_label(C);
+					sljit_set_label(j_gs8, l_gstore);
+					sljit_set_label(j_gs1, l_gstore);
+					sljit_set_label(j_gs2, l_gstore);
+
+					sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+								   SLJIT_S5, 0, SLJIT_IMM, 3);
+					sljit_emit_op1(C, SLJIT_MOV,
+								   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+								   SLJIT_R0, 0);
+					if (!all_notnull)
+						sljit_emit_op1(C, SLJIT_MOV_U8,
+									   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+									   SLJIT_IMM, 0);
+
+					/* Advance offset by attlen */
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+								   SLJIT_S4, 0, SLJIT_R1, 0);
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+								   SLJIT_S5, 0, SLJIT_IMM, 1);
+					sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+				}
+
+				/* Byref: store pointer, advance by attlen */
+				sljit_set_label(j_generic_byref, sljit_emit_label(C));
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op1(C, SLJIT_MOV,
+							   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
+							   SLJIT_R0, 0);
+				if (!all_notnull)
+					sljit_emit_op1(C, SLJIT_MOV_U8,
+								   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
+								   SLJIT_IMM, 0);
+
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+							   SLJIT_S4, 0, SLJIT_R1, 0);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 1);
+				sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+			}
+		}
+
+		/* === EPILOGUE === */
+		l_epilogue = sljit_emit_label(C);
+		sljit_set_label(j_done, l_epilogue);
 	}
 
 	/* ============================================================
@@ -1421,6 +1965,14 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 	if (code && code_size_out)
 		*code_size_out = sljit_get_generated_code_size(C);
+
+	/* Patch dispatch jump table with actual handler addresses */
+	if (code && dispatch_jump_table)
+	{
+		int i;
+		for (i = 0; i < DHANDLER_COUNT; i++)
+			dispatch_jump_table[i] = sljit_get_label_addr(dispatch_handler_labels[i]);
+	}
 
 	sljit_free_compiler(C);
 

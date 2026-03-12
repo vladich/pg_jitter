@@ -65,7 +65,7 @@ TABLES_NEEDED=$(psql_cmd -t -A -c "
 SELECT string_agg(t, ',') FROM (VALUES
     ('bench_data'),('join_left'),('join_right'),('date_data'),
     ('text_data'),('numeric_data'),('jsonb_data'),('array_data'),
-    ('ultra_wide')
+    ('ultra_wide'),('json_text_bench')
 ) AS v(t)
 WHERE NOT EXISTS (
     SELECT 1 FROM pg_class c
@@ -83,6 +83,24 @@ if [ -n "$TABLES_NEEDED" ]; then
     echo "Setup complete."
 else
     echo "All tables present."
+fi
+
+# Super-wide tables (100/300/1000 columns)
+WIDE_NEEDED=$(psql_cmd -t -A -c "
+SELECT string_agg(t, ',') FROM (VALUES
+    ('wide_100'),('wide_300'),('wide_1000')
+) AS v(t)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = v.t AND n.nspname = 'public'
+      AND c.relkind = 'r'
+);")
+
+if [ -n "$WIDE_NEEDED" ]; then
+    echo "Creating wide tables: $WIDE_NEEDED"
+    psql_cmd -q -f "$SCRIPT_DIR/bench_setup_wide.sql" 2>&1 | grep -E "NOTICE|ERROR" || true
+    echo "Wide table setup complete."
 fi
 
 # Ensure the SQL function exists
@@ -148,17 +166,29 @@ echo ""
 # ================================================================
 # Query execution helpers
 # ================================================================
-get_exec_time() {
-    local query="$1"
-    local jit_on="$2"
-    local backend="$3"
+
+median() {
+    # Read N values, sort, return middle
+    local vals=("$@")
+    local n=${#vals[@]}
+    local sorted=($(printf '%s\n' "${vals[@]}" | sort -g))
+    echo "${sorted[$((n / 2))]}"
+}
+
+# Generate a SQL script that runs ALL queries in a single connection.
+# Each query gets 1 warmup + NRUNS timed runs.
+# Output is parseable: BENCH_RESULT|<query_index>|<run_index>|<exec_time_ms>
+generate_bench_sql() {
+    local jit_on="$1"
+    local backend="$2"
     local set_backend=""
 
     if [ "$META_MODE" -eq 1 ] && [ "$backend" != "interp" ]; then
         set_backend="SET pg_jitter.backend = '$backend';"
     fi
 
-    psql_cmd -t -A -c "
+    cat <<EOSQL
+-- Session-wide settings (single connection for all queries)
 SET jit = $jit_on;
 SET jit_above_cost = 0;
 SET jit_inline_above_cost = 0;
@@ -167,16 +197,96 @@ SET enable_mergejoin = off;
 SET enable_nestloop = off;
 SET max_parallel_workers_per_gather = 0;
 $set_backend
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON) $query;
-" 2>/dev/null | grep "Execution Time" | sed 's/.*Execution Time: //' | sed 's/ ms//'
+
+-- Warmup buffer cache inside this connection
+SELECT COUNT(*) FROM bench_data;
+SELECT COUNT(*) FROM join_left;
+SELECT COUNT(*) FROM join_right;
+SELECT COUNT(*) FROM date_data;
+SELECT COUNT(*) FROM text_data;
+SELECT COUNT(*) FROM numeric_data;
+SELECT COUNT(*) FROM array_data;
+SELECT COUNT(*) FROM ultra_wide;
+SELECT COUNT(*) FROM jsonb_data;
+SELECT COUNT(*) FROM part_data;
+SELECT COUNT(*) FROM json_text_bench;
+SELECT COUNT(*) FROM composite_data;
+SELECT COUNT(*) FROM wide_100;
+SELECT COUNT(*) FROM wide_300;
+SELECT COUNT(*) FROM wide_1000;
+
+CREATE OR REPLACE FUNCTION pg_temp.bench_query(qidx int, query_text text, nruns int)
+RETURNS SETOF text LANGUAGE plpgsql AS \$\$
+DECLARE
+    t_start timestamptz;
+    t_end   timestamptz;
+    r       int;
+    dummy   record;
+    et      float8;
+    line    text;
+BEGIN
+    -- Warmup: execute once via EXPLAIN ANALYZE (result discarded)
+    FOR dummy IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON) ' || query_text LOOP
+        NULL;
+    END LOOP;
+    -- Timed runs: use EXPLAIN ANALYZE to get accurate execution time
+    -- This avoids plpgsql row-iteration overhead for large result sets
+    FOR r IN 1..nruns LOOP
+        et := NULL;
+        FOR dummy IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY ON) ' || query_text LOOP
+            line := dummy."QUERY PLAN";
+            IF line LIKE '%Execution Time:%' THEN
+                et := replace(replace(split_part(line, 'Execution Time: ', 2), ' ms', ''), ' ', '')::float8;
+            END IF;
+        END LOOP;
+        IF et IS NOT NULL THEN
+            RETURN NEXT 'BENCH_RESULT|' || qidx || '|' || r || '|' || round(et::numeric, 3);
+        END IF;
+    END LOOP;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NEXT 'BENCH_ERROR|' || qidx || '|' || SQLERRM;
+END;
+\$\$;
+
+EOSQL
+
+    for qi in $(seq 0 $((NQUERIES - 1))); do
+        local query="${QUERIES[$qi]}"
+        # Escape single quotes for SQL string literal (sed handles it correctly)
+        local escaped_query
+        escaped_query=$(echo "$query" | sed "s/'/''/g")
+        echo "SELECT pg_temp.bench_query($qi, '${escaped_query}', $NRUNS);"
+    done
 }
 
-median() {
-    # Read N values, sort, return middle
-    local vals=("$@")
-    local n=${#vals[@]}
-    local sorted=($(printf '%s\n' "${vals[@]}" | sort -g))
-    echo "${sorted[$((n / 2))]}"
+# Run a backend benchmark: generate SQL, execute in one connection, parse results
+run_backend_bench() {
+    local jit_on="$1"
+    local backend="$2"
+    local bname="$3"
+    local sql_file="$TMPDIR/${bname}_bench.sql"
+    local raw_file="$TMPDIR/${bname}_raw.txt"
+
+    generate_bench_sql "$jit_on" "$backend" > "$sql_file"
+
+    # Execute entire script in a single psql connection
+    psql_cmd -t -A -f "$sql_file" > "$raw_file" 2>/dev/null
+
+    # Parse results: BENCH_RESULT|qi|run|time_ms
+    for qi in $(seq 0 $((NQUERIES - 1))); do
+        local times=()
+        while IFS='|' read -r tag idx run ms; do
+            times+=("$ms")
+        done < <(grep "^BENCH_RESULT|${qi}|" "$raw_file")
+
+        if [ ${#times[@]} -eq 0 ]; then
+            echo "CRASH" > "$TMPDIR/${bname}_${qi}.txt"
+        else
+            local m
+            m=$(median "${times[@]}")
+            echo "$m" > "$TMPDIR/${bname}_${qi}.txt"
+        fi
+    done
 }
 
 # ================================================================
@@ -262,6 +372,24 @@ add_query "JSONB_extract"       "SELECT SUM((doc->>'a')::int) FROM jsonb_data"
 add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE doc @> '{\"a\": 42}'"
 add_query "JSONB_agg"           "SELECT grp_jsonb, COUNT(*), SUM((doc->>'a')::int) FROM jsonb_data GROUP BY grp_jsonb"
 
+# --- JSON Text Parsing (simdjson) ---
+add_section "JSON Text Parsing (simdjson)"
+# IS JSON validation on text (EEOP_IS_JSON intercept)
+add_query "IS_JSON_text"        "SELECT COUNT(*) FROM json_text_bench WHERE doc IS JSON"
+add_query "IS_JSON_OBJECT"      "SELECT COUNT(*) FROM json_text_bench WHERE doc IS JSON OBJECT"
+# text → json cast (EEOP_IOCOERCE → json_in intercept)
+add_query "Cast_text_json"      "SELECT COUNT(*) FROM json_text_bench WHERE doc::json IS NOT NULL"
+# text → jsonb cast (EEOP_IOCOERCE → jsonb_in intercept)
+add_query "Cast_text_jsonb"     "SELECT COUNT(*) FROM json_text_bench WHERE doc::jsonb IS NOT NULL"
+# text → jsonb + extract field
+add_query "Cast_jsonb_extract"  "SELECT SUM((doc::jsonb->>'id')::int) FROM json_text_bench"
+# text → jsonb + containment check
+add_query "Cast_jsonb_contains" "SELECT COUNT(*) FROM json_text_bench WHERE doc::jsonb @> '{\"active\": true}'"
+# text → jsonb + aggregation by tier
+add_query "Cast_jsonb_grp_agg"  "SELECT tier, COUNT(*), SUM((doc::jsonb->>'id')::int) FROM json_text_bench GROUP BY tier"
+# large payloads only (tier=2, ~350B) — maximizes simdjson benefit
+add_query "Cast_jsonb_large"    "SELECT COUNT(*), SUM((doc::jsonb->>'id')::int) FROM json_text_bench WHERE tier = 2"
+
 # --- Arrays ---
 add_section "Arrays"
 add_query "Array_overlap"       "SELECT COUNT(*) FROM array_data WHERE tags && ARRAY[1,2,3,4,5]"
@@ -279,6 +407,53 @@ add_section "Partitioned"
 add_query "PartScan_filter"     "SELECT COUNT(*), SUM(val) FROM part_data WHERE grp BETWEEN 10 AND 30"
 add_query "PartScan_agg_all"    "SELECT grp, COUNT(*), SUM(val) FROM part_data GROUP BY grp"
 
+# --- SQL Value Functions (inlined) ---
+add_section "SQL Value Functions"
+add_query "CURRENT_DATE_filter"      "SELECT COUNT(*) FROM date_data WHERE d < CURRENT_DATE"
+add_query "CURRENT_TIMESTAMP_expr"   "SELECT COUNT(*) FROM date_data WHERE ts < CURRENT_TIMESTAMP"
+add_query "LOCALTIMESTAMP_diff"      "SELECT SUM(EXTRACT(epoch FROM LOCALTIMESTAMP - ts)) FROM date_data WHERE id <= 100000"
+
+# --- Array Construction (inlined for fixed-width by-val) ---
+add_section "Array Construction"
+add_query "ArrayExpr_int3"      "SELECT ARRAY[val1, val2, val3] FROM bench_data WHERE id <= 200000"
+add_query "ArrayExpr_int5"      "SELECT ARRAY[val1, val2, val3, val4, val5] FROM bench_data WHERE id <= 200000"
+add_query "ArrayExpr_text"      "SELECT ARRAY[txt, grp::text] FROM bench_data WHERE id <= 200000"
+
+# --- Field Selection (inlined null check) ---
+add_section "Field Selection"
+add_query "FieldSelect_int"     "SELECT SUM((rec).a) FROM composite_data"
+add_query "FieldSelect_multi"   "SELECT SUM((rec).a + (rec).b) FROM composite_data"
+
+# --- Super-Wide Tables (100/300/1000 columns) ---
+# These test JIT deform performance on realistic wide schemas
+# Column patterns: every 10th column pair is integer (c00x7, c00x8)
+add_section "Super-Wide Deform"
+
+# 100-column table (500K rows): sum early int cols (c0007+c0008)
+add_query "Wide100_early2"      "SELECT SUM(c0007+c0008) FROM wide_100"
+# 100-column table: sum int cols across full width
+add_query "Wide100_span10"      "SELECT SUM(c0007+c0018+c0028+c0038+c0048+c0058+c0068+c0078+c0088+c0098) FROM wide_100"
+# 100-column table: access last column (grp is col 102, forces full deform)
+add_query "Wide100_last"        "SELECT SUM(grp) FROM wide_100"
+# 100-column table: GroupBy on last column
+add_query "Wide100_grpby"       "SELECT grp, COUNT(*), SUM(c0007+c0048+c0098) FROM wide_100 GROUP BY grp"
+
+# 300-column table (200K rows): sum early cols
+add_query "Wide300_early2"      "SELECT SUM(c0007+c0008) FROM wide_300"
+# 300-column table: span across full width
+add_query "Wide300_span10"      "SELECT SUM(c0007+c0058+c0108+c0158+c0208+c0258+c0298) FROM wide_300"
+# 300-column table: access last column (grp is col 302)
+add_query "Wide300_last"        "SELECT SUM(grp) FROM wide_300"
+
+# 1000-column table (100K rows): sum early cols
+add_query "Wide1000_early2"     "SELECT SUM(c0007+c0008) FROM wide_1000"
+# 1000-column table: span across full width
+add_query "Wide1000_span10"     "SELECT SUM(c0007+c0108+c0208+c0308+c0408+c0508+c0608+c0708+c0808+c0908) FROM wide_1000"
+# 1000-column table: access last column (grp is col 1002, forces deform of all 1000 cols)
+add_query "Wide1000_last"       "SELECT SUM(grp) FROM wide_1000"
+# 1000-column table: GroupBy on last column
+add_query "Wide1000_grpby"      "SELECT grp, COUNT(*), SUM(c0007+c0508+c0998) FROM wide_1000 GROUP BY grp"
+
 NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""
@@ -294,25 +469,30 @@ SELECT COUNT(*) FROM join_right; SELECT COUNT(*) FROM date_data;
 SELECT COUNT(*) FROM text_data; SELECT COUNT(*) FROM numeric_data;
 SELECT COUNT(*) FROM array_data; SELECT COUNT(*) FROM ultra_wide;
 SELECT COUNT(*) FROM jsonb_data; SELECT COUNT(*) FROM part_data;
+SELECT COUNT(*) FROM json_text_bench;
+SELECT COUNT(*) FROM composite_data;
+SELECT COUNT(*) FROM wide_100;
+SELECT COUNT(*) FROM wide_300;
+SELECT COUNT(*) FROM wide_1000;
 " > /dev/null 2>&1
 echo ""
 
 # ================================================================
-# Run all queries per backend
+# Run all queries per backend (single connection per backend)
 # ================================================================
 for bi in "${!BACKENDS[@]}"; do
     backend="${BACKENDS[$bi]}"
     bname="${NAMES[$bi]}"
 
     if [ "$backend" = "interp" ]; then
-        echo "Running $bname (jit=off)..."
+        echo -n "Running $bname (jit=off, single connection)..."
         jit_on="off"
     elif [ "$META_MODE" -eq 1 ]; then
-        echo "Running $bname (SET pg_jitter.backend)..."
+        echo -n "Running $bname (single connection)..."
         jit_on="on"
     else
         # Fallback: ALTER SYSTEM + restart (when not using meta-provider)
-        echo "Switching to $bname (ALTER SYSTEM + restart)..."
+        echo -n "Switching to $bname (ALTER SYSTEM + restart)..."
         ensure_pg_running
         psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
         "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
@@ -320,48 +500,7 @@ for bi in "${!BACKENDS[@]}"; do
         jit_on="on"
     fi
 
-    crash_count=0
-    for qi in $(seq 0 $((NQUERIES - 1))); do
-        if [ "$crash_count" -ge 3 ]; then
-            echo ""
-            echo "  Backend $bname crashed 3+ times, skipping remaining queries."
-            for rqi in $(seq "$qi" $((NQUERIES - 1))); do
-                echo "CRASH" >> "$TMPDIR/${bname}_${rqi}.txt"
-            done
-            break
-        fi
-
-        query="${QUERIES[$qi]}"
-        ensure_pg_running
-
-        # Warmup run
-        get_exec_time "$query" "$jit_on" "$backend" > /dev/null 2>&1
-        ensure_pg_running
-
-        # Timed runs
-        times=()
-        for r in $(seq 1 "$NRUNS"); do
-            t=$(get_exec_time "$query" "$jit_on" "$backend")
-            times+=("$t")
-        done
-
-        # Check for crash (all empty)
-        all_empty=1
-        for t in "${times[@]}"; do
-            [ -n "$t" ] && all_empty=0
-        done
-
-        if [ "$all_empty" -eq 1 ]; then
-            m="CRASH"
-            crash_count=$((crash_count + 1))
-            ensure_pg_running
-        else
-            m=$(median "${times[@]}")
-        fi
-
-        echo "$m" >> "$TMPDIR/${bname}_${qi}.txt"
-        printf "."
-    done
+    run_backend_bench "$jit_on" "$backend" "$bname"
     echo " done."
 done
 

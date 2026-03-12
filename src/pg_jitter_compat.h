@@ -141,6 +141,15 @@ jitter_attalign_to_int(char align)
 #endif
 
 /* ----------------------------------------------------------------
+ * INSTR_TIME_GET_NANOSEC — added in PG16.
+ * On PG14-15, derive from INSTR_TIME_GET_MICROSEC.
+ * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM < 160000
+#include "portability/instr_time.h"
+#define INSTR_TIME_GET_NANOSEC(t)  (INSTR_TIME_GET_MICROSEC(t) * 1000)
+#endif
+
+/* ----------------------------------------------------------------
  * pg_file_exists — added in PG17.  On older versions, use access().
  * ---------------------------------------------------------------- */
 #if PG_VERSION_NUM < 170000

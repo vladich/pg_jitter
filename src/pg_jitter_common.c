@@ -2146,30 +2146,22 @@ int pg_jitter_deform_threshold(void) {
  * crossover depends on per-tuple iteration cost, which scales with
  * the number of columns and is bounded by data-cache capacity.
  *
- * Architecture-specific limits (benchmarked):
+ * The dispatch-table general loop uses a 1-byte dispatch array
+ * (vs 8-byte descriptors) and specialized handlers with all
+ * properties as compile-time immediates.  Benchmarks at 1000 cols:
+ *   Wide1000_last: JIT 112ms vs interpreter 109ms (3% slower)
+ *   Wide1000_grpby: JIT 116ms vs interpreter 111ms (4% slower)
  *
- *   ARM64 (Apple M1–M3)     — 64 KB L1D, 192 KB L1I
- *     L1D / 128 = 512 columns.  Benchmarks show 300-col tables
- *     are 1.3× faster with JIT deform; 1000-col is 1.5× slower.
+ * The crossover is around 700-800 columns.  We set the limit at
+ * ~680 to safely cover 300-col tables with margin.
  *
- *   ARM64 (Apple M4+)       — 128 KB L1D, 192 KB L1I
- *     L1D / 128 = 1024 columns.  Larger L1D pushes the crossover
- *     higher — 1000-col tables should benefit.
+ * Architecture-specific limits:
  *
- *   ARM64 (Graviton 2/3, Ampere Altra) — 64 KB L1D
- *     L1D / 128 = 512 columns.
- *
- *   ARM64 (AmpereOne)       — 64 KB L1D, 16 KB L1I
- *     L1D / 128 = 512 columns.  Same L1D as Altra despite the
- *     much smaller L1I (which affects unrolled threshold, not this).
- *
- *   x86-64 (Skylake, Zen 3) — 32 KB L1D, 32 KB L1I
- *     L1D / 64 = 512 columns.  x86 has higher per-iteration
- *     overhead (variable-length encoding, fewer registers) so
- *     we use a smaller divisor to keep the limit reasonable.
- *
- *   x86-64 (Ice Lake+, Zen 4+) — 48 KB L1D, 32 KB L1I
- *     L1D / 64 = 768 columns.
+ *   ARM64 (Apple M1–M3)     — 64 KB L1D → 682.
+ *   ARM64 (Apple M4+)       — 128 KB L1D → 1365.
+ *   ARM64 (Graviton 2/3)    — 64 KB L1D → 682.
+ *   x86-64 (Skylake, Zen 3) — 32 KB L1D → 682.
+ *   x86-64 (Ice Lake+, Zen 4+) — 48 KB L1D → 1024.
  */
 int pg_jitter_wide_deform_limit(void) {
   static int limit = 0;
@@ -2211,24 +2203,24 @@ int pg_jitter_wide_deform_limit(void) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     /*
      * ARM64: efficient fixed-width instructions, generous caches.
-     * Apple M1-M3: 64 KB → 512,  M4+: 128 KB → 1024.
-     * Graviton: 64 KB → 512.
+     * Apple M1-M3: 64 KB → 682,  M4+: 128 KB → 1365.
+     * Graviton: 64 KB → 682.
      */
     if (l1d_size <= 0)
       l1d_size = 65536;           /* assume 64 KB if detection fails */
-    limit = l1d_size / 128;
+    limit = l1d_size / 96;
 #elif defined(__x86_64__) || defined(_M_X64)
     /*
      * x86-64: variable-length encoding, more register pressure.
-     * Skylake/Zen3: 32 KB → 512,  Ice Lake/Zen4+: 48 KB → 768.
+     * Skylake/Zen3: 32 KB → 682,  Ice Lake/Zen4+: 48 KB → 1024.
      */
     if (l1d_size <= 0)
       l1d_size = 32768;           /* assume 32 KB if detection fails */
-    limit = l1d_size / 64;
+    limit = l1d_size / 48;
 #else
     if (l1d_size <= 0)
       l1d_size = 32768;
-    limit = l1d_size / 128;
+    limit = l1d_size / 96;
 #endif
 
     if (limit < 100)

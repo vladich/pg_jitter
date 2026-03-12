@@ -327,5 +327,106 @@ END $$;
 
 ANALYZE text_long;
 
+-- ════════════════════════════════════════════════════════════════════
+-- JSON text parsing benchmark table (simdjson acceleration)
+-- ════════════════════════════════════════════════════════════════════
+
+-- json_text_bench: 500K rows of JSON stored as TEXT
+-- Payloads range from ~120 to ~350+ bytes, well above the 64-byte simdjson threshold.
+-- Three payload tiers exercise different parsing complexity:
+--   small (~120B): flat object, 4 fields
+--   medium (~200B): nested object + small array
+--   large (~350B): deep nesting + larger array + more fields
+CREATE TABLE IF NOT EXISTS json_text_bench (
+    id   integer,
+    doc  text,        -- JSON stored as text (the simdjson target)
+    tier smallint     -- 0=small, 1=medium, 2=large
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM json_text_bench LIMIT 1) THEN
+        RAISE NOTICE 'Populating json_text_bench (500K rows, 120-350B JSON text)...';
+        INSERT INTO json_text_bench
+        SELECT i,
+               CASE (i % 3)
+               WHEN 0 THEN
+                   /* ~120 bytes: flat object */
+                   jsonb_build_object(
+                       'id', i,
+                       'name', 'user_' || i,
+                       'hash', md5(i::text),
+                       'score', (i % 10000) * 1.5
+                   )::text
+               WHEN 1 THEN
+                   /* ~200 bytes: nested object + array */
+                   jsonb_build_object(
+                       'id', i,
+                       'profile', jsonb_build_object(
+                           'name', 'user_' || i,
+                           'email', 'u' || i || '@test.com',
+                           'level', i % 100
+                       ),
+                       'tags', jsonb_build_array('t1', 't2', 't3', 't4'),
+                       'active', (i % 2 = 0)
+                   )::text
+               ELSE
+                   /* ~350 bytes: deep nesting + larger array */
+                   jsonb_build_object(
+                       'id', i,
+                       'profile', jsonb_build_object(
+                           'name', 'user_' || i,
+                           'email', 'u' || i || '@example.com',
+                           'address', jsonb_build_object(
+                               'city', 'city_' || (i % 500),
+                               'zip', 10000 + (i % 90000)
+                           )
+                       ),
+                       'scores', jsonb_build_array(
+                           i % 100, (i*3) % 100, (i*7) % 100,
+                           (i*11) % 100, (i*13) % 100
+                       ),
+                       'meta', jsonb_build_object(
+                           'created', '2025-01-01',
+                           'version', i % 10,
+                           'hash', md5(i::text)
+                       )
+                   )::text
+               END,
+               (i % 3)::smallint
+        FROM generate_series(1, 500000) i;
+    END IF;
+END $$;
+
+ANALYZE json_text_bench;
+
+-- ════════════════════════════════════════════════════════════════════
+-- Composite type benchmark table (FIELDSELECT opcode)
+-- ════════════════════════════════════════════════════════════════════
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'bench_composite') THEN
+        CREATE TYPE bench_composite AS (a int, b int, c text);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS composite_data (
+    id  integer,
+    rec bench_composite
+);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM composite_data LIMIT 1) THEN
+        RAISE NOTICE 'Populating composite_data (500K rows)...';
+        INSERT INTO composite_data
+        SELECT i, ROW(i, i*2, 'val_' || i)::bench_composite
+        FROM generate_series(1, 500000) i;
+    END IF;
+END $$;
+
+ANALYZE composite_data;
+
 \echo 'Extra setup complete.'
 \timing off

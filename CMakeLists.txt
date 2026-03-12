@@ -231,6 +231,36 @@ if(WITH_VECTORSCAN AND NOT WIN32)
     endif()
 endif()
 
+# ---------- simdjson (optional, C++ static library) ----------
+set(SIMDJSON_DIR "${CMAKE_SOURCE_DIR}/../simdjson/singleheader" CACHE PATH
+    "Path to simdjson singleheader directory")
+option(WITH_SIMDJSON "Enable simdjson SIMD JSON parsing acceleration" ON)
+
+set(PG_JITTER_HAVE_SIMDJSON OFF)
+if(WITH_SIMDJSON)
+    set(_sj_hdr "${SIMDJSON_DIR}/simdjson.h")
+    set(_sj_cpp "${SIMDJSON_DIR}/simdjson.cpp")
+    if(EXISTS "${_sj_hdr}" AND EXISTS "${_sj_cpp}")
+        set(PG_JITTER_HAVE_SIMDJSON ON)
+        add_library(simdjson_lib STATIC
+            ${_sj_cpp}
+            src/pg_jitter_simdjson.cpp)
+        target_include_directories(simdjson_lib PRIVATE
+            ${SIMDJSON_DIR} ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR}
+            src ${PG_EXTRA_INCLUDE_DIRS})
+        set_target_properties(simdjson_lib PROPERTIES
+            CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(simdjson_lib PRIVATE PG_JITTER_HAVE_SIMDJSON)
+        # simdjson MUST be compiled with optimization — without inlining,
+        # the tiny SIMD helper functions become real calls and performance
+        # drops 20x below PG's native byte-by-byte parser.
+        target_compile_options(simdjson_lib PRIVATE -w -O2)
+        message(STATUS "simdjson:           ${_sj_hdr}")
+    else()
+        message(STATUS "simdjson:           not found at ${SIMDJSON_DIR}")
+    endif()
+endif()
+
 
 # ==========================================================================
 # Pre-compilation infrastructure (LLVM / c2mir)
@@ -275,6 +305,26 @@ function(pg_jitter_configure_target TARGET_NAME)
         target_link_libraries(${TARGET_NAME} PRIVATE vectorscan_lib)
         if(LIBCXX)
             target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
+        endif()
+    endif()
+    if(PG_JITTER_HAVE_SIMDJSON)
+        target_include_directories(${TARGET_NAME} PRIVATE ${SIMDJSON_DIR})
+        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_SIMDJSON)
+        target_link_libraries(${TARGET_NAME} PRIVATE simdjson_lib)
+        if(LIBCXX)
+            target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
+        endif()
+        # Force linker to keep simdjson symbols (referenced by JIT at runtime)
+        if(APPLE)
+            target_link_options(${TARGET_NAME} PRIVATE
+                -Wl,-u,_pg_jitter_sj_is_json_datum
+                -Wl,-u,_pg_jitter_sj_json_in
+                -Wl,-u,_pg_jitter_sj_jsonb_in)
+        elseif(UNIX)
+            target_link_options(${TARGET_NAME} PRIVATE
+                -Wl,-u,pg_jitter_sj_is_json_datum
+                -Wl,-u,pg_jitter_sj_json_in
+                -Wl,-u,pg_jitter_sj_jsonb_in)
         endif()
     endif()
     if(WIN32)
@@ -380,3 +430,9 @@ foreach(_tgt ${PG_JITTER_TARGETS})
     # $<TARGET_FILE:...> resolves to the full path of the built shared library.
     install(FILES $<TARGET_FILE:${_tgt}> DESTINATION ${PG_JITTER_INSTALL_DIR})
 endforeach()
+
+# Install SQL function definitions
+execute_process(COMMAND ${PG_CONFIG} --sharedir
+    OUTPUT_VARIABLE PG_SHAREDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+install(FILES ${CMAKE_SOURCE_DIR}/sql/pg_jitter_functions.sql
+    DESTINATION ${PG_SHAREDIR}/pg_jitter)

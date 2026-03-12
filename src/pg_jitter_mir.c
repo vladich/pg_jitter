@@ -22,10 +22,18 @@
 #include "pg_jit_funcs.h"
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
+#include "pg_jitter_simdjson.h"
 #include "utils/fmgrprotos.h"
 #include "pg_jitter_vectorscan.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/primnodes.h"
 #include "mb/pg_wchar.h"
 #include "catalog/pg_collation_d.h"
+#include "utils/date.h"
+#include "utils/timestamp.h"
+#include "nodes/miscnodes.h"
+#include "commands/sequence.h"
+#include "funcapi.h"
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <libkern/OSCacheControl.h>
@@ -764,6 +772,77 @@ static bool mir_compile_expr(ExprState *state) {
   proto_agg_helper =
       MIR_new_proto(ctx, "p_aggh", 0, NULL, 2, MIR_T_P, "s", MIR_T_P, "o");
 
+  /* Proto for SVF: int32 fn(void) — for GetSQLCurrentDate */
+  MIR_item_t proto_svf_i32_void;
+  {
+    MIR_type_t rt_i32 = MIR_T_I32;
+    proto_svf_i32_void =
+        MIR_new_proto(ctx, "p_svfi32v", 1, &rt_i32, 0);
+  }
+
+  /* Proto for SVF: int64 fn(int32) — for GetSQLCurrentTime/Timestamp etc. */
+  MIR_item_t proto_svf_i64_i32;
+  {
+    MIR_type_t rt_i64 = MIR_T_I64;
+    proto_svf_i64_i32 =
+        MIR_new_proto(ctx, "p_svfi64i32", 1, &rt_i64, 1, MIR_T_I32, "tm");
+  }
+
+  /* Proto for palloc: void* fn(Size) — for ARRAYEXPR inline */
+  MIR_item_t proto_palloc;
+  {
+    MIR_type_t rt_p = MIR_T_P;
+    proto_palloc =
+        MIR_new_proto(ctx, "p_palloc", 1, &rt_p, 1, MIR_T_I64, "sz");
+  }
+  MIR_item_t import_palloc = MIR_new_import(ctx, "palloc_fn");
+
+  /* Proto for nextval_internal: int64 fn(int32 seqid, int32 check_perms) */
+  MIR_item_t proto_nextval;
+  {
+    MIR_type_t rt_i64 = MIR_T_I64;
+    proto_nextval =
+        MIR_new_proto(ctx, "p_nextval", 1, &rt_i64, 2, MIR_T_I32, "sid", MIR_T_I32, "cp");
+  }
+
+  /* Proto for heap_form_tuple: void* fn(void* tupdesc, void* vals, void* nulls) */
+  MIR_item_t proto_hft;
+  {
+    MIR_type_t rt_p = MIR_T_P;
+    proto_hft =
+        MIR_new_proto(ctx, "p_hft", 1, &rt_p, 3, MIR_T_P, "td", MIR_T_P, "v", MIR_T_P, "n");
+  }
+
+  /* Proto for HeapTupleHeaderGetDatum: Datum fn(void* tuple_header) */
+  MIR_item_t proto_htgd;
+  {
+    MIR_type_t rt_p = MIR_T_P;
+    proto_htgd =
+        MIR_new_proto(ctx, "p_htgd", 1, &rt_p, 1, MIR_T_P, "th");
+  }
+
+  MIR_item_t import_nextval = MIR_new_import(ctx, "nextval_fn");
+  MIR_item_t import_hft = MIR_new_import(ctx, "hft_fn");
+  MIR_item_t import_htgd = MIR_new_import(ctx, "htgd_fn");
+
+#ifdef PG_JITTER_HAVE_SIMDJSON
+  /* Proto for simdjson IS_JSON: (Datum, int32) -> int32 */
+  MIR_item_t proto_sj_is_json;
+  {
+    MIR_type_t rt32 = MIR_T_I32;
+    proto_sj_is_json = MIR_new_proto(ctx, "p_sjisj", 1, &rt32, 2,
+                                      MIR_T_I64, "datum", MIR_T_I32, "itype");
+  }
+
+  /* Proto for simdjson json_in/jsonb_in: (Datum, FunctionCallInfo) -> Datum */
+  MIR_item_t proto_sj_json_in;
+  {
+    MIR_type_t rt64 = MIR_T_I64;
+    proto_sj_json_in = MIR_new_proto(ctx, "p_sjjin", 1, &rt64, 2,
+                                      MIR_T_I64, "cstr", MIR_T_P, "fci");
+  }
+#endif
+
 #ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
   /* Proto + imports for presorted distinct: fn(AggState*, AggStatePerTrans) ->
    * bool */
@@ -776,6 +855,12 @@ static bool mir_compile_expr(ExprState *state) {
   }
   import_presorted_single = MIR_new_import(ctx, "pdist_single");
   import_presorted_multi = MIR_new_import(ctx, "pdist_multi");
+#endif
+
+#ifdef PG_JITTER_HAVE_SIMDJSON
+  MIR_item_t import_sj_is_json = MIR_new_import(ctx, "sj_is_json");
+  MIR_item_t import_sj_json_in = MIR_new_import(ctx, "sj_json_in");
+  MIR_item_t import_sj_jsonb_in = MIR_new_import(ctx, "sj_jsonb_in");
 #endif
 
   /* Proto for 3-arg void calls: fn(state, op, econtext) -> void */
@@ -960,7 +1045,7 @@ static bool mir_compile_expr(ExprState *state) {
 #ifdef HAVE_EEOP_PARAM_SET
              opcode == EEOP_PARAM_SET ||
 #endif
-             opcode == EEOP_ARRAYCOERCE || opcode == EEOP_FIELDSELECT ||
+             opcode == EEOP_ARRAYCOERCE ||
              opcode == EEOP_FIELDSTORE_DEFORM ||
              opcode == EEOP_FIELDSTORE_FORM || opcode == EEOP_CONVERT_ROWTYPE ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
@@ -975,13 +1060,9 @@ static bool mir_compile_expr(ExprState *state) {
              opcode == EEOP_SUBPLAN || opcode == EEOP_WHOLEROW ||
              opcode == EEOP_AGG_ORDERED_TRANS_DATUM ||
              opcode == EEOP_AGG_ORDERED_TRANS_TUPLE ||
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-             opcode == EEOP_IOCOERCE_SAFE ||
-#endif
              /* SCALARARRAYOP uses dedicated inline with separate imports */
-             opcode == EEOP_SQLVALUEFUNCTION ||
              opcode == EEOP_CURRENTOFEXPR || opcode == EEOP_NEXTVALUEEXPR ||
-             opcode == EEOP_ARRAYEXPR || opcode == EEOP_ROW ||
+             opcode == EEOP_ROW ||
              opcode == EEOP_MINMAX || opcode == EEOP_DOMAIN_NOTNULL ||
              opcode == EEOP_DOMAIN_CHECK || opcode == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
@@ -995,7 +1076,43 @@ static bool mir_compile_expr(ExprState *state) {
       char name[32];
       snprintf(name, sizeof(name), "dc_%d", i);
       step_fn_imports[i] = MIR_new_import(ctx, name);
-    } else if (opcode == EEOP_INNER_SYSVAR || opcode == EEOP_OUTER_SYSVAR ||
+    }
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+    else if (opcode == EEOP_IOCOERCE_SAFE) {
+      /* Two separate imports for output and input functions (like IOCOERCE) */
+      char name[32];
+      snprintf(name, sizeof(name), "ioc_safe_out_%d", i);
+      step_fn_imports[i] = MIR_new_import(ctx, name);
+      snprintf(name, sizeof(name), "ioc_safe_in_%d", i);
+      ioc_in_imports[i] = MIR_new_import(ctx, name);
+    }
+#endif
+    else if (opcode == EEOP_SQLVALUEFUNCTION) {
+      /* Import for SVF getter or fallback ExecEvalSQLValueFunction */
+      SQLValueFunction *svf = op->d.sqlvaluefunction.svf;
+      char name[32];
+      switch (svf->op) {
+      case SVFOP_CURRENT_DATE:
+      case SVFOP_CURRENT_TIME: case SVFOP_CURRENT_TIME_N:
+      case SVFOP_CURRENT_TIMESTAMP: case SVFOP_CURRENT_TIMESTAMP_N:
+      case SVFOP_LOCALTIME: case SVFOP_LOCALTIME_N:
+      case SVFOP_LOCALTIMESTAMP: case SVFOP_LOCALTIMESTAMP_N:
+        snprintf(name, sizeof(name), "svf_%d", i);
+        step_fn_imports[i] = MIR_new_import(ctx, name);
+        break;
+      default:
+        snprintf(name, sizeof(name), "dc_%d", i);
+        step_fn_imports[i] = MIR_new_import(ctx, name);
+        break;
+      }
+    }
+    else if (opcode == EEOP_ARRAYEXPR || opcode == EEOP_FIELDSELECT) {
+      /* Fallback import for ARRAYEXPR/FIELDSELECT */
+      char name[32];
+      snprintf(name, sizeof(name), "dc_%d", i);
+      step_fn_imports[i] = MIR_new_import(ctx, name);
+    }
+    else if (opcode == EEOP_INNER_SYSVAR || opcode == EEOP_OUTER_SYSVAR ||
                opcode == EEOP_SCAN_SYSVAR
 #ifdef HAVE_EEOP_OLD_NEW
                || opcode == EEOP_OLD_SYSVAR || opcode == EEOP_NEW_SYSVAR
@@ -5827,6 +5944,274 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
     /*
+     * ---- NEXTVALUEEXPR (inlined) ----
+     * Call nextval_internal with seqid as immediate.
+     * Compile-time switch on seqtypid.
+     */
+    case EEOP_NEXTVALUEEXPR: {
+      Oid seqid = op->d.nextvalueexpr.seqid;
+      Oid seqtypid = op->d.nextvalueexpr.seqtypid;
+
+      char nv_reg_name[32];
+      snprintf(nv_reg_name, sizeof(nv_reg_name), "nv_result_%d", opno);
+      MIR_reg_t r_nv = MIR_new_func_reg(ctx, func_item->u.func, MIR_T_I64,
+                                          nv_reg_name);
+
+      /* Call nextval_internal(seqid, false) */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_nextval),
+                            MIR_new_ref_op(ctx, import_nextval),
+                            MIR_new_reg_op(ctx, r_nv),
+                            MIR_new_int_op(ctx, (int64_t)seqid),
+                            MIR_new_int_op(ctx, 0)));
+
+      /* Compile-time cast */
+      switch (seqtypid) {
+      case INT2OID:
+        /* Sign-extend 16-bit: (int16)(int64) val */
+        MIR_append_insn(ctx, func_item,
+                        MIR_new_insn(ctx, MIR_EXT16,
+                                     MIR_new_reg_op(ctx, r_nv),
+                                     MIR_new_reg_op(ctx, r_nv)));
+        break;
+      case INT4OID:
+        /* Sign-extend 32-bit: (int32)(int64) val */
+        MIR_append_insn(ctx, func_item,
+                        MIR_new_insn(ctx, MIR_EXT32,
+                                     MIR_new_reg_op(ctx, r_nv),
+                                     MIR_new_reg_op(ctx, r_nv)));
+        break;
+      case INT8OID:
+        break; /* identity */
+      }
+
+      /* *resvalue = r_nv */
+      MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                       MIR_new_reg_op(ctx, r_nv)));
+      /* *resnull = false */
+      MIR_STEP_LOAD(r_tmp3, opno, resnull);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                       MIR_new_int_op(ctx, 0)));
+      break;
+    }
+
+    /*
+     * ---- ROW (inlined) ----
+     * Direct call to heap_form_tuple + inline HeapTupleGetDatum.
+     */
+    case EEOP_ROW: {
+      /* Load args from step data */
+      MIR_STEP_LOAD(r_tmp1, opno, d.row.tupdesc);
+      MIR_STEP_LOAD(r_tmp2, opno, d.row.elemvalues);
+
+      char row_reg_name[32];
+      snprintf(row_reg_name, sizeof(row_reg_name), "row_nulls_%d", opno);
+      MIR_reg_t r_rnulls = MIR_new_func_reg(ctx, func_item->u.func,
+                                              MIR_T_I64, row_reg_name);
+      MIR_STEP_LOAD(r_rnulls, opno, d.row.elemnulls);
+
+      /* heap_form_tuple(tupdesc, values, nulls) -> HeapTuple */
+      snprintf(row_reg_name, sizeof(row_reg_name), "row_tuple_%d", opno);
+      MIR_reg_t r_tuple = MIR_new_func_reg(ctx, func_item->u.func,
+                                             MIR_T_I64, row_reg_name);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 6, MIR_new_ref_op(ctx, proto_hft),
+                            MIR_new_ref_op(ctx, import_hft),
+                            MIR_new_reg_op(ctx, r_tuple),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_tmp2),
+                            MIR_new_reg_op(ctx, r_rnulls)));
+
+      /* HeapTupleGetDatum(tuple) = HeapTupleHeaderGetDatum(tuple->t_data)
+       * Must call HeapTupleHeaderGetDatum to flatten external TOAST ptrs */
+      snprintf(row_reg_name, sizeof(row_reg_name), "row_tdata_%d", opno);
+      MIR_reg_t r_tdata = MIR_new_func_reg(ctx, func_item->u.func,
+                                             MIR_T_I64, row_reg_name);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tdata),
+                       MIR_new_mem_op(ctx, MIR_T_P,
+                                      (int)offsetof(HeapTupleData, t_data),
+                                      r_tuple, 0, 1)));
+
+      snprintf(row_reg_name, sizeof(row_reg_name), "row_datum_%d", opno);
+      MIR_reg_t r_datum = MIR_new_func_reg(ctx, func_item->u.func,
+                                             MIR_T_I64, row_reg_name);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_htgd),
+                            MIR_new_ref_op(ctx, import_htgd),
+                            MIR_new_reg_op(ctx, r_datum),
+                            MIR_new_reg_op(ctx, r_tdata)));
+
+      /* *resvalue = datum */
+      MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                       MIR_new_reg_op(ctx, r_datum)));
+      /* *resnull = false */
+      MIR_STEP_LOAD(r_tmp3, opno, resnull);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                       MIR_new_int_op(ctx, 0)));
+      break;
+    }
+
+    /*
+     * ---- AGG_ORDERED_TRANS_DATUM ----
+     * Direct call (AggStatePerTransData is opaque).
+     */
+    case EEOP_AGG_ORDERED_TRANS_DATUM: {
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+      break;
+    }
+
+    /*
+     * ---- AGG_ORDERED_TRANS_TUPLE ----
+     * Direct call (AggStatePerTransData is opaque).
+     */
+    case EEOP_AGG_ORDERED_TRANS_TUPLE: {
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+      break;
+    }
+
+    /*
+     * ---- WHOLEROW ----
+     * Direct call to ExecEvalWholeRowVar.
+     */
+    case EEOP_WHOLEROW: {
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+      break;
+    }
+
+    /*
+     * ---- CONVERT_ROWTYPE (partially inlined) ----
+     * Null check: if *op->resnull, skip C call.
+     */
+    case EEOP_CONVERT_ROWTYPE: {
+      MIR_insn_t cvt_done = MIR_new_label(ctx);
+
+      /* Check *op->resnull */
+      MIR_STEP_LOAD(r_tmp3, opno, resnull);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+      /* if (resnull) skip */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, cvt_done),
+                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
+
+      /* Non-null: call ExecEvalConvertRowtype */
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+
+      MIR_append_insn(ctx, func_item, cvt_done);
+      break;
+    }
+
+#ifdef HAVE_EEOP_JSONEXPR
+    /*
+     * ---- JSONEXPR_COERCION_FINISH (partially inlined, PG17+) ----
+     * Happy path: if escontext.error_occurred is false, no-op.
+     */
+    case EEOP_JSONEXPR_COERCION_FINISH: {
+      MIR_insn_t jcf_done = MIR_new_label(ctx);
+
+      /* Compute struct offset at JIT compile time */
+      JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+      int esctx_err_off = (int)(
+          (char *)&jsestate->escontext.error_occurred - (char *)jsestate);
+
+      /* Load jsestate from step data */
+      MIR_STEP_LOAD(r_tmp2, opno, d.jsonexpr.jsestate);
+
+      /* Check error_occurred */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                       MIR_new_mem_op(ctx, MIR_T_U8, esctx_err_off,
+                                      r_tmp2, 0, 1)));
+      /* if (!error_occurred) skip */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_BEQ, MIR_new_label_op(ctx, jcf_done),
+                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
+
+      /* Error: call ExecEvalJsonCoercionFinish(state, op) */
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1)));
+
+      MIR_append_insn(ctx, func_item, jcf_done);
+      break;
+    }
+#endif /* HAVE_EEOP_JSONEXPR */
+
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+    /*
+     * ---- JSON_CONSTRUCTOR (PG16+) ----
+     * Direct call to ExecEvalJsonConstructor.
+     */
+    case EEOP_JSON_CONSTRUCTOR: {
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+      break;
+    }
+#endif /* HAVE_EEOP_JSON_CONSTRUCTOR */
+
+    /*
      * ---- DIRECT CALL: 3-arg void ----
      * fn(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
      */
@@ -5838,23 +6223,15 @@ static bool mir_compile_expr(ExprState *state) {
     case EEOP_PARAM_SET:
 #endif
     case EEOP_ARRAYCOERCE:
-    case EEOP_FIELDSELECT:
     case EEOP_FIELDSTORE_DEFORM:
     case EEOP_FIELDSTORE_FORM:
-    case EEOP_CONVERT_ROWTYPE:
-#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-    case EEOP_JSON_CONSTRUCTOR:
-#endif
 #ifdef HAVE_EEOP_JSONEXPR
     case EEOP_JSONEXPR_COERCION:
 #endif
 #ifdef HAVE_EEOP_MERGE_SUPPORT_FUNC
     case EEOP_MERGE_SUPPORT_FUNC:
 #endif
-    case EEOP_SUBPLAN:
-    case EEOP_WHOLEROW:
-    case EEOP_AGG_ORDERED_TRANS_DATUM:
-    case EEOP_AGG_ORDERED_TRANS_TUPLE: {
+    case EEOP_SUBPLAN: {
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
@@ -6023,24 +6400,99 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
     /*
+     * ---- IS_JSON (simdjson-accelerated for text input) ----
+     */
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+    case EEOP_IS_JSON: {
+#ifdef PG_JITTER_HAVE_SIMDJSON
+      JsonIsPredicate *pred = op->d.is_json.pred;
+      if (exprType(pred->expr) == TEXTOID && !pred->unique_keys) {
+        /* simdjson fast path */
+        MIR_label_t skip_null = MIR_new_label(ctx);
+        MIR_label_t done_label = MIR_new_label(ctx);
+
+        /* Load *op->resnull */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+        /* If resnull != 0, skip to null path */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, skip_null),
+                         MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* Load *op->resvalue (text Datum) */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+
+        /* Call pg_jitter_sj_is_json_datum(datum, item_type) → r_tmp2 */
+        MIR_reg_t r_item_type =
+            mir_new_reg(ctx, f, MIR_T_I64, "itype");
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_item_type),
+                         MIR_new_int_op(ctx, (int64_t)pred->item_type)));
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_sj_is_json),
+                              MIR_new_ref_op(ctx, import_sj_is_json),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_item_type)));
+
+        /* *op->resvalue = BoolGetDatum(r_tmp2) — zero-extend I32 to I64 */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_UEXT32, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, done_label)));
+
+        /* Null path: *op->resvalue = BoolGetDatum(false) = 0 */
+        MIR_append_insn(ctx, func_item, skip_null);
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        MIR_append_insn(ctx, func_item, done_label);
+        break;
+      }
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+      /* Fallback: generic 2-arg call */
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1)));
+      break;
+    }
+#endif
+
+    /*
      * ---- DIRECT CALL: 2-arg void ----
      * fn(ExprState *state, ExprEvalStep *op)
      */
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-    case EEOP_IOCOERCE_SAFE:
-#endif
-    case EEOP_SQLVALUEFUNCTION:
     case EEOP_CURRENTOFEXPR:
-    case EEOP_NEXTVALUEEXPR:
-    case EEOP_ARRAYEXPR:
-    case EEOP_ROW:
     case EEOP_XMLEXPR:
-#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-    case EEOP_IS_JSON:
-#endif
-#ifdef HAVE_EEOP_JSONEXPR
-    case EEOP_JSONEXPR_COERCION_FINISH:
-#endif
     {
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
@@ -6743,31 +7195,190 @@ static bool mir_compile_expr(ExprState *state) {
       MIR_reg_t r_fci_in = mir_new_reg(ctx, f, MIR_T_I64, "fci");
       MIR_STEP_LOAD(r_fci_in, opno, d.iocoerce.fcinfo_data_in);
 
-      /* fcinfo_in->args[0].value = r_tmp2 */
+#ifdef PG_JITTER_HAVE_SIMDJSON
+      if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
+          fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */) {
+        /* simdjson fast path: sj_fn(cstring, fcinfo_in) → Datum */
+        MIR_item_t sj_import = (fcinfo_in->flinfo->fn_oid == 321)
+                                    ? import_sj_json_in
+                                    : import_sj_jsonb_in;
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_sj_json_in),
+                              MIR_new_ref_op(ctx, sj_import),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_fci_in)));
+
+        /* *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* *op->resnull = false */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+      } else
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+      {
+        /* Standard input function call */
+
+        /* fcinfo_in->args[0].value = r_tmp2 */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV,
+                MIR_new_mem_op(ctx, MIR_T_I64, arg0_val_off, r_fci_in, 0, 1),
+                MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* fcinfo_in->args[0].isnull = false */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV,
+                MIR_new_mem_op(ctx, MIR_T_U8, arg0_null_off, r_fci_in, 0, 1),
+                MIR_new_int_op(ctx, 0)));
+
+        /* fcinfo_in->isnull = false */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_in, 0,
+                                        1),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* Call input fn: ret = fn_addr_in(fcinfo_in) */
+        if (mir_shared_code_mode) {
+          MIR_reg_t r_fn = mir_new_reg(ctx, f, MIR_T_I64, "fn_rt");
+          MIR_reg_t r_flinfo = mir_new_reg(ctx, f, MIR_T_I64, "fli");
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(
+                  ctx, MIR_MOV, MIR_new_reg_op(ctx, r_flinfo),
+                  MIR_new_mem_op(ctx, MIR_T_P,
+                                 offsetof(FunctionCallInfoBaseData, flinfo),
+                                 r_fci_in, 0, 1)));
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_fn),
+                           MIR_new_mem_op(ctx, MIR_T_P,
+                                          offsetof(FmgrInfo, fn_addr),
+                                          r_flinfo, 0, 1)));
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
+                                MIR_new_reg_op(ctx, r_fn),
+                                MIR_new_reg_op(ctx, r_tmp2),
+                                MIR_new_reg_op(ctx, r_fci_in)));
+        } else {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
+                                MIR_new_ref_op(ctx, ioc_in_imports[opno]),
+                                MIR_new_reg_op(ctx, r_tmp2),
+                                MIR_new_reg_op(ctx, r_fci_in)));
+        }
+
+        /* *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* *op->resnull = fcinfo_in->isnull */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_in, 0,
+                                        1)));
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+      }
+
+      MIR_append_insn(ctx, func_item, skip_null);
+      break;
+    }
+
+    /*
+     * ---- IOCOERCE_SAFE ----
+     * Same as IOCOERCE but with soft-error handling after input function.
+     * If ErrorSaveContext.error_occurred is true after input function,
+     * store *resnull=true, *resvalue=0 instead of the normal result.
+     */
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+    case EEOP_IOCOERCE_SAFE: {
+      FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+      FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+
+      int64_t arg0_val_off =
+          (int64_t)((char *)&fcinfo_out->args[0].value - (char *)fcinfo_out);
+      int64_t arg0_null_off =
+          (int64_t)((char *)&fcinfo_out->args[0].isnull - (char *)fcinfo_out);
+      int64_t isnull_off = offsetof(FunctionCallInfoBaseData, isnull);
+
+      MIR_label_t skip_null_safe = MIR_new_label(ctx);
+
+      /* Load *op->resnull */
+      MIR_STEP_LOAD(r_tmp1, opno, resnull);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_insn(
-              ctx, MIR_MOV,
-              MIR_new_mem_op(ctx, MIR_T_I64, arg0_val_off, r_fci_in, 0, 1),
-              MIR_new_reg_op(ctx, r_tmp2)));
-
-      /* fcinfo_in->args[0].isnull = false */
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+      /* If resnull != 0, skip */
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_insn(
-              ctx, MIR_MOV,
-              MIR_new_mem_op(ctx, MIR_T_U8, arg0_null_off, r_fci_in, 0, 1),
-              MIR_new_int_op(ctx, 0)));
+          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, skip_null_safe),
+                       MIR_new_reg_op(ctx, r_tmp2), MIR_new_int_op(ctx, 0)));
 
-      /* fcinfo_in->isnull = false */
+      /* Load *op->resvalue */
+      MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
+
+      /* Load fcinfo_out from step data */
+      MIR_reg_t r_fco_safe = mir_new_reg(ctx, f, MIR_T_I64, "fcos");
+      MIR_STEP_LOAD(r_fco_safe, opno, d.iocoerce.fcinfo_data_out);
+
+      /* fcinfo_out->args[0].value = resvalue */
       MIR_append_insn(
           ctx, func_item,
           MIR_new_insn(ctx, MIR_MOV,
-                       MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_in, 0,
-                                      1),
+                       MIR_new_mem_op(ctx, MIR_T_I64, arg0_val_off,
+                                      r_fco_safe, 0, 1),
+                       MIR_new_reg_op(ctx, r_tmp2)));
+
+      /* fcinfo_out->args[0].isnull = false */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_U8, arg0_null_off,
+                                      r_fco_safe, 0, 1),
                        MIR_new_int_op(ctx, 0)));
 
-      /* Call input fn: ret = fn_addr_in(fcinfo_in) */
+      /* fcinfo_out->isnull = false */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV,
+                       MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fco_safe,
+                                      0, 1),
+                       MIR_new_int_op(ctx, 0)));
+
+      /* Call output fn: ret = fn_addr_out(fcinfo_out) */
       if (mir_shared_code_mode) {
         MIR_reg_t r_fn = mir_new_reg(ctx, f, MIR_T_I64, "fn_rt");
         MIR_reg_t r_flinfo = mir_new_reg(ctx, f, MIR_T_I64, "fli");
@@ -6777,7 +7388,7 @@ static bool mir_compile_expr(ExprState *state) {
                 ctx, MIR_MOV, MIR_new_reg_op(ctx, r_flinfo),
                 MIR_new_mem_op(ctx, MIR_T_P,
                                offsetof(FunctionCallInfoBaseData, flinfo),
-                               r_fci_in, 0, 1)));
+                               r_fco_safe, 0, 1)));
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_fn),
@@ -6789,38 +7400,518 @@ static bool mir_compile_expr(ExprState *state) {
             MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
                               MIR_new_reg_op(ctx, r_fn),
                               MIR_new_reg_op(ctx, r_tmp2),
-                              MIR_new_reg_op(ctx, r_fci_in)));
+                              MIR_new_reg_op(ctx, r_fco_safe)));
       } else {
         MIR_append_insn(
             ctx, func_item,
             MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
-                              MIR_new_ref_op(ctx, ioc_in_imports[opno]),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
                               MIR_new_reg_op(ctx, r_tmp2),
-                              MIR_new_reg_op(ctx, r_fci_in)));
+                              MIR_new_reg_op(ctx, r_fco_safe)));
       }
 
-      /* *op->resvalue = r_tmp2 */
-      MIR_STEP_LOAD(r_tmp1, opno, resvalue);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV,
-                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
-                       MIR_new_reg_op(ctx, r_tmp2)));
+      /* r_tmp2 now holds cstring result (Datum) */
 
-      /* *op->resnull = fcinfo_in->isnull */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
-                       MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_in, 0,
-                                      1)));
+      /* Load fcinfo_in from step data */
+      MIR_reg_t r_fci_safe = mir_new_reg(ctx, f, MIR_T_I64, "fcis");
+      MIR_STEP_LOAD(r_fci_safe, opno, d.iocoerce.fcinfo_data_in);
+
+#ifdef PG_JITTER_HAVE_SIMDJSON
+      if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
+          fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */) {
+        /* simdjson fast path: sj_fn(cstring, fcinfo_in) -> Datum */
+        MIR_item_t sj_import = (fcinfo_in->flinfo->fn_oid == 321)
+                                    ? import_sj_json_in
+                                    : import_sj_jsonb_in;
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_sj_json_in),
+                              MIR_new_ref_op(ctx, sj_import),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_fci_safe)));
+
+        /* *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* *op->resnull = false (simdjson ereport's on error, skip soft check) */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+      } else
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+      {
+        /* Standard input function call */
+
+        /* fcinfo_in->args[0].value = r_tmp2 */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV,
+                MIR_new_mem_op(ctx, MIR_T_I64, arg0_val_off, r_fci_safe, 0, 1),
+                MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* fcinfo_in->args[0].isnull = false */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV,
+                MIR_new_mem_op(ctx, MIR_T_U8, arg0_null_off, r_fci_safe, 0, 1),
+                MIR_new_int_op(ctx, 0)));
+
+        /* fcinfo_in->isnull = false */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_safe,
+                                        0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* Call input fn: ret = fn_addr_in(fcinfo_in) */
+        if (mir_shared_code_mode) {
+          MIR_reg_t r_fn = mir_new_reg(ctx, f, MIR_T_I64, "fn_rt");
+          MIR_reg_t r_flinfo = mir_new_reg(ctx, f, MIR_T_I64, "fli");
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(
+                  ctx, MIR_MOV, MIR_new_reg_op(ctx, r_flinfo),
+                  MIR_new_mem_op(ctx, MIR_T_P,
+                                 offsetof(FunctionCallInfoBaseData, flinfo),
+                                 r_fci_safe, 0, 1)));
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_fn),
+                           MIR_new_mem_op(ctx, MIR_T_P,
+                                          offsetof(FmgrInfo, fn_addr),
+                                          r_flinfo, 0, 1)));
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
+                                MIR_new_reg_op(ctx, r_fn),
+                                MIR_new_reg_op(ctx, r_tmp2),
+                                MIR_new_reg_op(ctx, r_fci_safe)));
+        } else {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_v1func),
+                                MIR_new_ref_op(ctx, ioc_in_imports[opno]),
+                                MIR_new_reg_op(ctx, r_tmp2),
+                                MIR_new_reg_op(ctx, r_fci_safe)));
+        }
+
+        /* Check SOFT_ERROR_OCCURRED(fcinfo_in->context) */
+        MIR_label_t soft_error_label = MIR_new_label(ctx);
+        MIR_label_t done_safe_label = MIR_new_label(ctx);
+
+        /* Load fcinfo_in->context */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp3),
+                         MIR_new_mem_op(ctx, MIR_T_P,
+                                        offsetof(FunctionCallInfoBaseData,
+                                                 context),
+                                        r_fci_safe, 0, 1)));
+
+        /* Load error_occurred bool */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp3),
+                         MIR_new_mem_op(ctx, MIR_T_U8,
+                                        offsetof(ErrorSaveContext,
+                                                 error_occurred),
+                                        r_tmp3, 0, 1)));
+
+        /* If error_occurred != 0, jump to soft error path */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_BNE,
+                         MIR_new_label_op(ctx, soft_error_label),
+                         MIR_new_reg_op(ctx, r_tmp3),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* No error: *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* *op->resnull = fcinfo_in->isnull */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_mem_op(ctx, MIR_T_U8, isnull_off, r_fci_safe,
+                                        0, 1)));
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* Jump past soft error path */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_JMP,
+                         MIR_new_label_op(ctx, done_safe_label)));
+
+        /* Soft error path: *op->resnull = true, *op->resvalue = 0 */
+        MIR_append_insn(ctx, func_item, soft_error_label);
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        MIR_append_insn(ctx, func_item, done_safe_label);
+      }
+
+      MIR_append_insn(ctx, func_item, skip_null_safe);
+      break;
+    }
+#endif /* HAVE_EEOP_IOCOERCE_SAFE */
+
+    /*
+     * ---- SQLVALUEFUNCTION (inlined) ----
+     * Resolve svf->op at compile time, emit direct call to getter.
+     * Time functions: direct call with typmod immediate.
+     * Identity functions: fall back to ExecEvalSQLValueFunction.
+     */
+    case EEOP_SQLVALUEFUNCTION: {
+      SQLValueFunction *svf = op->d.sqlvaluefunction.svf;
+
+      switch (svf->op) {
+      case SVFOP_CURRENT_DATE: {
+        /* *op->resnull = false */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* r_tmp2 = GetSQLCurrentDate() */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 3,
+                              MIR_new_ref_op(ctx, proto_svf_i32_void),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                              MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* Zero-extend I32 to I64 (DateADT is int32) */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_UEXT32, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+
+        /* *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+        break;
+      }
+
+      case SVFOP_CURRENT_TIME:
+      case SVFOP_CURRENT_TIME_N:
+      case SVFOP_CURRENT_TIMESTAMP:
+      case SVFOP_CURRENT_TIMESTAMP_N:
+      case SVFOP_LOCALTIME:
+      case SVFOP_LOCALTIME_N:
+      case SVFOP_LOCALTIMESTAMP:
+      case SVFOP_LOCALTIMESTAMP_N: {
+        /* *op->resnull = false */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* r_tmp3 = typmod (I64 reg, proto narrows to I32 at call boundary) */
+        MIR_reg_t r_typmod = mir_new_reg(ctx, f, MIR_T_I64, "tmod");
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_typmod),
+                         MIR_new_int_op(ctx, svf->typmod)));
+
+        /* r_tmp2 = fn(typmod) */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 4,
+                              MIR_new_ref_op(ctx, proto_svf_i64_i32),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                              MIR_new_reg_op(ctx, r_tmp2),
+                              MIR_new_reg_op(ctx, r_typmod)));
+
+        /* *op->resvalue = r_tmp2 */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_tmp2)));
+        break;
+      }
+
+      default:
+        /* Identity functions (CURRENT_USER etc): fall back to C helper */
+        MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 4,
+                              MIR_new_ref_op(ctx, proto_agg_helper),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                              MIR_new_reg_op(ctx, r_state),
+                              MIR_new_reg_op(ctx, r_tmp1)));
+        break;
+      }
+      break;
+    }
+
+    /*
+     * ---- ARRAYEXPR (inlined for fixed-width by-value) ----
+     * For simple 1-D arrays of fixed-width by-value elements with no nulls,
+     * inline: palloc(known_size) + header init + element copy.
+     * All other cases fall back to ExecEvalArrayExpr.
+     */
+    case EEOP_ARRAYEXPR: {
+      int nelems = op->d.arrayexpr.nelems;
+      int16 elemlength = op->d.arrayexpr.elemlength;
+      bool elembyval = op->d.arrayexpr.elembyval;
+      bool multidims = op->d.arrayexpr.multidims;
+
+      if (!multidims && elemlength > 0 && elembyval && nelems > 0 &&
+          nelems <= 64) {
+        /*
+         * Fast path: fixed-width by-value, 1-D, small array.
+         * Pre-compute total size at compile time.
+         */
+        int dataoff = ARR_OVERHEAD_NONULLS(1);
+        int data_size = nelems * elemlength;
+        int total_size = dataoff + data_size;
+
+        MIR_label_t has_null_label = MIR_new_label(ctx);
+        MIR_label_t arr_done_label = MIR_new_label(ctx);
+
+        /* Check for any nulls in elemnulls[] array */
+        MIR_reg_t r_enulls = mir_new_reg(ctx, f, MIR_T_I64, "enulls");
+        MIR_STEP_LOAD(r_enulls, opno, d.arrayexpr.elemnulls);
+
+        for (int k = 0; k < nelems; k++) {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                           MIR_new_mem_op(ctx, MIR_T_U8, k * sizeof(bool),
+                                          r_enulls, 0, 1)));
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_BNE,
+                           MIR_new_label_op(ctx, has_null_label),
+                           MIR_new_reg_op(ctx, r_tmp1),
+                           MIR_new_int_op(ctx, 0)));
+        }
+
+        /* No nulls: palloc(total_size) */
+        MIR_reg_t r_arr_sz = mir_new_reg(ctx, f, MIR_T_I64, "arsz");
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_arr_sz),
+                         MIR_new_int_op(ctx, total_size)));
+
+        MIR_reg_t r_arr = mir_new_reg(ctx, f, MIR_T_I64, "arr");
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 4,
+                              MIR_new_ref_op(ctx, proto_palloc),
+                              MIR_new_ref_op(ctx, import_palloc),
+                              MIR_new_reg_op(ctx, r_arr),
+                              MIR_new_reg_op(ctx, r_arr_sz)));
+
+        /* SET_VARSIZE(result, total_size): store (total_size << 2) in first 4 bytes */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32, 0, r_arr, 0, 1),
+                         MIR_new_int_op(ctx, total_size << 2)));
+
+        /* ndim = 1 */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32,
+                                        offsetof(ArrayType, ndim),
+                                        r_arr, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
+
+        /* dataoffset = 0 (no null bitmap) */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32,
+                                        offsetof(ArrayType, dataoffset),
+                                        r_arr, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        /* elemtype */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32,
+                                        offsetof(ArrayType, elemtype),
+                                        r_arr, 0, 1),
+                         MIR_new_int_op(ctx, op->d.arrayexpr.elemtype)));
+
+        /* dims[0] = nelems (offset = sizeof(ArrayType)) */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32,
+                                        (int64_t)sizeof(ArrayType),
+                                        r_arr, 0, 1),
+                         MIR_new_int_op(ctx, nelems)));
+
+        /* lbound[0] = 1 (offset = sizeof(ArrayType) + sizeof(int)) */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I32,
+                                        (int64_t)(sizeof(ArrayType) +
+                                                  sizeof(int)),
+                                        r_arr, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
+
+        /* Copy elements from elemvalues[] into data area */
+        MIR_reg_t r_evals = mir_new_reg(ctx, f, MIR_T_I64, "evals");
+        MIR_STEP_LOAD(r_evals, opno, d.arrayexpr.elemvalues);
+
+        for (int k = 0; k < nelems; k++) {
+          /* Load Datum from elemvalues[k] */
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                           MIR_new_mem_op(ctx, MIR_T_I64,
+                                          k * (int64_t)sizeof(Datum),
+                                          r_evals, 0, 1)));
+
+          /* Store into data area with correct element size */
+          MIR_type_t store_type;
+          if (elemlength == (int16)sizeof(Datum))
+            store_type = MIR_T_I64;
+          else if (elemlength == 4)
+            store_type = MIR_T_I32;
+          else if (elemlength == 2)
+            store_type = MIR_T_U16;
+          else
+            store_type = MIR_T_U8;
+
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV,
+                           MIR_new_mem_op(ctx, store_type,
+                                          dataoff + k * elemlength,
+                                          r_arr, 0, 1),
+                           MIR_new_reg_op(ctx, r_tmp1)));
+        }
+
+        /* *op->resvalue = PointerGetDatum(result) */
+        MIR_STEP_LOAD(r_tmp1, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
+                         MIR_new_reg_op(ctx, r_arr)));
+
+        /* *op->resnull = false */
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_JMP,
+                         MIR_new_label_op(ctx, arr_done_label)));
+
+        /* Fallback: has nulls or complex case -> call ExecEvalArrayExpr */
+        MIR_append_insn(ctx, func_item, has_null_label);
+        MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 4,
+                              MIR_new_ref_op(ctx, proto_agg_helper),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                              MIR_new_reg_op(ctx, r_state),
+                              MIR_new_reg_op(ctx, r_tmp1)));
+
+        MIR_append_insn(ctx, func_item, arr_done_label);
+      } else {
+        /* Fallback to C function for varlena/multidims/complex cases */
+        MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 4,
+                              MIR_new_ref_op(ctx, proto_agg_helper),
+                              MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                              MIR_new_reg_op(ctx, r_state),
+                              MIR_new_reg_op(ctx, r_tmp1)));
+      }
+      break;
+    }
+
+    /*
+     * ---- FIELDSELECT (inlined null check) ----
+     * If input is null, result is null (already set, skip).
+     * Otherwise call ExecEvalFieldSelect(state, op, econtext).
+     */
+    case EEOP_FIELDSELECT: {
+      MIR_label_t fsel_null_label = MIR_new_label(ctx);
+
+      /* If *op->resnull, skip (input null -> output null) */
       MIR_STEP_LOAD(r_tmp1, opno, resnull);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV,
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
-                       MIR_new_reg_op(ctx, r_tmp2)));
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_BNE,
+                       MIR_new_label_op(ctx, fsel_null_label),
+                       MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_int_op(ctx, 0)));
 
-      MIR_append_insn(ctx, func_item, skip_null);
+      /* Non-null: call ExecEvalFieldSelect(state, op, econtext) */
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 5,
+                            MIR_new_ref_op(ctx, proto_3arg_void),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
+
+      MIR_append_insn(ctx, func_item, fsel_null_label);
       break;
     }
 
@@ -7237,6 +8328,15 @@ static bool mir_compile_expr(ExprState *state) {
     /* GROUPING_FUNC helper */
     MIR_load_external(ctx, "bms_is_member",
                       mir_extern_addr((void *)bms_is_member));
+    /* ARRAYEXPR inline palloc helper */
+    MIR_load_external(ctx, "palloc_fn",
+                      mir_extern_addr((void *)palloc));
+    MIR_load_external(ctx, "nextval_fn",
+                      mir_extern_addr((void *)nextval_internal));
+    MIR_load_external(ctx, "hft_fn",
+                      mir_extern_addr((void *)heap_form_tuple));
+    MIR_load_external(ctx, "htgd_fn",
+                      mir_extern_addr((void *)HeapTupleHeaderGetDatum));
     /* Compiled LIKE match helper */
     MIR_load_external(ctx, "simd_like_match_compiled",
                       mir_extern_addr((void *)simd_like_match_compiled));
@@ -7317,7 +8417,55 @@ static bool mir_compile_expr(ExprState *state) {
           MIR_load_external(
               ctx, name, mir_extern_addr((void *)fcinfo_in->flinfo->fn_addr));
           continue;
-        } else if (op == EEOP_ROWCOMPARE_STEP) {
+        }
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+        else if (op == EEOP_IOCOERCE_SAFE) {
+          FunctionCallInfo fcinfo_out = steps[i].d.iocoerce.fcinfo_data_out;
+          FunctionCallInfo fcinfo_in = steps[i].d.iocoerce.fcinfo_data_in;
+          snprintf(name, sizeof(name), "ioc_safe_out_%d", i);
+          MIR_load_external(
+              ctx, name, mir_extern_addr((void *)fcinfo_out->flinfo->fn_addr));
+          snprintf(name, sizeof(name), "ioc_safe_in_%d", i);
+          MIR_load_external(
+              ctx, name, mir_extern_addr((void *)fcinfo_in->flinfo->fn_addr));
+          continue;
+        }
+#endif
+        else if (op == EEOP_SQLVALUEFUNCTION) {
+          SQLValueFunction *svf = steps[i].d.sqlvaluefunction.svf;
+          void *fn = NULL;
+          switch (svf->op) {
+          case SVFOP_CURRENT_DATE:
+            fn = (void *)GetSQLCurrentDate;
+            break;
+          case SVFOP_CURRENT_TIME:
+          case SVFOP_CURRENT_TIME_N:
+            fn = (void *)GetSQLCurrentTime;
+            break;
+          case SVFOP_CURRENT_TIMESTAMP:
+          case SVFOP_CURRENT_TIMESTAMP_N:
+            fn = (void *)GetSQLCurrentTimestamp;
+            break;
+          case SVFOP_LOCALTIME:
+          case SVFOP_LOCALTIME_N:
+            fn = (void *)GetSQLLocalTime;
+            break;
+          case SVFOP_LOCALTIMESTAMP:
+          case SVFOP_LOCALTIMESTAMP_N:
+            fn = (void *)GetSQLLocalTimestamp;
+            break;
+          default:
+            fn = (void *)ExecEvalSQLValueFunction;
+            break;
+          }
+          if (svf->op <= SVFOP_LOCALTIMESTAMP_N)
+            snprintf(name, sizeof(name), "svf_%d", i);
+          else
+            snprintf(name, sizeof(name), "dc_%d", i);
+          MIR_load_external(ctx, name, mir_extern_addr(fn));
+          continue;
+        }
+        else if (op == EEOP_ROWCOMPARE_STEP) {
           snprintf(name, sizeof(name), "rcmp_%d", i);
           MIR_load_external(
               ctx, name,
@@ -7355,11 +8503,7 @@ static bool mir_compile_expr(ExprState *state) {
                  op == EEOP_SUBPLAN || op == EEOP_WHOLEROW ||
                  op == EEOP_AGG_ORDERED_TRANS_DATUM ||
                  op == EEOP_AGG_ORDERED_TRANS_TUPLE ||
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-                 op == EEOP_IOCOERCE_SAFE ||
-#endif
                  /* SCALARARRAYOP uses dedicated inline with separate imports */
-                 op == EEOP_SQLVALUEFUNCTION ||
                  op == EEOP_CURRENTOFEXPR || op == EEOP_NEXTVALUEEXPR ||
                  op == EEOP_ARRAYEXPR || op == EEOP_ROW || op == EEOP_MINMAX ||
                  op == EEOP_DOMAIN_NOTNULL || op == EEOP_DOMAIN_CHECK ||
@@ -7435,15 +8579,6 @@ static bool mir_compile_expr(ExprState *state) {
             fn = (void *)ExecEvalAggOrderedTransTuple;
             break;
             /* 2-arg void calls */
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-          case EEOP_IOCOERCE_SAFE:
-            fn = (void *)ExecEvalCoerceViaIOSafe;
-            break;
-#endif
-          /* SCALARARRAYOP moved to dedicated inline case */
-          case EEOP_SQLVALUEFUNCTION:
-            fn = (void *)ExecEvalSQLValueFunction;
-            break;
           case EEOP_CURRENTOFEXPR:
             fn = (void *)ExecEvalCurrentOfExpr;
             break;
@@ -7579,6 +8714,15 @@ static bool mir_compile_expr(ExprState *state) {
           }
       }
     }
+
+#ifdef PG_JITTER_HAVE_SIMDJSON
+    MIR_load_external(ctx, "sj_is_json",
+                      mir_extern_addr((void *)pg_jitter_sj_is_json_datum));
+    MIR_load_external(ctx, "sj_json_in",
+                      mir_extern_addr((void *)pg_jitter_sj_json_in));
+    MIR_load_external(ctx, "sj_jsonb_in",
+                      mir_extern_addr((void *)pg_jitter_sj_jsonb_in));
+#endif
 
     MIR_link(ctx, MIR_set_lazy_gen_interface, NULL);
 

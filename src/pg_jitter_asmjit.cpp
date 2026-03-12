@@ -18,7 +18,10 @@ extern "C" {
 #include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
+#include "pg_jitter_simdjson.h"
 #include "pg_jitter_vectorscan.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/primnodes.h"
 #include "mb/pg_wchar.h"
 #include "catalog/pg_collation_d.h"
 #include "pg_jit_funcs.h"
@@ -30,6 +33,11 @@ extern "C" {
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
 #include "common/hashfn.h"
+#include "utils/date.h"
+#include "utils/timestamp.h"
+#include "nodes/miscnodes.h"
+#include "commands/sequence.h"
+#include "funcapi.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",

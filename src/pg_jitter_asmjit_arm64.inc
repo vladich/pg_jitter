@@ -4711,6 +4711,326 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			 * function directly.
 			 */
 
+			/*
+			 * ---- FIELDSELECT (partially inlined) ----
+			 * If input is null, result is already null — skip the C call.
+			 * Otherwise call ExecEvalFieldSelect(state, op, econtext).
+			 */
+			case EEOP_FIELDSELECT:
+			{
+				/* If *op->resnull, input is null → output is null, skip */
+				a64::Gp resnull_val = cc.new_gpx();
+				if (op->resnull == &state->resnull)
+					cc.ldrb(resnull_val.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					a64::Gp rn_addr = cc.new_gpx();
+					cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(resnull_val.w(), a64::ptr(rn_addr));
+				}
+				Label fs_done = cc.new_label();
+				cc.cbnz(resnull_val.w(), fs_done);
+
+				/* Non-null: call ExecEvalFieldSelect(state, op, econtext) */
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalFieldSelect);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+
+				cc.bind(fs_done);
+				break;
+			}
+
+			/*
+			 * ---- NEXTVALUEEXPR (inlined) ----
+			 * Embed seqid as immediate, call nextval_internal directly.
+			 * Compile-time switch on seqtypid eliminates runtime type dispatch.
+			 */
+			case EEOP_NEXTVALUEEXPR:
+			{
+				Oid seqid = op->d.nextvalueexpr.seqid;
+				Oid seqtypid = op->d.nextvalueexpr.seqtypid;
+
+				/* nextval_internal(seqid, false) -> int64 */
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) nextval_internal);
+				a64::Gp seqid_reg = cc.new_gpx();
+				cc.mov(seqid_reg, (uint64_t) seqid);
+				a64::Gp false_reg = cc.new_gpx();
+				cc.mov(false_reg, 0);
+				InvokeNode *invoke;
+				a64::Gp result = cc.new_gpx();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<int64_t, int32_t, int32_t>());
+				invoke->set_arg(0, seqid_reg);
+				invoke->set_arg(1, false_reg);
+				invoke->set_ret(0, result);
+
+				/* Compile-time cast based on seqtypid */
+				switch (seqtypid) {
+				case INT2OID:
+					cc.sxth(result, result);
+					break;
+				case INT4OID:
+					cc.sxtw(result, result);
+					break;
+				case INT8OID:
+					break; /* int64 -> Datum identity */
+				}
+
+				/* *op->resvalue = result */
+				if (op->resvalue == &state->resvalue)
+					cc.str(result, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					a64::Gp rv_addr = cc.new_gpx();
+					cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(result, a64::ptr(rv_addr));
+				}
+				/* *op->resnull = false */
+				{
+					a64::Gp zero = cc.new_gpx();
+					cc.mov(zero, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(zero.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						a64::Gp rn_addr = cc.new_gpx();
+						cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(zero.w(), a64::ptr(rn_addr));
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- ROW (inlined) ----
+			 * Direct call to heap_form_tuple + inline HeapTupleGetDatum.
+			 */
+			case EEOP_ROW:
+			{
+				/* Load args from step data */
+				a64::Gp tupdesc_reg = cc.new_gpx();
+				cc.ldr(tupdesc_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.row.tupdesc)));
+				a64::Gp vals_reg = cc.new_gpx();
+				cc.ldr(vals_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.row.elemvalues)));
+				a64::Gp nulls_reg = cc.new_gpx();
+				cc.ldr(nulls_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.row.elemnulls)));
+
+				/* Call heap_form_tuple(tupdesc, values, isnull) -> HeapTuple */
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) heap_form_tuple);
+				InvokeNode *invoke;
+				a64::Gp tuple_reg = cc.new_gpx();
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void *, void *, void *, void *>());
+				invoke->set_arg(0, tupdesc_reg);
+				invoke->set_arg(1, vals_reg);
+				invoke->set_arg(2, nulls_reg);
+				invoke->set_ret(0, tuple_reg);
+
+				/* HeapTupleGetDatum(tuple) = HeapTupleHeaderGetDatum(tuple->t_data)
+				 * Must call HeapTupleHeaderGetDatum to flatten external TOAST ptrs */
+				a64::Gp tdata_reg = cc.new_gpx();
+				cc.ldr(tdata_reg, a64::Mem(tuple_reg, (int32_t) offsetof(HeapTupleData, t_data)));
+
+				a64::Gp fn_htgd = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_htgd, (void *) HeapTupleHeaderGetDatum);
+				InvokeNode *invoke_htgd;
+				a64::Gp datum_reg = cc.new_gpx();
+				cc.invoke(Out(invoke_htgd), fn_htgd,
+						  FuncSignature::build<uint64_t, void *>());
+				invoke_htgd->set_arg(0, tdata_reg);
+				invoke_htgd->set_ret(0, datum_reg);
+
+				/* *op->resvalue = datum, *op->resnull = false */
+				if (op->resvalue == &state->resvalue)
+					cc.str(datum_reg, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+				else
+				{
+					a64::Gp rv_addr = cc.new_gpx();
+					cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+					cc.str(datum_reg, a64::ptr(rv_addr));
+				}
+				{
+					a64::Gp zero = cc.new_gpx();
+					cc.mov(zero, 0);
+					if (op->resnull == &state->resnull)
+						cc.strb(zero.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						a64::Gp rn_addr = cc.new_gpx();
+						cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(zero.w(), a64::ptr(rn_addr));
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- AGG_ORDERED_TRANS_DATUM ----
+			 * Direct call (AggStatePerTransData is opaque in headers).
+			 */
+			case EEOP_AGG_ORDERED_TRANS_DATUM:
+			{
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalAggOrderedTransDatum);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+			/*
+			 * ---- AGG_ORDERED_TRANS_TUPLE ----
+			 * Direct call (AggStatePerTransData is opaque in headers).
+			 */
+			case EEOP_AGG_ORDERED_TRANS_TUPLE:
+			{
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalAggOrderedTransTuple);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+			/*
+			 * ---- CONVERT_ROWTYPE (partially inlined) ----
+			 * Null check: if *op->resnull, result stays null — skip C call.
+			 */
+			case EEOP_CONVERT_ROWTYPE:
+			{
+				Label cvt_done = cc.new_label();
+
+				/* Check *op->resnull */
+				a64::Gp resnull_val = cc.new_gpx();
+				if (op->resnull == &state->resnull)
+					cc.ldrb(resnull_val.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+				else
+				{
+					a64::Gp rn_addr = cc.new_gpx();
+					cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+					cc.ldrb(resnull_val.w(), a64::ptr(rn_addr));
+				}
+				cc.cbnz(resnull_val.w(), cvt_done);
+
+				/* Non-null: call ExecEvalConvertRowtype(state, op, econtext) */
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalConvertRowtype);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+				}
+
+				cc.bind(cvt_done);
+				break;
+			}
+
+#ifdef HAVE_EEOP_JSONEXPR
+			/*
+			 * ---- JSONEXPR_COERCION_FINISH (partially inlined, PG17+) ----
+			 * Happy path: if escontext.error_occurred is false, no-op.
+			 * Error path: fall back to ExecEvalJsonCoercionFinish.
+			 */
+			case EEOP_JSONEXPR_COERCION_FINISH:
+			{
+				Label jcf_done = cc.new_label();
+
+				/* Compute struct offset at JIT compile time */
+				JsonExprState *jsestate = op->d.jsonexpr.jsestate;
+				int32_t esctx_err_off = (int32_t)(
+					(char *)&jsestate->escontext.error_occurred - (char *)jsestate);
+
+				/* Load jsestate from step data */
+				a64::Gp jse_reg = cc.new_gpx();
+				cc.ldr(jse_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.jsonexpr.jsestate)));
+
+				/* Check error_occurred flag */
+				a64::Gp err_flag = cc.new_gpx();
+				cc.ldrb(err_flag.w(), a64::Mem(jse_reg, esctx_err_off));
+				cc.cbz(err_flag.w(), jcf_done);
+
+				/* Error: call ExecEvalJsonCoercionFinish(state, op) */
+				{
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonCoercionFinish);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				}
+
+				cc.bind(jcf_done);
+				break;
+			}
+#endif /* HAVE_EEOP_JSONEXPR */
+
+			/*
+			 * ---- WHOLEROW ----
+			 * Direct call to ExecEvalWholeRowVar (complex first-time init).
+			 */
+			case EEOP_WHOLEROW:
+			{
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalWholeRowVar);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			/*
+			 * ---- JSON_CONSTRUCTOR (PG16+) ----
+			 * Direct call to ExecEvalJsonConstructor.
+			 */
+			case EEOP_JSON_CONSTRUCTOR:
+			{
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonConstructor);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				invoke->set_arg(2, v_econtext);
+				break;
+			}
+#endif /* HAVE_EEOP_JSON_CONSTRUCTOR */
+
 			/* 3-arg: fn(ExprState *state, ExprEvalStep *op, ExprContext *econtext) */
 			case EEOP_FUNCEXPR_FUSAGE:
 			case EEOP_FUNCEXPR_STRICT_FUSAGE:
@@ -4720,13 +5040,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_PARAM_SET:
 #endif
 			case EEOP_ARRAYCOERCE:
-			case EEOP_FIELDSELECT:
 			case EEOP_FIELDSTORE_DEFORM:
 			case EEOP_FIELDSTORE_FORM:
-			case EEOP_CONVERT_ROWTYPE:
-#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-			case EEOP_JSON_CONSTRUCTOR:
-#endif
 #ifdef HAVE_EEOP_JSONEXPR
 			case EEOP_JSONEXPR_COERCION:
 #endif
@@ -4734,9 +5049,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			case EEOP_MERGE_SUPPORT_FUNC:
 #endif
 			case EEOP_SUBPLAN:
-			case EEOP_WHOLEROW:
-			case EEOP_AGG_ORDERED_TRANS_DATUM:
-			case EEOP_AGG_ORDERED_TRANS_TUPLE:
 			case EEOP_PARAM_EXTERN:
 			{
 				void *fn;
@@ -4757,18 +5069,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #endif
 					case EEOP_ARRAYCOERCE:
 						fn = (void *) ExecEvalArrayCoerce; break;
-					case EEOP_FIELDSELECT:
-						fn = (void *) ExecEvalFieldSelect; break;
 					case EEOP_FIELDSTORE_DEFORM:
 						fn = (void *) ExecEvalFieldStoreDeForm; break;
 					case EEOP_FIELDSTORE_FORM:
 						fn = (void *) ExecEvalFieldStoreForm; break;
-					case EEOP_CONVERT_ROWTYPE:
-						fn = (void *) ExecEvalConvertRowtype; break;
-#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-					case EEOP_JSON_CONSTRUCTOR:
-						fn = (void *) ExecEvalJsonConstructor; break;
-#endif
 #ifdef HAVE_EEOP_JSONEXPR
 					case EEOP_JSONEXPR_COERCION:
 						fn = (void *) ExecEvalJsonCoercion; break;
@@ -4779,12 +5083,6 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #endif
 					case EEOP_SUBPLAN:
 						fn = (void *) ExecEvalSubPlan; break;
-					case EEOP_WHOLEROW:
-						fn = (void *) ExecEvalWholeRowVar; break;
-					case EEOP_AGG_ORDERED_TRANS_DATUM:
-						fn = (void *) ExecEvalAggOrderedTransDatum; break;
-					case EEOP_AGG_ORDERED_TRANS_TUPLE:
-						fn = (void *) ExecEvalAggOrderedTransTuple; break;
 					case EEOP_PARAM_EXTERN:
 						fn = (void *) ExecEvalParamExtern; break;
 					default:
@@ -5161,52 +5459,569 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				break;
 			}
 
-			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-			case EEOP_IOCOERCE_SAFE:
-#endif
-			case EEOP_SQLVALUEFUNCTION:
-			case EEOP_CURRENTOFEXPR:
-			case EEOP_NEXTVALUEEXPR:
-			case EEOP_ARRAYEXPR:
-			case EEOP_ROW:
-			case EEOP_XMLEXPR:
+			/*
+			 * ---- IS_JSON (simdjson-accelerated for text input) ----
+			 */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 			case EEOP_IS_JSON:
+			{
+#ifdef PG_JITTER_HAVE_SIMDJSON
+				JsonIsPredicate *pred = op->d.is_json.pred;
+				if (exprType(pred->expr) == TEXTOID && !pred->unique_keys)
+				{
+					/* simdjson fast path */
+					a64::Gp resval_addr = cc.new_gpx();
+					cc.mov(resval_addr, (uint64_t) op->resvalue);
+					a64::Gp resnull_addr = cc.new_gpx();
+					cc.mov(resnull_addr, (uint64_t) op->resnull);
+					a64::Gp resnull_reg = cc.new_gpx();
+					cc.ldrb(resnull_reg.w(), a64::Mem(resnull_addr));
+					Label skip_null = cc.new_label();
+					cc.cbnz(resnull_reg.w(), skip_null);
+
+					/* Load *op->resvalue (text Datum) */
+					a64::Gp datum_reg = cc.new_gpx();
+					cc.ldr(datum_reg, a64::Mem(resval_addr));
+
+					/* Call pg_jitter_sj_is_json_datum(datum, item_type) */
+					a64::Gp item_type_reg = cc.new_gpx();
+					cc.mov(item_type_reg, (int64_t) pred->item_type);
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_sj_is_json_datum);
+					InvokeNode *invoke;
+					a64::Gp ret_reg = cc.new_gpx();
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<int64_t, int64_t, int64_t>());
+					invoke->set_arg(0, datum_reg);
+					invoke->set_arg(1, item_type_reg);
+					invoke->set_ret(0, ret_reg);
+
+					/* Zero-extend int32 return to Datum (int64) —
+					 * ARM64 leaves upper 32 bits of x0 undefined for
+					 * int32 returns, but Datum comparison needs full 64-bit.
+					 * Mask to lower 32 bits since function returns int32. */
+					cc.and_(ret_reg, ret_reg, Imm(0xFFFFFFFF));
+
+					/* *op->resvalue = BoolGetDatum(ret) */
+					cc.str(ret_reg, a64::Mem(resval_addr));
+
+					Label done = cc.new_label();
+					cc.b(done);
+
+					/* Null path: *op->resvalue = false */
+					cc.bind(skip_null);
+					a64::Gp zero_reg = cc.new_gpx();
+					cc.mov(zero_reg, 0);
+					cc.str(zero_reg, a64::Mem(resval_addr));
+
+					cc.bind(done);
+					break;
+				}
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+				/* Fallback: generic 2-arg call */
+				a64::Gp fn_reg = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonIsPredicate);
+				a64::Gp op_reg = cc.new_gpx();
+				cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+				InvokeNode *invoke;
+				cc.invoke(Out(invoke), fn_reg,
+						  FuncSignature::build<void, void *, void *>());
+				invoke->set_arg(0, v_state);
+				invoke->set_arg(1, op_reg);
+				break;
+			}
 #endif
-#ifdef HAVE_EEOP_JSONEXPR
-			case EEOP_JSONEXPR_COERCION_FINISH:
-#endif
+
+
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+			/*
+			 * ---- IOCOERCE_SAFE (inlined, PG17+) ----
+			 * Like IOCOERCE but checks SOFT_ERROR_OCCURRED after input fn.
+			 * On soft error: *op->resnull = true, *op->resvalue = 0.
+			 */
+			case EEOP_IOCOERCE_SAFE:
+			{
+				FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+				FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+
+				/* if (*op->resnull) skip */
+				a64::Gp resnull_addr = cc.new_gpx();
+				a64::Gp resnull_reg = cc.new_gpx();
+				cc.mov(resnull_addr, (uint64_t) op->resnull);
+				cc.ldrb(resnull_reg.w(), a64::Mem(resnull_addr));
+				Label skip_null = cc.new_label();
+				cc.cbnz(resnull_reg.w(), skip_null);
+
+				/* fcinfo_out->args[0].value = *op->resvalue */
+				a64::Gp resval_addr = cc.new_gpx();
+				cc.mov(resval_addr, (uint64_t) op->resvalue);
+				a64::Gp resval_reg = cc.new_gpx();
+				cc.ldr(resval_reg, a64::Mem(resval_addr));
+				a64::Gp fcinfo_out_reg = cc.new_gpx();
+				cc.mov(fcinfo_out_reg, (uint64_t) fcinfo_out);
+				int64_t arg0_val_off = (int64_t)((char*)&fcinfo_out->args[0].value - (char*)fcinfo_out);
+				int64_t arg0_null_off = (int64_t)((char*)&fcinfo_out->args[0].isnull - (char*)fcinfo_out);
+				cc.str(resval_reg, a64::Mem(fcinfo_out_reg, (int32_t) arg0_val_off));
+				/* fcinfo_out->args[0].isnull = false */
+				a64::Gp zero_reg = cc.new_gpx();
+				cc.mov(zero_reg, 0);
+				cc.strb(zero_reg.w(), a64::Mem(fcinfo_out_reg, (int32_t) arg0_null_off));
+				/* fcinfo_out->isnull = false */
+				cc.strb(zero_reg.w(), a64::Mem(fcinfo_out_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+
+				/* Call output fn */
+				a64::Gp fn_out = cc.new_gpx();
+				ASMJIT_MOV_FN(cc, fn_out, (void *) fcinfo_out->flinfo->fn_addr);
+				InvokeNode *invoke_out;
+				a64::Gp ret_out = cc.new_gpx();
+				cc.invoke(Out(invoke_out), fn_out,
+						  FuncSignature::build<int64_t, void *>());
+				invoke_out->set_arg(0, fcinfo_out_reg);
+				invoke_out->set_ret(0, ret_out);
+
+				/* ret_out = cstring Datum; call input function (or simdjson) */
+#ifdef PG_JITTER_HAVE_SIMDJSON
+				if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
+					fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
+				{
+					/* simdjson fast path: sj_fn(cstring, fcinfo_in) -> Datum */
+					void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
+								  ? (void *) pg_jitter_sj_json_in
+								  : (void *) pg_jitter_sj_jsonb_in;
+					a64::Gp fcinfo_in_reg = cc.new_gpx();
+					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
+					a64::Gp sj_fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, sj_fn_reg, sj_fn);
+					InvokeNode *invoke_sj;
+					a64::Gp ret_sj = cc.new_gpx();
+					cc.invoke(Out(invoke_sj), sj_fn_reg,
+							  FuncSignature::build<int64_t, int64_t, void *>());
+					invoke_sj->set_arg(0, ret_out);
+					invoke_sj->set_arg(1, fcinfo_in_reg);
+					invoke_sj->set_ret(0, ret_sj);
+
+					/* *op->resvalue = ret_sj */
+					cc.str(ret_sj, a64::Mem(resval_addr));
+					/* *op->resnull = false (simdjson ereport's on error) */
+					cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
+					/* simdjson never uses soft errors, skip the check */
+				}
+				else
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+				{
+					/* Standard input function call */
+					a64::Gp fcinfo_in_reg = cc.new_gpx();
+					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
+					int64_t in_arg0_val_off = (int64_t)((char*)&fcinfo_in->args[0].value - (char*)fcinfo_in);
+					int64_t in_arg0_null_off = (int64_t)((char*)&fcinfo_in->args[0].isnull - (char*)fcinfo_in);
+					cc.str(ret_out, a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_val_off));
+					cc.strb(zero_reg.w(), a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_null_off));
+					cc.strb(zero_reg.w(), a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+
+					a64::Gp fn_in = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_in, (void *) fcinfo_in->flinfo->fn_addr);
+					InvokeNode *invoke_in;
+					a64::Gp ret_in = cc.new_gpx();
+					cc.invoke(Out(invoke_in), fn_in,
+							  FuncSignature::build<int64_t, void *>());
+					invoke_in->set_arg(0, fcinfo_in_reg);
+					invoke_in->set_ret(0, ret_in);
+
+					/* Check SOFT_ERROR_OCCURRED(fcinfo_in->context) */
+					a64::Gp ctx_reg = cc.new_gpx();
+					cc.ldr(ctx_reg, a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, context)));
+					a64::Gp err_reg = cc.new_gpx();
+					cc.ldrb(err_reg.w(), a64::Mem(ctx_reg, (int32_t) offsetof(ErrorSaveContext, error_occurred)));
+					Label no_soft_error = cc.new_label();
+					cc.cbz(err_reg.w(), no_soft_error);
+
+					/* Soft error path: *op->resnull = true, *op->resvalue = 0 */
+					{
+						a64::Gp one_reg = cc.new_gpx();
+						cc.mov(one_reg, 1);
+						cc.strb(one_reg.w(), a64::Mem(resnull_addr));
+						cc.str(zero_reg, a64::Mem(resval_addr));
+					}
+					Label iocoerce_safe_done = cc.new_label();
+					cc.b(iocoerce_safe_done);
+
+					/* No error: store result normally */
+					cc.bind(no_soft_error);
+					cc.str(ret_in, a64::Mem(resval_addr));
+					/* *op->resnull = fcinfo_in->isnull */
+					a64::Gp isnull_in = cc.new_gpx();
+					cc.ldrb(isnull_in.w(), a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+					cc.strb(isnull_in.w(), a64::Mem(resnull_addr));
+
+					cc.bind(iocoerce_safe_done);
+				}
+
+				cc.bind(skip_null);
+				break;
+			}
+#endif /* HAVE_EEOP_IOCOERCE_SAFE */
+
+			/*
+			 * ---- SQLVALUEFUNCTION (inlined) ----
+			 * Resolve svf->op at compile time, emit direct call to getter.
+			 * Time functions: direct call with typmod immediate.
+			 * Identity functions: fall back to ExecEvalSQLValueFunction.
+			 */
+			case EEOP_SQLVALUEFUNCTION:
+			{
+				SQLValueFunction *svf = op->d.sqlvaluefunction.svf;
+
+				switch (svf->op)
+				{
+					case SVFOP_CURRENT_DATE:
+					{
+						/* GetSQLCurrentDate() -> int32 (DateADT) */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) GetSQLCurrentDate);
+						InvokeNode *invoke;
+						a64::Gp ret = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int32_t>());
+						invoke->set_ret(0, ret);
+						/* Zero-extend int32 to Datum (64-bit) */
+						cc.and_(ret, ret, Imm(0xFFFFFFFF));
+						/* *op->resvalue = ret */
+						if (op->resvalue == &state->resvalue)
+							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							a64::Gp rv_addr = cc.new_gpx();
+							cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(ret, a64::ptr(rv_addr));
+						}
+						/* *op->resnull = false */
+						a64::Gp zero_r = cc.new_gpx();
+						cc.mov(zero_r, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(zero_r.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							a64::Gp rn_addr = cc.new_gpx();
+							cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(zero_r.w(), a64::ptr(rn_addr));
+						}
+						break;
+					}
+
+					case SVFOP_CURRENT_TIME:
+					case SVFOP_CURRENT_TIME_N:
+					{
+						/* GetSQLCurrentTime(int32 typmod) -> pointer (TimeTzADT*) */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) GetSQLCurrentTime);
+						a64::Gp typmod_reg = cc.new_gpx();
+						cc.mov(typmod_reg, (uint64_t)(uint32_t) svf->typmod);
+						InvokeNode *invoke;
+						a64::Gp ret = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int64_t, int32_t>());
+						invoke->set_arg(0, typmod_reg);
+						invoke->set_ret(0, ret);
+						/* *op->resvalue = ret (pointer Datum) */
+						if (op->resvalue == &state->resvalue)
+							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							a64::Gp rv_addr = cc.new_gpx();
+							cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(ret, a64::ptr(rv_addr));
+						}
+						/* *op->resnull = false */
+						a64::Gp zero_r = cc.new_gpx();
+						cc.mov(zero_r, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(zero_r.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							a64::Gp rn_addr = cc.new_gpx();
+							cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(zero_r.w(), a64::ptr(rn_addr));
+						}
+						break;
+					}
+
+					case SVFOP_CURRENT_TIMESTAMP:
+					case SVFOP_CURRENT_TIMESTAMP_N:
+					{
+						/* GetSQLCurrentTimestamp(int32 typmod) -> int64 */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) GetSQLCurrentTimestamp);
+						a64::Gp typmod_reg = cc.new_gpx();
+						cc.mov(typmod_reg, (uint64_t)(uint32_t) svf->typmod);
+						InvokeNode *invoke;
+						a64::Gp ret = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int64_t, int32_t>());
+						invoke->set_arg(0, typmod_reg);
+						invoke->set_ret(0, ret);
+						if (op->resvalue == &state->resvalue)
+							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							a64::Gp rv_addr = cc.new_gpx();
+							cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(ret, a64::ptr(rv_addr));
+						}
+						a64::Gp zero_r = cc.new_gpx();
+						cc.mov(zero_r, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(zero_r.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							a64::Gp rn_addr = cc.new_gpx();
+							cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(zero_r.w(), a64::ptr(rn_addr));
+						}
+						break;
+					}
+
+					case SVFOP_LOCALTIME:
+					case SVFOP_LOCALTIME_N:
+					{
+						/* GetSQLLocalTime(int32 typmod) -> int64 */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) GetSQLLocalTime);
+						a64::Gp typmod_reg = cc.new_gpx();
+						cc.mov(typmod_reg, (uint64_t)(uint32_t) svf->typmod);
+						InvokeNode *invoke;
+						a64::Gp ret = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int64_t, int32_t>());
+						invoke->set_arg(0, typmod_reg);
+						invoke->set_ret(0, ret);
+						if (op->resvalue == &state->resvalue)
+							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							a64::Gp rv_addr = cc.new_gpx();
+							cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(ret, a64::ptr(rv_addr));
+						}
+						a64::Gp zero_r = cc.new_gpx();
+						cc.mov(zero_r, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(zero_r.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							a64::Gp rn_addr = cc.new_gpx();
+							cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(zero_r.w(), a64::ptr(rn_addr));
+						}
+						break;
+					}
+
+					case SVFOP_LOCALTIMESTAMP:
+					case SVFOP_LOCALTIMESTAMP_N:
+					{
+						/* GetSQLLocalTimestamp(int32 typmod) -> int64 */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) GetSQLLocalTimestamp);
+						a64::Gp typmod_reg = cc.new_gpx();
+						cc.mov(typmod_reg, (uint64_t)(uint32_t) svf->typmod);
+						InvokeNode *invoke;
+						a64::Gp ret = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int64_t, int32_t>());
+						invoke->set_arg(0, typmod_reg);
+						invoke->set_ret(0, ret);
+						if (op->resvalue == &state->resvalue)
+							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							a64::Gp rv_addr = cc.new_gpx();
+							cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+							cc.str(ret, a64::ptr(rv_addr));
+						}
+						a64::Gp zero_r = cc.new_gpx();
+						cc.mov(zero_r, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(zero_r.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							a64::Gp rn_addr = cc.new_gpx();
+							cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+							cc.strb(zero_r.w(), a64::ptr(rn_addr));
+						}
+						break;
+					}
+
+					default:
+					{
+						/* Identity functions (CURRENT_USER etc): fall back to C */
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalSQLValueFunction);
+						a64::Gp op_reg = cc.new_gpx();
+						cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+						InvokeNode *invoke;
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<void, void *, void *>());
+						invoke->set_arg(0, v_state);
+						invoke->set_arg(1, op_reg);
+						break;
+					}
+				}
+				break;
+			}
+
+			/*
+			 * ---- ARRAYEXPR (inlined for fixed-width by-value) ----
+			 * For simple 1-D arrays of fixed-width by-value elements with no
+			 * nulls, we inline: palloc(known_size) + header init + element copy.
+			 * All other cases fall back to ExecEvalArrayExpr.
+			 */
+			case EEOP_ARRAYEXPR:
+			{
+				int nelems = op->d.arrayexpr.nelems;
+				int16 elemlength = op->d.arrayexpr.elemlength;
+				bool elembyval = op->d.arrayexpr.elembyval;
+				bool multidims = op->d.arrayexpr.multidims;
+
+				if (!multidims && elemlength > 0 && elembyval &&
+					nelems > 0 && nelems <= 64)
+				{
+					/*
+					 * Fast path: fixed-width by-value, 1-D, small array.
+					 * Pre-compute total size at compile time.
+					 */
+					int dataoff = ARR_OVERHEAD_NONULLS(1);
+					int data_size = nelems * elemlength;
+					int total_size = dataoff + data_size;
+
+					/* Check elemnulls[] for any nulls; jump to fallback if found */
+					a64::Gp elemnulls_reg = cc.new_gpx();
+					cc.ldr(elemnulls_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.arrayexpr.elemnulls)));
+					Label arr_fallback = cc.new_label();
+					for (int k = 0; k < nelems; k++)
+					{
+						a64::Gp null_byte = cc.new_gpx();
+						cc.ldrb(null_byte.w(), a64::Mem(elemnulls_reg, k * (int)sizeof(bool)));
+						cc.cbnz(null_byte.w(), arr_fallback);
+					}
+
+					/* No nulls: palloc(total_size) */
+					a64::Gp palloc_fn = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, palloc_fn, (void *) palloc);
+					a64::Gp size_reg = cc.new_gpx();
+					cc.mov(size_reg, (uint64_t) total_size);
+					InvokeNode *invoke_palloc;
+					a64::Gp arr_reg = cc.new_gpx();
+					cc.invoke(Out(invoke_palloc), palloc_fn,
+							  FuncSignature::build<int64_t, int64_t>());
+					invoke_palloc->set_arg(0, size_reg);
+					invoke_palloc->set_ret(0, arr_reg);
+
+					/* Initialize ArrayType header */
+					/* SET_VARSIZE: store (total_size << 2) in first 4 bytes */
+					a64::Gp hdr_val = cc.new_gpx();
+					cc.mov(hdr_val, (uint64_t)(total_size << 2));
+					cc.str(hdr_val.w(), a64::Mem(arr_reg, 0));
+					/* ndim = 1 */
+					a64::Gp one_reg = cc.new_gpx();
+					cc.mov(one_reg, 1);
+					cc.str(one_reg.w(), a64::Mem(arr_reg, (int32_t) offsetof(ArrayType, ndim)));
+					/* dataoffset = 0 (no null bitmap) */
+					a64::Gp zero_reg = cc.new_gpx();
+					cc.mov(zero_reg, 0);
+					cc.str(zero_reg.w(), a64::Mem(arr_reg, (int32_t) offsetof(ArrayType, dataoffset)));
+					/* elemtype */
+					a64::Gp etype_reg = cc.new_gpx();
+					cc.mov(etype_reg, (uint64_t) op->d.arrayexpr.elemtype);
+					cc.str(etype_reg.w(), a64::Mem(arr_reg, (int32_t) offsetof(ArrayType, elemtype)));
+					/* dims[0] = nelems (at offset sizeof(ArrayType)) */
+					a64::Gp nelems_reg = cc.new_gpx();
+					cc.mov(nelems_reg, (uint64_t) nelems);
+					cc.str(nelems_reg.w(), a64::Mem(arr_reg, (int32_t) sizeof(ArrayType)));
+					/* lbound[0] = 1 (at offset sizeof(ArrayType) + sizeof(int)) */
+					cc.str(one_reg.w(), a64::Mem(arr_reg, (int32_t)(sizeof(ArrayType) + sizeof(int))));
+
+					/* Copy elements from elemvalues[] into data area */
+					a64::Gp elemvals_reg = cc.new_gpx();
+					cc.ldr(elemvals_reg, a64::ptr(v_steps, STEP_OFFSET(opno, d.arrayexpr.elemvalues)));
+					for (int k = 0; k < nelems; k++)
+					{
+						a64::Gp elem = cc.new_gpx();
+						cc.ldr(elem, a64::Mem(elemvals_reg, k * (int)sizeof(Datum)));
+						if (elemlength == 8)
+							cc.str(elem, a64::Mem(arr_reg, (int32_t)(dataoff + k * elemlength)));
+						else if (elemlength == 4)
+							cc.str(elem.w(), a64::Mem(arr_reg, (int32_t)(dataoff + k * elemlength)));
+						else if (elemlength == 2)
+							cc.strh(elem.w(), a64::Mem(arr_reg, (int32_t)(dataoff + k * elemlength)));
+						else /* elemlength == 1 */
+							cc.strb(elem.w(), a64::Mem(arr_reg, (int32_t)(dataoff + k * elemlength)));
+					}
+
+					/* *op->resvalue = PointerGetDatum(arr_reg) */
+					if (op->resvalue == &state->resvalue)
+						cc.str(arr_reg, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+					else
+					{
+						a64::Gp rv_addr = cc.new_gpx();
+						cc.ldr(rv_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resvalue)));
+						cc.str(arr_reg, a64::ptr(rv_addr));
+					}
+					/* *op->resnull = false */
+					if (op->resnull == &state->resnull)
+						cc.strb(zero_reg.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+					else
+					{
+						a64::Gp rn_addr = cc.new_gpx();
+						cc.ldr(rn_addr, a64::ptr(v_steps, STEP_OFFSET(opno, resnull)));
+						cc.strb(zero_reg.w(), a64::ptr(rn_addr));
+					}
+
+					Label arr_done = cc.new_label();
+					cc.b(arr_done);
+
+					/* Fallback: has nulls or complex case -> call C function */
+					cc.bind(arr_fallback);
+					{
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalArrayExpr);
+						a64::Gp op_reg = cc.new_gpx();
+						cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+						InvokeNode *invoke;
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<void, void *, void *>());
+						invoke->set_arg(0, v_state);
+						invoke->set_arg(1, op_reg);
+					}
+
+					cc.bind(arr_done);
+				}
+				else
+				{
+					/* Fallback to C function for varlena/multidims/complex cases */
+					a64::Gp fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalArrayExpr);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.add(op_reg, v_steps, (int64_t)(opno * (int64_t)sizeof(ExprEvalStep)));
+					InvokeNode *invoke;
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+				}
+				break;
+			}
+
+			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
+			case EEOP_CURRENTOFEXPR:
+			case EEOP_XMLEXPR:
 			{
 				void *fn;
 
 				switch (opcode)
 				{
-#ifdef HAVE_EEOP_IOCOERCE_SAFE
-					case EEOP_IOCOERCE_SAFE:
-						fn = (void *) ExecEvalCoerceViaIOSafe; break;
-#endif
-					/* SCALARARRAYOP moved to dedicated inline case */
-					case EEOP_SQLVALUEFUNCTION:
-						fn = (void *) ExecEvalSQLValueFunction; break;
 					case EEOP_CURRENTOFEXPR:
 						fn = (void *) ExecEvalCurrentOfExpr; break;
-					case EEOP_NEXTVALUEEXPR:
-						fn = (void *) ExecEvalNextValueExpr; break;
-					case EEOP_ARRAYEXPR:
-						fn = (void *) ExecEvalArrayExpr; break;
-					case EEOP_ROW:
-						fn = (void *) ExecEvalRow; break;
 					case EEOP_XMLEXPR:
 						fn = (void *) ExecEvalXmlExpr; break;
-#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-					case EEOP_IS_JSON:
-						fn = (void *) ExecEvalJsonIsPredicate; break;
-#endif
-#ifdef HAVE_EEOP_JSONEXPR
-					case EEOP_JSONEXPR_COERCION_FINISH:
-						fn = (void *) ExecEvalJsonCoercionFinish; break;
-#endif
 					default:
 						pg_unreachable();
 				}
@@ -5419,9 +6234,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				a64::Gp resnull_addr = cc.new_gpx();
 				a64::Gp resnull_reg = cc.new_gpx();
 				cc.mov(resnull_addr, (uint64_t) op->resnull);
-				cc.ldrb(resnull_reg, a64::Mem(resnull_addr));
+				cc.ldrb(resnull_reg.w(), a64::Mem(resnull_addr));
 				Label skip_null = cc.new_label();
-				cc.cbnz(resnull_reg, skip_null);
+				cc.cbnz(resnull_reg.w(), skip_null);
 
 				/* fcinfo_out->args[0].value = *op->resvalue */
 				a64::Gp resval_addr = cc.new_gpx();
@@ -5436,9 +6251,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				/* fcinfo_out->args[0].isnull = false */
 				a64::Gp zero_reg = cc.new_gpx();
 				cc.mov(zero_reg, 0);
-				cc.strb(zero_reg, a64::Mem(fcinfo_out_reg, (int32_t) arg0_null_off));
+				cc.strb(zero_reg.w(), a64::Mem(fcinfo_out_reg, (int32_t) arg0_null_off));
 				/* fcinfo_out->isnull = false */
-				cc.strb(zero_reg, a64::Mem(fcinfo_out_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+				cc.strb(zero_reg.w(), a64::Mem(fcinfo_out_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
 
 				/* Call output fn */
 				a64::Gp fn_out = cc.new_gpx();
@@ -5450,31 +6265,60 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke_out->set_arg(0, fcinfo_out_reg);
 				invoke_out->set_ret(0, ret_out);
 
-				/* fcinfo_in->args[0].value = ret_out */
-				a64::Gp fcinfo_in_reg = cc.new_gpx();
-				cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
-				int64_t in_arg0_val_off = (int64_t)((char*)&fcinfo_in->args[0].value - (char*)fcinfo_in);
-				int64_t in_arg0_null_off = (int64_t)((char*)&fcinfo_in->args[0].isnull - (char*)fcinfo_in);
-				cc.str(ret_out, a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_val_off));
-				cc.strb(zero_reg, a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_null_off));
-				cc.strb(zero_reg, a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+				/* ret_out = cstring Datum; call input function (or simdjson) */
+#ifdef PG_JITTER_HAVE_SIMDJSON
+				if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
+					fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
+				{
+					/* simdjson fast path: sj_fn(cstring, fcinfo_in) → Datum */
+					void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
+								  ? (void *) pg_jitter_sj_json_in
+								  : (void *) pg_jitter_sj_jsonb_in;
+					a64::Gp fcinfo_in_reg = cc.new_gpx();
+					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
+					a64::Gp sj_fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, sj_fn_reg, sj_fn);
+					InvokeNode *invoke_sj;
+					a64::Gp ret_sj = cc.new_gpx();
+					cc.invoke(Out(invoke_sj), sj_fn_reg,
+							  FuncSignature::build<int64_t, int64_t, void *>());
+					invoke_sj->set_arg(0, ret_out);
+					invoke_sj->set_arg(1, fcinfo_in_reg);
+					invoke_sj->set_ret(0, ret_sj);
 
-				/* Call input fn */
-				a64::Gp fn_in = cc.new_gpx();
-				ASMJIT_MOV_FN(cc, fn_in, (void *) fcinfo_in->flinfo->fn_addr);
-				InvokeNode *invoke_in;
-				a64::Gp ret_in = cc.new_gpx();
-				cc.invoke(Out(invoke_in), fn_in,
-						  FuncSignature::build<int64_t, void *>());
-				invoke_in->set_arg(0, fcinfo_in_reg);
-				invoke_in->set_ret(0, ret_in);
+					/* *op->resvalue = ret_sj */
+					cc.str(ret_sj, a64::Mem(resval_addr));
+					/* *op->resnull = false */
+					cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
+				}
+				else
+#endif /* PG_JITTER_HAVE_SIMDJSON */
+				{
+					/* Standard input function call */
+					a64::Gp fcinfo_in_reg = cc.new_gpx();
+					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
+					int64_t in_arg0_val_off = (int64_t)((char*)&fcinfo_in->args[0].value - (char*)fcinfo_in);
+					int64_t in_arg0_null_off = (int64_t)((char*)&fcinfo_in->args[0].isnull - (char*)fcinfo_in);
+					cc.str(ret_out, a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_val_off));
+					cc.strb(zero_reg.w(), a64::Mem(fcinfo_in_reg, (int32_t) in_arg0_null_off));
+					cc.strb(zero_reg.w(), a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
 
-				/* *op->resvalue = ret_in */
-				cc.str(ret_in, a64::Mem(resval_addr));
-				/* *op->resnull = fcinfo_in->isnull */
-				a64::Gp isnull_in = cc.new_gpx();
-				cc.ldrb(isnull_in, a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
-				cc.strb(isnull_in, a64::Mem(resnull_addr));
+					a64::Gp fn_in = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_in, (void *) fcinfo_in->flinfo->fn_addr);
+					InvokeNode *invoke_in;
+					a64::Gp ret_in = cc.new_gpx();
+					cc.invoke(Out(invoke_in), fn_in,
+							  FuncSignature::build<int64_t, void *>());
+					invoke_in->set_arg(0, fcinfo_in_reg);
+					invoke_in->set_ret(0, ret_in);
+
+					/* *op->resvalue = ret_in */
+					cc.str(ret_in, a64::Mem(resval_addr));
+					/* *op->resnull = fcinfo_in->isnull */
+					a64::Gp isnull_in = cc.new_gpx();
+					cc.ldrb(isnull_in.w(), a64::Mem(fcinfo_in_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+					cc.strb(isnull_in.w(), a64::Mem(resnull_addr));
+				}
 
 				cc.bind(skip_null);
 				break;

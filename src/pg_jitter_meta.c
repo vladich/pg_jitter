@@ -133,6 +133,15 @@ typedef struct MetaJitterContext
 
 	/* DSM-based shared code state — mirrors JitShareState */
 	MetaJitShareState	share_state;
+<<<<<<< Updated upstream
+=======
+
+	/* Bitmask of backends that compiled something in this context */
+	uint8				backends_used;
+
+	/* Adaptive timing contexts active for this JIT context */
+	AdaptiveTimingNode *adaptive_timings;
+>>>>>>> Stashed changes
 } MetaJitterContext;
 
 /* ----------------------------------------------------------------
@@ -296,6 +305,22 @@ meta_load_backend(int idx)
 static void
 meta_backend_assign(int newval, void *extra)
 {
+<<<<<<< Updated upstream
+=======
+	if (newval == PG_JITTER_BACKEND_AUTO)
+	{
+		/*
+		 * Auto mode uses sljit + asmjit only.  MIR is excluded because
+		 * its compilation overhead (15-100x slower than sljit) rarely
+		 * justifies the marginal execution gains.  Users can still
+		 * SET pg_jitter.backend = 'mir' explicitly.
+		 */
+		meta_load_backend(PG_JITTER_BACKEND_SLJIT);
+		meta_load_backend(PG_JITTER_BACKEND_ASMJIT);
+		return;
+	}
+
+>>>>>>> Stashed changes
 	if (!meta_load_backend(newval))
 		ereport(WARNING,
 				(errmsg("pg_jitter backend \"%s\" is not installed, will fall back",
@@ -345,9 +370,637 @@ meta_ensure_context(ExprState *state)
 }
 
 /* ----------------------------------------------------------------
+<<<<<<< Updated upstream
  * Provider callbacks — dispatch to loaded backend
  * ---------------------------------------------------------------- */
 
+=======
+ * Adaptive statistics — management
+ * ---------------------------------------------------------------- */
+
+/*
+ * Convert backend enum (PG_JITTER_BACKEND_*) to adaptive index (0/1/2).
+ * Returns -1 for invalid backends.
+ */
+static inline int
+adaptive_backend_to_idx(int backend)
+{
+	switch (backend)
+	{
+		case PG_JITTER_BACKEND_SLJIT:	return ADAPTIVE_IDX_SLJIT;
+		case PG_JITTER_BACKEND_ASMJIT:	return ADAPTIVE_IDX_ASMJIT;
+		case PG_JITTER_BACKEND_MIR:		return ADAPTIVE_IDX_MIR;
+		default:						return -1;
+	}
+}
+
+static inline int
+adaptive_idx_to_backend(int idx)
+{
+	switch (idx)
+	{
+		case ADAPTIVE_IDX_SLJIT:	return PG_JITTER_BACKEND_SLJIT;
+		case ADAPTIVE_IDX_ASMJIT:	return PG_JITTER_BACKEND_ASMJIT;
+		case ADAPTIVE_IDX_MIR:		return PG_JITTER_BACKEND_MIR;
+		default:					return PG_JITTER_BACKEND_SLJIT;
+	}
+}
+
+/*
+ * Initialize the adaptive stats table in process-local memory.
+ *
+ * The JIT provider is loaded lazily (not via shared_preload_libraries),
+ * so we cannot use ShmemInitStruct.  Each backend process maintains its
+ * own stats table in TopMemoryContext.  Stats are per-process but
+ * expressions are deterministic — same query structure → same profile
+ * hash → converges quickly within a single session.
+ */
+static void
+adaptive_stats_init(void)
+{
+	Size	size;
+
+	if (adaptive_stats != NULL || adaptive_shmem_attempted)
+		return;
+
+	adaptive_shmem_attempted = true;
+
+	size = offsetof(AdaptiveStatsTable, entries) +
+		   sizeof(AdaptiveStatsEntry) * ADAPTIVE_STATS_MAX_ENTRIES;
+
+	adaptive_stats = (AdaptiveStatsTable *)
+		MemoryContextAllocZero(TopMemoryContext, size);
+
+	adaptive_stats->num_entries = 0;
+	adaptive_stats->max_entries = ADAPTIVE_STATS_MAX_ENTRIES;
+}
+
+/*
+ * Build an expression profile by scanning the step array.
+ */
+static void
+meta_build_profile(ExprState *state, ExprProfile *profile)
+{
+	ExprEvalStep *steps = state->steps;
+	int			  nsteps = state->steps_len;
+
+	memset(profile, 0, sizeof(ExprProfile));
+	profile->nsteps = (uint16) Min(nsteps, UINT16_MAX);
+
+	for (int i = 0; i < nsteps; i++)
+	{
+		ExprEvalOp opcode = ExecEvalStepOp(state, &steps[i]);
+
+		switch (opcode)
+		{
+			case EEOP_INNER_FETCHSOME:
+			case EEOP_OUTER_FETCHSOME:
+			case EEOP_SCAN_FETCHSOME:
+				profile->fetchsome_natts += steps[i].d.fetch.last_var;
+				break;
+
+#ifdef HAVE_EEOP_HASHDATUM
+			case EEOP_HASHDATUM_SET_INITVAL:
+			case EEOP_HASHDATUM_FIRST:
+			case EEOP_HASHDATUM_FIRST_STRICT:
+			case EEOP_HASHDATUM_NEXT32:
+			case EEOP_HASHDATUM_NEXT32_STRICT:
+				profile->n_hashdatum++;
+				break;
+#endif
+
+			case EEOP_FUNCEXPR:
+			case EEOP_FUNCEXPR_STRICT:
+			case EEOP_FUNCEXPR_FUSAGE:
+			case EEOP_FUNCEXPR_STRICT_FUSAGE:
+				profile->n_funcexpr++;
+				break;
+
+			case EEOP_QUAL:
+				profile->n_qual++;
+				break;
+
+			case EEOP_AGG_PLAIN_TRANS_BYVAL:
+			case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+				profile->n_agg++;
+				break;
+
+			default:
+				break;
+		}
+	}
+}
+
+/*
+ * Hash an expression profile using CRC32C.
+ * The profile struct is 8 bytes — one hardware CRC instruction on ARM64/x86.
+ */
+static uint32
+meta_profile_hash(const ExprProfile *profile)
+{
+	pg_crc32c	crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, profile, sizeof(ExprProfile));
+	FIN_CRC32C(crc);
+	return (uint32) crc;
+}
+
+/*
+ * Look up a profile hash in the stats table.
+ * Returns the entry index, or -1 if not found.
+ */
+static int
+adaptive_stats_lookup(uint32 profile_hash)
+{
+	int	n;
+
+	if (adaptive_stats == NULL)
+		return -1;
+
+	n = adaptive_stats->num_entries;
+	for (int i = 0; i < n; i++)
+	{
+		if (adaptive_stats->entries[i].profile_hash == profile_hash)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Insert a new profile hash into the stats table, storing the profile details.
+ * Returns the entry index, or -1 if the table is full.
+ */
+static int
+adaptive_stats_insert(uint32 profile_hash, const ExprProfile *profile)
+{
+	int		slot;
+	AdaptiveStatsEntry *e;
+
+	if (adaptive_stats == NULL)
+		return -1;
+
+	/* Check if already inserted */
+	{
+		int existing = adaptive_stats_lookup(profile_hash);
+		if (existing >= 0)
+			return existing;
+	}
+
+	if (adaptive_stats->num_entries >= adaptive_stats->max_entries)
+		return -1;		/* table full */
+
+	slot = adaptive_stats->num_entries++;
+	e = &adaptive_stats->entries[slot];
+
+	e->nsteps = profile->nsteps;
+	e->fetchsome_natts = profile->fetchsome_natts;
+	e->n_hashdatum = profile->n_hashdatum;
+	e->n_funcexpr = profile->n_funcexpr;
+	e->n_qual = profile->n_qual;
+	e->n_agg = profile->n_agg;
+	e->profile_hash = profile_hash;
+
+	return slot;
+}
+
+/*
+ * Record timing data into the stats table.
+ * compile_ns is the one-time compilation cost; exec_ns is accumulated execution time.
+ * profile may be NULL if the entry already exists.
+ */
+static void
+adaptive_stats_record(uint32 profile_hash, int adaptive_idx,
+					  int64 compile_ns, int64 exec_ns, int call_count,
+					  const ExprProfile *profile)
+{
+	int		slot;
+	static const ExprProfile empty_profile = {0};
+
+	if (adaptive_stats == NULL || adaptive_idx < 0)
+		return;
+
+	slot = adaptive_stats_lookup(profile_hash);
+	if (slot < 0)
+		slot = adaptive_stats_insert(profile_hash,
+									 profile ? profile : &empty_profile);
+	if (slot < 0)
+		return;		/* table full, discard stats */
+
+	adaptive_stats->entries[slot].call_count[adaptive_idx] += (uint32) call_count;
+	if (compile_ns > 0)
+		adaptive_stats->entries[slot].compile_ns[adaptive_idx] += (uint64) compile_ns;
+	if (exec_ns > 0)
+		adaptive_stats->entries[slot].exec_ns[adaptive_idx] += (uint64) exec_ns;
+}
+
+/*
+ * Select a backend using adaptive stats.
+ *
+ * Cost model: total_cost = compile_ns + exec_ns (over the sample window).
+ * This amortizes compilation overhead over the observed invocations —
+ * backends with high compilation cost (MIR) need proportionally faster
+ * per-call execution to win.
+ *
+ * Default priority: sljit > asmjit > mir.  A non-default backend is
+ * selected only if its total cost is strictly lower than sljit's.
+ *
+ * Returns a PG_JITTER_BACKEND_* value, or -1 if insufficient data
+ * (caller should use the default: sljit).
+ */
+static int
+adaptive_select(uint32 profile_hash)
+{
+	int		slot;
+	uint32	counts[ADAPTIVE_NUM_BACKENDS];
+	double	costs[ADAPTIVE_NUM_BACKENDS];
+	int		n_measured = 0;
+	int		best_idx = ADAPTIVE_IDX_SLJIT;
+	double	best_cost;
+	AdaptiveStatsEntry *e;
+
+	slot = adaptive_stats_lookup(profile_hash);
+	if (slot < 0)
+		return -1;
+
+	e = &adaptive_stats->entries[slot];
+
+	/* Read stats for all backends */
+	for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+	{
+		counts[b] = e->call_count[b];
+		if (counts[b] >= (uint32) meta_adaptive_samples)
+		{
+			uint64 comp = e->compile_ns[b];
+			uint64 exec = e->exec_ns[b];
+			costs[b] = (double) comp + (double) exec;
+			n_measured++;
+		}
+		else
+			costs[b] = -1.0;	/* not yet measured */
+	}
+
+	/* Need sljit measured plus at least one other */
+	if (costs[ADAPTIVE_IDX_SLJIT] < 0.0 || n_measured < 2)
+	{
+		/*
+		 * Bootstrap exploration: the heuristic has data for the primary
+		 * backend, occasionally try an unmeasured backend to validate.
+		 * 2% chance, uniformly distributed among unmeasured backends.
+		 */
+		if (counts[ADAPTIVE_IDX_SLJIT] > 0)
+		{
+			int unmeasured[ADAPTIVE_NUM_BACKENDS];
+			int n_unmeasured = 0;
+			uint32 rand_val;
+
+			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+			{
+				if (counts[b] == 0 && backends[adaptive_idx_to_backend(b)].available)
+					unmeasured[n_unmeasured++] = b;
+			}
+
+			if (n_unmeasured > 0)
+			{
+#if PG_VERSION_NUM >= 150000
+				rand_val = pg_prng_uint32(&pg_global_prng_state);
+#else
+				rand_val = (uint32) random();
+#endif
+				/* ~1.5% chance to explore unmeasured backends */
+				if ((rand_val % 64) == 0)
+				{
+					int pick = unmeasured[rand_val / 64 % n_unmeasured];
+					elog(DEBUG1, "pg_jitter adaptive: bootstrap explore %s "
+						 "(profile 0x%08x)",
+						 backend_libnames[adaptive_idx_to_backend(pick)],
+						 profile_hash);
+					return adaptive_idx_to_backend(pick);
+				}
+			}
+		}
+		return -1;
+	}
+
+	/* Find the backend with lowest total cost */
+	best_cost = costs[ADAPTIVE_IDX_SLJIT];
+	for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+	{
+		if (costs[b] >= 0.0 && costs[b] < best_cost)
+		{
+			best_cost = costs[b];
+			best_idx = b;
+		}
+	}
+
+	/* Epsilon-greedy exploration among measured backends */
+	if (meta_adaptive_epsilon > 0.0)
+	{
+		uint32 rand_val;
+
+#if PG_VERSION_NUM >= 150000
+		rand_val = pg_prng_uint32(&pg_global_prng_state);
+#else
+		rand_val = (uint32) random();
+#endif
+
+		if ((double)(rand_val % 10000) / 10000.0 < meta_adaptive_epsilon)
+		{
+			/* Pick a random measured backend that isn't the best */
+			int candidates[ADAPTIVE_NUM_BACKENDS];
+			int n_cand = 0;
+
+			for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+			{
+				if (b != best_idx && costs[b] >= 0.0)
+					candidates[n_cand++] = b;
+			}
+			if (n_cand > 0)
+			{
+				int pick = candidates[rand_val / 10000 % n_cand];
+				elog(DEBUG2, "pg_jitter adaptive: explore %s (profile 0x%08x)",
+					 backend_libnames[adaptive_idx_to_backend(pick)],
+					 profile_hash);
+				return adaptive_idx_to_backend(pick);
+			}
+		}
+	}
+
+	elog(DEBUG2, "pg_jitter adaptive: exploit %s (profile 0x%08x, "
+		 "costs: sljit=%.0f asmjit=%.0f mir=%.0f)",
+		 backend_libnames[adaptive_idx_to_backend(best_idx)],
+		 profile_hash,
+		 costs[ADAPTIVE_IDX_SLJIT],
+		 costs[ADAPTIVE_IDX_ASMJIT] >= 0 ? costs[ADAPTIVE_IDX_ASMJIT] : -1.0,
+		 costs[ADAPTIVE_IDX_MIR] >= 0 ? costs[ADAPTIVE_IDX_MIR] : -1.0);
+
+	return adaptive_idx_to_backend(best_idx);
+}
+
+/* ----------------------------------------------------------------
+ * Adaptive timing wrapper — self-removing evalfunc wrapper
+ * ---------------------------------------------------------------- */
+
+static Datum
+meta_adaptive_timing_wrapper(ExprState *state, ExprContext *econtext,
+							 bool *isNull)
+{
+	AdaptiveTimingCtx *tctx = (AdaptiveTimingCtx *) state->evalfunc_private;
+	ExprStateEvalFunc  saved_func = tctx->original_evalfunc;
+	void			  *saved_priv = tctx->original_evalfunc_priv;
+	instr_time		   start_time, end_time;
+	Datum			   result;
+
+	/*
+	 * Restore original evalfunc/private so the real function works.
+	 * The validation wrapper (pg_jitter_run_compiled_expr) may replace
+	 * evalfunc with the raw compiled function on its first call — that's
+	 * fine, we'll capture whatever it leaves behind.
+	 */
+	state->evalfunc = saved_func;
+	state->evalfunc_private = saved_priv;
+
+	INSTR_TIME_SET_CURRENT(start_time);
+	result = state->evalfunc(state, econtext, isNull);
+	INSTR_TIME_SET_CURRENT(end_time);
+
+	tctx->call_count++;
+	tctx->exec_ns += INSTR_TIME_GET_NANOSEC(end_time) -
+					 INSTR_TIME_GET_NANOSEC(start_time);
+
+	/*
+	 * Capture what evalfunc/private are NOW (after the real function ran).
+	 * The validation wrapper replaces itself on first call, so subsequent
+	 * calls should use the updated values.
+	 */
+	tctx->original_evalfunc = state->evalfunc;
+	tctx->original_evalfunc_priv = state->evalfunc_private;
+
+	if (tctx->call_count >= meta_adaptive_samples)
+	{
+		/* Flush accumulated stats to shared memory */
+		adaptive_stats_record(tctx->profile_hash, tctx->backend_idx,
+							  tctx->compile_ns, tctx->exec_ns,
+							  tctx->call_count, &tctx->profile);
+
+		elog(DEBUG1, "pg_jitter adaptive: recorded %d calls, "
+			 "compile %lld ns, exec %lld ns for %s "
+			 "(profile 0x%08x, avg %.0f ns/call)",
+			 tctx->call_count,
+			 (long long) tctx->compile_ns,
+			 (long long) tctx->exec_ns,
+			 backend_libnames[adaptive_idx_to_backend(tctx->backend_idx)],
+			 tctx->profile_hash,
+			 (double) tctx->exec_ns / tctx->call_count);
+
+		/*
+		 * Mark as done — leave evalfunc/private as the real function.
+		 * The tctx is freed during meta_release_context, not here, to
+		 * avoid dangling pointers in the adaptive_timings tracking list.
+		 */
+		tctx->done = true;
+		return result;
+	}
+
+	/* Re-install wrapper for next call */
+	state->evalfunc_private = tctx;
+	state->evalfunc = meta_adaptive_timing_wrapper;
+
+	return result;
+}
+
+/*
+ * Install the adaptive timing wrapper on a compiled expression.
+ * Must be called AFTER the backend has compiled and installed its evalfunc.
+ * compile_ns is the time spent compiling this expression (measured in meta_compile_expr).
+ */
+static void
+meta_install_timing_wrapper(ExprState *state, int backend_enum,
+							uint32 profile_hash, int64 compile_ns,
+							const ExprProfile *profile)
+{
+	AdaptiveTimingCtx  *tctx;
+	MetaJitterContext  *ctx;
+	AdaptiveTimingNode *node;
+	int					adaptive_idx;
+
+	adaptive_idx = adaptive_backend_to_idx(backend_enum);
+	if (adaptive_idx < 0)
+		return;		/* invalid backend */
+
+	/* Only wrap if the expression was actually compiled */
+	if (state->evalfunc == NULL)
+		return;
+
+	/* Skip wrapping for expressions without a parent (can't track for cleanup) */
+	if (!state->parent || !state->parent->state->es_jit)
+		return;
+
+	/*
+	 * Skip wrapping if this backend already has sufficient data for this
+	 * profile.  The wrapper only measures the backend that was selected;
+	 * there's no point re-measuring a backend we already have stats for.
+	 */
+	{
+		int slot = adaptive_stats_lookup(profile_hash);
+		if (slot >= 0 &&
+			adaptive_stats->entries[slot].call_count[adaptive_idx]
+				>= (uint32) meta_adaptive_samples)
+			return;		/* already have enough data for this backend */
+	}
+
+	tctx = (AdaptiveTimingCtx *)
+		MemoryContextAlloc(TopMemoryContext, sizeof(AdaptiveTimingCtx));
+	tctx->original_evalfunc = state->evalfunc;
+	tctx->original_evalfunc_priv = state->evalfunc_private;
+	tctx->profile_hash = profile_hash;
+	tctx->profile = *profile;
+	tctx->backend_idx = adaptive_idx;
+	tctx->call_count = 0;
+	tctx->exec_ns = 0;
+	tctx->compile_ns = compile_ns;
+	tctx->done = false;
+
+	state->evalfunc = meta_adaptive_timing_wrapper;
+	state->evalfunc_private = tctx;
+
+	/*
+	 * Track this timing context so we can clean it up if the JIT context
+	 * is released before the sample count is reached.
+	 */
+	if (state->parent && state->parent->state->es_jit)
+	{
+		ctx = (MetaJitterContext *) state->parent->state->es_jit;
+		node = (AdaptiveTimingNode *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(AdaptiveTimingNode));
+		node->tctx = tctx;
+		node->state = state;
+		node->next = ctx->adaptive_timings;
+		ctx->adaptive_timings = node;
+	}
+}
+
+/*
+ * SQL function registration is handled manually:
+ *
+ *   CREATE FUNCTION pg_jitter_current_backend() RETURNS text
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_current_backend';
+ *
+ *   CREATE FUNCTION pg_jitter_adaptive_stats(
+ *     OUT profile_hash text, OUT nsteps int, OUT fetchsome_natts int,
+ *     OUT n_hashdatum int, OUT n_funcexpr int, OUT n_qual int, OUT n_agg int,
+ *     OUT sljit_calls int, OUT sljit_compile_ns float8, OUT sljit_avg_ns float8,
+ *     OUT asmjit_calls int, OUT asmjit_compile_ns float8, OUT asmjit_avg_ns float8,
+ *     OUT mir_calls int, OUT mir_compile_ns float8, OUT mir_avg_ns float8,
+ *     OUT selected text, OUT margin_pct float8
+ *   ) RETURNS SETOF record
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats';
+ *
+ *   CREATE FUNCTION pg_jitter_adaptive_stats_reset() RETURNS void
+ *     LANGUAGE c STRICT AS 'pg_jitter', 'pg_jitter_adaptive_stats_reset';
+ */
+
+/* ----------------------------------------------------------------
+ * Provider callbacks — dispatch to loaded backend
+ * ---------------------------------------------------------------- */
+
+/*
+ * Default backend priority: sljit > asmjit > mir.
+ *
+ * Always returns sljit as the default.  The adaptive statistics system
+ * may override this if runtime data shows a different backend is faster
+ * (considering both compilation cost and per-invocation execution time).
+ */
+static int
+meta_default_backend(void)
+{
+	if (backends[PG_JITTER_BACKEND_SLJIT].available)
+		return PG_JITTER_BACKEND_SLJIT;
+	if (backends[PG_JITTER_BACKEND_ASMJIT].available)
+		return PG_JITTER_BACKEND_ASMJIT;
+	if (backends[PG_JITTER_BACKEND_MIR].available)
+		return PG_JITTER_BACKEND_MIR;
+	return PG_JITTER_BACKEND_SLJIT;	/* nominal fallback */
+}
+
+/*
+ * Analyze expression steps and select the best backend for this expression.
+ *
+ * First tries adaptive selection (stats-driven), falls back to the static
+ * heuristic if insufficient data.  Stores the profile hash in *profile_hash_out
+ * for use by the timing wrapper.
+ */
+static int
+meta_auto_select_backend(ExprState *state, uint32 *profile_hash_out,
+						 ExprProfile *profile_out)
+{
+	ExprProfile		profile;
+	uint32			profile_hash;
+	int				selected;
+
+	/* Build profile and hash it */
+	meta_build_profile(state, &profile);
+	profile_hash = meta_profile_hash(&profile);
+	*profile_hash_out = profile_hash;
+	*profile_out = profile;
+
+	/*
+	 * Static heuristic: pick backend based on expression profile.
+	 *
+	 * asmjit excels at deform-heavy workloads (hash joins, wide tables).
+	 * sljit excels at expression-heavy workloads (CASE, arithmetic, IN).
+	 *
+	 * Rules (applied in order):
+	 * 1. Hash join with deform → asmjit
+	 * 2. Deform-heavy (natts >= 10, deform > 1/3 of steps) → asmjit
+	 * 3. Everything else → sljit
+	 */
+	if (backends[PG_JITTER_BACKEND_ASMJIT].available)
+	{
+		bool use_asmjit = false;
+
+		/* Hash join build/probe with deform work */
+		if (profile.n_hashdatum > 0 && profile.fetchsome_natts > 0)
+			use_asmjit = true;
+
+		/* Deform-heavy: natts >= 10 and deform represents > 1/3 of steps */
+#ifdef __aarch64__
+		/* ARM64: asmjit deform advantage is larger, lower threshold */
+		else if (profile.fetchsome_natts >= 10 &&
+				 profile.fetchsome_natts * 3 > profile.nsteps)
+			use_asmjit = true;
+#else
+		/* x86_64: need wider tuples for asmjit to win */
+		else if (profile.fetchsome_natts >= 20 &&
+				 profile.fetchsome_natts * 3 > profile.nsteps)
+			use_asmjit = true;
+#endif
+
+		selected = use_asmjit ? PG_JITTER_BACKEND_ASMJIT
+							  : PG_JITTER_BACKEND_SLJIT;
+	}
+	else
+	{
+		selected = meta_default_backend();
+	}
+
+	/* Adaptive override: if we have enough data showing a different winner,
+	 * use that instead of the static heuristic. */
+	if (meta_adaptive && adaptive_stats != NULL)
+	{
+		int adaptive_choice = adaptive_select(profile_hash);
+		if (adaptive_choice >= 0 && backends[adaptive_choice].available)
+			selected = adaptive_choice;
+	}
+
+	elog(DEBUG1, "pg_jitter auto: steps=%d natts=%d hashdatum=%d -> %s",
+		 profile.nsteps, profile.fetchsome_natts, profile.n_hashdatum,
+		 backend_libnames[selected]);
+
+	return selected;
+}
+
+>>>>>>> Stashed changes
 static bool
 meta_compile_expr(ExprState *state)
 {
@@ -362,13 +1015,58 @@ meta_compile_expr(ExprState *state)
 
 	/* Try selected backend first */
 	if (meta_load_backend(idx))
+<<<<<<< Updated upstream
 		return backends[idx].cb.compile_expr(state);
+=======
+	{
+		instr_time	compile_start, compile_end;
+		int64		compile_ns = 0;
+		bool		ok;
+
+		/* Time the compilation */
+		if (is_auto && meta_adaptive && adaptive_stats != NULL)
+			INSTR_TIME_SET_CURRENT(compile_start);
+
+		ok = backends[idx].cb.compile_expr(state);
+
+		if (is_auto && meta_adaptive && adaptive_stats != NULL)
+		{
+			INSTR_TIME_SET_CURRENT(compile_end);
+			compile_ns = INSTR_TIME_GET_NANOSEC(compile_end) -
+						 INSTR_TIME_GET_NANOSEC(compile_start);
+		}
+
+		/* Install timing wrapper for adaptive data collection */
+		if (ok && is_auto && meta_adaptive && adaptive_stats != NULL)
+			meta_install_timing_wrapper(state, idx, profile_hash, compile_ns,
+										&profile);
+
+		/* Track which backends were used for deform reset optimization */
+		if (ok && state->parent && state->parent->state->es_jit)
+		{
+			MetaJitterContext *ctx =
+				(MetaJitterContext *) state->parent->state->es_jit;
+			ctx->backends_used |= (1 << idx);
+		}
+
+		return ok;
+	}
+>>>>>>> Stashed changes
 
 	/* Fallback: try each in order */
 	for (idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
 	{
 		if (meta_load_backend(idx))
-			return backends[idx].cb.compile_expr(state);
+		{
+			bool ok = backends[idx].cb.compile_expr(state);
+			if (ok && state->parent && state->parent->state->es_jit)
+			{
+				MetaJitterContext *fctx =
+					(MetaJitterContext *) state->parent->state->es_jit;
+				fctx->backends_used |= (1 << idx);
+			}
+			return ok;
+		}
 	}
 
 	/* No backend available — PG interpreter will run */
@@ -382,15 +1080,17 @@ meta_release_context(JitContext *context)
 	MetaCompiledCode *cc, *next;
 
 	/*
-	 * Reset deform dispatch fast-path cache in all loaded backends.
-	 * Each backend .dylib has its own static dispatch_fast[] cache keyed
-	 * by TupleDesc pointer.  After context release, TupleDesc pointers may
-	 * be reused by palloc for different table layouts, causing stale cache
-	 * hits that return deform functions compiled for wrong column types.
+	 * Reset deform dispatch fast-path cache only for backends that actually
+	 * compiled something in this context.  Each backend .dylib has its own
+	 * static dispatch_fast[] cache keyed by TupleDesc pointer.  After context
+	 * release, TupleDesc pointers may be reused by palloc for different table
+	 * layouts, causing stale cache hits returning deform functions compiled
+	 * for wrong column types.
 	 */
 	for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
 	{
-		if (backends[idx].available && backends[idx].deform_reset)
+		if ((ctx->backends_used & (1 << idx)) &&
+			backends[idx].available && backends[idx].deform_reset)
 			backends[idx].deform_reset();
 	}
 
