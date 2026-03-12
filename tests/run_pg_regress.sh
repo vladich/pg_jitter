@@ -20,7 +20,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 PGPORT="${PGPORT:-5433}"
 PG_SRC="${PG_SRC:-}"
-BACKENDS="sljit asmjit mir"
+BACKENDS="sljit asmjit mir auto"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -78,6 +78,15 @@ REGRESS_DIR="$PG_SRC/src/test/regress"
 
 # Verify all backend dylibs exist
 for backend in $BACKENDS; do
+    # "auto" uses the meta provider (pg_jitter.dylib), not a separate dylib
+    if [ "$backend" = "auto" ]; then
+        if [ ! -f "$PKGLIBDIR/pg_jitter.dylib" ] && \
+           [ ! -f "$PKGLIBDIR/pg_jitter.so" ]; then
+            echo "ERROR: pg_jitter (meta provider) not found in $PKGLIBDIR"
+            exit 1
+        fi
+        continue
+    fi
     if [ ! -f "$PKGLIBDIR/pg_jitter_$backend.dylib" ] && \
        [ ! -f "$PKGLIBDIR/pg_jitter_$backend.so" ]; then
         echo "ERROR: pg_jitter_$backend not found in $PKGLIBDIR"
@@ -211,15 +220,24 @@ for backend in $BACKENDS; do
     # Clean up leftover state between backends
     ensure_pg_running
     cleanup_database
-    "$PSQL" -p "$PGPORT" -d postgres -q -c \
-        "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
+
+    # "auto" uses the meta provider with pg_jitter.backend = 'auto'
+    if [ "$backend" = "auto" ]; then
+        EXPECTED_PROVIDER="pg_jitter"
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
+    else
+        EXPECTED_PROVIDER="pg_jitter_$backend"
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
+    fi
     "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
     sleep 1
 
     # Verify provider is active
     ACTIVE="$("$PSQL" -p "$PGPORT" -d postgres -t -A -c "SHOW jit_provider;" 2>/dev/null)"
-    if [ "$ACTIVE" != "pg_jitter_$backend" ]; then
-        echo "  WARNING: expected pg_jitter_$backend, got $ACTIVE"
+    if [ "$ACTIVE" != "$EXPECTED_PROVIDER" ]; then
+        echo "  WARNING: expected $EXPECTED_PROVIDER, got $ACTIVE"
     fi
 
     # Run installcheck, capture output

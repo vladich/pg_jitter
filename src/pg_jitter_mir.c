@@ -31,7 +31,9 @@
 #include "catalog/pg_collation_d.h"
 #include "utils/date.h"
 #include "utils/timestamp.h"
+#if PG_VERSION_NUM >= 160000
 #include "nodes/miscnodes.h"
+#endif
 #include "commands/sequence.h"
 #include "funcapi.h"
 

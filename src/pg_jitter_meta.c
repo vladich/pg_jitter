@@ -29,9 +29,17 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "executor/execExpr.h"
 #include "storage/dsm.h"
 #include "storage/shmem.h"
 #include "port/atomics.h"
+#include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
+#if PG_VERSION_NUM >= 150000
+#include "common/pg_prng.h"
+#endif
 
 /*
  * PG 14 doesn't mark pkglib_path with PGDLLIMPORT, so it can't be linked
@@ -95,6 +103,9 @@ meta_shmem_clear_dsm_handle(void)
 		pg_atomic_write_u32(&meta_dsm_slots->handles[proc_index], 0);
 }
 
+/* Forward declaration for adaptive timing node (defined after BackendEntry) */
+typedef struct AdaptiveTimingNode AdaptiveTimingNode;
+
 /* ----------------------------------------------------------------
  * PgJitterContext — must match the layout in pg_jitter_common.h
  * ---------------------------------------------------------------- */
@@ -133,15 +144,12 @@ typedef struct MetaJitterContext
 
 	/* DSM-based shared code state — mirrors JitShareState */
 	MetaJitShareState	share_state;
-<<<<<<< Updated upstream
-=======
 
 	/* Bitmask of backends that compiled something in this context */
 	uint8				backends_used;
 
 	/* Adaptive timing contexts active for this JIT context */
 	AdaptiveTimingNode *adaptive_timings;
->>>>>>> Stashed changes
 } MetaJitterContext;
 
 /* ----------------------------------------------------------------
@@ -207,13 +215,15 @@ enum PgJitterBackend
 	PG_JITTER_BACKEND_SLJIT = 0,
 	PG_JITTER_BACKEND_ASMJIT = 1,
 	PG_JITTER_BACKEND_MIR = 2,
-	PG_JITTER_NUM_BACKENDS
+	PG_JITTER_NUM_BACKENDS,
+	PG_JITTER_BACKEND_AUTO,
 };
 
 static const struct config_enum_entry backend_options[] = {
 	{"sljit", PG_JITTER_BACKEND_SLJIT, false},
 	{"asmjit", PG_JITTER_BACKEND_ASMJIT, false},
 	{"mir", PG_JITTER_BACKEND_MIR, false},
+	{"auto", PG_JITTER_BACKEND_AUTO, false},
 	{NULL, 0, false}
 };
 
@@ -230,6 +240,9 @@ static int meta_parallel_mode = 1;		/* PARALLEL_JIT_PER_WORKER */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
 static bool meta_deform_cache = true;
 static int meta_min_expr_steps = 4;
+static bool meta_adaptive = true;
+static int meta_adaptive_samples = 64;
+static double meta_adaptive_epsilon = 0.05;
 
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
@@ -247,6 +260,87 @@ typedef struct BackendEntry
 } BackendEntry;
 
 static BackendEntry backends[PG_JITTER_NUM_BACKENDS];
+
+/* ----------------------------------------------------------------
+ * Adaptive statistics — expression profile stats
+ *
+ * Collects per-(expression_profile, backend) timing data across all
+ * backends in the cluster.  Each expression is profiled by its opcode
+ * shape (step count, deform natts, hashdatum count, etc.) and hashed
+ * with CRC32C.  Timing data is collected via a self-removing wrapper
+ * around evalfunc that measures the first N calls, then disappears.
+ *
+ * The stats table lives in process-local memory (TopMemoryContext).
+ * Each backend learns independently — convergence is fast since
+ * expression profiles are deterministic.
+ * ---------------------------------------------------------------- */
+#define ADAPTIVE_STATS_MAX_ENTRIES  256
+#define ADAPTIVE_NUM_BACKENDS       3   /* sljit=0, asmjit=1, mir=2 */
+#define ADAPTIVE_IDX_SLJIT          0
+#define ADAPTIVE_IDX_ASMJIT         1
+#define ADAPTIVE_IDX_MIR            2
+
+/* Expression profile — captures the "shape" of an expression */
+typedef struct ExprProfile
+{
+	uint16	nsteps;
+	uint16	fetchsome_natts;
+	uint8	n_hashdatum;
+	uint8	n_funcexpr;
+	uint8	n_qual;
+	uint8	n_agg;
+} ExprProfile;
+
+/* Per-profile, per-backend timing stats (process-local) */
+typedef struct AdaptiveStatsEntry
+{
+	uint32		profile_hash;		/* 0 = empty slot */
+
+	/* Expression profile details (set once at insertion, never updated) */
+	uint16		nsteps;
+	uint16		fetchsome_natts;
+	uint8		n_hashdatum;
+	uint8		n_funcexpr;
+	uint8		n_qual;
+	uint8		n_agg;
+
+	/* Per-backend stats */
+	uint32		call_count[ADAPTIVE_NUM_BACKENDS];
+	uint64		compile_ns[ADAPTIVE_NUM_BACKENDS];	/* compilation time */
+	uint64		exec_ns[ADAPTIVE_NUM_BACKENDS];		/* execution time */
+} AdaptiveStatsEntry;
+
+typedef struct AdaptiveStatsTable
+{
+	int			num_entries;
+	int			max_entries;
+	AdaptiveStatsEntry	entries[FLEXIBLE_ARRAY_MEMBER];
+} AdaptiveStatsTable;
+
+static AdaptiveStatsTable *adaptive_stats = NULL;
+static bool adaptive_shmem_attempted = false;
+
+/* Per-expression timing context (process-local, heap-allocated) */
+typedef struct AdaptiveTimingCtx
+{
+	ExprStateEvalFunc	original_evalfunc;
+	void			   *original_evalfunc_priv;
+	uint32				profile_hash;
+	ExprProfile			profile;		/* expression profile for stats insertion */
+	int					backend_idx;	/* ADAPTIVE_IDX_SLJIT, _ASMJIT, or _MIR */
+	int					call_count;
+	int64				exec_ns;		/* accumulated execution time */
+	int64				compile_ns;		/* compilation time (set once) */
+	bool				done;			/* true = samples collected, wrapper removed */
+} AdaptiveTimingCtx;
+
+/* List of active timing contexts for cleanup on context release */
+struct AdaptiveTimingNode
+{
+	struct AdaptiveTimingNode  *next;
+	AdaptiveTimingCtx          *tctx;
+	ExprState                  *state;
+};
 
 /* ----------------------------------------------------------------
  * Backend loading
@@ -305,22 +399,14 @@ meta_load_backend(int idx)
 static void
 meta_backend_assign(int newval, void *extra)
 {
-<<<<<<< Updated upstream
-=======
 	if (newval == PG_JITTER_BACKEND_AUTO)
 	{
-		/*
-		 * Auto mode uses sljit + asmjit only.  MIR is excluded because
-		 * its compilation overhead (15-100x slower than sljit) rarely
-		 * justifies the marginal execution gains.  Users can still
-		 * SET pg_jitter.backend = 'mir' explicitly.
-		 */
-		meta_load_backend(PG_JITTER_BACKEND_SLJIT);
-		meta_load_backend(PG_JITTER_BACKEND_ASMJIT);
+		/* Eagerly load all available backends for auto mode */
+		for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
+			meta_load_backend(idx);
 		return;
 	}
 
->>>>>>> Stashed changes
 	if (!meta_load_backend(newval))
 		ereport(WARNING,
 				(errmsg("pg_jitter backend \"%s\" is not installed, will fall back",
@@ -363,6 +449,7 @@ meta_ensure_context(ExprState *state)
 	ctx->last_plan_node_id = -1;
 	ctx->expr_ordinal = 0;
 	memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
+	ctx->adaptive_timings = NULL;
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
 
@@ -370,11 +457,6 @@ meta_ensure_context(ExprState *state)
 }
 
 /* ----------------------------------------------------------------
-<<<<<<< Updated upstream
- * Provider callbacks — dispatch to loaded backend
- * ---------------------------------------------------------------- */
-
-=======
  * Adaptive statistics — management
  * ---------------------------------------------------------------- */
 
@@ -646,7 +728,7 @@ adaptive_select(uint32 profile_hash)
 		/*
 		 * Bootstrap exploration: the heuristic has data for the primary
 		 * backend, occasionally try an unmeasured backend to validate.
-		 * 2% chance, uniformly distributed among unmeasured backends.
+		 * ~1.5% chance, uniformly distributed among unmeasured backends.
 		 */
 		if (counts[ADAPTIVE_IDX_SLJIT] > 0)
 		{
@@ -1000,11 +1082,15 @@ meta_auto_select_backend(ExprState *state, uint32 *profile_hash_out,
 	return selected;
 }
 
->>>>>>> Stashed changes
 static bool
 meta_compile_expr(ExprState *state)
 {
-	int		idx = pg_jitter_backend;
+	int			idx = pg_jitter_backend;
+	bool		is_auto = (idx == PG_JITTER_BACKEND_AUTO);
+	uint32		profile_hash = 0;
+	ExprProfile	profile;
+
+	memset(&profile, 0, sizeof(ExprProfile));
 
 	/*
 	 * Pre-create the context with our resowner desc before the backend
@@ -1013,11 +1099,16 @@ meta_compile_expr(ExprState *state)
 	if (state->parent)
 		meta_ensure_context(state);
 
+	/* Initialize adaptive stats table lazily on first auto compile */
+	if (is_auto && meta_adaptive && adaptive_stats == NULL)
+		adaptive_stats_init();
+
+	/* Resolve auto mode to a concrete backend */
+	if (is_auto)
+		idx = meta_auto_select_backend(state, &profile_hash, &profile);
+
 	/* Try selected backend first */
 	if (meta_load_backend(idx))
-<<<<<<< Updated upstream
-		return backends[idx].cb.compile_expr(state);
-=======
 	{
 		instr_time	compile_start, compile_end;
 		int64		compile_ns = 0;
@@ -1051,7 +1142,6 @@ meta_compile_expr(ExprState *state)
 
 		return ok;
 	}
->>>>>>> Stashed changes
 
 	/* Fallback: try each in order */
 	for (idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
@@ -1107,6 +1197,49 @@ meta_release_context(JitContext *context)
 		memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
 	}
 
+	/*
+	 * Flush and free any active adaptive timing contexts.
+	 * These are expressions that haven't yet reached their sample count.
+	 * Flush whatever data we have before freeing.
+	 */
+	{
+		AdaptiveTimingNode *anode, *anext;
+
+		for (anode = ctx->adaptive_timings; anode != NULL; anode = anext)
+		{
+			anext = anode->next;
+			if (anode->tctx)
+			{
+				if (!anode->tctx->done)
+				{
+					/* Flush partial stats if we have any calls recorded */
+					if (anode->tctx->call_count > 0)
+						adaptive_stats_record(anode->tctx->profile_hash,
+											  anode->tctx->backend_idx,
+											  anode->tctx->compile_ns,
+											  anode->tctx->exec_ns,
+											  anode->tctx->call_count,
+											  NULL);
+
+					/*
+					 * Restore the expression's original evalfunc if the
+					 * wrapper is still installed.
+					 */
+					if (anode->state &&
+						anode->state->evalfunc == meta_adaptive_timing_wrapper)
+					{
+						anode->state->evalfunc = anode->tctx->original_evalfunc;
+						anode->state->evalfunc_private = anode->tctx->original_evalfunc_priv;
+					}
+				}
+
+				pfree(anode->tctx);
+			}
+			pfree(anode);
+		}
+		ctx->adaptive_timings = NULL;
+	}
+
 	/* Free all compiled code — each node carries its own free_fn */
 	for (cc = ctx->compiled_list; cc != NULL; cc = next)
 	{
@@ -1148,9 +1281,216 @@ PG_FUNCTION_INFO_V1(pg_jitter_current_backend);
 Datum
 pg_jitter_current_backend(PG_FUNCTION_ARGS)
 {
-	const char *name = backend_options[pg_jitter_backend].name;
+	int val = pg_jitter_backend;
 
-	PG_RETURN_TEXT_P(cstring_to_text(name));
+	for (int i = 0; backend_options[i].name != NULL; i++)
+	{
+		if (backend_options[i].val == val)
+			PG_RETURN_TEXT_P(cstring_to_text(backend_options[i].name));
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text("unknown"));
+}
+
+/* ----------------------------------------------------------------
+ * SQL function: pg_jitter_adaptive_stats() returns SETOF record
+ *
+ * Returns the contents of the adaptive stats table
+ * with profile details and separate compilation/execution timing.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats);
+
+Datum
+pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc		tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext	per_query_ctx;
+	MemoryContext	oldcontext;
+	int				n_entries;
+
+#define ADAPTIVE_STATS_NCOLS 18
+
+	/* Switch to per-query memory context for tuplestore */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tupdesc for our result type */
+	tupdesc = CreateTemplateTupleDesc(ADAPTIVE_STATS_NCOLS);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  1, "profile_hash",     TEXTOID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  2, "nsteps",           INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  3, "fetchsome_natts",  INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  4, "n_hashdatum",      INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  5, "n_funcexpr",       INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  6, "n_qual",           INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  7, "n_agg",            INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  8, "sljit_calls",      INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber)  9, "sljit_compile_ns", FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "sljit_avg_ns",     FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "asmjit_calls",     INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "asmjit_compile_ns",FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 13, "asmjit_avg_ns",    FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 14, "mir_calls",        INT4OID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 15, "mir_compile_ns",   FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 16, "mir_avg_ns",       FLOAT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 17, "selected",         TEXTOID,   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 18, "margin_pct",       FLOAT8OID, -1, 0);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	/* Lazily initialize if needed */
+	if (adaptive_stats == NULL && !adaptive_shmem_attempted)
+		adaptive_stats_init();
+
+	if (adaptive_stats != NULL)
+	{
+		n_entries = adaptive_stats->num_entries;
+
+		for (int i = 0; i < n_entries; i++)
+		{
+			Datum		values[ADAPTIVE_STATS_NCOLS];
+			bool		nulls[ADAPTIVE_STATS_NCOLS];
+			AdaptiveStatsEntry *e = &adaptive_stats->entries[i];
+			uint32		hash_val;
+			uint32		sc, ac;
+			uint64		s_compile, a_compile, s_exec, a_exec;
+			double		savg, aavg;
+			char		hashbuf[11];	/* "0x" + 8 hex + NUL */
+
+			memset(nulls, false, sizeof(nulls));
+
+			hash_val = e->profile_hash;
+			if (hash_val == 0)
+				continue;
+
+			sc = e->call_count[ADAPTIVE_IDX_SLJIT];
+			ac = e->call_count[ADAPTIVE_IDX_ASMJIT];
+			s_compile = e->compile_ns[ADAPTIVE_IDX_SLJIT];
+			a_compile = e->compile_ns[ADAPTIVE_IDX_ASMJIT];
+			s_exec = e->exec_ns[ADAPTIVE_IDX_SLJIT];
+			a_exec = e->exec_ns[ADAPTIVE_IDX_ASMJIT];
+
+			savg = sc > 0 ? (double) s_exec / sc : 0.0;
+			aavg = ac > 0 ? (double) a_exec / ac : 0.0;
+
+			/* MIR stats */
+			{
+				uint32	mc = e->call_count[ADAPTIVE_IDX_MIR];
+				uint64	m_compile = e->compile_ns[ADAPTIVE_IDX_MIR];
+				uint64	m_exec = e->exec_ns[ADAPTIVE_IDX_MIR];
+				double	mavg = mc > 0 ? (double) m_exec / mc : 0.0;
+
+				snprintf(hashbuf, sizeof(hashbuf), "0x%08x", hash_val);
+				values[0]  = CStringGetTextDatum(hashbuf);
+				values[1]  = Int32GetDatum((int32) e->nsteps);
+				values[2]  = Int32GetDatum((int32) e->fetchsome_natts);
+				values[3]  = Int32GetDatum((int32) e->n_hashdatum);
+				values[4]  = Int32GetDatum((int32) e->n_funcexpr);
+				values[5]  = Int32GetDatum((int32) e->n_qual);
+				values[6]  = Int32GetDatum((int32) e->n_agg);
+				values[7]  = Int32GetDatum((int32) sc);
+				values[8]  = Float8GetDatum((double) s_compile);
+				values[9]  = Float8GetDatum(savg);
+				values[10] = Int32GetDatum((int32) ac);
+				values[11] = Float8GetDatum((double) a_compile);
+				values[12] = Float8GetDatum(aavg);
+				values[13] = Int32GetDatum((int32) mc);
+				values[14] = Float8GetDatum((double) m_compile);
+				values[15] = Float8GetDatum(mavg);
+
+				/*
+				 * Determine winner using total cost = compile_ns + exec_ns.
+				 * Need at least 2 backends with sufficient samples.
+				 */
+				{
+					double	total_costs[ADAPTIVE_NUM_BACKENDS];
+					uint32	call_counts[ADAPTIVE_NUM_BACKENDS];
+					int		n_measured = 0;
+					int		best_b = -1;
+					double	best_cost = 0;
+					double	second_cost = 0;
+
+					call_counts[ADAPTIVE_IDX_SLJIT] = sc;
+					call_counts[ADAPTIVE_IDX_ASMJIT] = ac;
+					call_counts[ADAPTIVE_IDX_MIR] = mc;
+					total_costs[ADAPTIVE_IDX_SLJIT] = (double) s_compile + (double) s_exec;
+					total_costs[ADAPTIVE_IDX_ASMJIT] = (double) a_compile + (double) a_exec;
+					total_costs[ADAPTIVE_IDX_MIR] = (double) m_compile + (double) m_exec;
+
+					for (int b = 0; b < ADAPTIVE_NUM_BACKENDS; b++)
+					{
+						if (call_counts[b] >= (uint32) meta_adaptive_samples)
+						{
+							if (best_b < 0 || total_costs[b] < best_cost)
+							{
+								second_cost = best_cost;
+								best_cost = total_costs[b];
+								best_b = b;
+							}
+							else if (n_measured == 1 || total_costs[b] < second_cost)
+							{
+								second_cost = total_costs[b];
+							}
+							n_measured++;
+						}
+					}
+
+					if (n_measured >= 2 && best_b >= 0)
+					{
+						static const char *idx_names[] = {"sljit", "asmjit", "mir"};
+						double margin = second_cost > 0
+							? ((second_cost - best_cost) / second_cost) * 100.0
+							: 0.0;
+
+						values[16] = CStringGetTextDatum(idx_names[best_b]);
+						values[17] = Float8GetDatum(margin);
+					}
+					else
+					{
+						values[16] = CStringGetTextDatum("pending");
+						values[17] = Float8GetDatum(0.0);
+					}
+				}
+			}
+
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		}
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+	return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * SQL function: pg_jitter_adaptive_stats_reset() returns void
+ *
+ * Resets all adaptive statistics counters.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats_reset);
+
+Datum
+pg_jitter_adaptive_stats_reset(PG_FUNCTION_ARGS)
+{
+	/* Lazily initialize if needed */
+	if (adaptive_stats == NULL && !adaptive_shmem_attempted)
+		adaptive_stats_init();
+
+	if (adaptive_stats != NULL)
+	{
+		int n = adaptive_stats->num_entries;
+
+		for (int i = 0; i < n; i++)
+		{
+			memset(&adaptive_stats->entries[i], 0, sizeof(AdaptiveStatsEntry));
+		}
+		adaptive_stats->num_entries = 0;
+	}
+
+	PG_RETURN_VOID();
 }
 
 /* ----------------------------------------------------------------
@@ -1165,14 +1505,28 @@ static int
 meta_detect_default(void)
 {
 	char	path[MAXPGPATH];
+	int		n_available = 0;
+	int		first_available = -1;
 
 	for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
 	{
 		snprintf(path, MAXPGPATH, "%s/%s%s",
 				 pkglib_path, backend_libnames[idx], DLSUFFIX);
 		if (pg_file_exists(path))
-			return idx;
+		{
+			n_available++;
+			if (first_available < 0)
+				first_available = idx;
+		}
 	}
+
+	/* Two or more backends installed — default to auto */
+	if (n_available >= 2)
+		return PG_JITTER_BACKEND_AUTO;
+
+	/* Exactly one backend — use it directly */
+	if (first_available >= 0)
+		return first_available;
 
 	/* Nothing installed — keep sljit as nominal default; fallback handles it */
 	return PG_JITTER_BACKEND_SLJIT;
@@ -1255,6 +1609,44 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 		4,			/* skip JIT for expressions with fewer than 4 steps */
 		0,			/* minimum */
 		1000,		/* maximum */
+		PGC_USERSET,
+		GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_jitter.adaptive",
+							 "Enable adaptive backend selection based on "
+							 "runtime performance statistics. "
+							 "Only effective when pg_jitter.backend = 'auto'.",
+							 NULL,
+							 &meta_adaptive,
+							 true,
+							 PGC_USERSET,
+							 GUC_ALLOW_IN_PARALLEL,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_jitter.adaptive_samples",
+		"Number of expression evaluations to time before considering "
+		"a backend profiled for adaptive selection.",
+		NULL,
+		&meta_adaptive_samples,
+		64,			/* default: 64 calls */
+		4,			/* minimum: need at least a few samples */
+		10000,		/* maximum */
+		PGC_USERSET,
+		GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		"pg_jitter.adaptive_epsilon",
+		"Exploration probability for adaptive backend selection. "
+		"0.0 = always pick the best measured backend, "
+		"1.0 = always pick randomly.",
+		NULL,
+		&meta_adaptive_epsilon,
+		0.05,		/* 5% exploration by default */
+		0.0,
+		1.0,
 		PGC_USERSET,
 		GUC_ALLOW_IN_PARALLEL,
 		NULL, NULL, NULL);
