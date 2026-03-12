@@ -36,7 +36,9 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/timestamp.h"
+#if PG_VERSION_NUM >= 160000
 #include "nodes/miscnodes.h"
+#endif
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "commands/sequence.h"
