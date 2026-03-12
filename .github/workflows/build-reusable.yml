@@ -129,11 +129,10 @@ jobs:
           echo "Vectorscan library:"
           ls -la lib/libhs.a
 
-      # ---- Clone PostgreSQL source for regression tests (Unix only) ----
+      # ---- Clone PostgreSQL source for regression tests ----
       # Pin to the exact minor version to avoid test expectation mismatches
       # (e.g., Homebrew may ship 17.8 while REL_17_STABLE is already at 17.9)
       - name: Determine PostgreSQL version tag
-        if: runner.os != 'Windows'
         id: pg_version
         shell: bash
         run: |
@@ -146,7 +145,6 @@ jobs:
           echo "PostgreSQL version: $PG_FULL → tag: $PG_TAG"
 
       - name: Clone PostgreSQL source
-        if: runner.os != 'Windows'
         uses: actions/checkout@v4
         with:
           repository: postgres/postgres
@@ -209,7 +207,7 @@ jobs:
           sleep 1
           psql -c "SHOW jit_provider;" "${{ steps.postgres.outputs.connection-uri }}"
 
-      # ---- Build regression test shared libraries (Unix only) ----
+      # ---- Build regression test shared libraries ----
       - name: Build regression test libraries
         if: runner.os != 'Windows'
         shell: bash
@@ -242,9 +240,43 @@ jobs:
           echo "Built libraries:"
           ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
 
-      # ---- Regression tests for each backend (Unix only) ----
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build regression test libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          PGSRC="${{ github.workspace }}/postgres-src"
+          DLPATH="$PGSRC/src/test/regress"
+          INCSERVER="$(cygpath -w "$(pg_config --includedir-server)")"
+          INC="$(cygpath -w "$(pg_config --includedir)")"
+          LIBDIR="$(cygpath -w "$(pg_config --libdir)")"
+          # PG ships stub Unix headers (netinet/in.h, sys/socket.h, etc.) for MSVC
+          INCWIN32="$(cygpath -w "$(pg_config --includedir-server)/port/win32")"
+          INCMSVC="$(cygpath -w "$(pg_config --includedir-server)/port/win32_msvc")"
+
+          SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
+
+          cd "$PGSRC"
+          for src in $SOURCES; do
+            base=$(basename "$src" .c)
+            EXTRA_CFLAGS=""
+            [[ "$base" == "refint" ]] && EXTRA_CFLAGS="/DREFINT_VERBOSE"
+            # MSYS2_ARG_CONV_EXCL disables MSYS2 auto-conversion of /LD, /link etc. to paths
+            MSYS2_ARG_CONV_EXCL="*" cl.exe /LD /DWIN32 \
+              /I"$INCSERVER" /I"$INC" /I"$INCWIN32" /I"$INCMSVC" \
+              $EXTRA_CFLAGS \
+              "$(cygpath -w "$src")" \
+              /Fe:"$(cygpath -w "$DLPATH/${base}.dll")" \
+              /link "$LIBDIR\\postgres.lib"
+          done
+          echo "Built libraries:"
+          ls "$DLPATH"/*.dll 2>/dev/null || true
+
+      # ---- Regression tests for each backend ----
       - name: Run regression tests
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
@@ -379,6 +411,12 @@ jobs:
 
             echo "Active backend: $backend"
 
+            # Save log position before tests so we can dump only new lines on failure
+            LOG_OFFSET=0
+            if [ -f "$PGDATA/logfile" ]; then
+              LOG_OFFSET=$(wc -c < "$PGDATA/logfile" | tr -d ' ')
+            fi
+
             # Quick sanity check — basic JIT query
             psql "$CONNURI" -c "SELECT 1+1 AS jit_test;" || echo "WARNING: basic JIT query failed for $backend"
 
@@ -420,10 +458,14 @@ jobs:
               fi
               FAILED=$((FAILED + 1))
 
-              # Dump last 200 lines of PG server log to capture crash details + query
+              # Dump crash-related log lines from this backend's run
               if [ -f "$PGDATA/logfile" ]; then
-                echo "--- Last 200 lines of PostgreSQL server log ---"
-                tail -200 "$PGDATA/logfile"
+                echo "--- Crash/error lines from PostgreSQL server log ---"
+                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
+                  | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|access violation' \
+                  | head -50 || true
+                echo "--- First 200 log lines from this backend ---"
+                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | head -200
               fi
 
               # Get backtrace from core dumps (Linux)
