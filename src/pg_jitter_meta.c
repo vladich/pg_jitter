@@ -395,12 +395,9 @@ meta_load_backend(int idx)
 	}
 	PG_CATCH();
 	{
-		ErrorData *edata = CopyErrorData();
-
 		FlushErrorState();
-		elog(WARNING, "pg_jitter: failed to load backend %s: %s",
-			 backend_libnames[idx], edata->message);
-		FreeErrorData(edata);
+		elog(WARNING, "pg_jitter: failed to load backend %s",
+			 backend_libnames[idx]);
 
 		/* Mark as attempted-but-unavailable */
 		backends[idx].available = false;
