@@ -33,7 +33,7 @@
 #include "storage/dsm.h"
 #include "storage/shmem.h"
 #include "port/atomics.h"
-#include "port/pg_crc32c.h"
+/* pg_crc32c.h included via pg_jitter_compat.h (with Windows CRC32C override) */
 #include "portability/instr_time.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"

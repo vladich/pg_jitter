@@ -25,7 +25,7 @@
 #include <sys/mman.h>
 #include <unistd.h>            /* sysconf, _SC_PAGESIZE */
 
-#include "port/pg_crc32c.h"
+/* pg_crc32c.h included via pg_jitter_compat.h (with Windows CRC32C override) */
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE

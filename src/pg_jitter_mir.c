@@ -774,58 +774,67 @@ static bool mir_compile_expr(ExprState *state) {
   proto_agg_helper =
       MIR_new_proto(ctx, "p_aggh", 0, NULL, 2, MIR_T_P, "s", MIR_T_P, "o");
 
+  /*
+   * Pre-scan: determine which opcode groups are present so we only create
+   * MIR protos/imports that are actually needed.  Unconditional creation of
+   * dead module items can trigger latent MIR codegen issues.
+   */
+  bool need_svf = false, need_arrayexpr = false;
+  bool need_nextval = false, need_row = false;
+  for (int i = 0; i < steps_len; i++) {
+    ExprEvalOp opc = ExecEvalStepOp(state, &steps[i]);
+    if (opc == EEOP_SQLVALUEFUNCTION) need_svf = true;
+    else if (opc == EEOP_ARRAYEXPR) need_arrayexpr = true;
+    else if (opc == EEOP_NEXTVALUEEXPR) need_nextval = true;
+    else if (opc == EEOP_ROW) need_row = true;
+  }
+
   /* Proto for SVF: int32 fn(void) — for GetSQLCurrentDate */
-  MIR_item_t proto_svf_i32_void;
-  {
+  MIR_item_t proto_svf_i32_void = NULL;
+  MIR_item_t proto_svf_i64_i32 = NULL;
+  if (need_svf) {
     MIR_type_t rt_i32 = MIR_T_I32;
     proto_svf_i32_void =
         MIR_new_proto(ctx, "p_svfi32v", 1, &rt_i32, 0);
-  }
-
-  /* Proto for SVF: int64 fn(int32) — for GetSQLCurrentTime/Timestamp etc. */
-  MIR_item_t proto_svf_i64_i32;
-  {
     MIR_type_t rt_i64 = MIR_T_I64;
     proto_svf_i64_i32 =
         MIR_new_proto(ctx, "p_svfi64i32", 1, &rt_i64, 1, MIR_T_I32, "tm");
   }
 
   /* Proto for palloc: void* fn(Size) — for ARRAYEXPR inline */
-  MIR_item_t proto_palloc;
-  {
+  MIR_item_t proto_palloc = NULL;
+  MIR_item_t import_palloc = NULL;
+  if (need_arrayexpr) {
     MIR_type_t rt_p = MIR_T_P;
     proto_palloc =
         MIR_new_proto(ctx, "p_palloc", 1, &rt_p, 1, MIR_T_I64, "sz");
+    import_palloc = MIR_new_import(ctx, "palloc_fn");
   }
-  MIR_item_t import_palloc = MIR_new_import(ctx, "palloc_fn");
 
   /* Proto for nextval_internal: int64 fn(int32 seqid, int32 check_perms) */
-  MIR_item_t proto_nextval;
-  {
+  MIR_item_t proto_nextval = NULL;
+  MIR_item_t import_nextval = NULL;
+  if (need_nextval) {
     MIR_type_t rt_i64 = MIR_T_I64;
     proto_nextval =
         MIR_new_proto(ctx, "p_nextval", 1, &rt_i64, 2, MIR_T_I32, "sid", MIR_T_I32, "cp");
+    import_nextval = MIR_new_import(ctx, "nextval_fn");
   }
 
-  /* Proto for heap_form_tuple: void* fn(void* tupdesc, void* vals, void* nulls) */
-  MIR_item_t proto_hft;
-  {
+  /* Proto for heap_form_tuple / HeapTupleHeaderGetDatum — for ROW inline */
+  MIR_item_t proto_hft = NULL;
+  MIR_item_t proto_htgd = NULL;
+  MIR_item_t import_hft = NULL;
+  MIR_item_t import_htgd = NULL;
+  if (need_row) {
     MIR_type_t rt_p = MIR_T_P;
     proto_hft =
         MIR_new_proto(ctx, "p_hft", 1, &rt_p, 3, MIR_T_P, "td", MIR_T_P, "v", MIR_T_P, "n");
-  }
-
-  /* Proto for HeapTupleHeaderGetDatum: Datum fn(void* tuple_header) */
-  MIR_item_t proto_htgd;
-  {
-    MIR_type_t rt_p = MIR_T_P;
     proto_htgd =
         MIR_new_proto(ctx, "p_htgd", 1, &rt_p, 1, MIR_T_P, "th");
+    import_hft = MIR_new_import(ctx, "hft_fn");
+    import_htgd = MIR_new_import(ctx, "htgd_fn");
   }
-
-  MIR_item_t import_nextval = MIR_new_import(ctx, "nextval_fn");
-  MIR_item_t import_hft = MIR_new_import(ctx, "hft_fn");
-  MIR_item_t import_htgd = MIR_new_import(ctx, "htgd_fn");
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
   /* Proto for simdjson IS_JSON: (Datum, int32) -> int32 */
@@ -7616,10 +7625,10 @@ static bool mir_compile_expr(ExprState *state) {
                               MIR_new_ref_op(ctx, step_fn_imports[opno]),
                               MIR_new_reg_op(ctx, r_tmp2)));
 
-        /* Zero-extend I32 to I64 (DateADT is int32) */
+        /* Sign-extend I32 to I64 (DateADT is signed int32) */
         MIR_append_insn(
             ctx, func_item,
-            MIR_new_insn(ctx, MIR_UEXT32, MIR_new_reg_op(ctx, r_tmp2),
+            MIR_new_insn(ctx, MIR_EXT32, MIR_new_reg_op(ctx, r_tmp2),
                          MIR_new_reg_op(ctx, r_tmp2)));
 
         /* *op->resvalue = r_tmp2 */
@@ -8330,15 +8339,19 @@ static bool mir_compile_expr(ExprState *state) {
     /* GROUPING_FUNC helper */
     MIR_load_external(ctx, "bms_is_member",
                       mir_extern_addr((void *)bms_is_member));
-    /* ARRAYEXPR inline palloc helper */
-    MIR_load_external(ctx, "palloc_fn",
-                      mir_extern_addr((void *)palloc));
-    MIR_load_external(ctx, "nextval_fn",
-                      mir_extern_addr((void *)nextval_internal));
-    MIR_load_external(ctx, "hft_fn",
-                      mir_extern_addr((void *)heap_form_tuple));
-    MIR_load_external(ctx, "htgd_fn",
-                      mir_extern_addr((void *)HeapTupleHeaderGetDatum));
+    /* Conditional externals — only loaded when the expression uses them */
+    if (need_arrayexpr)
+      MIR_load_external(ctx, "palloc_fn",
+                        mir_extern_addr((void *)palloc));
+    if (need_nextval)
+      MIR_load_external(ctx, "nextval_fn",
+                        mir_extern_addr((void *)nextval_internal));
+    if (need_row) {
+      MIR_load_external(ctx, "hft_fn",
+                        mir_extern_addr((void *)heap_form_tuple));
+      MIR_load_external(ctx, "htgd_fn",
+                        mir_extern_addr((void *)HeapTupleHeaderGetDatum));
+    }
     /* Compiled LIKE match helper */
     MIR_load_external(ctx, "simd_like_match_compiled",
                       mir_extern_addr((void *)simd_like_match_compiled));

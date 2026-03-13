@@ -5683,8 +5683,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.invoke(Out(invoke), fn_reg,
 								  FuncSignature::build<int32_t>());
 						invoke->set_ret(0, ret);
-						/* Zero-extend int32 to Datum (64-bit) */
-						cc.and_(ret, ret, Imm(0xFFFFFFFF));
+						/* Sign-extend int32 to Datum (64-bit) — DateADT is signed */
+						cc.sxtw(ret, ret);
 						/* *op->resvalue = ret */
 						if (op->resvalue == &state->resvalue)
 							cc.str(ret, a64::ptr(v_state, offsetof(ExprState, resvalue)));

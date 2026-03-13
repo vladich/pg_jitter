@@ -374,6 +374,11 @@ if(PG_JITTER_BUILD_ASMJIT)
     target_compile_definitions(pg_jitter_asmjit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
+    # GCC -O3 miscompiles the 6500-line asmjit_emit_all function on ARM64.
+    # Clamp to -O2 for the main AsmJIT source to avoid codegen corruption.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        set_source_files_properties(src/pg_jitter_asmjit.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+    endif()
     if(TARGET generate_deform_templates)
         add_dependencies(pg_jitter_asmjit generate_deform_templates)
     endif()

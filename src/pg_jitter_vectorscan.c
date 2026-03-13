@@ -20,7 +20,7 @@
 #include "varatt.h"
 #endif
 
-#include "port/pg_crc32c.h"
+/* pg_crc32c.h included via pg_jitter_compat.h (with Windows CRC32C override) */
 #include "hs.h"
 
 /* ================================================================

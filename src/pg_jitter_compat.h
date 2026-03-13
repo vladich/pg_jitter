@@ -172,6 +172,50 @@ pg_file_exists(const char *name)
 #define JITTER_INSTR_DEFORM_ACCUM(instr, end, start) ((void) 0)
 #endif
 
+/* ----------------------------------------------------------------
+ * CRC32C — include PG's header here so we can override on Windows.
+ * pg_comp_crc32c is not reliably exported from postgres.exe across
+ * all PG versions.  Replace PG's macros with hardware SSE4.2 CRC32C
+ * intrinsics (available on all x86_64 CPUs since Nehalem, 2008).
+ * ---------------------------------------------------------------- */
+#include "port/pg_crc32c.h"
+
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_AMD64))
+#include <nmmintrin.h>
+
+static inline pg_crc32c
+jitter_crc32c_sse42(pg_crc32c crc, const void *data, size_t len)
+{
+	const unsigned char *p = (const unsigned char *) data;
+	const unsigned char *end = p + len;
+
+	while (p + 8 <= end)
+	{
+		crc = (pg_crc32c) _mm_crc32_u64(crc, *(const unsigned __int64 *) p);
+		p += 8;
+	}
+	if (p + 4 <= end)
+	{
+		crc = _mm_crc32_u32(crc, *(const unsigned int *) p);
+		p += 4;
+	}
+	while (p < end)
+	{
+		crc = _mm_crc32_u8(crc, *p);
+		p++;
+	}
+	return crc;
+}
+
+#undef INIT_CRC32C
+#undef COMP_CRC32C
+#undef FIN_CRC32C
+#define INIT_CRC32C(crc)            ((crc) = 0xFFFFFFFF)
+#define COMP_CRC32C(crc, data, len) \
+	((crc) = jitter_crc32c_sse42((crc), (data), (len)))
+#define FIN_CRC32C(crc)             ((crc) ^= 0xFFFFFFFF)
+#endif /* _WIN32 && x86_64 */
+
 /* ================================================================
  * Feature-test macros — for #ifdef guards in backend code
  *

@@ -343,7 +343,11 @@ jobs:
           # Enable core dumps and verbose logging for crash diagnosis
           if [ "$RUNNER_OS" = "Linux" ]; then
             ulimit -c unlimited 2>/dev/null || true
-            echo '/tmp/core.%p' | sudo tee /proc/sys/kernel/core_pattern || true
+            # Disable systemd-coredump/apport so cores go to filesystem
+            echo '/tmp/core.%e.%p' | sudo tee /proc/sys/kernel/core_pattern || true
+            # Allow core dumps from processes that changed credentials
+            sudo sysctl -w fs.suid_dumpable=2 2>/dev/null || true
+            sudo sysctl -w kernel.core_uses_pid=1 2>/dev/null || true
             sudo apt-get install -y -qq gdb 2>/dev/null || true
           fi
           # Enable log_statement=all to see which query crashes
@@ -428,13 +432,23 @@ jobs:
 
               # Get backtrace from core dumps (Linux)
               if [ "$RUNNER_OS" = "Linux" ]; then
+                echo "--- Searching for core dumps ---"
+                ls -la /tmp/core.* 2>/dev/null || echo "  No /tmp/core.* files found"
+                PGBIN=$(pg_config --bindir)/postgres
+                echo "  postgres binary: $PGBIN"
                 for corefile in /tmp/core.*; do
                   [ -f "$corefile" ] || continue
                   echo "--- Backtrace from $corefile ---"
-                  PGBIN=$(pg_config --bindir)/postgres
-                  gdb -batch -ex "thread apply all bt" "$PGBIN" "$corefile" 2>&1 | head -100
+                  gdb -batch -ex "thread apply all bt full" "$PGBIN" "$corefile" 2>&1 | head -200
                   rm -f "$corefile"
                 done
+                # Fallback: try coredumpctl (systemd-coredump may intercept cores)
+                if command -v coredumpctl &>/dev/null; then
+                  echo "--- coredumpctl list (last 5) ---"
+                  coredumpctl list --no-pager 2>/dev/null | tail -5 || true
+                  echo "--- coredumpctl backtrace ---"
+                  coredumpctl info --no-pager 2>/dev/null | head -200 || true
+                fi
               fi
 
               # macOS crash reports
