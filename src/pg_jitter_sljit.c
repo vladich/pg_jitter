@@ -4907,12 +4907,16 @@ static bool sljit_compile_expr(ExprState *state) {
           SLJIT_R1);
       EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(W, P, P), fn);
 
+#ifdef _WIN64
       /*
        * Zero-extend the bool return value: the function returns bool
-       * (1 byte in AL). Upper bytes of RAX may contain garbage on
-       * Windows x64.  MOV_U8 clears upper bits before comparison.
+       * (1 byte in AL). The Windows x64 ABI does not guarantee upper
+       * bytes of RAX are cleared for sub-word returns.  MOV_U8 clears
+       * them before comparison.  Not needed on System V (Linux/macOS)
+       * which guarantees zero-extension.
        */
       sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+#endif
 
       /* If result == 0 (not distinct), jump */
       struct sljit_jump *j =
