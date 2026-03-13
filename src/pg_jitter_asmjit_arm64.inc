@@ -6339,8 +6339,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(fcinfo_base, (uint64_t) fcinfo);
 					int64_t a0null_off = (int64_t)((char*)&fcinfo->args[0].isnull - (char*)fcinfo);
 					int64_t a1null_off = (int64_t)((char*)&fcinfo->args[1].isnull - (char*)fcinfo);
-					cc.ldrb(a0null, a64::Mem(fcinfo_base, (int32_t) a0null_off));
-					cc.ldrb(a1null, a64::Mem(fcinfo_base, (int32_t) a1null_off));
+					cc.ldrb(a0null.w(), a64::Mem(fcinfo_base, (int32_t) a0null_off));
+					cc.ldrb(a1null.w(), a64::Mem(fcinfo_base, (int32_t) a1null_off));
 					cc.orr(a0null, a0null, a1null);
 
 					Label not_null = cc.new_label();
@@ -6351,7 +6351,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(resnull_addr, (uint64_t) op->resnull);
 					a64::Gp one_reg = cc.new_gpx();
 					cc.mov(one_reg, 1);
-					cc.strb(one_reg, a64::Mem(resnull_addr));
+					cc.strb(one_reg.w(), a64::Mem(resnull_addr));
 					cc.b(step_labels[jnull]);
 
 					cc.bind(not_null);
@@ -6362,7 +6362,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(fcinfo_reg, (uint64_t) fcinfo);
 				a64::Gp zero_reg = cc.new_gpx();
 				cc.mov(zero_reg, 0);
-				cc.strb(zero_reg, a64::Mem(fcinfo_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+				cc.strb(zero_reg.w(), a64::Mem(fcinfo_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
 
 				/* Call fn_addr(fcinfo) */
 				a64::Gp fn_reg = cc.new_gpx();
@@ -6381,7 +6381,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				/* If fcinfo->isnull -> resnull=true, jump to jnull */
 				a64::Gp isnull_reg = cc.new_gpx();
-				cc.ldrb(isnull_reg, a64::Mem(fcinfo_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
+				cc.ldrb(isnull_reg.w(), a64::Mem(fcinfo_reg, (int32_t) offsetof(FunctionCallInfoBaseData, isnull)));
 				Label not_null2 = cc.new_label();
 				cc.cbz(isnull_reg, not_null2);
 				{
@@ -6389,7 +6389,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.mov(resnull_addr, (uint64_t) op->resnull);
 					a64::Gp one = cc.new_gpx();
 					cc.mov(one, 1);
-					cc.strb(one, a64::Mem(resnull_addr));
+					cc.strb(one.w(), a64::Mem(resnull_addr));
 					cc.b(step_labels[jnull]);
 				}
 				cc.bind(not_null2);
@@ -6398,7 +6398,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					a64::Gp resnull_addr = cc.new_gpx();
 					cc.mov(resnull_addr, (uint64_t) op->resnull);
-					cc.strb(zero_reg, a64::Mem(resnull_addr));
+					cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
 				}
 
 				/* If int32(ret_reg) != 0, jump to jumpdone */
@@ -6438,7 +6438,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(resnull_addr, (uint64_t) op->resnull);
 				a64::Gp zero_reg = cc.new_gpx();
 				cc.mov(zero_reg, 0);
-				cc.strb(zero_reg, a64::Mem(resnull_addr));
+				cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
 				break;
 			}
 
@@ -6465,7 +6465,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(resnull_addr, (uint64_t) op->resnull);
 				a64::Gp one_reg = cc.new_gpx();
 				cc.mov(one_reg, 1);
-				cc.strb(one_reg, a64::Mem(resnull_addr));
+				cc.strb(one_reg.w(), a64::Mem(resnull_addr));
 				cc.b(step_labels[op->d.returningexpr.jumpdone]);
 
 				cc.bind(cont);

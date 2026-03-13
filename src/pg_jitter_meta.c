@@ -1170,17 +1170,15 @@ meta_release_context(JitContext *context)
 	MetaCompiledCode *cc, *next;
 
 	/*
-	 * Reset deform dispatch fast-path cache only for backends that actually
-	 * compiled something in this context.  Each backend .dylib has its own
-	 * static dispatch_fast[] cache keyed by TupleDesc pointer.  After context
-	 * release, TupleDesc pointers may be reused by palloc for different table
-	 * layouts, causing stale cache hits returning deform functions compiled
-	 * for wrong column types.
+	 * Reset deform dispatch fast-path cache for all available backends.
+	 * Each backend .dylib has its own static dispatch_fast[] cache keyed
+	 * by TupleDesc pointer.  After context release, TupleDesc pointers may
+	 * be reused by palloc for different table layouts, causing stale cache
+	 * hits returning deform functions compiled for wrong column types.
 	 */
 	for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
 	{
-		if ((ctx->backends_used & (1 << idx)) &&
-			backends[idx].available && backends[idx].deform_reset)
+		if (backends[idx].available && backends[idx].deform_reset)
 			backends[idx].deform_reset();
 	}
 
