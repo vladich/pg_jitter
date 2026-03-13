@@ -38,6 +38,10 @@
 
 /* ================================================================
  * Error handlers — cold path, never inlined
+ *
+ * On Windows x64, these call ereport(ERROR) which does longjmp through
+ * JIT-generated stack frames.  This is safe because we register proper
+ * SEH unwind metadata via RtlInstallFunctionTableCallback.
  * ================================================================ */
 
 pg_noinline void jit_error_int2_overflow(void) {

@@ -125,6 +125,26 @@ extern void pg_jitter_register_compiled(PgJitterContext *ctx,
 										void *data);
 
 /*
+ * Windows x64 unwind table registration for JIT code.
+ *
+ * On Windows, longjmp() uses SEH-based unwinding and requires every stack
+ * frame to have registered UNWIND_INFO.  JIT-generated code has no such
+ * metadata, so longjmp() from ereport(ERROR) crashes (STATUS_STACK_BUFFER_OVERRUN)
+ * when it tries to unwind through a JIT frame.
+ *
+ * pg_jitter_win64_register_unwind() registers a minimal RUNTIME_FUNCTION entry
+ * covering the JIT code region so the SEH unwinder can traverse it.
+ * pg_jitter_win64_deregister_unwind() removes it before freeing the code.
+ */
+#ifdef _WIN64
+extern void pg_jitter_win64_register_unwind(void *code, size_t code_size);
+extern void pg_jitter_win64_deregister_unwind(void *code);
+#else
+#define pg_jitter_win64_register_unwind(code, size) ((void)0)
+#define pg_jitter_win64_deregister_unwind(code) ((void)0)
+#endif
+
+/*
  * Fallback dispatch: calls the appropriate ExecEval* C function.
  * Returns -1 to continue to next step, or >= 0 for jump target step index.
  * Uses int64 to match machine word size for sljit/MIR calling convention.

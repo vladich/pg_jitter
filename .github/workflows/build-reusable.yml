@@ -152,9 +152,18 @@ jobs:
           path: postgres-src
           fetch-depth: 1
 
+      # ---- MSVC environment (Windows) ----
+      # Must come before Configure & Build so cl.exe / link.exe are on PATH
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # ---- Configure & Build ----
       - name: Configure
         shell: bash
+        env:
+          # Prevent MSYS2 from mangling /D, /I and other MSVC flags into Unix paths
+          MSYS2_ARG_CONV_EXCL: '*'
         run: |
           CMAKE_ARGS="-DPG_JITTER_BACKENDS=sljit;asmjit;mir"
           CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
@@ -173,9 +182,18 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
           fi
 
-          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
+          # Windows: use Ninja generator (MSVC toolchain on PATH from msvc-dev-cmd)
+          GENERATOR_ARGS=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            GENERATOR_ARGS="-G Ninja"
+          fi
+
+          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
 
       - name: Build
+        shell: bash
+        env:
+          MSYS2_ARG_CONV_EXCL: '*'
         run: cmake --build build --parallel
 
       # ---- Install pg_jitter & restart with it ----
@@ -239,10 +257,6 @@ jobs:
           done
           echo "Built libraries:"
           ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
-
-      - name: Setup MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build regression test libraries (Windows)
         if: runner.os == 'Windows'

@@ -162,8 +162,10 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
  * Free sljit compiled code.
  */
 static void sljit_code_free(void *data) {
-  if (data)
+  if (data) {
+    pg_jitter_win64_deregister_unwind(data);
     sljit_free_code(data, NULL);
+  }
 }
 
 /*
@@ -562,6 +564,17 @@ static void *find_or_compile_deform(PgJitterContext *ctx,
       sljit_emit_icall(C, type, arg_types, SLJIT_IMM, (sljit_sw)(fn));         \
     }                                                                          \
   } while (0)
+
+/*
+ * Emit a call to a JIT error handler (jit_error_*).
+ *
+ * These handlers call ereport(ERROR) which does longjmp and never returns.
+ * On Windows x64, longjmp safely traverses JIT frames because we register
+ * proper SEH unwind metadata via RtlInstallFunctionTableCallback
+ * (see pg_jitter_win64_register_unwind in pg_jitter_common.c).
+ */
+#define EMIT_JIT_ERROR(C, type, arg_types, fn)                                 \
+  EMIT_ICALL(C, type, arg_types, fn)
 
 /*
  * Emit deform code inline into the expression function body.
@@ -1381,7 +1394,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_ADD32 | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0,
                    0, SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     /* Sign-extend 32-bit result to 64-bit Datum */
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
@@ -1391,7 +1404,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_SUB32 | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0,
                    0, SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
     return true;
@@ -1400,7 +1413,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_MUL32 | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0,
                    0, SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
     return true;
@@ -1410,7 +1423,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
 
     /* Check divisor == 0 */
     j_not_zero = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 0);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
     sljit_set_label(j_not_zero, sljit_emit_label(C));
 
     /* Check INT32_MIN / -1 overflow */
@@ -1421,7 +1434,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
       struct sljit_jump *j_not_neg1;
       j_not_neg1 =
           sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, -1);
-      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
+      EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
       sljit_set_label(j_not_neg1, sljit_emit_label(C));
     }
     sljit_set_label(j_not_minmax, sljit_emit_label(C));
@@ -1436,7 +1449,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
 
     /* Check divisor == 0 */
     j_not_zero = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 0);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
     sljit_set_label(j_not_zero, sljit_emit_label(C));
 
     /* Check INT32_MIN % -1 → return 0 */
@@ -1469,7 +1482,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_ADD | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0, 0,
                    SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     return true;
 
@@ -1477,7 +1490,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_SUB | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0, 0,
                    SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     return true;
 
@@ -1485,7 +1498,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op2(C, SLJIT_MUL | SLJIT_SET_OVERFLOW, SLJIT_R0, 0, SLJIT_R0, 0,
                    SLJIT_R1, 0);
     j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
     sljit_set_label(j_ok, sljit_emit_label(C));
     return true;
 
@@ -1604,7 +1617,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
                     SLJIT_FR5, 0);
     j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
     /* Neither arg was Inf → overflow error */
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
     sljit_set_label(j_not_inf, sljit_emit_label(C));
     sljit_set_label(j_arg0_inf, sljit_emit_label(C));
     sljit_set_label(j_done, sljit_emit_label(C));
@@ -1635,7 +1648,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR4, 0,
                     SLJIT_FR5, 0);
     j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
     sljit_set_label(j_not_inf, sljit_emit_label(C));
     sljit_set_label(j_arg0_inf, sljit_emit_label(C));
     sljit_set_label(j_done, sljit_emit_label(C));
@@ -1669,7 +1682,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR4, 0,
                     SLJIT_FR5, 0);
     j_inf_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
     sljit_set_label(j_not_inf, sljit_emit_label(C));
     sljit_set_label(j_arg0_inf, sljit_emit_label(C));
     sljit_set_label(j_inf_done, sljit_emit_label(C));
@@ -1685,7 +1698,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR3, 0,
                     SLJIT_FR4, 0);
     j_done = sljit_emit_jump(C, SLJIT_F_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
     sljit_set_label(j_not_zero, sljit_emit_label(C));
     sljit_set_label(j_a_zero, sljit_emit_label(C));
     sljit_set_label(j_done, sljit_emit_label(C));
@@ -1706,7 +1719,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR1, 0,
                     SLJIT_FR4, 0);
     j_not_zero_divisor = sljit_emit_jump(C, SLJIT_F_NOT_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_division_by_zero);
     sljit_set_label(j_not_zero_divisor, sljit_emit_label(C));
     /* Save arg0 for overflow check (divisor can't be Inf if it's 0) */
     sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR2, 0, SLJIT_FR0, 0);
@@ -1723,7 +1736,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR4, 0,
                     SLJIT_FR5, 0);
     j_arg0_inf = sljit_emit_jump(C, SLJIT_F_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_overflow);
     sljit_set_label(j_not_inf, sljit_emit_label(C));
     sljit_set_label(j_arg0_inf, sljit_emit_label(C));
     /* Underflow check: result==0 && a!=0 */
@@ -1734,7 +1747,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_F_EQUAL, SLJIT_FR2, 0,
                     SLJIT_FR4, 0);
     j_a_zero = sljit_emit_jump(C, SLJIT_F_EQUAL);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_float_underflow);
     sljit_set_label(j_not_zero_result, sljit_emit_label(C));
     sljit_set_label(j_a_zero, sljit_emit_label(C));
     return true;
@@ -4554,7 +4567,7 @@ static bool sljit_compile_expr(ExprState *state) {
           struct sljit_jump *j_ok;
 
           j_ok = sljit_emit_jump(C, SLJIT_NOT_OVERFLOW);
-          EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
+          EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int8_overflow);
           sljit_set_label(j_ok, sljit_emit_label(C));
         }
         /* Store result */
@@ -4893,6 +4906,13 @@ static bool sljit_compile_expr(ExprState *state) {
           offsetof(ExprEvalStep, d.agg_presorted_distinctcheck.pertrans),
           SLJIT_R1);
       EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(W, P, P), fn);
+
+      /*
+       * Zero-extend the bool return value: the function returns bool
+       * (1 byte in AL). Upper bytes of RAX may contain garbage on
+       * Windows x64.  MOV_U8 clears upper bits before comparison.
+       */
+      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
 
       /* If result == 0 (not distinct), jump */
       struct sljit_jump *j =
@@ -7767,6 +7787,9 @@ static bool sljit_compile_expr(ExprState *state) {
                                   shared_node_id, shared_expr_idx,
                                   (uint64)(uintptr_t)pg_jitter_fallback_step);
     }
+
+    /* Register Windows x64 unwind metadata for SEH-safe longjmp */
+    pg_jitter_win64_register_unwind(code, sljit_get_generated_code_size(C));
 
     /* Register for cleanup */
     pg_jitter_register_compiled(ctx, sljit_code_free, code);
