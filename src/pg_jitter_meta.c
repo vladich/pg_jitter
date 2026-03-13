@@ -376,21 +376,36 @@ meta_load_backend(int idx)
 		return false;
 	}
 
-	/* Load and initialize */
-	init_fn = (JitProviderInit)
-		load_external_function(path, "_PG_jit_provider_init", true, NULL);
+	/* Load and initialize — catch any errors (e.g., missing symbols) */
+	PG_TRY();
+	{
+		init_fn = (JitProviderInit)
+			load_external_function(path, "_PG_jit_provider_init", true, NULL);
 
-	init_fn(&backends[idx].cb);
-	backends[idx].available = true;
+		init_fn(&backends[idx].cb);
+		backends[idx].available = true;
 
-	/* Look up the deform cache reset function (each backend has its own copy) */
-	backends[idx].deform_reset = (void (*)(void))
-		load_external_function(path,
-							   "pg_jitter_deform_dispatch_reset_fastpath",
-							   false, NULL);
+		/* Look up the deform cache reset function (each backend has its own copy) */
+		backends[idx].deform_reset = (void (*)(void))
+			load_external_function(path,
+								   "pg_jitter_deform_dispatch_reset_fastpath",
+								   false, NULL);
 
-	elog(DEBUG1, "pg_jitter: loaded backend %s", backend_libnames[idx]);
-	return true;
+		elog(DEBUG1, "pg_jitter: loaded backend %s", backend_libnames[idx]);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		elog(WARNING, "pg_jitter: failed to load backend %s",
+			 backend_libnames[idx]);
+
+		/* Mark as attempted-but-unavailable */
+		backends[idx].available = false;
+		backends[idx].deform_reset = NULL;
+	}
+	PG_END_TRY();
+
+	return backends[idx].available;
 }
 
 /* ----------------------------------------------------------------
@@ -1175,6 +1190,22 @@ meta_release_context(JitContext *context)
 	 * by TupleDesc pointer.  After context release, TupleDesc pointers may
 	 * be reused by palloc for different table layouts, causing stale cache
 	 * hits returning deform functions compiled for wrong column types.
+	 * Reset deform dispatch fast-path cache for ALL available backends.
+	 *
+	 * Each backend .dylib has its own static dispatch_fast[] cache keyed by
+	 * TupleDesc pointer.  After context release, TupleDesc pointers may be
+	 * reused by palloc for different table layouts, causing stale cache hits
+	 * returning deform functions compiled for wrong column types.
+	 *
+	 * We reset ALL backends rather than just ctx->backends_used because on
+	 * Linux (RTLD_GLOBAL), all backends' calls to
+	 * pg_jitter_compiled_deform_dispatch() resolve to the first-loaded
+	 * backend's copy (typically sljit).  When asmjit or mir is selected as
+	 * the expression compiler, their JIT code still populates sljit's
+	 * dispatch_fast[] via the PLT, but backends_used only records the
+	 * expression-compiler backend.  Resetting only that backend's cache
+	 * leaves sljit's dispatch_fast[] stale, causing crashes on TupleDesc
+	 * pointer reuse.  Resetting all three is cheap (one integer store each).
 	 */
 	for (int idx = 0; idx < PG_JITTER_NUM_BACKENDS; idx++)
 	{

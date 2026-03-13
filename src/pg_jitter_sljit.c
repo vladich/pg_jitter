@@ -2334,13 +2334,24 @@ static bool emit_precompiled_inline(struct sljit_compiler *C,
    * x86_64: Patch ret (0xC3) → JMP forward past the error-handler
    * tail. x86_64 JMP near: 0xE9 + 32-bit displacement.
    * The displacement is relative to the end of the 5-byte JMP instruction.
+   *
+   * If the 5-byte JMP does not fit within code_len (remaining < 0),
+   * the blob has no error-handler tail — just stop emitting before
+   * the ret and let execution fall through to the next sljit instruction.
    */
-  if (pi->ret_offset >= 0) {
-    int remaining = pi->code_len - pi->ret_offset - 5;
-    buf[pi->ret_offset] = 0xE9; /* JMP near */
-    int32_t disp = remaining;
-    memcpy(buf + pi->ret_offset + 1, &disp, 4);
-  }
+  {
+    int emit_len = pi->code_len;
+    if (pi->ret_offset >= 0) {
+      int remaining = pi->code_len - pi->ret_offset - 5;
+      if (remaining >= 0) {
+        buf[pi->ret_offset] = 0xE9; /* JMP near */
+        int32_t disp = remaining;
+        memcpy(buf + pi->ret_offset + 1, &disp, 4);
+      } else {
+        /* No room for JMP: truncate at ret, fall through */
+        emit_len = pi->ret_offset;
+      }
+    }
 #else
   return false;
 #endif
@@ -2362,11 +2373,12 @@ static bool emit_precompiled_inline(struct sljit_compiler *C,
   /*
    * x86_64: Variable-length instructions. Emit individual bytes.
    * sljit_emit_op_custom() on x86 accepts 1..16 byte instructions.
-   * We emit the entire blob as a sequence of single-byte emissions.
+   * We emit up to emit_len bytes (truncated at ret when no JMP fits).
    */
-  for (int off = 0; off < pi->code_len; off++) {
+  for (int off = 0; off < emit_len; off++) {
     sljit_emit_op_custom(C, buf + off, 1);
   }
+  }  /* close emit_len block */
 #endif
 
   /* Record BL/CALL relocations for post-generation fixup */
