@@ -376,21 +376,39 @@ meta_load_backend(int idx)
 		return false;
 	}
 
-	/* Load and initialize */
-	init_fn = (JitProviderInit)
-		load_external_function(path, "_PG_jit_provider_init", true, NULL);
+	/* Load and initialize — catch any errors (e.g., missing symbols) */
+	PG_TRY();
+	{
+		init_fn = (JitProviderInit)
+			load_external_function(path, "_PG_jit_provider_init", true, NULL);
 
-	init_fn(&backends[idx].cb);
-	backends[idx].available = true;
+		init_fn(&backends[idx].cb);
+		backends[idx].available = true;
 
-	/* Look up the deform cache reset function (each backend has its own copy) */
-	backends[idx].deform_reset = (void (*)(void))
-		load_external_function(path,
-							   "pg_jitter_deform_dispatch_reset_fastpath",
-							   false, NULL);
+		/* Look up the deform cache reset function (each backend has its own copy) */
+		backends[idx].deform_reset = (void (*)(void))
+			load_external_function(path,
+								   "pg_jitter_deform_dispatch_reset_fastpath",
+								   false, NULL);
 
-	elog(DEBUG1, "pg_jitter: loaded backend %s", backend_libnames[idx]);
-	return true;
+		elog(DEBUG1, "pg_jitter: loaded backend %s", backend_libnames[idx]);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata = CopyErrorData();
+
+		FlushErrorState();
+		elog(WARNING, "pg_jitter: failed to load backend %s: %s",
+			 backend_libnames[idx], edata->message);
+		FreeErrorData(edata);
+
+		/* Mark as attempted-but-unavailable */
+		backends[idx].available = false;
+		backends[idx].deform_reset = NULL;
+	}
+	PG_END_TRY();
+
+	return backends[idx].available;
 }
 
 /* ----------------------------------------------------------------

@@ -403,9 +403,15 @@ jobs:
 
             # Switch backend by writing to config and reloading.
             # ALTER SYSTEM SET rejects unknown GUCs, but the config file accepts them.
-            grep -v '^pg_jitter\.backend' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
+            # Remove ALL pg_jitter.* settings from auto.conf so each run starts clean.
+            grep -v '^pg_jitter\.' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
             mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf"
             echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
+            # For auto mode, disable adaptive timing to test static heuristic only.
+            # Adaptive timing is tested separately; this avoids potential CI instability.
+            if [ "$backend" = "auto" ]; then
+              echo "pg_jitter.adaptive = 'off'" >> "$PGDATA/postgresql.auto.conf"
+            fi
             pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
             sleep 1
 
