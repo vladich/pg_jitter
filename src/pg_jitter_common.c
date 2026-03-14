@@ -3948,22 +3948,82 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
   if (p + 4 <= end && p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA)
     p += 4;
 
-  /* Parse PUSH instructions */
-  while (p < end && npushes < 16) {
-    if (*p >= 0x50 && *p <= 0x57) {
-      /* PUSH r64 (registers RAX-RDI) */
-      push_reg[npushes] = *p - 0x50;
-      pushes_offset[npushes] = (int)(p - code);
-      npushes++;
-      p += 1;
-    } else if (p + 1 < end && *p == 0x41 && p[1] >= 0x50 && p[1] <= 0x57) {
-      /* PUSH r64 with REX.B (registers R8-R15) */
-      push_reg[npushes] = 8 + (p[1] - 0x50);
-      pushes_offset[npushes] = (int)(p - code);
-      npushes++;
-      p += 2;
-    } else {
-      break;  /* not a PUSH — prologue pushes are done */
+  /*
+   * Parse PUSH instructions and inline MOV/LEA instructions that compilers
+   * (sljit, AsmJIT, MIR) place between PUSHes in the prologue.
+   *
+   * AsmJIT's Compiler may generate:
+   *   push rbp; mov rbp, rsp; push rbx; push rsi; push rdi; sub rsp, N
+   * or:
+   *   push rbp; push rbx; push rsi; sub rsp, N; lea rbp, [rsp+off]
+   *
+   * We parse PUSHes and skip MOV/LEA instructions (up to a limit)
+   * until we hit something that isn't part of the prologue.
+   */
+  {
+    int non_push_skips = 0;
+    const int max_non_push_skips = 8;
+
+    while (p < end && npushes < 16) {
+      if (*p >= 0x50 && *p <= 0x57) {
+        /* PUSH r64 (registers RAX-RDI) */
+        push_reg[npushes] = *p - 0x50;
+        pushes_offset[npushes] = (int)(p - code);
+        npushes++;
+        p += 1;
+        non_push_skips = 0;
+      } else if (p + 1 < end && *p == 0x41 && p[1] >= 0x50 && p[1] <= 0x57) {
+        /* PUSH r64 with REX.B (registers R8-R15) */
+        push_reg[npushes] = 8 + (p[1] - 0x50);
+        pushes_offset[npushes] = (int)(p - code);
+        npushes++;
+        p += 2;
+        non_push_skips = 0;
+      } else if (p + 2 < end && p[0] == 0x48 && p[1] == 0x89 && p[2] == 0xE5) {
+        /* MOV RBP, RSP (48 89 E5) — AsmJIT frame pointer setup */
+        /* Record as UWOP_SET_FPREG — frame pointer = RBP at RSP+0 */
+        set_fpreg_offset = (uint8_t)(p + 3 - code);
+        *frame_reg_out = 5; /* RBP */
+        *frame_offset_out = 0;
+        p += 3;
+        non_push_skips++;
+      } else if (p + 2 < end && p[0] == 0x48 && p[1] == 0x8B && p[2] == 0xEC) {
+        /* MOV RBP, RSP (48 8B EC) — alternate encoding */
+        set_fpreg_offset = (uint8_t)(p + 3 - code);
+        *frame_reg_out = 5; /* RBP */
+        *frame_offset_out = 0;
+        p += 3;
+        non_push_skips++;
+      } else if (non_push_skips < max_non_push_skips) {
+        /*
+         * Try to skip other MOV/LEA instructions that compilers place
+         * in prologues (e.g., saving argument registers).
+         * We use a simple heuristic: if the byte has a REX prefix (0x48-0x4F)
+         * followed by MOV (0x89, 0x8B) or LEA (0x8D), skip the instruction.
+         */
+        if (p + 2 < end && (*p & 0xF0) == 0x40) {
+          uint8_t opcode = p[1];
+          if (opcode == 0x89 || opcode == 0x8B || opcode == 0x8D) {
+            /* REX + MOV/LEA — determine instruction length from ModR/M */
+            uint8_t modrm = p[2];
+            uint8_t mod = modrm >> 6;
+            uint8_t rm = modrm & 7;
+            int len = 3; /* REX + opcode + ModR/M */
+            if (rm == 4 && mod != 3) len++; /* SIB byte */
+            if (mod == 1) len += 1;  /* disp8 */
+            else if (mod == 2) len += 4;  /* disp32 */
+            else if (mod == 0 && rm == 5) len += 4; /* RIP-relative */
+            if (p + len <= end) {
+              p += len;
+              non_push_skips++;
+              continue;
+            }
+          }
+        }
+        break; /* Unknown instruction — stop */
+      } else {
+        break;
+      }
     }
   }
 
@@ -4040,18 +4100,18 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
 
   /*
    * Build UNWIND_CODE array in reverse chronological order
-   * (last prologue instruction first).
+   * (last prologue instruction first = highest offset first).
+   *
+   * We have three types of entries to merge:
+   *   - ALLOC (SUB RSP): always has the highest offset when present
+   *   - SET_FPREG (MOV RBP,RSP or similar): offset varies by backend
+   *   - PUSH_NONVOL: in pushes_offset[] array, ascending order
+   *
+   * Strategy: emit ALLOC first (highest offset), then merge SET_FPREG
+   * and PUSHes in descending offset order.
    */
 
-  /* Frame pointer setup (if detected) */
-  if (set_fpreg_offset > 0) {
-    if (ncodes >= max_codes) return 0;
-    unwind_codes[ncodes * 2]     = set_fpreg_offset;
-    unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_SET_FPREG | (0 << 4));
-    ncodes++;
-  }
-
-  /* Stack allocation (if any) */
+  /* Stack allocation (if any) — always highest offset */
   if (alloc_size > 0) {
     if (alloc_size <= 128 && (alloc_size % 8) == 0) {
       /* UWOP_ALLOC_SMALL: allocates (OpInfo * 8 + 8) bytes */
@@ -4078,12 +4138,40 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
     }
   }
 
-  /* Register pushes in reverse order (last push first) */
-  for (int i = npushes - 1; i >= 0; i--) {
-    if (ncodes >= max_codes) return 0;
-    unwind_codes[ncodes * 2]     = (uint8_t)(pushes_offset[i] + 1); /* offset AFTER the push */
-    unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_PUSH_NONVOL | (push_reg[i] << 4));
-    ncodes++;
+  /*
+   * Merge SET_FPREG and PUSHes in descending offset order.
+   * PUSHes are in ascending offset order in the arrays, so we iterate
+   * from the last push backward. SET_FPREG is inserted at the right
+   * position based on its offset.
+   */
+  {
+    bool fpreg_emitted = (set_fpreg_offset == 0);
+    int pi = npushes - 1;  /* current push index, descending */
+
+    while (pi >= 0 || !fpreg_emitted) {
+      uint8_t push_off = (pi >= 0) ? (uint8_t)(pushes_offset[pi] + 1) : 0;
+      bool emit_fpreg_now = false;
+
+      if (!fpreg_emitted) {
+        if (pi < 0 || set_fpreg_offset > push_off) {
+          emit_fpreg_now = true;
+        }
+      }
+
+      if (emit_fpreg_now) {
+        if (ncodes >= max_codes) return 0;
+        unwind_codes[ncodes * 2]     = set_fpreg_offset;
+        unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_SET_FPREG | (0 << 4));
+        ncodes++;
+        fpreg_emitted = true;
+      } else {
+        if (ncodes >= max_codes) return 0;
+        unwind_codes[ncodes * 2]     = push_off;
+        unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_PUSH_NONVOL | (push_reg[pi] << 4));
+        ncodes++;
+        pi--;
+      }
+    }
   }
 
   return ncodes;
@@ -4104,6 +4192,30 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
   ncodes = win64_parse_prologue((const uint8_t *)code, code_size,
                                 codes_buf, WIN64_MAX_UNWIND_CODES,
                                 &prolog_size, &frame_reg, &frame_offset);
+
+  /* Log prologue bytes for diagnostics */
+  {
+    const uint8_t *bytes = (const uint8_t *)code;
+    int dump_len = code_size < 32 ? (int)code_size : 32;
+    char hex[97]; /* 32*3 + 1 */
+    for (int i = 0; i < dump_len; i++)
+      snprintf(hex + i * 3, 4, "%02X ", bytes[i]);
+    hex[dump_len * 3] = '\0';
+    elog(DEBUG1, "pg_jitter: win64 prologue bytes: %s "
+         "(ncodes=%d prolog=%u frame_reg=%u frame_off=%u)",
+         hex, ncodes, prolog_size, frame_reg, frame_offset);
+  }
+
+  /*
+   * If we couldn't parse any unwind codes, don't register bogus unwind info.
+   * A zero-code UNWIND_INFO claims "leaf function" which is incorrect for
+   * functions that push registers or allocate stack, causing 0xC0000028.
+   */
+  if (ncodes == 0) {
+    elog(WARNING, "pg_jitter: could not parse prologue for unwind info, "
+         "error handlers through this JIT frame may crash");
+    return;
+  }
 
   ctx = (Win64UnwindCtx *)malloc(sizeof(Win64UnwindCtx));
   if (!ctx)
