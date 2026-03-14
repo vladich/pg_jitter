@@ -200,11 +200,7 @@ jobs:
           cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" $CMAKE_ARGS
 
       - name: Build
-        shell: bash
-        run: |
-          echo "cmake: $(command -v cmake)"
-          echo "ninja: $(command -v ninja 2>/dev/null || echo 'not found')"
-          cmake --build build --parallel
+        run: cmake --build build --parallel
 
       # ---- Install pg_jitter & restart with it ----
       - name: Install pg_jitter and restart PostgreSQL
