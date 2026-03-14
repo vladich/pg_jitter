@@ -4093,73 +4093,68 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
    * (last prologue instruction first = highest offset first).
    *
    * We have three types of entries to merge:
-   *   - ALLOC (SUB RSP): always has the highest offset when present
+   *   - ALLOC (SUB RSP): offset varies by backend
    *   - SET_FPREG (MOV RBP,RSP or similar): offset varies by backend
    *   - PUSH_NONVOL: in pushes_offset[] array, ascending order
    *
-   * Strategy: emit ALLOC first (highest offset), then merge SET_FPREG
-   * and PUSHes in descending offset order.
-   */
-
-  /* Stack allocation (if any) — always highest offset */
-  if (alloc_size > 0) {
-    if (alloc_size <= 128 && (alloc_size % 8) == 0) {
-      /* UWOP_ALLOC_SMALL: allocates (OpInfo * 8 + 8) bytes */
-      if (ncodes >= max_codes) return 0;
-      unwind_codes[ncodes * 2]     = alloc_offset;
-      unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_SMALL | (((alloc_size / 8) - 1) << 4));
-      ncodes++;
-    } else if (alloc_size <= 512 * 1024 - 8 && (alloc_size % 8) == 0) {
-      /* UWOP_ALLOC_LARGE with OpInfo=0: next slot is size/8 */
-      if (ncodes + 1 >= max_codes) return 0;
-      unwind_codes[ncodes * 2]     = alloc_offset;
-      unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_LARGE | (0 << 4));
-      ncodes++;
-      *(uint16_t *)(unwind_codes + ncodes * 2) = (uint16_t)(alloc_size / 8);
-      ncodes++;
-    } else {
-      /* UWOP_ALLOC_LARGE with OpInfo=1: next two slots are raw size */
-      if (ncodes + 2 >= max_codes) return 0;
-      unwind_codes[ncodes * 2]     = alloc_offset;
-      unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_LARGE | (1 << 4));
-      ncodes++;
-      *(uint32_t *)(unwind_codes + ncodes * 2) = alloc_size;
-      ncodes += 2;
-    }
-  }
-
-  /*
-   * Merge SET_FPREG and PUSHes in descending offset order.
-   * PUSHes are in ascending offset order in the arrays, so we iterate
-   * from the last push backward. SET_FPREG is inserted at the right
-   * position based on its offset.
+   * The relative order varies by backend:
+   *   sljit/AsmJIT: PUSH...; [MOV RBP,RSP;] SUB RSP,N → ALLOC last
+   *   MIR:          SUB RSP,N; MOV [RSP+off],RBP; MOV RBP,R10 → SET_FPREG last
+   *
+   * Strategy: merge all three in descending offset order.  We track which
+   * of ALLOC, SET_FPREG, and the push array has the highest remaining
+   * offset and emit that one next.
    */
   {
+    bool alloc_emitted = (alloc_size == 0);
     bool fpreg_emitted = (set_fpreg_offset == 0);
     int pi = npushes - 1;  /* current push index, descending */
 
-    while (pi >= 0 || !fpreg_emitted) {
+    while (!alloc_emitted || !fpreg_emitted || pi >= 0) {
       uint8_t push_off = (pi >= 0) ? (uint8_t)(pushes_offset[pi] + 1) : 0;
-      bool emit_fpreg_now = false;
+      uint8_t a_off = alloc_emitted ? 0 : alloc_offset;
+      uint8_t f_off = fpreg_emitted ? 0 : set_fpreg_offset;
 
-      if (!fpreg_emitted) {
-        if (pi < 0 || set_fpreg_offset > push_off) {
-          emit_fpreg_now = true;
+      /* Find which has the highest offset */
+      if (!alloc_emitted && a_off >= f_off && a_off >= push_off) {
+        /* Emit ALLOC */
+        if (alloc_size <= 128 && (alloc_size % 8) == 0) {
+          if (ncodes >= max_codes) return 0;
+          unwind_codes[ncodes * 2]     = alloc_offset;
+          unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_SMALL | (((alloc_size / 8) - 1) << 4));
+          ncodes++;
+        } else if (alloc_size <= 512 * 1024 - 8 && (alloc_size % 8) == 0) {
+          if (ncodes + 1 >= max_codes) return 0;
+          unwind_codes[ncodes * 2]     = alloc_offset;
+          unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_LARGE | (0 << 4));
+          ncodes++;
+          *(uint16_t *)(unwind_codes + ncodes * 2) = (uint16_t)(alloc_size / 8);
+          ncodes++;
+        } else {
+          if (ncodes + 2 >= max_codes) return 0;
+          unwind_codes[ncodes * 2]     = alloc_offset;
+          unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_ALLOC_LARGE | (1 << 4));
+          ncodes++;
+          *(uint32_t *)(unwind_codes + ncodes * 2) = alloc_size;
+          ncodes += 2;
         }
-      }
-
-      if (emit_fpreg_now) {
+        alloc_emitted = true;
+      } else if (!fpreg_emitted && f_off >= push_off) {
+        /* Emit SET_FPREG */
         if (ncodes >= max_codes) return 0;
         unwind_codes[ncodes * 2]     = set_fpreg_offset;
         unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_SET_FPREG | (0 << 4));
         ncodes++;
         fpreg_emitted = true;
-      } else {
+      } else if (pi >= 0) {
+        /* Emit PUSH_NONVOL */
         if (ncodes >= max_codes) return 0;
         unwind_codes[ncodes * 2]     = push_off;
         unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_PUSH_NONVOL | (push_reg[pi] << 4));
         ncodes++;
         pi--;
+      } else {
+        break; /* shouldn't happen */
       }
     }
   }
