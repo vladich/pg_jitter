@@ -309,7 +309,7 @@ jobs:
             BACKENDS="sljit asmjit mir auto"
           fi
           REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
-          PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
+          PGPORT=$(psql -t -A -c "SHOW port;" "$CONNURI")
 
           # pg_regress spawns psql over TCP — needs password from env
           export PGPASSWORD="postgres"
@@ -339,7 +339,7 @@ jobs:
 
           # Cleanup function for state left by previous test runs
           cleanup_database() {
-            psql "$CONNURI" -q -X <<'CLEANUP_SQL'
+            psql -q -X "$CONNURI" <<'CLEANUP_SQL'
           DO $$ DECLARE r RECORD; BEGIN
               FOR r IN SELECT evtname FROM pg_event_trigger LOOP
                   EXECUTE format('DROP EVENT TRIGGER IF EXISTS %I CASCADE', r.evtname);
@@ -394,10 +394,10 @@ jobs:
           CLEANUP_SQL
           }
 
-          PGDATA=$(psql "$CONNURI" -t -A -c "SHOW data_directory;")
+          PGDATA=$(psql -t -A -c "SHOW data_directory;" "$CONNURI")
 
           # Show locale/collation info for debugging (datlocprovider added in PG15)
-          psql "$CONNURI" -c "SELECT datcollate, datctype FROM pg_database WHERE datname = current_database();" || true
+          psql -c "SELECT datcollate, datctype FROM pg_database WHERE datname = current_database();" "$CONNURI" || true
 
           # Enable core dumps and verbose logging for crash diagnosis
           if [ "$RUNNER_OS" = "Linux" ]; then
@@ -446,7 +446,7 @@ jobs:
             fi
 
             # Quick sanity check — basic JIT query
-            psql "$CONNURI" -c "SELECT 1+1 AS jit_test;" || echo "WARNING: basic JIT query failed for $backend"
+            psql -c "SELECT 1+1 AS jit_test;" "$CONNURI" || echo "WARNING: basic JIT query failed for $backend"
 
             OUTDIR="${{ github.workspace }}/regress-output-$backend"
             mkdir -p "$OUTDIR"
