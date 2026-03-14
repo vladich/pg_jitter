@@ -311,7 +311,7 @@ static MIR_context_t mir_get_or_create_ctx(PgJitterContext *jctx) {
 /*
  * Provider entry point.
  */
-void _PG_jit_provider_init(JitProviderCallbacks *cb) {
+PGDLLEXPORT void _PG_jit_provider_init(JitProviderCallbacks *cb) {
   cb->reset_after_error = mir_reset_after_error;
   cb->release_context = pg_jitter_release_context;
   cb->compile_expr = mir_compile_expr;

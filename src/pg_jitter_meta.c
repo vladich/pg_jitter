@@ -1558,7 +1558,7 @@ meta_detect_default(void)
 	return PG_JITTER_BACKEND_SLJIT;
 }
 
-void
+PGDLLEXPORT void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
 	int		boot_default;

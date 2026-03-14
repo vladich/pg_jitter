@@ -148,7 +148,7 @@ asmjit_code_free(void *data)
 	}
 }
 
-extern "C" void
+extern "C" PGDLLEXPORT void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
 	cb->reset_after_error = pg_jitter_reset_after_error;
