@@ -148,7 +148,10 @@ asmjit_code_free(void *data)
 	}
 }
 
-extern "C" PGDLLEXPORT void
+#if defined(_MSC_VER) && PG_VERSION_NUM < 160000
+#pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
+#endif
+extern "C" void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
 	cb->reset_after_error = pg_jitter_reset_after_error;

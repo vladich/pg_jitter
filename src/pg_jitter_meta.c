@@ -1558,7 +1558,10 @@ meta_detect_default(void)
 	return PG_JITTER_BACKEND_SLJIT;
 }
 
-PGDLLEXPORT void
+#if defined(_MSC_VER) && PG_VERSION_NUM < 160000
+#pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
+#endif
+void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
 	int		boot_default;

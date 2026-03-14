@@ -104,7 +104,10 @@ static void sljit_code_free(void *data);
 /*
  * Provider entry point — called by PG when loading the JIT provider.
  */
-PGDLLEXPORT void _PG_jit_provider_init(JitProviderCallbacks *cb) {
+#if defined(_MSC_VER) && PG_VERSION_NUM < 160000
+#pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
+#endif
+void _PG_jit_provider_init(JitProviderCallbacks *cb) {
   cb->reset_after_error = pg_jitter_reset_after_error;
   cb->release_context = pg_jitter_release_context;
   cb->compile_expr = sljit_compile_expr;
