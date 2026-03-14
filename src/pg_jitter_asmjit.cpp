@@ -140,7 +140,10 @@ asmjit_code_free(void *data)
 	if (ac)
 	{
 		if (ac->func)
+		{
+			pg_jitter_win64_deregister_unwind(ac->func);
 			ac->rt.release(ac->func);
+		}
 		delete ac;
 	}
 }
@@ -461,6 +464,9 @@ asmjit_compile_expr(ExprState *state)
 
 				pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
 
+				/* Register Windows x64 unwind metadata for SEH-safe longjmp */
+				pg_jitter_win64_register_unwind(code_ptr, code_size);
+
 				/* Worker: set up binary search arrays for CASE optimization */
 				pg_jitter_setup_case_bsearch_arrays(state, state->steps,
 													 state->steps_len);
@@ -534,6 +540,9 @@ asmjit_compile_expr(ExprState *state)
 
 	/* Register for cleanup */
 	pg_jitter_register_compiled(ctx, asmjit_code_free, ac);
+
+	/* Register Windows x64 unwind metadata for SEH-safe longjmp */
+	pg_jitter_win64_register_unwind(ac->func, code.code_size());
 
 	/* Set the eval function (with validation wrapper on first call) */
 	pg_jitter_install_expr(state, (ExprStateEvalFunc) ac->func);

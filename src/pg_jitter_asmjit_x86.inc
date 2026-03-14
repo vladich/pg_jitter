@@ -2083,6 +2083,15 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke->set_arg(1, pt);
 				invoke->set_ret(0, ret_reg);
 
+#ifdef _WIN64
+				/*
+				 * Zero-extend the bool return value: these functions return
+				 * bool (1 byte in AL).  The Windows x64 ABI does not guarantee
+				 * upper bytes of RAX are cleared for sub-word returns.
+				 */
+				cc.movzx(ret_reg.r32(), ret_reg.r8());
+#endif
+
 				/* If result == 0 (not distinct), jump to jumpdistinct */
 				if (jumpdistinct >= 0 && jumpdistinct < steps_len)
 					x86_cbz(cc, ret_reg, step_labels[jumpdistinct]);
@@ -3593,6 +3602,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke->set_arg(1, op_reg);
 				invoke->set_arg(2, v_econtext);
 				invoke->set_ret(0, ret_reg);
+#ifdef _WIN64
+				/*
+				 * Zero-extend bool return: subscriptfunc returns bool
+				 * (1 byte in AL). Windows x64 ABI does not guarantee
+				 * upper bytes of RAX are cleared.
+				 */
+				cc.movzx(ret_reg.r32(), ret_reg.r8());
+#endif
 				/* If false (0), jump to jumpdone */
 				int jumpdone = op->d.sbsref_subscript.jumpdone;
 				cc.test(ret_reg, ret_reg);

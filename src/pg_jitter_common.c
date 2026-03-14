@@ -3902,6 +3902,7 @@ win64_unwind_callback(DWORD64 ControlPc, PVOID Context) {
 #define UWOP_PUSH_NONVOL     0
 #define UWOP_ALLOC_LARGE     1
 #define UWOP_ALLOC_SMALL     2
+#define UWOP_SET_FPREG       3
 
 /*
  * x64 register numbers for UNWIND_CODE (same as Windows convention):
@@ -3927,7 +3928,8 @@ win64_unwind_callback(DWORD64 ControlPc, PVOID Context) {
 static int
 win64_parse_prologue(const uint8_t *code, size_t code_size,
                      uint8_t *unwind_codes, int max_codes,
-                     uint8_t *prolog_size_out)
+                     uint8_t *prolog_size_out,
+                     uint8_t *frame_reg_out, uint8_t *frame_offset_out)
 {
   const uint8_t *p = code;
   const uint8_t *end = code + (code_size < 256 ? code_size : 256);
@@ -3937,6 +3939,10 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
   int npushes = 0;
   uint32_t alloc_size = 0;
   uint8_t alloc_offset = 0;
+  uint8_t set_fpreg_offset = 0;
+
+  *frame_reg_out = 0;
+  *frame_offset_out = 0;
 
   /* Skip ENDBR64 if present */
   if (p + 4 <= end && p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA)
@@ -3995,12 +4001,55 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
   }
   /* If no SUB RSP found: might be a very small leaf function */
 
+  /*
+   * Detect MIR-style frame pointer setup after SUB RSP:
+   *   MOV [RSP+disp8], RBP    → 48 89 6C 24 XX (5 bytes)
+   *   MOV RBP, R10            → 49 8B EA       (3 bytes)
+   *
+   * MIR's prologue with MIR_NO_RED_ZONE_ABI:
+   *   LEA R10, [RSP-8]        (before SUB RSP, already skipped)
+   *   SUB RSP, N
+   *   MOV [RSP+N-8], RBP      (save old RBP)
+   *   MOV RBP, R10             (set frame pointer = old_RSP - 8)
+   */
+  if (alloc_size > 0 && p + 7 <= end) {
+    const uint8_t *q = NULL;
+    if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x6C && p[3] == 0x24) {
+      /* MOV [RSP+disp8], RBP — 48 89 6C 24 XX (5 bytes) */
+      q = p + 5;
+    } else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x2C && p[3] == 0x24) {
+      /* MOV [RSP], RBP — 48 89 2C 24 (4 bytes, zero displacement) */
+      q = p + 4;
+    }
+    if (q != NULL) {
+      /* Check for MOV RBP, R10 (49 8B EA) or MOV RBP, RAX (48 8B E8) */
+      if (q + 3 <= end &&
+          ((q[0] == 0x49 && q[1] == 0x8B && q[2] == 0xEA) ||   /* MOV RBP, R10 */
+           (q[0] == 0x48 && q[1] == 0x8B && q[2] == 0xE8))) {  /* MOV RBP, RAX */
+        /* Frame pointer is established: RBP = old_RSP - 8 = RSP + alloc_size - 8 */
+        uint32_t fp_rsp_offset = alloc_size - 8;
+        set_fpreg_offset = (uint8_t)(q + 3 - code);
+        p = q + 3;
+        *frame_reg_out = 5; /* RBP */
+        *frame_offset_out = (uint8_t)(fp_rsp_offset / 16);
+      }
+    }
+  }
+
   *prolog_size_out = (uint8_t)(p - code);
 
   /*
    * Build UNWIND_CODE array in reverse chronological order
    * (last prologue instruction first).
    */
+
+  /* Frame pointer setup (if detected) */
+  if (set_fpreg_offset > 0) {
+    if (ncodes >= max_codes) return 0;
+    unwind_codes[ncodes * 2]     = set_fpreg_offset;
+    unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_SET_FPREG | (0 << 4));
+    ncodes++;
+  }
 
   /* Stack allocation (if any) */
   if (alloc_size > 0) {
@@ -4045,6 +4094,7 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
   DWORD64 base = (DWORD64)code;
   int ncodes;
   uint8_t prolog_size;
+  uint8_t frame_reg, frame_offset;
   uint8_t codes_buf[WIN64_MAX_UNWIND_CODES * 2];
 
   if (!code || code_size == 0)
@@ -4053,7 +4103,7 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
   /* Parse the prologue to build accurate unwind codes */
   ncodes = win64_parse_prologue((const uint8_t *)code, code_size,
                                 codes_buf, WIN64_MAX_UNWIND_CODES,
-                                &prolog_size);
+                                &prolog_size, &frame_reg, &frame_offset);
 
   ctx = (Win64UnwindCtx *)malloc(sizeof(Win64UnwindCtx));
   if (!ctx)
@@ -4066,7 +4116,7 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
   ctx->unwind_info[0] = 0x01;       /* Version=1, Flags=0 */
   ctx->unwind_info[1] = prolog_size; /* SizeOfProlog */
   ctx->unwind_info[2] = (uint8_t)ncodes; /* CountOfCodes */
-  ctx->unwind_info[3] = 0x00;       /* FrameRegister=0, FrameOffset=0 */
+  ctx->unwind_info[3] = (uint8_t)((frame_reg & 0x0F) | ((frame_offset & 0x0F) << 4));
 
   /* Copy unwind codes */
   if (ncodes > 0)

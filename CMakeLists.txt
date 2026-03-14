@@ -184,6 +184,11 @@ if(PG_JITTER_BUILD_MIR OR PG_JITTER_USE_C2MIR)
         target_link_libraries(mir_lib PRIVATE Threads::Threads)
         target_compile_definitions(mir_lib PRIVATE MIR_PARALLEL_GEN)
     endif()
+
+    # Windows x64 has no red zone — MIR must not store below RSP
+    if(WIN32)
+        target_compile_definitions(mir_lib PRIVATE MIR_NO_RED_ZONE_ABI)
+    endif()
 endif()
 
 # ---------- AsmJIT (via add_subdirectory) ----------
