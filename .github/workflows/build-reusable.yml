@@ -165,6 +165,15 @@ jobs:
           # Prevent MSYS2 from mangling /D, /I and other MSVC flags into Unix paths
           MSYS2_ARG_CONV_EXCL: '*'
         run: |
+          # Resolve pg_config: command -v returns MSYS2 paths (e.g. /c/PROGRA~1/...)
+          # which CMake (a native Windows process) cannot execute.
+          # Convert to native Windows path with cygpath -w on Windows.
+          PG_CONFIG="$(command -v pg_config 2>/dev/null || which pg_config 2>/dev/null || true)"
+          if [[ "$RUNNER_OS" == "Windows" && -n "$PG_CONFIG" ]]; then
+            PG_CONFIG="$(cygpath -m "$PG_CONFIG")"
+          fi
+          echo "pg_config resolved to: $PG_CONFIG"
+
           CMAKE_ARGS="-DPG_JITTER_BACKENDS=sljit;asmjit;mir"
           CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
           CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
@@ -188,7 +197,7 @@ jobs:
             GENERATOR_ARGS="-G Ninja"
           fi
 
-          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
+          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" $CMAKE_ARGS
 
       - name: Build
         shell: bash
