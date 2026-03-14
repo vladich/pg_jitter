@@ -290,7 +290,7 @@ jobs:
             # function itself, so GetProcAddress can't find it.  Extract all
             # PG_FUNCTION_INFO_V1 names and pass /EXPORT: for each.
             EXPORTS=""
-            for fn in $(grep -oP 'PG_FUNCTION_INFO_V1\(\K[^)]+' "$src"); do
+            for fn in $(sed -n 's/.*PG_FUNCTION_INFO_V1(\([^)]*\)).*/\1/p' "$src"); do
               EXPORTS="$EXPORTS /EXPORT:$fn"
             done
             # MSYS2_ARG_CONV_EXCL disables MSYS2 auto-conversion of /LD, /link etc. to paths
