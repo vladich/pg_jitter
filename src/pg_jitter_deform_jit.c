@@ -26,6 +26,9 @@
 #include <unistd.h>            /* sysconf, _SC_PAGESIZE */
 
 #include "port/pg_crc32c.h"
+#ifdef _WIN64
+#include "pg_crc32c_compat.h"
+#endif
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE

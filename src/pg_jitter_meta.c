@@ -34,6 +34,9 @@
 #include "storage/shmem.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#ifdef _WIN64
+#include "pg_crc32c_compat.h"
+#endif
 #include "portability/instr_time.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"
