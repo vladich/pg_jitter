@@ -496,7 +496,7 @@ jobs:
               # Windows: check Application Event Log for crash entries
               if [ "$RUNNER_OS" = "Windows" ]; then
                 echo "--- Windows Event Log (Application, last 20 errors) ---"
-                powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 20 2>\$null | Format-List TimeCreated,ProviderName,Message" 2>/dev/null | head -60 || true
+                timeout 10 powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,ProviderName,Message" 2>/dev/null | head -60 || true
               fi
 
               # Get backtrace from core dumps (Linux)
