@@ -3887,26 +3887,6 @@ typedef struct Win64UnwindCtx {
 static Win64UnwindCtx *win64_unwind_list = NULL;
 
 /*
- * Callback invoked by the OS unwinder for addresses in our registered range.
- *
- * The registered span (BaseAddress + Length) may cover addresses beyond our
- * actual JIT code — e.g., if the heap-allocated ctx is far from the JIT code,
- * the span covers everything in between.  We must only return our
- * RUNTIME_FUNCTION for addresses that are actually within our JIT code block.
- * Returning a bogus RUNTIME_FUNCTION for non-JIT addresses causes the
- * unwinder to use wrong unwind info, leading to STATUS_STACK_BUFFER_OVERRUN
- * (0xC00000FF) during longjmp.
- */
-static PRUNTIME_FUNCTION
-win64_unwind_callback(DWORD64 ControlPc, PVOID Context) {
-  Win64UnwindCtx *ctx = (Win64UnwindCtx *)Context;
-  if (ControlPc >= ctx->code_base &&
-      ControlPc < ctx->code_base + ctx->code_size_dw)
-    return &ctx->rf;
-  return NULL;
-}
-
-/*
  * Windows x64 UNWIND_CODE operations.
  */
 #define UWOP_PUSH_NONVOL     0
@@ -4249,12 +4229,21 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
 
   /*
    * RUNTIME_FUNCTION RVAs are relative to the BaseAddress passed to
-   * RtlInstallFunctionTableCallback.  We use min(ctx, code) as the base
-   * so all RVAs are positive DWORDs, regardless of whether the heap-
-   * allocated ctx is above or below the JIT code in the address space.
+   * RtlAddFunctionTable.  We use min(ctx, code) as the base so all RVAs
+   * are positive DWORDs, regardless of whether the heap-allocated ctx is
+   * above or below the JIT code in the address space.
    *
-   * The span from min_addr to max(code_end, ctx_end) must fit in 32 bits.
-   * In practice both are in user-mode VA space and the gap is small.
+   * We use RtlAddFunctionTable instead of RtlInstallFunctionTableCallback
+   * because the callback approach registers a dynamic function table that
+   * covers a large span [min_addr, min_addr+span).  This span can shadow
+   * static function tables (.pdata) of other modules loaded in the same
+   * address range, causing STATUS_STACK_BUFFER_OVERRUN (0xC00000FF) during
+   * longjmp when the unwinder can't find proper unwind info for non-JIT
+   * frames within the span.
+   *
+   * RtlAddFunctionTable registers a table that only covers the specific
+   * address ranges declared in the RUNTIME_FUNCTION entries, avoiding
+   * the shadowing problem entirely.
    */
   {
     DWORD64 ctx_addr = (DWORD64)ctx;
@@ -4277,15 +4266,12 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
     ctx->rf.UnwindData   = (DWORD)((DWORD64)ctx->unwind_info - min_addr);
 
     elog(DEBUG2, "pg_jitter: win64 unwind registered code=%p size=%zu "
-         "prolog=%u ncodes=%d",
-         code, code_size, prolog_size, ncodes);
+         "prolog=%u ncodes=%d base=0x%llX",
+         code, code_size, prolog_size, ncodes,
+         (unsigned long long)min_addr);
 
-    if (!RtlInstallFunctionTableCallback(
-            base | 0x3,   /* identifier with bits 0-1 set */
-            min_addr,     /* base for RVA resolution */
-            (DWORD)span,  /* length covering both ctx and code */
-            win64_unwind_callback, ctx, NULL)) {
-      elog(WARNING, "pg_jitter: RtlInstallFunctionTableCallback FAILED");
+    if (!RtlAddFunctionTable(&ctx->rf, 1, min_addr)) {
+      elog(WARNING, "pg_jitter: RtlAddFunctionTable FAILED");
       free(ctx);
       return;
     }
@@ -4311,8 +4297,8 @@ void pg_jitter_win64_deregister_unwind(void *code) {
       ctx = *pp;
       *pp = ctx->next;
 
-      /* Deregister the dynamic function table */
-      RtlDeleteFunctionTable((PRUNTIME_FUNCTION)(base | 0x3));
+      /* Deregister: pass the same RUNTIME_FUNCTION pointer used in RtlAddFunctionTable */
+      RtlDeleteFunctionTable(&ctx->rf);
 
       free(ctx);
       return;
