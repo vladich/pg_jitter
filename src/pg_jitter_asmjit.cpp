@@ -148,6 +148,9 @@ asmjit_code_free(void *data)
 	}
 }
 
+#if defined(_MSC_VER) && PG_VERSION_NUM < 160000
+#pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
+#endif
 extern "C" void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
