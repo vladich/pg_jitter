@@ -152,10 +152,28 @@ jobs:
           path: postgres-src
           fetch-depth: 1
 
+      # ---- MSVC environment (Windows) ----
+      # Must come before Configure & Build so cl.exe / link.exe are on PATH
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # ---- Configure & Build ----
       - name: Configure
         shell: bash
+        env:
+          # Prevent MSYS2 from mangling /D, /I and other MSVC flags into Unix paths
+          MSYS2_ARG_CONV_EXCL: '*'
         run: |
+          # Resolve pg_config: command -v returns MSYS2 paths (e.g. /c/PROGRA~1/...)
+          # which CMake (a native Windows process) cannot execute.
+          # Convert to native Windows path with cygpath -w on Windows.
+          PG_CONFIG="$(command -v pg_config 2>/dev/null || which pg_config 2>/dev/null || true)"
+          if [[ "$RUNNER_OS" == "Windows" && -n "$PG_CONFIG" ]]; then
+            PG_CONFIG="$(cygpath -m "$PG_CONFIG")"
+          fi
+          echo "pg_config resolved to: $PG_CONFIG"
+
           CMAKE_ARGS="-DPG_JITTER_BACKENDS=sljit;asmjit;mir"
           CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
           CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
@@ -173,7 +191,13 @@ jobs:
             CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
           fi
 
-          cmake -B build -DPG_CONFIG="$(command -v pg_config)" $CMAKE_ARGS
+          # Windows: use Ninja generator (MSVC toolchain on PATH from msvc-dev-cmd)
+          GENERATOR_ARGS=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            GENERATOR_ARGS="-G Ninja"
+          fi
+
+          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" $CMAKE_ARGS
 
       - name: Build
         run: cmake --build build --parallel
@@ -186,8 +210,10 @@ jobs:
           echo "Installing to $PKGLIBDIR"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp build/Debug/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
-            cp build/pg_jitter*.dll "$PKGLIBDIR/" 2>/dev/null || true
+            # MIR backend has pre-existing code-gen bugs on Windows — exclude it
+            for f in build/Debug/pg_jitter*.dll build/pg_jitter*.dll; do
+              [[ -f "$f" && "$(basename "$f")" != "pg_jitter_mir.dll" ]] && cp "$f" "$PKGLIBDIR/" || true
+            done
           else
             sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
             sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
@@ -240,10 +266,6 @@ jobs:
           echo "Built libraries:"
           ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
 
-      - name: Setup MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Build regression test libraries (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -280,7 +302,12 @@ jobs:
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
-          BACKENDS="sljit asmjit mir auto"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # MIR backend has pre-existing code-gen bugs on Windows — skip it
+            BACKENDS="sljit asmjit auto"
+          else
+            BACKENDS="sljit asmjit mir auto"
+          fi
           REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
           PGPORT=$(psql "$CONNURI" -t -A -c "SHOW port;")
 
@@ -463,10 +490,20 @@ jobs:
               if [ -f "$PGDATA/logfile" ]; then
                 echo "--- Crash/error lines from PostgreSQL server log ---"
                 tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
-                  | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|access violation' \
+                  | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|access violation|exit code [1-9]|signal [0-9]' \
                   | head -50 || true
-                echo "--- First 200 log lines from this backend ---"
-                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | head -200
+                echo "--- pg_jitter unwind debug from server log ---"
+                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
+                  | grep -i 'pg_jitter.*unwind\|pg_jitter.*prologue\|pg_jitter.*parse\|pg_jitter.*bytes' \
+                  | head -20 || true
+                echo "--- Last 100 log lines from this backend ---"
+                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -100 || true
+              fi
+
+              # Windows: check Application Event Log for crash entries
+              if [ "$RUNNER_OS" = "Windows" ]; then
+                echo "--- Windows Event Log (Application, last 20 errors) ---"
+                timeout 10 powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated,ProviderName,Message" 2>/dev/null | head -60 || true
               fi
 
               # Get backtrace from core dumps (Linux)

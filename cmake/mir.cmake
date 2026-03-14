@@ -20,6 +20,11 @@ add_library(mir_lib STATIC ${MIR_DIR}/mir.c ${MIR_DIR}/mir-gen.c)
 target_include_directories(mir_lib PUBLIC ${MIR_DIR})
 target_compile_options(mir_lib PRIVATE -std=gnu11 -w)
 
+# Windows x64 has no red zone — MIR must not store below RSP
+if(WIN32)
+    target_compile_definitions(mir_lib PRIVATE MIR_NO_RED_ZONE_ABI)
+endif()
+
 # ---------- sljit (static library, for deform JIT shared across backends) ----------
 add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
 target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)

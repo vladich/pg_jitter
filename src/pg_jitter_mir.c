@@ -239,6 +239,11 @@ static int mir_patch_sentinels(void *code, Size code_size) {
 typedef struct MirPerQueryState {
   MIR_context_t ctx;
   int module_counter;
+#ifdef _WIN64
+  void **unwind_codes;  /* machine_code pointers with registered SEH unwind */
+  int n_unwind;
+  int unwind_capacity;
+#endif
 } MirPerQueryState;
 
 /* Single-threaded PG: cache the current per-query state */
@@ -256,6 +261,13 @@ static void mir_ctx_free(void *data) {
       mir_current_state = NULL;
       mir_current_jctx = NULL;
     }
+#ifdef _WIN64
+    /* Deregister SEH unwind info before MIR frees code pages */
+    for (int i = 0; i < st->n_unwind; i++)
+      pg_jitter_win64_deregister_unwind(st->unwind_codes[i]);
+    if (st->unwind_codes)
+      pfree(st->unwind_codes);
+#endif
     MIR_gen_finish(st->ctx);
     MIR_finish(st->ctx);
     pfree(st);
@@ -4829,6 +4841,17 @@ static bool mir_compile_expr(ExprState *state) {
               MIR_new_ref_op(ctx, fn_import), MIR_new_reg_op(ctx, r_tmp2),
               MIR_new_reg_op(ctx, r_aggst), MIR_new_reg_op(ctx, r_tmp1)));
 
+      /*
+       * Zero-extend bool return: the function returns bool (1 byte in AL).
+       * On Windows x64 the ABI does not guarantee upper bytes of RAX are
+       * cleared.  Mask to 8 bits before comparing.
+       */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_AND, MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_int_op(ctx, 0xFF)));
+
       /* If result == 0 (not distinct), jump to jumpdistinct */
       if (jumpdistinct >= 0 && jumpdistinct < steps_len) {
         MIR_append_insn(
@@ -6574,6 +6597,15 @@ static bool mir_compile_expr(ExprState *state) {
                   MIR_new_reg_op(ctx, r_tmp1),
                   MIR_new_int_op(ctx, attnum),
                   MIR_new_reg_op(ctx, r_gcols)));
+#ifdef _WIN64
+          /* bms_is_member returns bool (1 byte in AL). Windows x64 ABI
+           * does not guarantee upper bytes of RAX are cleared. */
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_AND, MIR_new_reg_op(ctx, r_tmp1),
+                           MIR_new_reg_op(ctx, r_tmp1),
+                           MIR_new_int_op(ctx, 0xFF)));
+#endif
 
           /* if (bms_is_member) skip OR */
           MIR_append_insn(
@@ -7069,6 +7101,13 @@ static bool mir_compile_expr(ExprState *state) {
                             MIR_new_reg_op(ctx, r_state),
                             MIR_new_reg_op(ctx, r_tmp1),
                             MIR_new_reg_op(ctx, r_econtext)));
+
+      /* Zero-extend bool return (same Windows x64 ABI issue) */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_AND, MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_reg_op(ctx, r_tmp2),
+                       MIR_new_int_op(ctx, 0xFF)));
 
       /* If false (0), jump to jumpdone */
       {
@@ -8814,6 +8853,31 @@ static bool mir_compile_expr(ExprState *state) {
       }
 #endif
     }
+
+#ifdef _WIN64
+    /* Register Windows x64 SEH unwind metadata for longjmp safety */
+    {
+      void *mcode = f->machine_code;
+      Size mcode_size = f->machine_code_len;
+
+      pg_jitter_win64_register_unwind(mcode, mcode_size);
+
+      /* Track for deregistration when MIR context is freed */
+      if (mir_current_state) {
+        MirPerQueryState *st = mir_current_state;
+        if (st->n_unwind >= st->unwind_capacity) {
+          int new_cap = st->unwind_capacity ? st->unwind_capacity * 2 : 8;
+          if (st->unwind_codes)
+            st->unwind_codes = repalloc(st->unwind_codes, new_cap * sizeof(void *));
+          else
+            st->unwind_codes = MemoryContextAlloc(TopMemoryContext,
+                                                   new_cap * sizeof(void *));
+          st->unwind_capacity = new_cap;
+        }
+        st->unwind_codes[st->n_unwind++] = mcode;
+      }
+    }
+#endif
 
     /* Set the eval function (with validation wrapper on first call) */
     pg_jitter_install_expr(state, (ExprStateEvalFunc)code);

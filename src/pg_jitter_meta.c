@@ -34,6 +34,9 @@
 #include "storage/shmem.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#ifdef _WIN64
+#include "pg_crc32c_compat.h"
+#endif
 #include "portability/instr_time.h"
 #include "funcapi.h"
 #include "utils/tuplestore.h"
@@ -1246,15 +1249,14 @@ meta_release_context(JitContext *context)
 											  NULL);
 
 					/*
-					 * Restore the expression's original evalfunc if the
-					 * wrapper is still installed.
+					 * Do NOT try to restore evalfunc on anode->state here.
+					 * The ExprState lives in per-query memory and may already
+					 * be freed when release_context runs via resource owner
+					 * cleanup (e.g. error paths).  Dereferencing anode->state
+					 * would be a use-after-free.  The ExprState is never
+					 * reused after its JIT context is released, so restoring
+					 * evalfunc is unnecessary.
 					 */
-					if (anode->state &&
-						anode->state->evalfunc == meta_adaptive_timing_wrapper)
-					{
-						anode->state->evalfunc = anode->tctx->original_evalfunc;
-						anode->state->evalfunc_private = anode->tctx->original_evalfunc_priv;
-					}
 				}
 
 				pfree(anode->tctx);

@@ -98,7 +98,8 @@ message(STATUS "PG libdir:          ${PG_LIBDIR}")
 
 # ---------- Windows: find postgres import library ----------
 if(WIN32)
-    find_library(POSTGRES_LIB postgres
+    find_library(POSTGRES_LIB
+        NAMES postgres postgres.exe
         PATHS "${PG_LIBDIR}" "${PG_PKGLIBDIR}"
         NO_DEFAULT_PATH)
     if(NOT POSTGRES_LIB)
@@ -183,6 +184,11 @@ if(PG_JITTER_BUILD_MIR OR PG_JITTER_USE_C2MIR)
     if(Threads_FOUND)
         target_link_libraries(mir_lib PRIVATE Threads::Threads)
         target_compile_definitions(mir_lib PRIVATE MIR_PARALLEL_GEN)
+    endif()
+
+    # Windows x64 has no red zone — MIR must not store below RSP
+    if(WIN32)
+        target_compile_definitions(mir_lib PRIVATE MIR_NO_RED_ZONE_ABI)
     endif()
 endif()
 

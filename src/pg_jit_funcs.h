@@ -117,7 +117,10 @@ jit_sljit_call_type(const JitDirectFn *dfn)
 
 /*
  * Error handlers — cold path, callable from JIT code.
- * These never return (ereport), so no register save needed at call site.
+ * These call ereport(ERROR) which does longjmp and never returns.
+ *
+ * On Windows x64, longjmp safely traverses JIT frames because we
+ * register proper SEH unwind metadata via RtlInstallFunctionTableCallback.
  */
 extern pg_noinline void jit_error_int2_overflow(void);
 extern pg_noinline void jit_error_int4_overflow(void);
