@@ -201,9 +201,10 @@ jobs:
 
       - name: Build
         shell: bash
-        env:
-          MSYS2_ARG_CONV_EXCL: '*'
-        run: cmake --build build --parallel
+        run: |
+          echo "cmake: $(command -v cmake)"
+          echo "ninja: $(command -v ninja 2>/dev/null || echo 'not found')"
+          cmake --build build --parallel
 
       # ---- Install pg_jitter & restart with it ----
       - name: Install pg_jitter and restart PostgreSQL
