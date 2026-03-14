@@ -4202,17 +4202,22 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
    * compiler generated. Use LOG level to avoid polluting client output
    * (WARNING would appear in regression test results).
    */
-  if (ncodes == 0) {
+  {
     const uint8_t *bytes = (const uint8_t *)code;
     int dump_len = code_size < 32 ? (int)code_size : 32;
     char hex[97]; /* 32*3 + 1 */
     for (int i = 0; i < dump_len; i++)
       snprintf(hex + i * 3, 4, "%02X ", bytes[i]);
     hex[dump_len * 3] = '\0';
-    elog(LOG, "pg_jitter: could not parse prologue for unwind info "
-         "(bytes: %s), error handlers through this JIT frame may crash",
-         hex);
-    return;
+    elog(DEBUG2, "pg_jitter: win64 unwind prologue: %s "
+         "(ncodes=%d prolog=%u frame_reg=%u frame_off=%u)",
+         hex, ncodes, prolog_size, frame_reg, frame_offset);
+
+    if (ncodes == 0) {
+      elog(DEBUG2, "pg_jitter: could not parse prologue for unwind info, "
+           "error handlers through this JIT frame may crash");
+      return;
+    }
   }
 
   ctx = (Win64UnwindCtx *)malloc(sizeof(Win64UnwindCtx));
