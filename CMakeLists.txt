@@ -98,7 +98,8 @@ message(STATUS "PG libdir:          ${PG_LIBDIR}")
 
 # ---------- Windows: find postgres import library ----------
 if(WIN32)
-    find_library(POSTGRES_LIB postgres
+    find_library(POSTGRES_LIB
+        NAMES postgres postgres.exe
         PATHS "${PG_LIBDIR}" "${PG_PKGLIBDIR}"
         NO_DEFAULT_PATH)
     if(NOT POSTGRES_LIB)
