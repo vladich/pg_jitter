@@ -3887,13 +3887,23 @@ typedef struct Win64UnwindCtx {
 static Win64UnwindCtx *win64_unwind_list = NULL;
 
 /*
- * Callback invoked by the OS unwinder for addresses in our JIT code range.
+ * Callback invoked by the OS unwinder for addresses in our registered range.
+ *
+ * The registered span (BaseAddress + Length) may cover addresses beyond our
+ * actual JIT code — e.g., if the heap-allocated ctx is far from the JIT code,
+ * the span covers everything in between.  We must only return our
+ * RUNTIME_FUNCTION for addresses that are actually within our JIT code block.
+ * Returning a bogus RUNTIME_FUNCTION for non-JIT addresses causes the
+ * unwinder to use wrong unwind info, leading to STATUS_STACK_BUFFER_OVERRUN
+ * (0xC00000FF) during longjmp.
  */
 static PRUNTIME_FUNCTION
 win64_unwind_callback(DWORD64 ControlPc, PVOID Context) {
   Win64UnwindCtx *ctx = (Win64UnwindCtx *)Context;
-  (void)ControlPc;
-  return &ctx->rf;
+  if (ControlPc >= ctx->code_base &&
+      ControlPc < ctx->code_base + ctx->code_size_dw)
+    return &ctx->rf;
+  return NULL;
 }
 
 /*
