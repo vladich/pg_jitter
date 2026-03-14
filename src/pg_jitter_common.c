@@ -4193,27 +4193,25 @@ void pg_jitter_win64_register_unwind(void *code, size_t code_size) {
                                 codes_buf, WIN64_MAX_UNWIND_CODES,
                                 &prolog_size, &frame_reg, &frame_offset);
 
-  /* Log prologue bytes for diagnostics */
-  {
+  /*
+   * If we couldn't parse any unwind codes, don't register bogus unwind info.
+   * A zero-code UNWIND_INFO claims "leaf function" which is incorrect for
+   * functions that push registers or allocate stack, causing 0xC0000028.
+   *
+   * Log the first 32 bytes of the prologue so we can diagnose what the
+   * compiler generated. Use LOG level to avoid polluting client output
+   * (WARNING would appear in regression test results).
+   */
+  if (ncodes == 0) {
     const uint8_t *bytes = (const uint8_t *)code;
     int dump_len = code_size < 32 ? (int)code_size : 32;
     char hex[97]; /* 32*3 + 1 */
     for (int i = 0; i < dump_len; i++)
       snprintf(hex + i * 3, 4, "%02X ", bytes[i]);
     hex[dump_len * 3] = '\0';
-    elog(DEBUG1, "pg_jitter: win64 prologue bytes: %s "
-         "(ncodes=%d prolog=%u frame_reg=%u frame_off=%u)",
-         hex, ncodes, prolog_size, frame_reg, frame_offset);
-  }
-
-  /*
-   * If we couldn't parse any unwind codes, don't register bogus unwind info.
-   * A zero-code UNWIND_INFO claims "leaf function" which is incorrect for
-   * functions that push registers or allocate stack, causing 0xC0000028.
-   */
-  if (ncodes == 0) {
-    elog(WARNING, "pg_jitter: could not parse prologue for unwind info, "
-         "error handlers through this JIT frame may crash");
+    elog(LOG, "pg_jitter: could not parse prologue for unwind info "
+         "(bytes: %s), error handlers through this JIT frame may crash",
+         hex);
     return;
   }
 
