@@ -286,13 +286,20 @@ jobs:
             base=$(basename "$src" .c)
             EXTRA_CFLAGS=""
             [[ "$base" == "refint" ]] && EXTRA_CFLAGS="/DREFINT_VERBOSE"
+            # PG < 16 PG_FUNCTION_INFO_V1 does not add PGDLLEXPORT to the
+            # function itself, so GetProcAddress can't find it.  Extract all
+            # PG_FUNCTION_INFO_V1 names and pass /EXPORT: for each.
+            EXPORTS=""
+            for fn in $(grep -oP 'PG_FUNCTION_INFO_V1\(\K[^)]+' "$src"); do
+              EXPORTS="$EXPORTS /EXPORT:$fn"
+            done
             # MSYS2_ARG_CONV_EXCL disables MSYS2 auto-conversion of /LD, /link etc. to paths
             MSYS2_ARG_CONV_EXCL="*" cl.exe /LD /DWIN32 \
               /I"$INCSERVER" /I"$INC" /I"$INCWIN32" /I"$INCMSVC" \
               $EXTRA_CFLAGS \
               "$(cygpath -w "$src")" \
               /Fe:"$(cygpath -w "$DLPATH/${base}.dll")" \
-              /link "$LIBDIR\\postgres.lib"
+              /link "$LIBDIR\\postgres.lib" $EXPORTS
           done
           echo "Built libraries:"
           ls "$DLPATH"/*.dll 2>/dev/null || true
