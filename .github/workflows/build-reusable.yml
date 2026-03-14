@@ -483,14 +483,20 @@ jobs:
               if [ -f "$PGDATA/logfile" ]; then
                 echo "--- Crash/error lines from PostgreSQL server log ---"
                 tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
-                  | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|access violation' \
+                  | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|access violation|exit code [1-9]|signal [0-9]' \
                   | head -50 || true
                 echo "--- pg_jitter unwind debug from server log ---"
                 tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
                   | grep -i 'pg_jitter.*unwind\|pg_jitter.*prologue\|pg_jitter.*parse\|pg_jitter.*bytes' \
                   | head -20 || true
-                echo "--- First 200 log lines from this backend ---"
-                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | head -200
+                echo "--- Last 100 log lines from this backend ---"
+                tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -100 || true
+              fi
+
+              # Windows: check Application Event Log for crash entries
+              if [ "$RUNNER_OS" = "Windows" ]; then
+                echo "--- Windows Event Log (Application, last 20 errors) ---"
+                powershell -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 20 2>\$null | Format-List TimeCreated,ProviderName,Message" 2>/dev/null | head -60 || true
               fi
 
               # Get backtrace from core dumps (Linux)
