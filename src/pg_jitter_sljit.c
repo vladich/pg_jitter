@@ -97,6 +97,16 @@ static bool sljit_shared_code_mode = false;
  */
 static int sljit_sreg_steps = 0;
 
+/*
+ * Per-compilation register-based slot cache.
+ * When non-zero, FETCHSOME caches tts_values/tts_isnull in saved registers
+ * instead of on the stack, and VAR/ASSIGN_VAR use indexed loads from those
+ * registers directly (saves 1 stack load per access).
+ * Index: 0=inner, 1=outer, 2=scan, 3=old, 4=new.
+ */
+static int sljit_sreg_slot_vals[5];
+static int sljit_sreg_slot_nulls[5];
+
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
 static void sljit_code_free(void *data);
@@ -259,6 +269,10 @@ static void sljit_code_free(void *data) {
  *   S5 = AggState *aggstate  (when has_agg) OR sreg_hash (when has_hash_next &&
  * !has_agg) S6 = sreg_hash  (when has_agg && has_hash_next, on archs with >= 7
  * saved regs)
+ *
+ * On architectures with enough saved registers (ARM64 has 10), additional
+ * registers are allocated for slot caching (tts_values/tts_isnull pairs),
+ * eliminating stack loads on every VAR/ASSIGN_VAR access.
  *
  * Base: 6 saved registers — safe on all sljit architectures
  * (SLJIT_NUMBER_OF_SAVED_REGISTERS >= 6 everywhere, including x86-64).
@@ -1110,6 +1124,39 @@ static uint32 slot_cache_bit(ExprEvalOp opcode) {
 #endif
   default:
     return 0;
+  }
+}
+
+/*
+ * Helper: get register-cache index for a slot type.
+ * 0=inner, 1=outer, 2=scan, 3=old, 4=new, -1=unknown.
+ */
+static int slot_idx(ExprEvalOp opcode) {
+  switch (opcode) {
+  case EEOP_INNER_FETCHSOME:
+  case EEOP_INNER_VAR:
+  case EEOP_ASSIGN_INNER_VAR:
+    return 0;
+  case EEOP_OUTER_FETCHSOME:
+  case EEOP_OUTER_VAR:
+  case EEOP_ASSIGN_OUTER_VAR:
+    return 1;
+  case EEOP_SCAN_FETCHSOME:
+  case EEOP_SCAN_VAR:
+  case EEOP_ASSIGN_SCAN_VAR:
+    return 2;
+#ifdef HAVE_EEOP_OLD_NEW
+  case EEOP_OLD_FETCHSOME:
+  case EEOP_OLD_VAR:
+  case EEOP_ASSIGN_OLD_VAR:
+    return 3;
+  case EEOP_NEW_FETCHSOME:
+  case EEOP_NEW_VAR:
+  case EEOP_ASSIGN_NEW_VAR:
+    return 4;
+#endif
+  default:
+    return -1;
   }
 }
 
@@ -2747,6 +2794,39 @@ static bool sljit_compile_expr(ExprState *state) {
     }
 #endif
 
+    /*
+     * Slot register caching: use saved registers for tts_values/tts_isnull
+     * pointers instead of stack slots, eliminating 1 memory load per
+     * VAR/ASSIGN_VAR access.  Priority: inner > outer > scan.
+     * Each slot needs 2 registers (vals + nulls).
+     */
+    memset(sljit_sreg_slot_vals, 0, sizeof(sljit_sreg_slot_vals));
+    memset(sljit_sreg_slot_nulls, 0, sizeof(sljit_sreg_slot_nulls));
+
+#if SLJIT_NUMBER_OF_SAVED_REGISTERS >= 8
+    {
+      bool has_slot[5] = {false};
+      for (int i = 0; i < steps_len; i++) {
+        ExprEvalOp sop = ExecEvalStepOp(state, &steps[i]);
+        int si = slot_idx(sop);
+        if (si >= 0)
+          has_slot[si] = true;
+      }
+
+      /* Allocate register pairs for each used slot type */
+      static const int slot_priority[] = {0, 1, 2, 3, 4}; /* inner, outer, scan, old, new */
+      for (int p = 0; p < 5; p++) {
+        int si = slot_priority[p];
+        if (has_slot[si] &&
+            nsaved + 2 <= SLJIT_NUMBER_OF_SAVED_REGISTERS) {
+          sljit_sreg_slot_vals[si] = SLJIT_S(nsaved);
+          sljit_sreg_slot_nulls[si] = SLJIT_S(nsaved + 1);
+          nsaved += 2;
+        }
+      }
+    }
+#endif
+
     C = sljit_create_compiler(NULL);
     if (!C)
       return false;
@@ -3156,20 +3236,34 @@ static bool sljit_compile_expr(ExprState *state) {
       sljit_set_label(skip_j, sljit_emit_label(C));
 
       /*
-       * Cache the slot's tts_values and tts_isnull pointers
-       * on the stack for subsequent VAR/ASSIGN_VAR opcodes.
+       * Cache the slot's tts_values and tts_isnull pointers for
+       * subsequent VAR/ASSIGN_VAR opcodes.  Prefer saved registers
+       * (zero-cost indexed loads) over stack (1 extra load per use).
        * Must be after skip label so cache is set for both paths.
        */
       if (vals_off >= 0) {
+        int si = slot_idx(opcode);
+        int rv = (si >= 0) ? sljit_sreg_slot_vals[si] : 0;
+        int rn = (si >= 0) ? sljit_sreg_slot_nulls[si] : 0;
+
         emit_load_econtext_slot(C, SLJIT_R0, opcode);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(TupleTableSlot, tts_values));
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off, SLJIT_R1,
-                       0);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(TupleTableSlot, tts_isnull));
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off + 8,
-                       SLJIT_R1, 0);
+        if (rv) {
+          /* Register-based caching: 3 instructions (load slot + 2 field loads) */
+          sljit_emit_op1(C, SLJIT_MOV, rv, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_values));
+          sljit_emit_op1(C, SLJIT_MOV, rn, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_isnull));
+        } else {
+          /* Stack-based caching: 5 instructions (load slot + 2 loads + 2 stores) */
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_values));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off, SLJIT_R1,
+                         0);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_isnull));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), vals_off + 8,
+                         SLJIT_R1, 0);
+        }
         slots_cached |= slot_cache_bit(opcode);
       }
       break;
@@ -3195,6 +3289,10 @@ static bool sljit_compile_expr(ExprState *state) {
     {
       sljit_sw vals_off = slot_cache_offset(opcode);
       bool use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
+      int si = slot_idx(opcode);
+      int rv = (si >= 0) ? sljit_sreg_slot_vals[si] : 0;
+      int rn = (si >= 0) ? sljit_sreg_slot_nulls[si] : 0;
+      bool use_reg = use_cache && rv != 0;
 
       /*
        * Look ahead: count consecutive VARs from the same slot.
@@ -3223,16 +3321,21 @@ static bool sljit_compile_expr(ExprState *state) {
         int attnum = op->d.var.attnum;
 
         /* Load value from tts_values[attnum] → R2 */
-        if (use_cache)
+        if (use_reg)
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(rv),
+                         attnum * (sljit_sw)sizeof(Datum));
+        else if (use_cache) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                          vals_off);
-        else {
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+                         attnum * (sljit_sw)sizeof(Datum));
+        } else {
           emit_load_econtext_slot(C, SLJIT_R0, opcode);
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
                          offsetof(TupleTableSlot, tts_values));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+                         attnum * (sljit_sw)sizeof(Datum));
         }
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
-                       attnum * (sljit_sw)sizeof(Datum));
 
         /* R1 = resvalue ptr (via steps-relative, shared for both stores) */
         emit_load_step_field(C, opno, offsetof(ExprEvalStep, resvalue),
@@ -3240,54 +3343,68 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0, SLJIT_R2, 0);
 
         /* Load isnull from tts_isnull[attnum] → R2 */
-        if (use_cache)
+        if (use_reg)
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(rn),
+                         attnum * (sljit_sw)sizeof(bool));
+        else if (use_cache) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                          vals_off + 8);
-        else {
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+                         attnum * (sljit_sw)sizeof(bool));
+        } else {
           emit_load_econtext_slot(C, SLJIT_R0, opcode);
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
                          offsetof(TupleTableSlot, tts_isnull));
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+                         attnum * (sljit_sw)sizeof(bool));
         }
-        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
-                       attnum * (sljit_sw)sizeof(bool));
 
         /* Store isnull via paired offset from R1 */
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1),
                        (sljit_sw)sizeof(Datum), SLJIT_R2, 0);
       } else {
         /* Multi-VAR batch or S0-relative: use phased approach */
+        sljit_s32 vals_base, nulls_base;
 
         /* Phase 1: load all values from tts_values */
-        if (use_cache)
+        if (use_reg) {
+          vals_base = rv;
+        } else if (use_cache) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                          vals_off);
-        else {
+          vals_base = SLJIT_R0;
+        } else {
           emit_load_econtext_slot(C, SLJIT_R0, opcode);
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
                          offsetof(TupleTableSlot, tts_values));
+          vals_base = SLJIT_R0;
         }
-        /* R0 = tts_values, stays live (emit_store uses R1) */
+        /* vals_base holds tts_values pointer (saved reg or R0) */
         for (int bi = 0; bi < batch_count; bi++) {
           ExprEvalStep *cur = &steps[opno + bi];
           int attnum = cur->d.var.attnum;
-          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(vals_base),
                          attnum * (sljit_sw)sizeof(Datum));
           emit_store_resvalue(C, state, opno + bi, cur, SLJIT_R2);
         }
 
         /* Phase 2: load all isnulls from tts_isnull */
-        if (use_cache)
+        if (use_reg) {
+          nulls_base = rn;
+        } else if (use_cache) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                          vals_off + 8);
-        else {
+          nulls_base = SLJIT_R0;
+        } else {
           emit_load_econtext_slot(C, SLJIT_R0, opcode);
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
                          offsetof(TupleTableSlot, tts_isnull));
+          nulls_base = SLJIT_R0;
         }
         for (int bi = 0; bi < batch_count; bi++) {
           ExprEvalStep *cur = &steps[opno + bi];
           int attnum = cur->d.var.attnum;
-          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(nulls_base),
                          attnum * (sljit_sw)sizeof(bool));
           emit_store_resnull_reg(C, state, opno + bi, cur, SLJIT_R2);
         }
@@ -3317,6 +3434,10 @@ static bool sljit_compile_expr(ExprState *state) {
     {
       sljit_sw vals_off = slot_cache_offset(opcode);
       bool use_cache = (slots_cached & slot_cache_bit(opcode)) != 0;
+      int si = slot_idx(opcode);
+      int rv = (si >= 0) ? sljit_sreg_slot_vals[si] : 0;
+      int rn = (si >= 0) ? sljit_sreg_slot_nulls[si] : 0;
+      bool use_reg = use_cache && rv != 0;
 
       /* Look ahead for consecutive same-slot ASSIGN_VARs.
        * Stop before any step that is a jump target. */
@@ -3357,7 +3478,9 @@ static bool sljit_compile_expr(ExprState *state) {
           struct sljit_jump *loop_back;
 
           /* -- values loop -- */
-          if (use_cache)
+          if (use_reg)
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, rv, 0);
+          else if (use_cache)
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                            vals_off);
           else {
@@ -3387,7 +3510,9 @@ static bool sljit_compile_expr(ExprState *state) {
           sljit_set_label(loop_back, loop_top);
 
           /* -- isnulls loop -- */
-          if (use_cache)
+          if (use_reg)
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, rn, 0);
+          else if (use_cache)
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                            vals_off + 8);
           else {
@@ -3424,43 +3549,55 @@ static bool sljit_compile_expr(ExprState *state) {
         }
       }
 
-      /* Phase 1: load all values from source tts_values */
-      if (use_cache)
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
-                       vals_off);
-      else {
-        emit_load_econtext_slot(C, SLJIT_R0, opcode);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(TupleTableSlot, tts_values));
-      }
-      /* R0 = tts_values, stays live (STR to S3/S4 doesn't touch R0) */
-      for (int bi = 0; bi < batch_count; bi++) {
-        ExprEvalStep *cur = &steps[opno + bi];
-        int attnum = cur->d.assign_var.attnum;
-        int resultnum = cur->d.assign_var.resultnum;
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
-                       attnum * (sljit_sw)sizeof(Datum));
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SREG_RESULTVALS),
-                       resultnum * (sljit_sw)sizeof(Datum), SLJIT_R2, 0);
-      }
+      {
+        /* Phase 1: load all values from source tts_values */
+        sljit_s32 vals_base, nulls_base;
 
-      /* Phase 2: load all isnulls from source tts_isnull */
-      if (use_cache)
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
-                       vals_off + 8);
-      else {
-        emit_load_econtext_slot(C, SLJIT_R0, opcode);
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(TupleTableSlot, tts_isnull));
-      }
-      for (int bi = 0; bi < batch_count; bi++) {
-        ExprEvalStep *cur = &steps[opno + bi];
-        int attnum = cur->d.assign_var.attnum;
-        int resultnum = cur->d.assign_var.resultnum;
-        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0),
-                       attnum * (sljit_sw)sizeof(bool));
-        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SREG_RESULTNULLS),
-                       resultnum * (sljit_sw)sizeof(bool), SLJIT_R2, 0);
+        if (use_reg) {
+          vals_base = rv;
+        } else if (use_cache) {
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                         vals_off);
+          vals_base = SLJIT_R0;
+        } else {
+          emit_load_econtext_slot(C, SLJIT_R0, opcode);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_values));
+          vals_base = SLJIT_R0;
+        }
+        /* vals_base holds tts_values pointer (saved reg or R0) */
+        for (int bi = 0; bi < batch_count; bi++) {
+          ExprEvalStep *cur = &steps[opno + bi];
+          int attnum = cur->d.assign_var.attnum;
+          int resultnum = cur->d.assign_var.resultnum;
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(vals_base),
+                         attnum * (sljit_sw)sizeof(Datum));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SREG_RESULTVALS),
+                         resultnum * (sljit_sw)sizeof(Datum), SLJIT_R2, 0);
+        }
+
+        /* Phase 2: load all isnulls from source tts_isnull */
+        if (use_reg) {
+          nulls_base = rn;
+        } else if (use_cache) {
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                         vals_off + 8);
+          nulls_base = SLJIT_R0;
+        } else {
+          emit_load_econtext_slot(C, SLJIT_R0, opcode);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                         offsetof(TupleTableSlot, tts_isnull));
+          nulls_base = SLJIT_R0;
+        }
+        for (int bi = 0; bi < batch_count; bi++) {
+          ExprEvalStep *cur = &steps[opno + bi];
+          int attnum = cur->d.assign_var.attnum;
+          int resultnum = cur->d.assign_var.resultnum;
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(nulls_base),
+                         attnum * (sljit_sw)sizeof(bool));
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SREG_RESULTNULLS),
+                         resultnum * (sljit_sw)sizeof(bool), SLJIT_R2, 0);
+        }
       }
 
       /* Emit labels for skipped steps so jump targets work */
@@ -3858,12 +3995,21 @@ static bool sljit_compile_expr(ExprState *state) {
                 }
 
                 /*
-                 * LIKE/regex: Vectorscan/StringZilla use POSIX character
-                 * classes, not ICU.  Only safe for C/POSIX collation where
-                 * character classification is ASCII-only.
+                 * LIKE/regex fast paths collation gating:
+                 * - LIKE: StringZilla tier 1 does pure byte-level matching
+                 *   (memcmp, sz_find) — safe for any deterministic collation.
+                 * - Regex (~, ~*): Vectorscan POSIX character classes
+                 *   ([:alpha:], [:upper:], etc.) are ASCII-only, even with
+                 *   HS_FLAG_UTF8.  Non-C collations expect Unicode properties
+                 *   (e.g., ä ∈ [:alpha:] for ICU).  Only safe for C locale.
                  */
-                if (pat_const && !fcinfo->args[1].isnull &&
-                    pg_jitter_collation_is_c(fcinfo->fncollation)) {
+                bool collation_ok;
+                if (is_like_fn || is_ilike_fn)
+                  collation_ok = pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+                else
+                  collation_ok = pg_jitter_collation_is_c(fcinfo->fncollation);
+
+                if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
                   text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
                   char *pat_str = VARDATA_ANY(pat_text);
                   int pat_len = VARSIZE_ANY_EXHDR(pat_text);
