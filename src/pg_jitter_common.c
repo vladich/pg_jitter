@@ -3202,7 +3202,8 @@ pg_jitter_detect_case_bsearch(ExprState *state,
               desc->cmp_collation != C_COLLATION_OID)
           {
             pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-            if (locale->deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
+            bool deterministic = (locale == NULL) ? true : locale->deterministic;
+            if (deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
               use_memcmp_sort = true;
           }
 
@@ -3721,7 +3722,13 @@ pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc *desc)
         desc->cmp_collation != C_COLLATION_OID)
     {
       pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-      if (locale->deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
+      /*
+       * PG14-17: pg_newlocale_from_collation() returns NULL for the
+       * default libc collation.  NULL means deterministic (byte-equal).
+       * PG18+ always returns a valid locale struct.
+       */
+      bool deterministic = (locale == NULL) ? true : locale->deterministic;
+      if (deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
         use_memcmp = true;
     }
 

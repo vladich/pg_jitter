@@ -2719,11 +2719,18 @@ static bool mir_compile_expr(ExprState *state) {
               }
 
               /*
-               * LIKE/regex: Vectorscan/StringZilla use POSIX character
-               * classes, not ICU.  Only safe for C/POSIX collation.
+               * LIKE/regex fast paths collation gating:
+               * - LIKE: byte-level — safe for deterministic collations.
+               * - Regex: Vectorscan POSIX classes ([:alpha:] etc.) are
+               *   ASCII-only — only safe for C locale.
                */
-              if (pat_const && !fcinfo->args[1].isnull &&
-                  pg_jitter_collation_is_c(fcinfo->fncollation)) {
+              bool collation_ok;
+              if (is_like_fn || is_ilike_fn)
+                collation_ok = pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+              else
+                collation_ok = pg_jitter_collation_is_c(fcinfo->fncollation);
+
+              if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
                 text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
                 char *pat_str = VARDATA_ANY(pat_text);
                 int pat_len = VARSIZE_ANY_EXHDR(pat_text);
