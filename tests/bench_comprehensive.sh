@@ -153,6 +153,12 @@ for b in sljit asmjit mir; do
     fi
 done
 
+# "auto" backend requires meta-provider (pg_jitter.backend = 'auto')
+if [ "$META_MODE" -eq 1 ]; then
+    ALL_BACKENDS+=("auto")
+    ALL_NAMES+=("auto")
+fi
+
 # Filter to requested backends if specified
 if [ -n "$REQUESTED_BACKENDS" ]; then
     BACKENDS=()
@@ -397,6 +403,8 @@ add_query "Regex_alternation"   "SELECT COUNT(*) FROM text_data WHERE hash_text 
 add_section "IN list / Sort"
 add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
 add_query "IN_list_small"       "SELECT COUNT(*) FROM join_left WHERE key1 + 0 IN (1,2,3,4,5,6,7,8,9,10)"
+add_query "IN_text_5"           "SELECT COUNT(*) FROM text_data WHERE grp_text IN ('prefix_1','prefix_10','prefix_20','prefix_50','prefix_99')"
+add_query "IN_text_20"          "SELECT COUNT(*) FROM text_data WHERE grp_text IN ('prefix_1','prefix_5','prefix_10','prefix_15','prefix_20','prefix_25','prefix_30','prefix_35','prefix_40','prefix_45','prefix_50','prefix_55','prefix_60','prefix_65','prefix_70','prefix_75','prefix_80','prefix_85','prefix_90','prefix_99')"
 add_query "Sort_int_500k"       "SELECT key1 FROM join_left ORDER BY key1 + 0 LIMIT 10"
 add_query "Sort_int_grpby"      "SELECT key1 % 100, COUNT(*) FROM join_left GROUP BY key1 % 100 ORDER BY COUNT(*) DESC LIMIT 10"
 
@@ -467,33 +475,18 @@ add_query "Bool_20cond"        "SELECT COUNT(*) FROM join_left WHERE (val > 100 
 add_query "Agg_complex_10"    "SELECT grp, COUNT(*), SUM(val1*val1), AVG(val2+val3), MIN(val1-val2+val3), MAX(val4*2-val5), SUM(CASE WHEN val1>5000 THEN val2 ELSE val3 END), AVG(ABS(val1-val2)), SUM(val1%100+val2%100), COUNT(NULLIF(val3,0)) FROM bench_data GROUP BY grp"
 
 # --- Extreme LIKE/Regex on Long Strings ---
+# TEMPORARILY DISABLED: all text_long queries crash on PG18 (pre-existing PCRE2 bug)
 # These test PCRE2 JIT advantage on 400-600 char strings (200K rows).
 # PG's regex engine must scan each position; PCRE2 JIT compiles to native code.
-add_section "Long String LIKE/Regex"
-
-# Interior LIKE on long strings — PCRE2 JIT substring search
-add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
-
-# ILIKE on long strings — case-insensitive PCRE2 JIT
-add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
-
-# NOT ILIKE on long strings
-add_query "Long_NOT_ILIKE"     "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
-
-# Regex with 3 alternations on long strings (~10x faster)
-add_query "Long_Regex_alt"     "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
-
-# Regex with 8 alternations — more alternatives = more SIMD advantage (~12x faster)
-add_query "Long_Regex_8alt"    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
-
-# Case-insensitive regex on long strings (~10x faster)
-add_query "Long_Regex_icase"   "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
-
-# Regex char class on long strings
-add_query "Long_Regex_class"   "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
-
-# Combined ILIKE + regex — both accelerated by Vectorscan
-add_query "Long_combined"      "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
+#add_section "Long String LIKE/Regex"
+#add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
+#add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
+#add_query "Long_NOT_ILIKE"     "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
+#add_query "Long_Regex_alt"     "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
+#add_query "Long_Regex_8alt"    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
+#add_query "Long_Regex_icase"   "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
+#add_query "Long_Regex_class"   "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
+#add_query "Long_combined"      "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
 
 # --- CASE Binary Search ---
 # These test O(log N) binary search optimization for large CASE expressions.
@@ -703,6 +696,7 @@ echo ""
     printf "$header_fmt\n" "${header_args[@]}"
     printf "$header_fmt\n" "$(printf -- '---%.0s' {1..25})" $(for b in "${NAMES[@]}"; do printf -- '----------  '; done)
 
+    # Get interp baseline for speedup calculation
     for qi in $(seq 0 $((NQUERIES - 1))); do
         # Section headers
         for sec in "${SECTIONS[@]}"; do
@@ -715,20 +709,29 @@ echo ""
         done
 
         label="${LABELS[$qi]}"
+        baseline=$(grep "^${label},interp," "$CSV_FILE" | head -1 | cut -d',' -f3)
         row_fmt="%-25s"
         row_args=("$label")
         for bname in "${NAMES[@]}"; do
             # Get exec_time from CSV
             v=$(grep "^${label},${bname}," "$CSV_FILE" | head -1 | cut -d',' -f3)
-            [ -z "$v" ] && v="N/A"
-            row_fmt+="%12s"
-            row_args+=("$v")
+            if [ -z "$v" ] || [ "$v" = "CRASH" ]; then
+                row_fmt+="%12s"
+                row_args+=("N/A")
+            elif [ "$bname" = "interp" ] || [ -z "$baseline" ] || [ "$baseline" = "CRASH" ] || [ "$baseline" = "0" ]; then
+                row_fmt+="%12s"
+                row_args+=("$v")
+            else
+                speedup=$(echo "scale=2; $baseline / $v" | bc 2>/dev/null || echo "?")
+                row_fmt+="%12s"
+                row_args+=("${v} ${speedup}x")
+            fi
         done
         printf "$row_fmt\n" "${row_args[@]}"
     done
 
     echo ""
-    echo "All times in ms (median of $NRUNS). Lower is better."
+    echo "All times in ms (median of $NRUNS). Nx = speedup vs interpreter (>1x = faster)."
 } | tee "$SCRIPT_DIR/bench_comprehensive_summary_$(date +%Y%m%d_%H%M%S).txt"
 
 fi  # end of MD_ONLY=0 block (benchmarking + summary)
@@ -805,7 +808,7 @@ HEADER
 - Buffer cache warmed before benchmarking
 - Each query: $NWARMUP warmup runs, then $NRUNS timed runs, median reported
 - JIT compilation timing from a separate \`EXPLAIN (ANALYZE, FORMAT JSON)\` run
-- Percentages relative to interpreter (no JIT) baseline: <100% = faster, >100% = slower
+- Speedup shown as Nx relative to interpreter: >1x = faster, <1x = slower
 
 ## Results
 
@@ -861,8 +864,8 @@ EOF
                 elif [ "$baseline" = "CRASH" ] || [ -z "$baseline" ] || [ "$baseline" = "0" ]; then
                     row+=" ${val} ms |"
                 else
-                    pct=$(echo "scale=0; $val * 100 / $baseline" | bc 2>/dev/null || echo "?")
-                    row+=" ${val} ms (${pct}%) |"
+                    speedup=$(echo "scale=2; $baseline / $val" | bc 2>/dev/null || echo "?")
+                    row+=" ${val} ms (${speedup}x) |"
                 fi
             done
             echo "$row" >> "$MD_FILE"

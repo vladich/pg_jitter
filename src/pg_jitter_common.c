@@ -47,6 +47,12 @@ bool pg_jitter_deform_cache = true;
 /* GUC: pg_jitter.min_expr_steps — skip JIT for expressions with fewer steps */
 int pg_jitter_min_expr_steps = 4;
 
+/* GUC: pg_jitter.in_hash — hash table strategy for large IN lists */
+int pg_jitter_in_hash_strategy = IN_HASH_CRC32;
+
+/* GUC: pg_jitter.in_bsearch_max — max IN list size for inline bsearch tree */
+int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
+
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
  *

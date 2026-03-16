@@ -262,11 +262,20 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 #define PARALLEL_JIT_PER_WORKER 1
 #define PARALLEL_JIT_SHARED     2
 
+/* IN-list strategy for HASHED_SCALARARRAYOP */
+#define IN_HASH_PG       0  /* PG's built-in Jenkins hash probe */
+#define IN_HASH_CRC32    1  /* CRC32C open-addressing */
+
+/* Default threshold: ≤ this → inline bsearch tree, > this → CRC32 hash */
+#define IN_BSEARCH_MAX_DEFAULT 4096
+
 /* GUC variables shared across backends (defined in pg_jitter_common.c) */
 extern int pg_jitter_parallel_mode;
 extern int pg_jitter_shared_code_max_kb;
 extern bool pg_jitter_deform_cache;
 extern int pg_jitter_min_expr_steps;
+extern int pg_jitter_in_hash_strategy;
+extern int pg_jitter_in_bsearch_max;
 
 /*
  * Read the current parallel mode from the GUC system.

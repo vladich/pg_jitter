@@ -2856,12 +2856,12 @@ static bool mir_compile_expr(ExprState *state) {
                 }
 
                 /* Compiled LIKE path for anchored patterns */
-                bool skip_pcre2 = false;
+                                bool use_v1 = false;
                 if (!vs_handled && is_like_fn) {
                   SzLikeCompiled *compiled =
                       simd_like_compile(pat_str, pat_len);
                   if (compiled == SIMD_LIKE_USE_V1) {
-                    skip_pcre2 = true;
+                    use_v1 = true;
                   } else if (compiled) {
                     char szcd_name[32], szce_name[32];
                     snprintf(szcd_name, sizeof(szcd_name), "szcd_%d", opno);
@@ -2928,7 +2928,7 @@ static bool mir_compile_expr(ExprState *state) {
 
 #ifdef PG_JITTER_HAVE_PCRE2
                 /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
-                if (!vs_handled && !skip_pcre2) {
+                if (!vs_handled && !use_v1) {
                   bool is_like = is_like_fn || is_ilike_fn;
                   bool case_insens = is_ilike_fn || is_iregex_fn;
                   Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
@@ -4574,6 +4574,7 @@ static bool mir_compile_expr(ExprState *state) {
       Datum *sorted_vals = NULL;
       int nvals = 0;
       bool array_has_nulls = false;
+      TextHashTable *text_ht = NULL;
 
       if (eq_dfn && eq_dfn->jit_fn) {
         /*
@@ -4596,7 +4597,7 @@ static bool mir_compile_expr(ExprState *state) {
             get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval,
                                  &typalign);
 
-            if (typbyval && nitems > 0 && nitems <= 64) {
+            if (typbyval && nitems > 0 && nitems <= 128) {
               /*
                * Extract all values. Check for NULLs.
                */
@@ -4640,6 +4641,64 @@ static bool mir_compile_expr(ExprState *state) {
                 }
                 sorted_vals[b + 1] = tmp;
               }
+            }
+          }
+        }
+      }
+
+      /*
+       * Text IN-list hash table (independent of eq_dfn).
+       */
+      if (!sorted_vals) {
+        Expr *arrayarg_t = (Expr *)lsecond(saop->args);
+
+        if (IsA(arrayarg_t, Const)) {
+          Const *arrayconst_t = (Const *)arrayarg_t;
+
+          if (!arrayconst_t->constisnull) {
+            ArrayType *arr_t = DatumGetArrayTypeP(arrayconst_t->constvalue);
+            int nitems_t = ArrayGetNItems(ARR_NDIM(arr_t), ARR_DIMS(arr_t));
+            int16 typlen_t;
+            bool typbyval_t;
+            char typalign_t;
+
+            get_typlenbyvalalign(ARR_ELEMTYPE(arr_t), &typlen_t,
+                                 &typbyval_t, &typalign_t);
+
+            if (!typbyval_t && ARR_ELEMTYPE(arr_t) == TEXTOID &&
+                nitems_t > 0 && nitems_t <= 16384 &&
+                pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+              bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
+              char *s_t = (char *)ARR_DATA_PTR(arr_t);
+              int bitmask_t = 1;
+              Datum *text_vals = palloc(nitems_t * sizeof(Datum));
+              int text_nvals = 0;
+              bool text_has_nulls = false;
+
+              for (int k = 0; k < nitems_t; k++) {
+                if (bitmap_t && (*bitmap_t & bitmask_t) == 0) {
+                  text_has_nulls = true;
+                } else {
+                  text_vals[text_nvals++] = fetch_att(s_t, false, typlen_t);
+                  s_t = att_addlength_pointer(s_t, typlen_t, s_t);
+                  s_t = (char *)att_align_nominal(s_t, typalign_t);
+                }
+
+                if (bitmap_t) {
+                  bitmask_t <<= 1;
+                  if (bitmask_t == 0x100) {
+                    bitmap_t++;
+                    bitmask_t = 1;
+                  }
+                }
+              }
+
+              if (text_nvals > 0) {
+                text_ht = text_hash_build(text_vals, text_nvals,
+                                           text_has_nulls);
+                array_has_nulls = text_has_nulls;
+              }
+              pfree(text_vals);
             }
           }
         }
@@ -4717,7 +4776,7 @@ static bool mir_compile_expr(ExprState *state) {
           struct {
             int lo, hi;
             MIR_insn_t entry_label;
-          } work[128];
+          } work[512];
           int work_top = 0;
 
           /* Push initial range */
@@ -4877,6 +4936,138 @@ static bool mir_compile_expr(ExprState *state) {
         MIR_append_insn(ctx, func_item, lbl_done);
 
         pfree(sorted_vals);
+      } else if (text_ht) {
+        /*
+         * ---- Text IN-list hash probe ----
+         */
+        MIR_insn_t lbl_found_th = MIR_new_label(ctx);
+        MIR_insn_t lbl_null_result_th = MIR_new_label(ctx);
+        MIR_insn_t lbl_done_th = MIR_new_label(ctx);
+
+        int64_t off_arg0_value_th =
+            (int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+        int64_t off_arg0_isnull_th =
+            (int64_t)((char *)&fcinfo->args[0].isnull - (char *)fcinfo);
+
+        /* Check scalar not NULL */
+        MIR_STEP_LOAD(r_tmp1, opno, d.hashedscalararrayop.fcinfo_data);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                MIR_new_mem_op(ctx, MIR_T_U8, off_arg0_isnull_th, r_tmp1, 0, 1)));
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, lbl_null_result_th),
+                         MIR_new_reg_op(ctx, r_tmp2), MIR_new_int_op(ctx, 0)));
+
+        /* Load scalar datum */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(
+                ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                MIR_new_mem_op(ctx, MIR_T_I64, off_arg0_value_th, r_tmp1, 0, 1)));
+
+        /* Load table pointer */
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                         MIR_new_int_op(ctx, (int64_t)(uintptr_t)text_ht)));
+
+        /* Call text_hash_probe(datum, table_ptr) -> I32 result */
+        {
+          char th_proto_name[32], th_import_name[32];
+          snprintf(th_proto_name, sizeof(th_proto_name), "p_thp_%d", opno);
+          snprintf(th_import_name, sizeof(th_import_name), "thp_%d", opno);
+
+          MIR_type_t th_res_type = MIR_T_I32;
+          MIR_item_t th_proto = MIR_new_proto(
+              ctx, th_proto_name, 1, &th_res_type, 2,
+              MIR_T_I64, "a0", MIR_T_I64, "a1");
+          MIR_item_t th_import = MIR_new_import(ctx, th_import_name);
+          MIR_load_external(ctx, th_import_name,
+                            mir_extern_addr((void *)text_hash_probe));
+
+          MIR_reg_t r_th_result = mir_new_reg(ctx, f, MIR_T_I64,
+                                               "thres");
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_call_insn(ctx, 5,
+                                MIR_new_ref_op(ctx, th_proto),
+                                MIR_new_ref_op(ctx, th_import),
+                                MIR_new_reg_op(ctx, r_th_result),
+                                MIR_new_reg_op(ctx, r_tmp1),
+                                MIR_new_reg_op(ctx, r_tmp2)));
+
+          /* Branch: found vs not found */
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, lbl_found_th),
+                           MIR_new_reg_op(ctx, r_th_result),
+                           MIR_new_int_op(ctx, 0)));
+        }
+
+        /* ---- Not found ---- */
+        MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                         MIR_new_int_op(ctx, inclause ? 0 : 1)));
+        MIR_STEP_LOAD(r_tmp3, opno, resnull);
+        if (text_ht->has_nulls) {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV,
+                           MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                           MIR_new_int_op(ctx, 1)));
+        } else {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV,
+                           MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                           MIR_new_int_op(ctx, 0)));
+        }
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, lbl_done_th)));
+
+        /* ---- Found ---- */
+        MIR_append_insn(ctx, func_item, lbl_found_th);
+        MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                         MIR_new_int_op(ctx, inclause ? 1 : 0)));
+        MIR_STEP_LOAD(r_tmp3, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, lbl_done_th)));
+
+        /* ---- Null scalar ---- */
+        MIR_append_insn(ctx, func_item, lbl_null_result_th);
+        MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
+        MIR_STEP_LOAD(r_tmp3, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
+
+        /* ---- Done ---- */
+        MIR_append_insn(ctx, func_item, lbl_done_th);
+
       } else {
         /*
          * Non-constant array or byref type -- fall back

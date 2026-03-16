@@ -1829,7 +1829,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 												 &typlen, &typbyval,
 												 &typalign);
 
-							if (typbyval && nitems > 0 && nitems <= 64)
+							if (typbyval && nitems > 0 && nitems <= 128)
 							{
 								bits8 *bitmap = ARR_NULLBITMAP(arr);
 								char *s = (char *) ARR_DATA_PTR(arr);
@@ -1914,7 +1914,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							int lo, hi;
 							Label entry_label;
 							bool has_entry;
-						} work[128];
+						} work[512];
 						int work_top = 0;
 
 						work[work_top].lo = 0;

@@ -171,6 +171,32 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
         NULL, NULL, NULL);
   }
 
+  if (!GetConfigOption("pg_jitter.in_hash", true, false)) {
+    static const struct config_enum_entry in_hash_options[] = {
+        {"pg", IN_HASH_PG, false},
+        {"crc32", IN_HASH_CRC32, false},
+        {NULL, 0, false}};
+    DefineCustomEnumVariable("pg_jitter.in_hash",
+                             "Hash table strategy for large IN lists (> 128 elements): "
+                             "pg (built-in Jenkins), crc32 (CRC32C open-addressing)",
+                             NULL, &pg_jitter_in_hash_strategy,
+                             IN_HASH_CRC32, in_hash_options,
+                             PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+                             NULL, NULL, NULL);
+  }
+
+  if (!GetConfigOption("pg_jitter.in_bsearch_max", true, false)) {
+    DefineCustomIntVariable(
+        "pg_jitter.in_bsearch_max",
+        "Max IN list elements for inline binary search tree. "
+        "Larger lists use CRC32 hash probe. 0 disables inline bsearch.",
+        NULL, &pg_jitter_in_bsearch_max,
+        IN_BSEARCH_MAX_DEFAULT,
+        0,    /* minimum: 0 = disable */
+        8192, /* maximum: beyond this SLJIT code buffer overflows */
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
 }
 
 /*
@@ -4057,13 +4083,12 @@ static bool sljit_compile_expr(ExprState *state) {
                   }
 
                   /* Compiled LIKE path for anchored patterns */
-                  bool skip_pcre2 = false;
+                  bool use_v1 = false;
                   if (!vs_handled && is_like_fn) {
                     SzLikeCompiled *compiled =
                         simd_like_compile(pat_str, pat_len);
                     if (compiled == SIMD_LIKE_USE_V1) {
-                      /* Floating underscore pattern — V1 is faster */
-                      skip_pcre2 = true;
+                      use_v1 = true; /* V1 MatchText is fastest here */
                     } else if (compiled) {
                       sljit_sw off0 =
                           (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -4093,14 +4118,136 @@ static bool sljit_compile_expr(ExprState *state) {
                   }
 
 #ifdef PG_JITTER_HAVE_PCRE2
-                  /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
-                  if (!vs_handled && !skip_pcre2) {
+                  /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex.
+                   *
+                   * When direct JIT state is available, inline the varlena
+                   * header extraction in SLJIT and call the PCRE2 JIT
+                   * function directly — zero C wrapper overhead.
+                   *
+                   * Fast path (1-byte varlena header, covers text ≤126 bytes):
+                   *   data = datum_ptr + 1
+                   *   len  = (first_byte >> 1) - 1
+                   *   call pcre2_jit_func(&jit_args)
+                   *
+                   * Slow path (4-byte header, toast): call C wrapper.
+                   */
+                  if (!vs_handled && !use_v1) {
                     bool is_like = is_like_fn || is_ilike_fn;
                     bool case_insens = is_ilike_fn || is_iregex_fn;
                     Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
                         pat_str, pat_len, is_like, case_insens);
 
-                    if (pe) {
+                    if (pe && pe->jit_func && pe->jit_direct) {
+                      /* Inline fast path: extract text + call JIT directly.
+                       * pe->jit_direct points to Pcre2DirectState whose
+                       * first field is pj_jit_args (at offset 0). */
+                      void *jit_args_ptr = pe->jit_direct;
+                      struct sljit_label *l_slow;
+                      struct sljit_label *l_done;
+                      struct sljit_jump *j_to_slow;
+                      struct sljit_jump *j_to_done;
+
+                      /* R0 = text datum pointer */
+                      sljit_sw off0 =
+                          (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                      if (r1_has_fcinfo)
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R1), off0);
+                      else {
+                        emit_load_step_field(
+                            C, opno,
+                            offsetof(ExprEvalStep, d.func.fcinfo_data),
+                            SLJIT_R2);
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R2), off0);
+                      }
+
+                      /* Load first byte of varlena header */
+                      sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+                                     SLJIT_MEM1(SLJIT_R0), 0);
+
+                      /* Check VARATT_IS_1B: bit 0 set → 1-byte header */
+                      sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
+                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+                      j_to_slow = sljit_emit_cmp(C, SLJIT_EQUAL,
+                                                  SLJIT_R2, 0, SLJIT_IMM, 0);
+
+                      /* === FAST PATH: 1-byte header === */
+                      /* R2 = data pointer = datum + 1 */
+                      sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+                                     SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                      /* R1 = length = (first_byte >> 1) - 1 */
+                      sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0,
+                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+                      sljit_emit_op2(C, SLJIT_SUB, SLJIT_R1, 0,
+                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+
+                      /* Store str, begin, end, startchar_ptr into jit_args */
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                     SLJIT_IMM, (sljit_sw)jit_args_ptr);
+                      /* args.str = data (offset 8) */
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 8,
+                                     SLJIT_R2, 0);
+                      /* args.begin = data (offset 16) */
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 16,
+                                     SLJIT_R2, 0);
+                      /* args.end = data + len (offset 24) */
+                      sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                                     SLJIT_R2, 0, SLJIT_R1, 0);
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 24,
+                                     SLJIT_R1, 0);
+                      /* args.startchar_ptr = data (offset 40) */
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 40,
+                                     SLJIT_R2, 0);
+
+                      /* Call PCRE2 JIT function: int func(jit_args *) */
+                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
+                                 pe->jit_func);
+
+                      /* Convert: R0 = (result >= 0) ? 1 : 0 */
+                      /* PCRE2 JIT returns >= 0 for match, < 0 for no match */
+                      sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_SIG_LESS,
+                                      SLJIT_R0, 0, SLJIT_IMM, 0);
+                      sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0,
+                                          SLJIT_SIG_GREATER_EQUAL);
+
+                      j_to_done = sljit_emit_jump(C, SLJIT_JUMP);
+
+                      /* === SLOW PATH: 4B header or toast === */
+                      l_slow = sljit_emit_label(C);
+                      sljit_set_label(j_to_slow, l_slow);
+
+                      /* Reload datum (R0 may have been clobbered) */
+                      if (r1_has_fcinfo)
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R1), off0);
+                      else {
+                        emit_load_step_field(
+                            C, opno,
+                            offsetof(ExprEvalStep, d.func.fcinfo_data),
+                            SLJIT_R2);
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_R2), off0);
+                      }
+                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                     SLJIT_IMM, (sljit_sw)pe);
+                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                                 pg_jitter_pcre2_match_text);
+
+                      /* === DONE === */
+                      l_done = sljit_emit_label(C);
+                      sljit_set_label(j_to_done, l_done);
+
+                      if (vs_negate)
+                        sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
+                                       SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                      emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                      vs_handled = true;
+                    }
+                    else if (pe) {
+                      /* No direct JIT state — use C wrapper */
                       sljit_sw off0 =
                           (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
                       if (r1_has_fcinfo)
@@ -6383,6 +6530,7 @@ static bool sljit_compile_expr(ExprState *state) {
       Datum *sorted_vals = NULL;
       int nvals = 0;
       bool array_has_nulls = false;
+      TextHashTable *text_ht = NULL;
 
       if (eq_dfn && eq_dfn->jit_fn) {
         /*
@@ -6405,7 +6553,7 @@ static bool sljit_compile_expr(ExprState *state) {
             get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval,
                                  &typalign);
 
-            if (typbyval && nitems > 0 && nitems <= 64) {
+            if (typbyval && nitems > 0 && nitems <= 16384) {
               /*
                * Extract all values. Check for NULLs.
                */
@@ -6454,9 +6602,69 @@ static bool sljit_compile_expr(ExprState *state) {
         }
       }
 
-      if (sorted_vals && nvals > 0) {
+      /*
+       * Text IN-list hash table (independent of eq_dfn).
+       * For text arrays with deterministic collation, build an
+       * open-addressing hash table at compile time and probe at runtime.
+       */
+      if (!sorted_vals) {
+        Expr *arrayarg_t = (Expr *)lsecond(saop->args);
+
+        if (IsA(arrayarg_t, Const)) {
+          Const *arrayconst_t = (Const *)arrayarg_t;
+
+          if (!arrayconst_t->constisnull) {
+            ArrayType *arr_t = DatumGetArrayTypeP(arrayconst_t->constvalue);
+            int nitems_t = ArrayGetNItems(ARR_NDIM(arr_t), ARR_DIMS(arr_t));
+            int16 typlen_t;
+            bool typbyval_t;
+            char typalign_t;
+
+            get_typlenbyvalalign(ARR_ELEMTYPE(arr_t), &typlen_t,
+                                 &typbyval_t, &typalign_t);
+
+            if (!typbyval_t && ARR_ELEMTYPE(arr_t) == TEXTOID &&
+                nitems_t > 0 && nitems_t <= 16384 &&
+                pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+              bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
+              char *s_t = (char *)ARR_DATA_PTR(arr_t);
+              int bitmask_t = 1;
+              Datum *text_vals = palloc(nitems_t * sizeof(Datum));
+              int text_nvals = 0;
+              bool text_has_nulls = false;
+
+              for (int k = 0; k < nitems_t; k++) {
+                if (bitmap_t && (*bitmap_t & bitmask_t) == 0) {
+                  text_has_nulls = true;
+                } else {
+                  text_vals[text_nvals++] = fetch_att(s_t, false, typlen_t);
+                  s_t = att_addlength_pointer(s_t, typlen_t, s_t);
+                  s_t = (char *)att_align_nominal(s_t, typalign_t);
+                }
+
+                if (bitmap_t) {
+                  bitmask_t <<= 1;
+                  if (bitmask_t == 0x100) {
+                    bitmap_t++;
+                    bitmask_t = 1;
+                  }
+                }
+              }
+
+              if (text_nvals > 0) {
+                text_ht = text_hash_build(text_vals, text_nvals,
+                                           text_has_nulls);
+                array_has_nulls = text_has_nulls;
+              }
+              pfree(text_vals);
+            }
+          }
+        }
+      }
+
+      if (sorted_vals && nvals > 0 && nvals <= pg_jitter_in_bsearch_max) {
         /*
-         * ---- Binary search path ----
+         * ---- Inline binary search path (up to 256 elements) ----
          *
          * Emit a balanced binary search tree as inline
          * CMP + conditional branch instructions.
@@ -6518,22 +6726,20 @@ static bool sljit_compile_expr(ExprState *state) {
          * "not found" to patch at the end.
          */
         {
-          /* Max depth for 64 elements = 7 levels.
-           * Work stack needs at most 2^7 = 128 entries,
-           * but binary search never stacks more than
-           * 2*depth entries. Use generous size. */
+          /* Max depth for 256 elements = 9 levels.
+           * Work stack needs at most 2*depth entries. */
           struct {
             int lo, hi;
             struct sljit_jump *entry_jump;
-          } work[128];
+          } work[2048*2];
           int work_top = 0;
 
           /* Jumps that need to go to "found" label */
-          struct sljit_jump *found_jumps[64];
+          struct sljit_jump *found_jumps[4096];
           int n_found = 0;
 
           /* Jumps that need to go to "not found" label */
-          struct sljit_jump *notfound_jumps[128];
+          struct sljit_jump *notfound_jumps[2048*2];
           int n_notfound = 0;
 
           /* Push initial range */
@@ -6676,6 +6882,255 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_set_label(j_done_null, lbl_done);
 
         pfree(sorted_vals);
+      } else if (sorted_vals && nvals > 0) {
+        /* sorted_vals is only set for typbyval int4/int8 types */
+        /*
+         * ---- Inline CRC32 hash probe (> 512 elements) ----
+         *
+         * Build CRC32 open-addressing hash table at compile time.
+         * Emit probe directly in SLJIT — no function call.
+         *
+         * Register usage:
+         *   R0 = scalar value (preserved)
+         *   R1 = hash index / CRC temp
+         *   R2 = slot address
+         *   R3 = loaded slot value
+         *
+         * Compile-time constants embedded as immediates:
+         *   mask, table base pointer, EMPTY sentinel
+         */
+        int32 *int4_vals = MemoryContextAlloc(TopMemoryContext,
+                                               nvals * sizeof(int32));
+        for (int k = 0; k < nvals; k++)
+          int4_vals[k] = DatumGetInt32(sorted_vals[k]);
+        pfree(sorted_vals);
+
+        Crc32HashTable *ht = crc32_hash_build_int4(int4_vals, nvals,
+                                                     array_has_nulls);
+        sljit_sw ht_table = (sljit_sw)ht->table;
+        sljit_s32 ht_mask = ht->mask;
+
+        struct sljit_jump *j_scalar_null_rt;
+        struct sljit_label *lbl_done_rt;
+        struct sljit_jump *j_to_done_rt;
+        struct sljit_jump *j_null_to_done_rt;
+
+        /* Check scalar not NULL */
+        sljit_sw off_arg0_isnull_rt =
+            (sljit_sw)&fcinfo->args[0].isnull - (sljit_sw)fcinfo;
+        emit_load_step_field(
+            C, opno,
+            offsetof(ExprEvalStep, d.hashedscalararrayop.fcinfo_data),
+            SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_R0), off_arg0_isnull_rt);
+        j_scalar_null_rt = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                                           SLJIT_R1, 0, SLJIT_IMM, 0);
+
+        /* Load scalar value into R0 */
+        sljit_sw off_arg0_value_rt =
+            (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                       SLJIT_MEM1(SLJIT_R0), off_arg0_value_rt);
+
+        /* CRC32 hash: R1 = crc32c(0xFFFFFFFF, R0) & mask */
+        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0,
+                       SLJIT_IMM, (sljit_sw)0xFFFFFFFF);
+
+#if defined(__aarch64__)
+        /* Emit CRC32CW W1, W1, W0 = 0x1AC05821 */
+        {
+          sljit_u8 crc_inst[4] = {0x21, 0x58, 0xC0, 0x1A};
+          sljit_emit_op_custom(C, crc_inst, 4);
+        }
+#elif defined(__x86_64__)
+        /* Emit CRC32 EDX, EAX: F2 0F 38 F1 D0 */
+        /* TODO: x86 uses different register mapping */
+        /* Fall back to function call on x86 for now */
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, W),
+                   crc32_hash_probe_int4);
+        goto crc32_inline_skip;
+#else
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, W),
+                   crc32_hash_probe_int4);
+        goto crc32_inline_skip;
+#endif
+
+        /* AND with mask → hash index in R1 */
+        sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0,
+                       SLJIT_R1, 0, SLJIT_IMM, ht_mask);
+
+        /* R2 = &table[hash] = table_base + R1 * 4 */
+        sljit_emit_op2(C, SLJIT_SHL32, SLJIT_R2, 0,
+                       SLJIT_R1, 0, SLJIT_IMM, 2);
+        sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+                       SLJIT_R2, 0, SLJIT_IMM, ht_table);
+
+        /* Probe loop */
+        {
+          struct sljit_label *lbl_probe = sljit_emit_label(C);
+
+          /* R3 = table[index] */
+          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R3, 0,
+                         SLJIT_MEM1(SLJIT_R2), 0);
+
+          /* if slot == EMPTY → not found */
+          struct sljit_jump *j_not_found_rt = sljit_emit_cmp(
+              C, SLJIT_EQUAL, SLJIT_R3, 0,
+              SLJIT_IMM, (sljit_sw)INT32_MIN);
+
+          /* if slot == val → found */
+          struct sljit_jump *j_found_inline = sljit_emit_cmp(
+              C, SLJIT_EQUAL, SLJIT_R3, 0, SLJIT_R0, 0);
+
+          /* Linear probe: index = (index + 1) & mask */
+          sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R1, 0,
+                         SLJIT_R1, 0, SLJIT_IMM, 1);
+          sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0,
+                         SLJIT_R1, 0, SLJIT_IMM, ht_mask);
+          sljit_emit_op2(C, SLJIT_SHL32, SLJIT_R2, 0,
+                         SLJIT_R1, 0, SLJIT_IMM, 2);
+          sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
+                         SLJIT_R2, 0, SLJIT_IMM, ht_table);
+          sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), lbl_probe);
+
+          /* Not found: R0 = 0 */
+          sljit_set_label(j_not_found_rt, sljit_emit_label(C));
+          sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 0);
+          struct sljit_jump *j_to_result = sljit_emit_jump(C, SLJIT_JUMP);
+
+          /* Found: R0 = 1 */
+          sljit_set_label(j_found_inline, sljit_emit_label(C));
+          sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 1);
+          sljit_set_label(j_to_result, sljit_emit_label(C));
+        }
+#if defined(__x86_64__) || (!defined(__aarch64__))
+        crc32_inline_skip:
+#endif
+
+        /* R0 = 1 (found) or 0 (not found). Branch on result. */
+        struct sljit_jump *j_found_rt = sljit_emit_cmp(
+            C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* --- Not found --- */
+        if (inclause) {
+          if (array_has_nulls) {
+            emit_store_resvalue_imm(C, state, opno, op, 0);
+            emit_store_resnull_true(C, state, opno, op);
+          } else {
+            emit_store_res_pair_false_imm(C, state, opno, op, 0);
+          }
+        } else {
+          if (array_has_nulls) {
+            emit_store_resvalue_imm(C, state, opno, op, 0);
+            emit_store_resnull_true(C, state, opno, op);
+          } else {
+            emit_store_res_pair_false_imm(C, state, opno, op, 1);
+          }
+        }
+        j_to_done_rt = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Found --- */
+        sljit_set_label(j_found_rt, sljit_emit_label(C));
+        if (inclause)
+          emit_store_res_pair_false_imm(C, state, opno, op, 1);
+        else
+          emit_store_res_pair_false_imm(C, state, opno, op, 0);
+        struct sljit_jump *j_to_done_rt2 = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Null scalar --- */
+        sljit_set_label(j_scalar_null_rt, sljit_emit_label(C));
+        emit_store_resvalue_imm(C, state, opno, op, 0);
+        emit_store_resnull_true(C, state, opno, op);
+        j_null_to_done_rt = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Done --- */
+        lbl_done_rt = sljit_emit_label(C);
+        sljit_set_label(j_to_done_rt, lbl_done_rt);
+        sljit_set_label(j_to_done_rt2, lbl_done_rt);
+        sljit_set_label(j_null_to_done_rt, lbl_done_rt);
+
+      } else if (text_ht) {
+        /*
+         * ---- Text IN-list hash probe ----
+         *
+         * Open-addressing hash table built at compile time.
+         * Runtime: text_hash_probe(datum, table_ptr) → 0/1.
+         */
+        struct sljit_jump *j_scalar_null_th;
+        struct sljit_jump *j_to_done_th, *j_to_done_th2;
+        struct sljit_jump *j_null_to_done_th;
+        struct sljit_label *lbl_done_th;
+
+        sljit_sw off_arg0_value_th =
+            (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+        sljit_sw off_arg0_isnull_th =
+            (sljit_sw)&fcinfo->args[0].isnull - (sljit_sw)fcinfo;
+
+        /* Check scalar not NULL */
+        emit_load_step_field(
+            C, opno,
+            offsetof(ExprEvalStep, d.hashedscalararrayop.fcinfo_data),
+            SLJIT_R0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
+                       SLJIT_MEM1(SLJIT_R0), off_arg0_isnull_th);
+        j_scalar_null_th = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                                           SLJIT_R1, 0, SLJIT_IMM, 0);
+
+        /* Load scalar datum into R0 */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                       SLJIT_MEM1(SLJIT_R0), off_arg0_value_th);
+
+        /* R1 = text hash table pointer */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                       SLJIT_IMM, (sljit_sw)text_ht);
+
+        /* Call text_hash_probe(datum, table_ptr) → R0 = 0/1 */
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                   text_hash_probe);
+
+        /* Branch on result */
+        struct sljit_jump *j_found_th = sljit_emit_cmp(
+            C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* --- Not found --- */
+        if (inclause) {
+          if (text_ht->has_nulls) {
+            emit_store_resvalue_imm(C, state, opno, op, 0);
+            emit_store_resnull_true(C, state, opno, op);
+          } else {
+            emit_store_res_pair_false_imm(C, state, opno, op, 0);
+          }
+        } else {
+          if (text_ht->has_nulls) {
+            emit_store_resvalue_imm(C, state, opno, op, 0);
+            emit_store_resnull_true(C, state, opno, op);
+          } else {
+            emit_store_res_pair_false_imm(C, state, opno, op, 1);
+          }
+        }
+        j_to_done_th = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Found --- */
+        sljit_set_label(j_found_th, sljit_emit_label(C));
+        if (inclause)
+          emit_store_res_pair_false_imm(C, state, opno, op, 1);
+        else
+          emit_store_res_pair_false_imm(C, state, opno, op, 0);
+        j_to_done_th2 = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Null scalar --- */
+        sljit_set_label(j_scalar_null_th, sljit_emit_label(C));
+        emit_store_resvalue_imm(C, state, opno, op, 0);
+        emit_store_resnull_true(C, state, opno, op);
+        j_null_to_done_th = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* --- Done --- */
+        lbl_done_th = sljit_emit_label(C);
+        sljit_set_label(j_to_done_th, lbl_done_th);
+        sljit_set_label(j_to_done_th2, lbl_done_th);
+        sljit_set_label(j_null_to_done_th, lbl_done_th);
+
       } else {
         /*
          * Non-constant array or byref type — fall back to

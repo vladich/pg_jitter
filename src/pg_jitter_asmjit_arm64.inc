@@ -2240,14 +2240,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							}
 
 							/* Compiled LIKE path for anchored patterns */
-							bool skip_pcre2 = false;
-							if (!vs_handled && is_like_fn)
+							bool use_v1 = false;
+														if (!vs_handled && is_like_fn)
 							{
 								SzLikeCompiled *compiled =
 									simd_like_compile(pat_str, pat_len);
 								if (compiled == SIMD_LIKE_USE_V1)
 								{
-									skip_pcre2 = true;
+									use_v1 = true;
 								}
 								else if (compiled)
 								{
@@ -2307,7 +2307,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 #ifdef PG_JITTER_HAVE_PCRE2
 							/* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
-							if (!vs_handled && !skip_pcre2)
+							if (!vs_handled && !use_v1)
 							{
 								bool is_like = is_like_fn || is_ilike_fn;
 								bool case_insens = is_ilike_fn || is_iregex_fn;
@@ -3639,6 +3639,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				Datum *sorted_vals = NULL;
 				int nvals = 0;
 				bool array_has_nulls = false;
+				TextHashTable *text_ht = NULL;
 
 				if (eq_dfn && eq_dfn->jit_fn)
 				{
@@ -3663,7 +3664,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 												 &typlen, &typbyval,
 												 &typalign);
 
-							if (typbyval && nitems > 0 && nitems <= 64)
+							if (typbyval && nitems > 0 && nitems <= 128)
 							{
 								bits8 *bitmap = ARR_NULLBITMAP(arr);
 								char *s = (char *) ARR_DATA_PTR(arr);
@@ -3721,6 +3722,87 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					}
 				}
 
+				/*
+				 * Text IN-list hash table (independent of eq_dfn).
+				 * For text arrays with deterministic collation, build an
+				 * open-addressing hash table at compile time and probe at runtime.
+				 */
+				if (!sorted_vals)
+				{
+					Expr *arrayarg_t = (Expr *) lsecond(saop->args);
+
+					if (IsA(arrayarg_t, Const))
+					{
+						Const *arrayconst_t = (Const *) arrayarg_t;
+
+						if (!arrayconst_t->constisnull)
+						{
+							ArrayType *arr_t =
+								DatumGetArrayTypeP(arrayconst_t->constvalue);
+							int nitems_t = ArrayGetNItems(
+								ARR_NDIM(arr_t), ARR_DIMS(arr_t));
+							int16 typlen_t;
+							bool typbyval_t;
+							char typalign_t;
+
+							get_typlenbyvalalign(ARR_ELEMTYPE(arr_t),
+								&typlen_t, &typbyval_t, &typalign_t);
+
+							if (!typbyval_t &&
+								ARR_ELEMTYPE(arr_t) == TEXTOID &&
+								nitems_t > 0 && nitems_t <= 16384 &&
+								pg_jitter_collation_is_deterministic(
+									fcinfo->fncollation))
+							{
+								bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
+								char *s_t = (char *) ARR_DATA_PTR(arr_t);
+								int bitmask_t = 1;
+								Datum *text_vals = (Datum *)
+									palloc(nitems_t * sizeof(Datum));
+								int text_nvals = 0;
+								bool text_has_nulls = false;
+
+								for (int k = 0; k < nitems_t; k++)
+								{
+									if (bitmap_t &&
+										(*bitmap_t & bitmask_t) == 0)
+									{
+										text_has_nulls = true;
+									}
+									else
+									{
+										text_vals[text_nvals++] =
+											fetch_att(s_t, false, typlen_t);
+										s_t = att_addlength_pointer(
+											s_t, typlen_t, s_t);
+										s_t = (char *) att_align_nominal(
+											s_t, typalign_t);
+									}
+
+									if (bitmap_t)
+									{
+										bitmask_t <<= 1;
+										if (bitmask_t == 0x100)
+										{
+											bitmap_t++;
+											bitmask_t = 1;
+										}
+									}
+								}
+
+								if (text_nvals > 0)
+								{
+									text_ht = text_hash_build(
+										text_vals, text_nvals,
+										text_has_nulls);
+									array_has_nulls = text_has_nulls;
+								}
+								pfree(text_vals);
+							}
+						}
+					}
+				}
+
 				if (sorted_vals && nvals > 0)
 				{
 					Label lbl_found = cc.new_label();
@@ -3748,7 +3830,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							int lo, hi;
 							Label entry_label;
 							bool has_entry;
-						} work[128];
+						} work[512];
 						int work_top = 0;
 
 						work[work_top].lo = 0;
@@ -3897,6 +3979,120 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.bind(lbl_done);
 
 					pfree(sorted_vals);
+				}
+				else if (text_ht)
+				{
+					Label lbl_found_th = cc.new_label();
+					Label lbl_not_found_th = cc.new_label();
+					Label lbl_null_result_th = cc.new_label();
+					Label lbl_done_th = cc.new_label();
+
+					int64_t off_arg0_value_th =
+						(int64_t)((char *)&fcinfo->args[0].value -
+								  (char *)fcinfo);
+					int64_t off_arg0_isnull_th =
+						(int64_t)((char *)&fcinfo->args[0].isnull -
+								  (char *)fcinfo);
+
+					/* Load fcinfo, check scalar not NULL */
+					a64::Gp fci_th = cc.new_gpx("fci_th");
+					cc.ldr(fci_th, a64::ptr(v_step_base, STEP_OFFSET(opno, d.hashedscalararrayop.fcinfo_data)));
+					cc.ldrb(tmp2.w(), a64::ptr(fci_th, off_arg0_isnull_th));
+					cc.cbnz(tmp2, lbl_null_result_th);
+
+					/* Load scalar datum */
+					a64::Gp scalar_th = cc.new_gpx("scalar_th");
+					cc.ldr(scalar_th, a64::ptr(fci_th, off_arg0_value_th));
+
+					/* Load table pointer */
+					a64::Gp tht_reg = cc.new_gpx("tht");
+					cc.mov(tht_reg, (uint64_t)(uintptr_t)text_ht);
+
+					/* Call text_hash_probe(datum, table_ptr) */
+					a64::Gp fn_th = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, fn_th, (void *)text_hash_probe);
+					InvokeNode *invoke_th;
+					a64::Gp ret_th = cc.new_gpx("ret_th");
+					cc.invoke(Out(invoke_th), fn_th,
+							  FuncSignature::build<int32_t, int64_t, int64_t>());
+					invoke_th->set_arg(0, scalar_th);
+					invoke_th->set_arg(1, tht_reg);
+					invoke_th->set_ret(0, ret_th);
+
+					/* Branch on result */
+					cc.cbnz(ret_th, lbl_found_th);
+
+					/* ---- Not found ---- */
+					cc.bind(lbl_not_found_th);
+					{
+						cc.mov(tmp1,
+							(uint64_t)(int64_t)(inclause ? 0 : 1));
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp1, a64::ptr(tmp3));
+						}
+						if (text_ht->has_nulls)
+							cc.mov(tmp1, 1);
+						else
+							cc.mov(tmp1, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
+						cc.b(lbl_done_th);
+					}
+
+					/* ---- Found ---- */
+					cc.bind(lbl_found_th);
+					{
+						cc.mov(tmp1,
+							(uint64_t)(int64_t)(inclause ? 1 : 0));
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp1, a64::ptr(tmp3));
+						}
+						cc.mov(tmp1, 0);
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
+						cc.b(lbl_done_th);
+					}
+
+					/* ---- Null scalar ---- */
+					cc.bind(lbl_null_result_th);
+					{
+						cc.mov(tmp1, 0);
+						if (op->resvalue == &state->resvalue)
+							cc.str(tmp1, a64::ptr(v_state, offsetof(ExprState, resvalue)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resvalue)));
+							cc.str(tmp1, a64::ptr(tmp3));
+						}
+						cc.mov(tmp1, 1);
+						if (op->resnull == &state->resnull)
+							cc.strb(tmp1.w(), a64::ptr(v_state, offsetof(ExprState, resnull)));
+						else
+						{
+							cc.ldr(tmp3, a64::ptr(v_step_base, STEP_OFFSET(opno, resnull)));
+							cc.strb(tmp1.w(), a64::ptr(tmp3));
+						}
+					}
+
+					cc.bind(lbl_done_th);
 				}
 				else
 				{

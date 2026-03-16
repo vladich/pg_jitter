@@ -40,6 +40,10 @@
 #include <mach/mach.h>
 #endif
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 /* ================================================================
  * sljit_compile_deform — unrolled per-column deform
  *
@@ -614,6 +618,216 @@ pg_jitter_compile_deform(TupleDesc desc,
  *   bit 7:    nullable flag
  */
 
+/* ================================================================
+ * deform_sparse_dispatch — C helper for wide nullable tables
+ *
+ * Processes the null bitmap byte-by-byte, eliminating per-column
+ * dispatch overhead for null columns. All-null bytes (0x00) are
+ * handled in ~5 instructions for 8 columns. Mixed bytes process
+ * individual bits. Non-null columns use descriptor-driven extraction.
+ *
+ * Called from JIT code via sljit_emit_icall for tables with:
+ *   - nullable columns (!all_notnull)
+ *   - local mode (!gen_buf)
+ *   - wide tables (natts >= 64)
+ * ================================================================ */
+static void
+deform_sparse_dispatch(TupleTableSlot *slot, int natts,
+                       const DeformColDesc *descs, int is_minimal)
+{
+    HeapTupleData *tuple;
+    HeapTupleHeader tup;
+    bits8 *t_bits;
+    char *tupdata;
+    uint32 off;
+    Datum *values = slot->tts_values;
+    bool *isnull = slot->tts_isnull;
+    int attnum = slot->tts_nvalid;
+
+    /* Get tuple pointer based on slot type */
+    if (is_minimal)
+        tuple = ((MinimalTupleTableSlot *)slot)->tuple;
+    else
+        tuple = ((HeapTupleTableSlot *)slot)->tuple;
+
+    tup = tuple->t_data;
+
+    /* Check for missing attributes */
+    int maxatt = HeapTupleHeaderGetNatts(tup);
+    if (maxatt < natts)
+        slot_getmissingattrs(slot, maxatt, natts);
+
+    bool hasnulls = (tup->t_infomask & HEAP_HASNULL) != 0;
+    t_bits = hasnulls ? tup->t_bits : NULL;
+    tupdata = (char *)tup + tup->t_hoff;
+
+    /* Initialize offset */
+    if (attnum == 0)
+        off = 0;
+    else if (is_minimal)
+        off = ((MinimalTupleTableSlot *)slot)->off;
+    else
+        off = ((HeapTupleTableSlot *)slot)->off;
+
+    int limit = Min(natts, maxatt);
+
+    if (!hasnulls)
+    {
+        /* No nulls in this tuple: extract all columns sequentially */
+        for (; attnum < limit; attnum++)
+        {
+            const DeformColDesc *d = &descs[attnum];
+
+            /* Alignment */
+            if (d->attlen == -1)
+                off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+            else if (d->attalign > 1)
+                off = att_align_nominal(off, d->attalign);
+
+            isnull[attnum] = false;
+            values[attnum] = fetch_att(tupdata + off, d->attbyval, d->attlen);
+            off = att_addlength_pointer(off, d->attlen, tupdata + off);
+        }
+    }
+    else
+    {
+        /*
+         * Has null bitmap: byte-level NEON-zero + CTZ extraction.
+         *
+         * For each bitmap byte:
+         *   1. Unconditionally NEON-zero 8 values[] + set 8 isnull[]
+         *      (assumes all null — 5 NEON instructions for 8 columns)
+         *   2. If any bits set: CTZ-scan to extract only non-null columns
+         *      (overwrites the zeros for present columns)
+         *
+         * This eliminates ALL branching for null columns. The CTZ loop
+         * runs only for non-null columns (~10% for 90% null tables).
+         * Total stores: 126 NEON stores + ~100 scalar stores ≈ 830
+         * vs interpreter's ~2004 individual stores.
+         */
+        int start_byte = attnum >> 3;
+        int start_bit_off = attnum & 7;
+        int nbytes = (limit + 7) >> 3;
+
+        /* Handle partial first byte if attnum not byte-aligned */
+        if (start_bit_off > 0)
+        {
+            uint8 bm = t_bits[start_byte];
+            int base = start_byte << 3;
+            int end_col = Min(base + 8, limit);
+
+            for (int col = attnum; col < end_col; col++)
+            {
+                if (!(bm & (1 << (col & 7))))
+                {
+                    values[col] = (Datum)0;
+                    isnull[col] = true;
+                }
+                else
+                {
+                    const DeformColDesc *d = &descs[col];
+                    if (d->attlen == -1)
+                        off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                    else if (d->attalign > 1)
+                        off = att_align_nominal(off, d->attalign);
+                    isnull[col] = false;
+                    values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
+                    off = att_addlength_pointer(off, d->attlen, tupdata + off);
+                }
+            }
+            attnum = end_col;
+            start_byte++;
+        }
+
+        /* Main loop: full bytes, NEON-zero + CTZ extract */
+        for (int bi = start_byte; bi < nbytes; bi++)
+        {
+            int base = bi << 3;
+
+            if (base + 8 > limit)
+            {
+                /* Partial last byte: per-bit processing */
+                uint8 bm = t_bits[bi];
+                for (int col = base; col < limit; col++)
+                {
+                    if (!(bm & (1 << (col & 7))))
+                    {
+                        values[col] = (Datum)0;
+                        isnull[col] = true;
+                    }
+                    else
+                    {
+                        const DeformColDesc *d = &descs[col];
+                        if (d->attlen == -1)
+                            off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                        else if (d->attalign > 1)
+                            off = att_align_nominal(off, d->attalign);
+                        isnull[col] = false;
+                        values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
+                        off = att_addlength_pointer(off, d->attlen, tupdata + off);
+                    }
+                }
+                attnum = limit;
+                break;
+            }
+
+            /*
+             * Set 8 isnull = true + zero 8 values (unconditional).
+             *
+             * NEON on ARM64: 1 store for isnull (8 bytes) +
+             * 4 stores for values (64 bytes) = 5 stores for 8 columns.
+             * The subsequent CTZ loop overwrites non-null entries.
+             *
+             * For bitmap bytes that are 0x00 (all null, ~43% at 90% null),
+             * no CTZ work follows — pure NEON, 0.625 instructions per column.
+             */
+#if defined(__aarch64__) || defined(_M_ARM64)
+            {
+                uint8x8_t vones = vdup_n_u8(1);
+                vst1_u8((uint8_t *)(isnull + base), vones);
+                uint64x2_t vzero = vdupq_n_u64(0);
+                vst1q_u64((uint64_t *)(values + base), vzero);
+                vst1q_u64((uint64_t *)(values + base + 2), vzero);
+                vst1q_u64((uint64_t *)(values + base + 4), vzero);
+                vst1q_u64((uint64_t *)(values + base + 6), vzero);
+            }
+#else
+            memset(isnull + base, 1, 8);
+            memset(values + base, 0, 8 * sizeof(Datum));
+#endif
+
+            /* CTZ-extract only non-null columns (overwrite zeros) */
+            uint8 bm = t_bits[bi];
+            while (bm)
+            {
+                int bit = __builtin_ctz(bm);
+                int col = base + bit;
+                const DeformColDesc *d = &descs[col];
+
+                if (d->attlen == -1)
+                    off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                else if (d->attalign > 1)
+                    off = att_align_nominal(off, d->attalign);
+
+                isnull[col] = false;
+                values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
+                off = att_addlength_pointer(off, d->attlen, tupdata + off);
+
+                bm &= bm - 1;
+            }
+            attnum = base + 8;
+        }
+    }
+
+    /* Epilogue: update slot metadata */
+    slot->tts_nvalid = natts;
+    if (is_minimal)
+        ((MinimalTupleTableSlot *)slot)->off = off;
+    else
+        ((HeapTupleTableSlot *)slot)->off = off;
+    slot->tts_flags |= TTS_FLAG_SLOW;
+}
+
 void *
 pg_jitter_compile_deform_loop(TupleDesc desc,
 							  const TupleTableSlotOps *ops,
@@ -809,6 +1023,45 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 			sljit_set_label(j_skip, sljit_emit_label(C));
 		}
+	}
+
+	/* ============================================================
+	 * SPARSE DISPATCH: wide nullable tables (C helper)
+	 *
+	 * For tables with 64-500 nullable columns in local mode,
+	 * delegate to a C helper that processes the null bitmap
+	 * byte-by-byte with NEON bulk-zero + CTZ bit scanning.
+	 *
+	 * For >500 columns, return NULL to let the dispatch function
+	 * fall back to PG's slot_getsomeattrs_int() — at that width,
+	 * deform is memory-bandwidth limited and the interpreter's
+	 * hand-tuned code matches our C helper.
+	 * ============================================================ */
+	if (!all_notnull && !gen_buf && natts > 500)
+	{
+		/* Too wide: interpreter beats any JIT path */
+		sljit_free_compiler(C);
+		if (!target_descs)
+			pfree(descriptors);
+		return NULL;
+	}
+
+	if (!all_notnull && !gen_buf && natts >= 64)
+	{
+		int is_minimal_val = (ops == &TTSOpsMinimalTuple) ? 1 : 0;
+
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, natts);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+					   SLJIT_IMM, (sljit_sw)descriptors);
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+					   SLJIT_IMM, is_minimal_val);
+		sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4V(P, 32, P, 32),
+						 SLJIT_IMM, (sljit_sw)deform_sparse_dispatch);
+		sljit_emit_return_void(C);
+
+		/* Skip all loop code and shared epilogue — C helper handles everything */
+		goto deform_code_gen;
 	}
 
 	/* ============================================================
@@ -1430,6 +1683,9 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		struct sljit_jump *j_done;
 		struct sljit_jump *j_is_int4 = NULL, *j_is_int8 = NULL;
 		uint8	*dispatch;
+		uint8	*batch_count = NULL;
+		bool	has_int4_batch = false;
+		bool	has_int8_batch = false;
 		MemoryContext old;
 
 		/* Allocate dispatch and jump_table in TopMemoryContext */
@@ -1468,6 +1724,66 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			dispatch[i] = d;
 		}
 
+		/* === Batch detection for run-length optimization (#1 + #3) ===
+		 *
+		 * Scan dispatch array for runs of >= 4 consecutive non-nullable
+		 * INT4 or INT8 columns.  For each column within a qualifying run,
+		 * batch_count[i] = remaining columns in the run from position i.
+		 * The INT4/INT8 handlers check this at runtime and process the
+		 * entire remaining run with a single SIMD/memcpy call instead
+		 * of per-column dispatch.
+		 */
+		{
+			uint8 *bc;
+			int run_start = 0;
+
+			old = MemoryContextSwitchTo(TopMemoryContext);
+			bc = palloc0(natts);
+			MemoryContextSwitchTo(old);
+
+			for (int i = 1; i <= natts; i++)
+			{
+				bool continues = (i < natts &&
+								  dispatch[i] == dispatch[run_start] &&
+								  !(dispatch[run_start] & DHANDLER_NULLABLE_BIT));
+				if (!continues)
+				{
+					int run_len = i - run_start;
+					uint8 handler = dispatch[run_start] & 0x7F;
+
+					if (handler == DHANDLER_INT4 && run_len >= 4 &&
+						!(dispatch[run_start] & DHANDLER_NULLABLE_BIT))
+					{
+						for (int j = run_start; j < run_start + run_len; j++)
+						{
+							int remaining = run_start + run_len - j;
+							if (remaining >= 4)
+								bc[j] = (remaining > 255) ? 255 : remaining;
+						}
+						has_int4_batch = true;
+					}
+					else if (handler == DHANDLER_INT8 && run_len >= 4 &&
+							 !(dispatch[run_start] & DHANDLER_NULLABLE_BIT))
+					{
+						for (int j = run_start; j < run_start + run_len; j++)
+						{
+							int remaining = run_start + run_len - j;
+							if (remaining >= 4)
+								bc[j] = (remaining > 255) ? 255 : remaining;
+						}
+						has_int8_batch = true;
+					}
+
+					run_start = i;
+				}
+			}
+
+			if (has_int4_batch || has_int8_batch)
+				batch_count = bc;
+			else
+				pfree(bc);
+		}
+
 #if DEFORM_USE_REG_DISPATCH
 		/* ARM64: dispatch base in S6, loop_limit in S7 */
 		sljit_emit_op1(C, SLJIT_MOV, SLJIT_S6, 0,
@@ -1504,8 +1820,9 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 					   SLJIT_IMM, (sljit_sw) dispatch_jump_table);
 #endif
 
-		/* Bulk-clear isnull when all columns are NOT NULL */
-		if (all_notnull)
+		/* Bulk-clear isnull for ALL tables (not just all_notnull).
+		 * This allows skipping per-handler isnull[S5] = false stores
+		 * and enables the early null check optimization below. */
 		{
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 						   SLJIT_S2, 0, SLJIT_S5, 0);
@@ -1516,6 +1833,48 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 							 SLJIT_IMM, (sljit_sw) memset);
 		}
 
+		/* === OPTIMIZATION #2: Bulk null bitmap check ===
+		 *
+		 * For nullable tables, check the entire null bitmap at once
+		 * using SIMD (NEON: 128 columns per op).  If all columns are
+		 * non-null for THIS tuple, clear the hasnulls flag on stack.
+		 * This makes every per-column null check in the dispatch loop
+		 * skip via the existing "hasnulls == 0" fast path (2 instructions
+		 * instead of ~8 for the bitmap lookup).
+		 */
+		if (!all_notnull)
+		{
+			struct sljit_jump *j_no_hasnulls_pre, *j_has_actual_nulls;
+
+			/* Skip if HEAP_HASNULL not set */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
+			j_no_hasnulls_pre = sljit_emit_cmp(C, SLJIT_EQUAL,
+											   SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* Call simd_nullbitmap_all_notnull(t_bits, natts) */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, natts);
+			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2(32, P, 32),
+							 SLJIT_IMM,
+							 (sljit_sw) simd_nullbitmap_all_notnull);
+
+			/* If returns false (has actual nulls), keep hasnulls flag */
+			j_has_actual_nulls = sljit_emit_cmp(C, SLJIT_EQUAL,
+												SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* All non-null: clear hasnulls → per-column checks skip */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS,
+						   SLJIT_IMM, 0);
+
+			{
+				struct sljit_label *l_bitmap_done = sljit_emit_label(C);
+				sljit_set_label(j_no_hasnulls_pre, l_bitmap_done);
+				sljit_set_label(j_has_actual_nulls, l_bitmap_done);
+			}
+		}
+
 		/* === LOOP TOP === */
 		l_loop_top = sljit_emit_label(C);
 
@@ -1523,42 +1882,135 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 		/* ARM64: bounds check against S7 register, dispatch from S6 */
 		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
 								SLJIT_S5, 0, SLJIT_S7, 0);
-
-		/* Load dispatch byte: R0 = S6[S5] (single indexed load) */
-		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
-					   SLJIT_MEM2(SLJIT_S6, SLJIT_S5), 0);
 #else
 		/* x86-64: bounds check against stack, dispatch from stack */
 		j_done = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
 								SLJIT_S5, 0,
 								SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
-
-		/* Load dispatch byte: load base from stack, then index */
-		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-					   SLJIT_MEM1(SLJIT_SP), DLOFF_DISPATCH);
-		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
-					   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
 #endif
 
-		/* R3 = handler index (bits 0-6) */
-		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
-					   SLJIT_R0, 0, SLJIT_IMM, 0x7F);
-
-		/* === NULL CHECK === */
-		if (!all_notnull)
+		/* === 8-COLUMN NULL GROUP SKIP ===
+		 *
+		 * For sparse tables (many NULLs), the per-column null bitmap
+		 * check dominates: ~15 instructions per NULL column.
+		 * At 8-column boundaries, check the entire bitmap byte.
+		 * If byte == 0x00 (all 8 columns NULL): bulk-zero values[]
+		 * and set isnull[] in ~12 instructions instead of 8×15=120.
+		 *
+		 * For 90% NULL tables with 1000 columns, this skips ~112
+		 * groups of 8, saving ~10,000 instructions per row.
+		 */
+		if (!all_notnull && natts >= 16)
 		{
-			struct sljit_jump *j_not_nullable, *j_no_nulls, *j_bit_set;
+			struct sljit_jump *j_not_boundary, *j_no_hasnulls_grp;
+			struct sljit_jump *j_not_all_null, *j_grp_overflow;
 
-			/* Check bit 7 (nullable flag) — skip if column is NOT NULL */
+			/* Only at 8-column boundaries: test S5 & 7 */
 			sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
-						   SLJIT_R0, 0, SLJIT_IMM, DHANDLER_NULLABLE_BIT);
-			j_not_nullable = sljit_emit_jump(C, SLJIT_ZERO);
+						   SLJIT_S5, 0, SLJIT_IMM, 7);
+			j_not_boundary = sljit_emit_jump(C, SLJIT_NOT_ZERO);
 
-			/* Column is nullable — check if tuple has nulls */
+			/* Skip if no hasnulls flag */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
-			j_no_nulls = sljit_emit_cmp(C, SLJIT_EQUAL,
-										SLJIT_R0, 0, SLJIT_IMM, 0);
+			j_no_hasnulls_grp = sljit_emit_cmp(C, SLJIT_EQUAL,
+											   SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* Bounds check: S5 + 8 <= limit */
+#if DEFORM_USE_REG_DISPATCH
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 8);
+			j_grp_overflow = sljit_emit_cmp(C, SLJIT_SIG_GREATER,
+											SLJIT_R0, 0, SLJIT_S7, 0);
+#else
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 8);
+			j_grp_overflow = sljit_emit_cmp(C, SLJIT_SIG_GREATER,
+											SLJIT_R0, 0,
+											SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
+#endif
+
+			/* Load bitmap byte: R0 = t_bits[S5 >> 3] */
+			sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_TBITS);
+			sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+						   SLJIT_MEM2(SLJIT_R1, SLJIT_R0), 0);
+
+			/* If byte != 0 (some columns not null), fall through */
+			j_not_all_null = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+											SLJIT_R0, 0, SLJIT_IMM, 0);
+
+			/* ALL 8 COLUMNS ARE NULL: bulk-zero values + set isnull */
+
+			/* R0 = &values[S5] */
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S1, 0, SLJIT_R0, 0);
+			/* Zero 8 Datum values (64 bytes) */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 0,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 8,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 16,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 24,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 32,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 40,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 48,
+						   SLJIT_IMM, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 56,
+						   SLJIT_IMM, 0);
+
+			/* Set 8 isnull bytes to true (0x0101010101010101) */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S2, 0, SLJIT_S5, 0);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+						   SLJIT_IMM, (sljit_sw) 0x0101010101010101LL);
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 0,
+						   SLJIT_R1, 0);
+
+			/* Advance S5 by 8 and loop */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 8);
+			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+
+			/* Normal per-column dispatch for non-boundary or non-all-null */
+			{
+				struct sljit_label *l_normal_dispatch = sljit_emit_label(C);
+				sljit_set_label(j_not_boundary, l_normal_dispatch);
+				sljit_set_label(j_no_hasnulls_grp, l_normal_dispatch);
+				sljit_set_label(j_not_all_null, l_normal_dispatch);
+				sljit_set_label(j_grp_overflow, l_normal_dispatch);
+			}
+		}
+
+		/* === EARLY NULL CHECK ===
+		 *
+		 * Check null bitmap BEFORE loading dispatch byte.  For sparse
+		 * tables (90% NULL), this skips dispatch byte load + handler
+		 * extraction + nullable bit check for null columns — saving
+		 * ~5 instructions per null column.
+		 *
+		 * Since isnull[] is bulk-cleared to false above, we only need
+		 * to set isnull[S5] = true and values[S5] = 0 for null columns.
+		 * Non-null columns jump directly to dispatch byte load.
+		 */
+		if (!all_notnull)
+		{
+			struct sljit_jump *j_no_hasnulls_early, *j_bit_set_early;
+
+			/* Fast path when hasnulls==0 (Opt#2 cleared it or
+			 * HEAP_HASNULL not set): skip bitmap check entirely */
+			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+						   SLJIT_MEM1(SLJIT_SP), DLOFF_HASNULLS);
+			j_no_hasnulls_early = sljit_emit_cmp(C, SLJIT_EQUAL,
+												 SLJIT_R0, 0, SLJIT_IMM, 0);
 
 			/* Bitmap check: byte = t_bits[S5 >> 3] */
 			sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
@@ -1575,12 +2027,13 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
 						   SLJIT_R2, 0, SLJIT_R1, 0);
 
-			/* if (byte & bit) → not null */
+			/* if (byte & bit) → not null, skip to dispatch */
 			sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
 						   SLJIT_R0, 0, SLJIT_R2, 0);
-			j_bit_set = sljit_emit_jump(C, SLJIT_NOT_ZERO);
+			j_bit_set_early = sljit_emit_jump(C, SLJIT_NOT_ZERO);
 
-			/* IS NULL: values[attnum] = 0, isnull[attnum] = true */
+			/* IS NULL: values[S5] = 0, isnull[S5] = true
+			 * (isnull was bulk-cleared to false, override for nulls) */
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 3);
 			sljit_emit_op1(C, SLJIT_MOV,
@@ -1590,19 +2043,35 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 						   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
 						   SLJIT_IMM, 1);
 
-			/* Advance attnum and loop */
+			/* Advance attnum and loop (skip dispatch entirely) */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
 						   SLJIT_S5, 0, SLJIT_IMM, 1);
 			sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
 
-			/* Not null target */
+			/* Not null: fall through to dispatch byte load */
 			{
-				struct sljit_label *l_not_null = sljit_emit_label(C);
-				sljit_set_label(j_not_nullable, l_not_null);
-				sljit_set_label(j_no_nulls, l_not_null);
-				sljit_set_label(j_bit_set, l_not_null);
+				struct sljit_label *l_load_dispatch = sljit_emit_label(C);
+				sljit_set_label(j_no_hasnulls_early, l_load_dispatch);
+				sljit_set_label(j_bit_set_early, l_load_dispatch);
 			}
 		}
+
+		/* Load dispatch byte */
+#if DEFORM_USE_REG_DISPATCH
+		/* ARM64: R0 = S6[S5] (single indexed load) */
+		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+					   SLJIT_MEM2(SLJIT_S6, SLJIT_S5), 0);
+#else
+		/* x86-64: load base from stack, then index */
+		sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+					   SLJIT_MEM1(SLJIT_SP), DLOFF_DISPATCH);
+		sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+					   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+#endif
+
+		/* R3 = handler index (bits 0-6) */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R0, 0, SLJIT_IMM, 0x7F);
 
 		/* === HANDLER DISPATCH: direct branches for common types ===
 		 * INT4 and INT8 cover ~40% of analytics columns.  Direct
@@ -1636,10 +2105,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, 1);
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
@@ -1662,10 +2128,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, 2);
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
@@ -1683,6 +2146,86 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 						   SLJIT_S4, 0, SLJIT_IMM, 3);
 			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)3);
+
+			/* === OPTIMIZATION #1+#3: Batch INT4 extraction ===
+			 *
+			 * Check if this column starts a run of >= 4 consecutive
+			 * non-nullable INT4 columns.  If so, process the entire
+			 * run with a single simd_extract_int32_values() call
+			 * (NEON/SSE vectorized) instead of per-column dispatch.
+			 */
+			if (has_int4_batch)
+			{
+				struct sljit_jump *j_no_batch;
+
+				/* R0 = batch_count[S5] */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_IMM, (sljit_sw) batch_count);
+				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+							   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+				j_no_batch = sljit_emit_cmp(C, SLJIT_EQUAL,
+											SLJIT_R0, 0, SLJIT_IMM, 0);
+
+				/* --- BATCH PATH --- */
+				if (!all_notnull)
+				{
+					/* memset(&isnull[S5], 0, count) */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+								   SLJIT_R0, 0);		/* save count in R3 */
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+								   SLJIT_S2, 0, SLJIT_S5, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_IMM, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_R3, 0);
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
+									 SLJIT_IMM, (sljit_sw) memset);
+					/* Reload count after call clobbers R0-R3 */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_IMM, (sljit_sw) batch_count);
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+								   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+				}
+				else
+				{
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_R0, 0);
+				}
+
+				/* simd_extract_int32_values(S3 + S4, &values[S5], count)
+				 * R2 = count (set above) */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S1, 0, SLJIT_R1, 0);
+				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+								 SLJIT_IMM,
+								 (sljit_sw) simd_extract_int32_values);
+
+				/* Reload count for offset/attnum advance */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_IMM, (sljit_sw) batch_count);
+				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+							   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+
+				/* S4 += count * 4 */
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_R0, 0, SLJIT_IMM, 2);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+							   SLJIT_S4, 0, SLJIT_R1, 0);
+				/* S5 += count */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+							   SLJIT_S5, 0, SLJIT_R0, 0);
+
+				sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+
+				/* --- SINGLE-COLUMN PATH --- */
+				sljit_set_label(j_no_batch, sljit_emit_label(C));
+			}
+
+			/* Single INT4 column: load, store, advance */
 			sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
 						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
@@ -1690,10 +2233,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, 4);
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
@@ -1711,6 +2251,86 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 						   SLJIT_S4, 0, SLJIT_IMM, 7);
 			sljit_emit_op2(C, SLJIT_AND, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, (sljit_sw) ~(sljit_uw)7);
+
+			/* === OPTIMIZATION #3: Batch INT8 extraction ===
+			 *
+			 * For runs of >= 4 consecutive non-nullable INT8 columns,
+			 * use memcpy instead of per-column dispatch.  INT8 Datum
+			 * is the same as int64 (8 bytes), so the copy is identity.
+			 */
+			if (has_int8_batch)
+			{
+				struct sljit_jump *j_no_batch;
+
+				/* R0 = batch_count[S5] */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_IMM, (sljit_sw) batch_count);
+				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+							   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+				j_no_batch = sljit_emit_cmp(C, SLJIT_EQUAL,
+											SLJIT_R0, 0, SLJIT_IMM, 0);
+
+				/* --- BATCH PATH --- */
+				if (!all_notnull)
+				{
+					/* memset(&isnull[S5], 0, count) */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+								   SLJIT_R0, 0);
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+								   SLJIT_S2, 0, SLJIT_S5, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+								   SLJIT_IMM, 0);
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_R3, 0);
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, 32, W),
+									 SLJIT_IMM, (sljit_sw) memset);
+					/* Reload count */
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+								   SLJIT_IMM, (sljit_sw) batch_count);
+					sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0,
+								   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+				}
+				else
+				{
+					sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+								   SLJIT_R0, 0);
+				}
+
+				/* memcpy(&values[S5], tupdata + S4, count * 8)
+				 * R2 = count (set above) */
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S1, 0, SLJIT_R0, 0);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
+							   SLJIT_R2, 0, SLJIT_IMM, 3);  /* count * 8 */
+				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(P, P, P, W),
+								 SLJIT_IMM, (sljit_sw) memcpy);
+
+				/* Reload count for advance */
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+							   SLJIT_IMM, (sljit_sw) batch_count);
+				sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+							   SLJIT_MEM2(SLJIT_R0, SLJIT_S5), 0);
+
+				/* S4 += count * 8 */
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_R0, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
+							   SLJIT_S4, 0, SLJIT_R1, 0);
+				/* S5 += count */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
+							   SLJIT_S5, 0, SLJIT_R0, 0);
+
+				sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), l_loop_top);
+
+				/* --- SINGLE-COLUMN PATH --- */
+				sljit_set_label(j_no_batch, sljit_emit_label(C));
+			}
+
+			/* Single INT8 column: load, store, advance */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM2(SLJIT_S3, SLJIT_S4), 0);
 			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
@@ -1718,10 +2338,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 						   SLJIT_S4, 0, SLJIT_IMM, 8);
 			sljit_emit_op2(C, SLJIT_ADD, SLJIT_S5, 0,
@@ -1756,10 +2373,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 
 			/* Advance: S4 += varsize_any(base + offset)
 			 * R0 still = S3 + S4 from pointer store above */
@@ -1784,10 +2398,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			sljit_emit_op1(C, SLJIT_MOV,
 						   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 						   SLJIT_R0, 0);
-			if (!all_notnull)
-				sljit_emit_op1(C, SLJIT_MOV_U8,
-							   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-							   SLJIT_IMM, 0);
+			/* isnull[S5] already false from bulk-clear */
 
 			/* Advance: S4 += strlen(base + offset) + 1
 			 * R0 still = S3 + S4 */
@@ -1885,10 +2496,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 					sljit_emit_op1(C, SLJIT_MOV,
 								   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 								   SLJIT_R0, 0);
-					if (!all_notnull)
-						sljit_emit_op1(C, SLJIT_MOV_U8,
-									   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-									   SLJIT_IMM, 0);
+					/* isnull[S5] already false from bulk-clear */
 
 					/* Advance offset by attlen */
 					sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
@@ -1907,10 +2515,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				sljit_emit_op1(C, SLJIT_MOV,
 							   SLJIT_MEM2(SLJIT_S1, SLJIT_R2), 0,
 							   SLJIT_R0, 0);
-				if (!all_notnull)
-					sljit_emit_op1(C, SLJIT_MOV_U8,
-								   SLJIT_MEM2(SLJIT_S2, SLJIT_S5), 0,
-								   SLJIT_IMM, 0);
+				/* isnull[S5] already false from bulk-clear */
 
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_S4, 0,
 							   SLJIT_S4, 0, SLJIT_R1, 0);
@@ -1953,6 +2558,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 
 	sljit_emit_return_void(C);
 
+deform_code_gen:
 	/* Generate native code */
 	if (gen_buf)
 	{
