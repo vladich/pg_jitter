@@ -19,7 +19,7 @@ extern "C" {
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
 #include "pg_jitter_simdjson.h"
-#include "pg_jitter_vectorscan.h"
+#include "pg_jitter_pcre2.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "mb/pg_wchar.h"
@@ -121,6 +121,7 @@ static const struct config_enum_entry parallel_jit_options[] = {
 	{NULL, 0, false}
 };
 
+
 /* Per-expression compiled code handle */
 struct AsmjitCode {
 	JitRuntime	rt;
@@ -209,6 +210,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			GUC_ALLOW_IN_PARALLEL,
 			NULL, NULL, NULL);
 	}
+
 }
 
 /*

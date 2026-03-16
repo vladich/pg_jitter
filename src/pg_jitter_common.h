@@ -27,7 +27,7 @@ extern bool pg_jitter_collation_is_c(Oid collid);
 /*
  * pg_jitter_collation_is_deterministic — check if a collation is deterministic.
  * LIKE/regex matching is byte-level and safe for any deterministic collation.
- * Used to gate StringZilla/Vectorscan LIKE/regex fast paths.
+ * Used to gate StringZilla/PCRE2 LIKE/regex fast paths.
  */
 extern bool pg_jitter_collation_is_deterministic(Oid collid);
 

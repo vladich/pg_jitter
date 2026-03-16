@@ -368,16 +368,16 @@ add_query "LIKE_exact"          "SELECT COUNT(*) FROM text_data WHERE grp_text L
 add_query "NOT_LIKE_prefix"     "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE 'c4ca%'"
 add_query "NOT_LIKE_interior"   "SELECT COUNT(*) FROM text_data WHERE hash_text NOT LIKE '%abc%'"
 
-# --- LIKE with _ wildcard (falls through to Vectorscan or PG fallback) ---
+# --- LIKE with _ wildcard (falls through to PCRE2 or PG fallback) ---
 add_section "LIKE (underscore)"
 add_query "LIKE_under_prefix"   "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE 'c4c_4%'"
 add_query "LIKE_under_mid"      "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a_c%'"
 add_query "LIKE_under_only"     "SELECT COUNT(*) FROM text_data WHERE grp_text LIKE 'prefix___'"
 add_query "LIKE_pct_under_mix"  "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '_4%a_b%'"
 
-# --- LIKE complex + ILIKE (Vectorscan fast path) ---
-# Multi-wildcard LIKE and all ILIKE/regex go through Vectorscan SIMD regex engine.
-add_section "ILIKE/Regex (Vectorscan)"
+# --- LIKE complex + ILIKE (PCRE2 JIT fast path) ---
+# Multi-wildcard LIKE and all ILIKE/regex go through PCRE2 JIT regex engine.
+add_section "ILIKE/Regex (PCRE2)"
 add_query "LIKE_multi"          "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%'"
 add_query "LIKE_3wild"          "SELECT COUNT(*) FROM text_data WHERE hash_text LIKE '%a%b%c%'"
 add_query "ILIKE_prefix"        "SELECT COUNT(*) FROM text_data WHERE hash_text ILIKE 'C4CA%'"
@@ -406,10 +406,14 @@ add_query "Numeric_agg"         "SELECT grp_num, SUM(val1), AVG(val2) FROM numer
 add_query "Numeric_arith"       "SELECT SUM(val1 * val2 + val1 - val2) FROM numeric_data"
 
 # --- JSONB ---
+# doc = {"a": int, "b": md5_string, "c": float}
 add_section "JSONB"
-add_query "JSONB_extract"       "SELECT SUM((doc->>'a')::int) FROM jsonb_data"
-add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE (doc->>'a')::int = 42"
+add_query "JSONB_extract_num"   "SELECT SUM((doc->>'a')::int) FROM jsonb_data"
+add_query "JSONB_extract_str"   "SELECT COUNT(doc->>'b') FROM jsonb_data"
+add_query "JSONB_filter"        "SELECT COUNT(*) FROM jsonb_data WHERE (doc->>'a')::int = 42"
 add_query "JSONB_agg"           "SELECT grp_jsonb, COUNT(*), SUM((doc->>'a')::int) FROM jsonb_data GROUP BY grp_jsonb"
+add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE doc @> '{\"a\": 42}'"
+add_query "JSONB_exists_key"    "SELECT COUNT(*) FROM jsonb_data WHERE doc ? 'a'"
 
 # --- Arrays ---
 add_section "Arrays"
@@ -463,14 +467,14 @@ add_query "Bool_20cond"        "SELECT COUNT(*) FROM join_left WHERE (val > 100 
 add_query "Agg_complex_10"    "SELECT grp, COUNT(*), SUM(val1*val1), AVG(val2+val3), MIN(val1-val2+val3), MAX(val4*2-val5), SUM(CASE WHEN val1>5000 THEN val2 ELSE val3 END), AVG(ABS(val1-val2)), SUM(val1%100+val2%100), COUNT(NULLIF(val3,0)) FROM bench_data GROUP BY grp"
 
 # --- Extreme LIKE/Regex on Long Strings ---
-# These test Vectorscan SIMD advantage on 400-600 char strings (200K rows).
-# PG's regex engine must scan each position; Vectorscan compiles to SIMD DFA.
+# These test PCRE2 JIT advantage on 400-600 char strings (200K rows).
+# PG's regex engine must scan each position; PCRE2 JIT compiles to native code.
 add_section "Long String LIKE/Regex"
 
-# Interior LIKE on long strings — Vectorscan SIMD substring search
+# Interior LIKE on long strings — PCRE2 JIT substring search
 add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
 
-# ILIKE on long strings — case-insensitive Vectorscan (~6x faster)
+# ILIKE on long strings — case-insensitive PCRE2 JIT
 add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
 
 # NOT ILIKE on long strings

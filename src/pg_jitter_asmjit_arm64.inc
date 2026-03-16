@@ -2108,12 +2108,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 				asmjit_funcexpr_v1_fallback:
 				/*
-				 * TIER 2 — V1 FALLBACK (or Vectorscan LIKE/regex).
+				 * TIER 2 — V1 FALLBACK (or PCRE2 LIKE/regex).
 				 */
 				bool vs_handled = false;
 
 				/*
-				 * LIKE/regex FAST PATH: StringZilla + Vectorscan.
+				 * LIKE/regex FAST PATH: StringZilla + PCRE2.
 				 * Detects textlike, textnlike, texticlike, texticnlike,
 				 * textregexeq, textregexne, texticregexeq, texticregexne
 				 * with a compile-time constant pattern.  Only in non-shared
@@ -2151,15 +2151,13 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 						/*
 						 * LIKE/regex fast paths collation gating:
-						 * - LIKE: byte-level — safe for deterministic collations.
-						 * - Regex: Vectorscan POSIX classes ([:alpha:] etc.) are
-						 *   ASCII-only — only safe for C locale.
+						 * - LIKE: StringZilla does pure byte-level matching — safe
+						 *   for any deterministic collation.
+						 * - Regex: PCRE2 with PCRE2_UCP handles Unicode POSIX
+						 *   classes correctly — safe for any deterministic collation.
 						 */
-						bool collation_ok;
-						if (is_like_fn || is_ilike_fn)
-							collation_ok = pg_jitter_collation_is_deterministic(fcinfo->fncollation);
-						else
-							collation_ok = pg_jitter_collation_is_c(fcinfo->fncollation);
+						bool collation_ok =
+							pg_jitter_collation_is_deterministic(fcinfo->fncollation);
 
 						if (pat_const && !fcinfo->args[1].isnull && collation_ok)
 						{
@@ -2242,14 +2240,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							}
 
 							/* Compiled LIKE path for anchored patterns */
-							bool skip_vectorscan = false;
+							bool skip_pcre2 = false;
 							if (!vs_handled && is_like_fn)
 							{
 								SzLikeCompiled *compiled =
 									simd_like_compile(pat_str, pat_len);
 								if (compiled == SIMD_LIKE_USE_V1)
 								{
-									skip_vectorscan = true;
+									skip_pcre2 = true;
 								}
 								else if (compiled)
 								{
@@ -2307,18 +2305,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								}
 							}
 
-#ifdef PG_JITTER_HAVE_VECTORSCAN
-							/* Vectorscan path for complex LIKE or regex */
-							if (!vs_handled && !skip_vectorscan)
+#ifdef PG_JITTER_HAVE_PCRE2
+							/* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
+							if (!vs_handled && !skip_pcre2)
 							{
-								bool is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
-								VsCacheEntry *entry = pg_jitter_vs_compile(
-									pat_str, pat_len,
-									is_like_fn || is_ilike_fn,
-									is_ilike_fn || is_iregex_fn,
-									is_utf8);
+								bool is_like = is_like_fn || is_ilike_fn;
+								bool case_insens = is_ilike_fn || is_iregex_fn;
+								Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+									pat_str, pat_len, is_like, case_insens);
 
-								if (entry)
+								if (pe)
 								{
 									a64::Gp fci_base = cc.new_gpx();
 									cc.ldr(fci_base, a64::ptr(v_step_base,
@@ -2330,11 +2326,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									cc.ldr(arg0, a64::ptr(fci_base, val_off_0));
 
 									a64::Gp entry_reg = cc.new_gpx();
-									cc.mov(entry_reg, (uint64_t)(uintptr_t)entry);
+									cc.mov(entry_reg, (uint64_t)(uintptr_t)pe);
 
 									a64::Gp fn_reg = cc.new_gpx();
 									ASMJIT_MOV_FN(cc, fn_reg,
-												   (void *)pg_jitter_vs_match_text);
+												   (void *)pg_jitter_pcre2_match_text);
 
 									InvokeNode *invoke;
 									cc.invoke(Out(invoke), fn_reg,
@@ -2373,7 +2369,85 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									vs_handled = true;
 								}
 							}
-#endif /* PG_JITTER_HAVE_VECTORSCAN */
+#endif /* PG_JITTER_HAVE_PCRE2 */
+						}
+					}
+				}
+
+				/*
+				 * JSONB fast path: doc->>'key' with constant key.
+				 */
+				if (!vs_handled && !asmjit_shared_code_mode)
+				{
+					PGFunction fn = op->d.func.fn_addr;
+					if (fn == jsonb_object_field_text && fcinfo->nargs == 2)
+					{
+						bool key_const = true;
+						for (int j = opno - 1; j >= 0; j--) {
+							if (steps[j].resvalue == &fcinfo->args[1].value) {
+								key_const = (steps[j].opcode == EEOP_CONST);
+								break;
+							}
+						}
+
+						if (key_const && !fcinfo->args[1].isnull)
+						{
+							text *key_text = DatumGetTextPP(fcinfo->args[1].value);
+							const char *key_str = VARDATA_ANY(key_text);
+							int key_len = VARSIZE_ANY_EXHDR(key_text);
+
+							/* Load args[0].value (jsonb datum) */
+							a64::Gp fci_base = cc.new_gpx();
+							cc.ldr(fci_base, a64::ptr(v_step_base,
+								   STEP_OFFSET(opno, d.func.fcinfo_data)));
+							int64_t val_off_0 =
+								(int64_t)((char *)&fcinfo->args[0].value -
+								          (char *)fcinfo);
+							a64::Gp arg0 = cc.new_gpx();
+							cc.ldr(arg0, a64::ptr(fci_base, val_off_0));
+
+							/* key pointer + length as immediates */
+							a64::Gp arg1 = cc.new_gpx();
+							cc.mov(arg1, (uint64_t)(uintptr_t)key_str);
+							a64::Gp arg2 = cc.new_gpx();
+							cc.mov(arg2, (uint64_t)key_len);
+
+							/* resnull pointer */
+							a64::Gp arg3 = cc.new_gpx();
+							if (op->resnull == &state->resnull)
+								cc.add(arg3, v_state,
+								       Imm(offsetof(ExprState, resnull)));
+							else
+								cc.ldr(arg3, a64::ptr(v_step_base,
+								       STEP_OFFSET(opno, resnull)));
+
+							a64::Gp fn_reg = cc.new_gpx();
+							ASMJIT_MOV_FN(cc, fn_reg,
+							              (void *)jit_jsonb_object_field_text);
+
+							InvokeNode *invoke;
+							cc.invoke(Out(invoke), fn_reg,
+							          FuncSignature::build<int64_t,
+							          int64_t, int64_t, int32_t, int64_t>());
+							invoke->set_arg(0, arg0);
+							invoke->set_arg(1, arg1);
+							invoke->set_arg(2, arg2);
+							invoke->set_arg(3, arg3);
+							invoke->set_ret(0, tmp1);
+
+							/* Store result */
+							if (op->resvalue == &state->resvalue)
+								cc.str(tmp1, a64::ptr(v_state,
+								       offsetof(ExprState, resvalue)));
+							else
+							{
+								cc.ldr(tmp2, a64::ptr(v_step_base,
+								       STEP_OFFSET(opno, resvalue)));
+								cc.str(tmp1, a64::ptr(tmp2));
+							}
+							/* resnull already set by the wrapper */
+
+							vs_handled = true;
 						}
 					}
 				}
@@ -2429,7 +2503,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					}
 				}
 				} /* end if (!vs_handled) */
-				} /* end else fallback / vectorscan */
+				} /* end else fallback / pcre2 */
 				} /* end direct-call dispatch */
 
 				cc.bind(done_label);

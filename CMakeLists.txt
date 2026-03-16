@@ -123,9 +123,9 @@ set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
 set(STRINGZILLA_DIR "${CMAKE_SOURCE_DIR}/../stringzilla" CACHE PATH
     "Path to StringZilla source directory (header-only)")
-set(VECTORSCAN_DIR "${CMAKE_SOURCE_DIR}/../vectorscan" CACHE PATH
-    "Path to Vectorscan source directory")
-option(WITH_VECTORSCAN "Enable Vectorscan SIMD regex/LIKE acceleration" ON)
+set(PCRE2_DIR "${CMAKE_SOURCE_DIR}/../pcre2" CACHE PATH
+    "Path to PCRE2 source directory")
+option(WITH_PCRE2 "Enable PCRE2 Unicode-aware regex/LIKE acceleration" ON)
 
 
 # Validate dependency directories (only for enabled backends)
@@ -199,40 +199,36 @@ if(PG_JITTER_BUILD_ASMJIT)
     add_subdirectory(${ASMJIT_DIR} ${CMAKE_BINARY_DIR}/asmjit)
 endif()
 
-# ---------- Vectorscan / Hyperscan (optional, static library) ----------
-# Supports: (1) source tree build, (2) system packages (apt/brew)
-set(PG_JITTER_HAVE_VECTORSCAN OFF)
-if(WITH_VECTORSCAN AND NOT WIN32)
-    set(_vs_lib "${VECTORSCAN_DIR}/build/lib/libhs.a")
-    set(_vs_hdr "${VECTORSCAN_DIR}/src/hs.h")
-    if(EXISTS "${_vs_lib}" AND EXISTS "${_vs_hdr}")
-        # Source tree build (local development)
-        set(PG_JITTER_HAVE_VECTORSCAN ON)
-        set(VECTORSCAN_INCLUDE_DIR "${VECTORSCAN_DIR}/src")
-        add_library(vectorscan_lib STATIC IMPORTED)
-        set_target_properties(vectorscan_lib PROPERTIES
-            IMPORTED_LOCATION "${_vs_lib}")
-        find_library(LIBCXX c++ PATHS /opt/homebrew/lib /usr/lib)
-        message(STATUS "Vectorscan:         ${_vs_lib}")
+# ---------- PCRE2 (optional, static library with JIT) ----------
+set(PG_JITTER_HAVE_PCRE2 OFF)
+if(WITH_PCRE2 AND NOT WIN32)
+    # PCRE2 CMake puts .a directly in build/, not build/lib/
+    set(_pcre2_lib "${PCRE2_DIR}/build/libpcre2-8.a")
+    set(_pcre2_hdr "${PCRE2_DIR}/build/interface/pcre2.h")
+    if(EXISTS "${_pcre2_lib}" AND EXISTS "${_pcre2_hdr}")
+        set(PG_JITTER_HAVE_PCRE2 ON)
+        set(PCRE2_INCLUDE_DIR "${PCRE2_DIR}/build/interface")
+        add_library(pcre2_lib STATIC IMPORTED)
+        set_target_properties(pcre2_lib PROPERTIES
+            IMPORTED_LOCATION "${_pcre2_lib}")
+        message(STATUS "PCRE2:              ${_pcre2_lib}")
     else()
-        # System-installed hyperscan/vectorscan (apt libhyperscan-dev, brew vectorscan)
-        find_path(_vs_sys_hdr NAMES hs.h PATH_SUFFIXES hs)
-        find_library(_vs_sys_lib NAMES hs)
-        if(_vs_sys_hdr AND _vs_sys_lib)
-            set(PG_JITTER_HAVE_VECTORSCAN ON)
-            set(VECTORSCAN_INCLUDE_DIR "${_vs_sys_hdr}")
-            # Detect library type from extension
-            if(_vs_sys_lib MATCHES "\\.a$")
-                add_library(vectorscan_lib STATIC IMPORTED)
+        # Try system-installed pcre2
+        find_path(_pcre2_sys_hdr NAMES pcre2.h)
+        find_library(_pcre2_sys_lib NAMES pcre2-8)
+        if(_pcre2_sys_hdr AND _pcre2_sys_lib)
+            set(PG_JITTER_HAVE_PCRE2 ON)
+            set(PCRE2_INCLUDE_DIR "${_pcre2_sys_hdr}")
+            if(_pcre2_sys_lib MATCHES "\\.a$")
+                add_library(pcre2_lib STATIC IMPORTED)
             else()
-                add_library(vectorscan_lib SHARED IMPORTED)
+                add_library(pcre2_lib SHARED IMPORTED)
             endif()
-            set_target_properties(vectorscan_lib PROPERTIES
-                IMPORTED_LOCATION "${_vs_sys_lib}")
-            find_library(LIBCXX c++ PATHS /opt/homebrew/lib /usr/lib)
-            message(STATUS "Vectorscan:         ${_vs_sys_lib} (system)")
+            set_target_properties(pcre2_lib PROPERTIES
+                IMPORTED_LOCATION "${_pcre2_sys_lib}")
+            message(STATUS "PCRE2:              ${_pcre2_sys_lib} (system)")
         else()
-            message(STATUS "Vectorscan:         not found (install libhyperscan-dev or build from source)")
+            message(STATUS "PCRE2:              not found (build from source or install libpcre2-dev)")
         endif()
     endif()
 endif()
@@ -304,14 +300,10 @@ endif()
 function(pg_jitter_configure_target TARGET_NAME)
     target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS}
         ${STRINGZILLA_DIR}/include)
-    if(PG_JITTER_HAVE_VECTORSCAN)
-        target_include_directories(${TARGET_NAME} PRIVATE
-            ${VECTORSCAN_INCLUDE_DIR} ${VECTORSCAN_DIR}/build)
-        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_VECTORSCAN)
-        target_link_libraries(${TARGET_NAME} PRIVATE vectorscan_lib)
-        if(LIBCXX)
-            target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
-        endif()
+    if(PG_JITTER_HAVE_PCRE2)
+        target_include_directories(${TARGET_NAME} PRIVATE ${PCRE2_INCLUDE_DIR})
+        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_PCRE2)
+        target_link_libraries(${TARGET_NAME} PRIVATE pcre2_lib)
     endif()
     if(PG_JITTER_HAVE_SIMDJSON)
         target_include_directories(${TARGET_NAME} PRIVATE ${SIMDJSON_DIR})
@@ -354,7 +346,7 @@ endfunction()
 # ==========================================================================
 # Backend targets
 # ==========================================================================
-set(COMMON_SRC src/pg_jitter_common.c src/pg_jit_funcs.c src/pg_jit_tier2_wrappers.c src/pg_jitter_simd.c src/pg_jitter_vectorscan.c)
+set(COMMON_SRC src/pg_jitter_common.c src/pg_jit_funcs.c src/pg_jit_tier2_wrappers.c src/pg_jitter_simd.c src/pg_jitter_pcre2.c)
 
 # Collect targets for install
 set(PG_JITTER_TARGETS "")

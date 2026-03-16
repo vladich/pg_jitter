@@ -20,7 +20,7 @@
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
 #include "pg_jitter_simdjson.h"
-#include "pg_jitter_vectorscan.h"
+#include "pg_jitter_pcre2.h"
 #include "sljitLir.h"
 #include "utils/fmgrprotos.h"
 #include "mb/pg_wchar.h"
@@ -79,6 +79,7 @@ static const struct config_enum_entry parallel_jit_options[] = {
     {"per_worker", PARALLEL_JIT_PER_WORKER, false},
     {"shared", PARALLEL_JIT_SHARED, false},
     {NULL, 0, false}};
+
 
 /*
  * Per-compilation flag: when true, EMIT_ICALL forces SLJIT_REWRITABLE_JUMP
@@ -169,6 +170,7 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
         PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
         NULL, NULL, NULL);
   }
+
 }
 
 /*
@@ -3956,12 +3958,12 @@ static bool sljit_compile_expr(ExprState *state) {
           } else {
             sljit_funcexpr_v1_fallback: ;
             /*
-             * TIER 2 — V1 FALLBACK (or Vectorscan LIKE/regex).
+             * TIER 2 — V1 FALLBACK (or PCRE2 LIKE/regex).
              */
             bool vs_handled = false;
 
             /*
-             * LIKE/regex FAST PATH: StringZilla + Vectorscan.
+             * LIKE/regex FAST PATH: StringZilla + PCRE2.
              * Detects textlike, textnlike, texticlike, texticnlike,
              * textregexeq, textregexne, texticregexeq, texticregexne
              * with a compile-time constant pattern.  Only in non-shared
@@ -3996,18 +3998,13 @@ static bool sljit_compile_expr(ExprState *state) {
 
                 /*
                  * LIKE/regex fast paths collation gating:
-                 * - LIKE: StringZilla tier 1 does pure byte-level matching
-                 *   (memcmp, sz_find) — safe for any deterministic collation.
-                 * - Regex (~, ~*): Vectorscan POSIX character classes
-                 *   ([:alpha:], [:upper:], etc.) are ASCII-only, even with
-                 *   HS_FLAG_UTF8.  Non-C collations expect Unicode properties
-                 *   (e.g., ä ∈ [:alpha:] for ICU).  Only safe for C locale.
+                 * - LIKE: StringZilla does pure byte-level matching — safe
+                 *   for any deterministic collation.
+                 * - Regex: PCRE2 with PCRE2_UCP handles Unicode POSIX
+                 *   classes correctly — safe for any deterministic collation.
                  */
-                bool collation_ok;
-                if (is_like_fn || is_ilike_fn)
-                  collation_ok = pg_jitter_collation_is_deterministic(fcinfo->fncollation);
-                else
-                  collation_ok = pg_jitter_collation_is_c(fcinfo->fncollation);
+                bool collation_ok =
+                    pg_jitter_collation_is_deterministic(fcinfo->fncollation);
 
                 if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
                   text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
@@ -4016,7 +4013,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
                   /*
                    * StringZilla fast path for simple LIKE patterns.
-                   * Faster than Vectorscan (no regex compilation).
+                   * Faster than PCRE2 (no regex compilation).
                    * Only for LIKE/NOT LIKE (not ILIKE/regex).
                    */
                   if (is_like_fn) {
@@ -4060,13 +4057,13 @@ static bool sljit_compile_expr(ExprState *state) {
                   }
 
                   /* Compiled LIKE path for anchored patterns */
-                  bool skip_vectorscan = false;
+                  bool skip_pcre2 = false;
                   if (!vs_handled && is_like_fn) {
                     SzLikeCompiled *compiled =
                         simd_like_compile(pat_str, pat_len);
                     if (compiled == SIMD_LIKE_USE_V1) {
                       /* Floating underscore pattern — V1 is faster */
-                      skip_vectorscan = true;
+                      skip_pcre2 = true;
                     } else if (compiled) {
                       sljit_sw off0 =
                           (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -4095,17 +4092,15 @@ static bool sljit_compile_expr(ExprState *state) {
                     }
                   }
 
-#ifdef PG_JITTER_HAVE_VECTORSCAN
-                  /* Vectorscan path for complex LIKE or regex patterns */
-                  if (!vs_handled && !skip_vectorscan) {
-                    bool is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
-                    VsCacheEntry *entry = pg_jitter_vs_compile(
-                        pat_str, pat_len,
-                        is_like_fn || is_ilike_fn, /* is_like */
-                        is_ilike_fn || is_iregex_fn, /* case_insensitive */
-                        is_utf8);
+#ifdef PG_JITTER_HAVE_PCRE2
+                  /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
+                  if (!vs_handled && !skip_pcre2) {
+                    bool is_like = is_like_fn || is_ilike_fn;
+                    bool case_insens = is_ilike_fn || is_iregex_fn;
+                    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+                        pat_str, pat_len, is_like, case_insens);
 
-                    if (entry) {
+                    if (pe) {
                       sljit_sw off0 =
                           (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
                       if (r1_has_fcinfo)
@@ -4120,9 +4115,9 @@ static bool sljit_compile_expr(ExprState *state) {
                                        SLJIT_MEM1(SLJIT_R2), off0);
                       }
                       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                                     SLJIT_IMM, (sljit_sw)entry);
+                                     SLJIT_IMM, (sljit_sw)pe);
                       EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
-                                 pg_jitter_vs_match_text);
+                                 pg_jitter_pcre2_match_text);
 
                       if (vs_negate)
                         sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
@@ -4132,7 +4127,82 @@ static bool sljit_compile_expr(ExprState *state) {
                       vs_handled = true;
                     }
                   }
-#endif /* PG_JITTER_HAVE_VECTORSCAN */
+#endif /* PG_JITTER_HAVE_PCRE2 */
+                }
+              }
+            }
+
+            /*
+             * JSONB fast path: doc->>'key' with constant key.
+             * Bypasses FunctionCallInfo by calling our thin wrapper
+             * that invokes getKeyJsonValueFromContainer directly.
+             */
+            if (!vs_handled && !sljit_shared_code_mode) {
+              PGFunction fn = op->d.func.fn_addr;
+              if (fn == jsonb_object_field_text && fcinfo->nargs == 2) {
+                /* Check if args[1] (the key) is a compile-time constant */
+                bool key_const = true;
+                for (int j = opno - 1; j >= 0; j--) {
+                  if (steps[j].resvalue == &fcinfo->args[1].value) {
+                    key_const = (steps[j].opcode == EEOP_CONST);
+                    break;
+                  }
+                }
+
+                if (key_const && !fcinfo->args[1].isnull) {
+                  text *key_text = DatumGetTextPP(fcinfo->args[1].value);
+                  const char *key_str = VARDATA_ANY(key_text);
+                  int key_len = VARSIZE_ANY_EXHDR(key_text);
+
+                  /* Load args[0].value (jsonb datum) */
+                  sljit_sw off0 =
+                      (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                  if (r1_has_fcinfo)
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(SLJIT_R1), off0);
+                  else {
+                    emit_load_step_field(
+                        C, opno,
+                        offsetof(ExprEvalStep, d.func.fcinfo_data),
+                        SLJIT_R2);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(SLJIT_R2), off0);
+                  }
+
+                  /* R1 = key string pointer, R2 = key length */
+                  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                 SLJIT_IMM, (sljit_sw)key_str);
+                  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                                 SLJIT_IMM, key_len);
+                  /* R3 = &(*op->resnull) for isnull output */
+                  if (op->resnull == &state->resnull)
+                    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+                                   SLJIT_S0, 0,
+                                   SLJIT_IMM, offsetof(ExprState, resnull));
+                  else {
+                    emit_load_step_field(C, opno,
+                                         offsetof(ExprEvalStep, resnull),
+                                         SLJIT_R3);
+                  }
+
+                  EMIT_ICALL(C, SLJIT_CALL,
+                             SLJIT_ARGS4(W, W, W, 32, W),
+                             jit_jsonb_object_field_text);
+
+                  /* Store result: *op->resvalue = R0 */
+                  if (op->resvalue == &state->resvalue)
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_S0),
+                                   offsetof(ExprState, resvalue),
+                                   SLJIT_R0, 0);
+                  else {
+                    emit_load_step_field(C, opno,
+                                         offsetof(ExprEvalStep, resvalue),
+                                         SLJIT_R1);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R1), 0,
+                                   SLJIT_R0, 0);
+                  }
+                  /* resnull already set by jit_jsonb_object_field_text */
+                  vs_handled = true;
                 }
               }
             }
@@ -4178,7 +4248,7 @@ static bool sljit_compile_expr(ExprState *state) {
                              offsetof(FunctionCallInfoBaseData, isnull));
               emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
             }
-          } /* end V1 fallback / vectorscan */
+          } /* end V1 fallback / pcre2 */
 #ifdef PG_JITTER_HAVE_INLINE_BLOBS
         } /* end if (!used_precompiled) */
 #endif

@@ -2278,7 +2278,7 @@ pg_jitter_collation_is_c(Oid collid)
  *
  * LIKE and regex matching in PostgreSQL are byte-level operations that produce
  * correct results for any deterministic collation. This is used to gate the
- * StringZilla/Vectorscan LIKE/regex fast paths, which are also byte-level.
+ * StringZilla/PCRE2 LIKE/regex fast paths, which are also byte-level.
  */
 bool
 pg_jitter_collation_is_deterministic(Oid collid)
