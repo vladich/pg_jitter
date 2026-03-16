@@ -948,9 +948,16 @@ jit_jsonb_object_field_text(int64 jb_datum, int64 key_ptr,
 				: (int64)(Datum)PointerGetDatum(
 					cstring_to_text_with_len("false", 5));
 
+		case jbvBinary:
+		{
+			StringInfoData jtext;
+			initStringInfo(&jtext);
+			JsonbToCString(&jtext, v->val.binary.data, v->val.binary.len);
+			return (int64)(Datum)PointerGetDatum(
+				cstring_to_text_with_len(jtext.data, jtext.len));
+		}
+
 		default:
-			/* jbvBinary (nested object/array) — fall back to NULL
-			 * rather than pulling in JsonbToCString dependency */
 			*isnull = true;
 			return (int64)0;
 	}
