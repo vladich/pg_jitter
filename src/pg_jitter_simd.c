@@ -183,7 +183,7 @@ simd_hashtext(int64 a)
  * StringZilla fast-path LIKE matching
  *
  * For simple LIKE patterns, StringZilla substring search is faster
- * than Vectorscan regex compilation.  The JIT compiler classifies
+ * than PCRE2 regex compilation.  The JIT compiler classifies
  * the pattern at compile time and passes the match_type:
  *   0 = exact match (no wildcards)
  *   1 = prefix match (pattern%)
@@ -288,7 +288,7 @@ simd_like_classify(const char *pattern, int patlen,
 	else if (has_leading_pct && !has_trailing_pct)
 		return LIKE_MATCH_SUFFIX;
 	else
-		return -1; /* INTERIOR: V1/Vectorscan is faster than sz_find */
+		return LIKE_MATCH_INTERIOR; /* %literal% — sz_find SIMD substring search */
 }
 
 /* ================================================================
@@ -395,7 +395,7 @@ simd_like_compile(const char *pattern, int patlen)
 
 	/*
 	 * Route patterns based on what's fastest:
-	 * - Single-segment interior, no underscore (%literal%): Vectorscan's
+	 * - Single-segment interior, no underscore (%literal%): PCRE2's
 	 *   literal matcher is fastest (85% on short, 29% on long strings).
 	 * - Everything else: V1 (PG's MatchText) — its tight inline loop
 	 *   beats compiled LIKE's function call + struct access overhead
@@ -409,7 +409,7 @@ simd_like_compile(const char *pattern, int patlen)
 		int num_floating = num_segments - anchored_count;
 
 		if (num_floating > 0 && num_segments == 1 && !has_underscore) {
-			/* Single-segment interior: Vectorscan literal matcher */
+			/* Single-segment interior: PCRE2 literal matcher */
 			pfree(kinds); pfree(chars);
 			return NULL;
 		}
@@ -886,4 +886,79 @@ pg_jitter_scalararrayop_loop(ExprEvalStep *op, void *arr_ptr,
 
 	*op->resvalue = result;
 	*op->resnull = resultnull;
+}
+
+/* ================================================================
+ * JSONB fast-path extraction: doc->>'key' with constant key
+ *
+ * Bypasses FunctionCallInfo overhead by calling
+ * getKeyJsonValueFromContainer directly with pre-extracted key.
+ *
+ * Returns text Datum, or 0 with *isnull=true for NULL/missing.
+ * ================================================================ */
+#include "utils/jsonb.h"
+#include "utils/builtins.h"
+#include "utils/numeric.h"
+
+int64
+jit_jsonb_object_field_text(int64 jb_datum, int64 key_ptr,
+                             int32 key_len, int64 isnull_ptr)
+{
+	bool *isnull = (bool *)(uintptr_t)isnull_ptr;
+	Jsonb *jb = DatumGetJsonbP((Datum)jb_datum);
+	const char *key = (const char *)(uintptr_t)key_ptr;
+	JsonbValue vbuf;
+	JsonbValue *v;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+	{
+		*isnull = true;
+		return (int64)0;
+	}
+
+	v = getKeyJsonValueFromContainer(&jb->root, key, key_len, &vbuf);
+
+	if (v == NULL || v->type == jbvNull)
+	{
+		*isnull = true;
+		return (int64)0;
+	}
+
+	*isnull = false;
+
+	switch (v->type)
+	{
+		case jbvString:
+			return (int64)(Datum)PointerGetDatum(
+				cstring_to_text_with_len(v->val.string.val,
+				                         v->val.string.len));
+
+		case jbvNumeric:
+		{
+			char *cstr = DatumGetCString(
+				DirectFunctionCall1(numeric_out,
+				                    PointerGetDatum(v->val.numeric)));
+			return (int64)(Datum)PointerGetDatum(cstring_to_text(cstr));
+		}
+
+		case jbvBool:
+			return v->val.boolean
+				? (int64)(Datum)PointerGetDatum(
+					cstring_to_text_with_len("true", 4))
+				: (int64)(Datum)PointerGetDatum(
+					cstring_to_text_with_len("false", 5));
+
+		case jbvBinary:
+		{
+			StringInfoData jtext;
+			initStringInfo(&jtext);
+			JsonbToCString(&jtext, v->val.binary.data, v->val.binary.len);
+			return (int64)(Datum)PointerGetDatum(
+				cstring_to_text_with_len(jtext.data, jtext.len));
+		}
+
+		default:
+			*isnull = true;
+			return (int64)0;
+	}
 }

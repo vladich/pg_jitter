@@ -74,60 +74,41 @@ jobs:
           repository: ashvardanian/StringZilla
           path: deps/stringzilla
 
-      # ---- Vectorscan / Hyperscan (SIMD regex/LIKE acceleration) ----
-      # Strategy: use system packages (fast) where available, build from source otherwise
-      #   Linux x86_64: apt libhyperscan-dev (Intel Hyperscan, pre-built)
-      #   Linux ARM64:  build VectorCamp/vectorscan from source (no apt package for ARM)
-      #   macOS ARM64:  brew vectorscan (pre-built)
-      #   Windows:      not supported
-
-      - name: Install Hyperscan (Ubuntu x86_64)
-        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'X64'
-        run: |
-          sudo apt-get install -y -qq libhyperscan-dev
-
-      - name: Install Vectorscan (macOS)
-        if: startsWith(inputs.os, 'macos')
-        run: |
-          brew install vectorscan
-
-      # ARM64 Linux: no pre-built package, build from source
-      - name: Clone Vectorscan (ARM64 Linux)
-        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64'
+      # ---- PCRE2 (Unicode-aware regex/LIKE with JIT) ----
+      - name: Clone PCRE2
+        if: runner.os != 'Windows'
         uses: actions/checkout@v4
         with:
-          repository: VectorCamp/vectorscan
-          path: deps/vectorscan
+          repository: PCRE2Project/pcre2
+          path: deps/pcre2
+          submodules: true
 
-      - name: Cache Vectorscan build (ARM64 Linux)
-        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64'
-        id: cache-vectorscan
+      - name: Cache PCRE2 build
+        if: runner.os != 'Windows'
+        id: cache-pcre2
         uses: actions/cache@v4
         with:
-          path: deps/vectorscan/build
-          key: vectorscan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deps/vectorscan/CMakeLists.txt') }}
+          path: deps/pcre2/build
+          key: pcre2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deps/pcre2/CMakeLists.txt') }}
 
-      - name: Install Vectorscan build deps (ARM64 Linux)
-        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64' && steps.cache-vectorscan.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get install -y -qq ragel libboost-dev pkg-config
-
-      - name: Build Vectorscan (ARM64 Linux)
-        if: startsWith(inputs.os, 'ubuntu') && runner.arch == 'ARM64' && steps.cache-vectorscan.outputs.cache-hit != 'true'
+      - name: Build PCRE2
+        if: runner.os != 'Windows' && steps.cache-pcre2.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cd deps/vectorscan
+          cd deps/pcre2
           mkdir -p build && cd build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DPCRE2_SUPPORT_JIT=ON \
+            -DPCRE2_SUPPORT_UNICODE=ON \
+            -DPCRE2_BUILD_PCRE2_8=ON \
             -DBUILD_SHARED_LIBS=OFF \
-            -DFAT_RUNTIME=OFF \
-            -DBUILD_EXAMPLES=OFF \
-            -DBUILD_BENCHMARKS=OFF
-          cmake --build . --target hs -j 2
-          echo "Vectorscan library:"
-          ls -la lib/libhs.a
+            -DPCRE2_BUILD_PCRE2GREP=OFF \
+            -DPCRE2_BUILD_TESTS=OFF \
+            -DPCRE2_STATIC_PIC=ON
+          cmake --build . --target pcre2-8-static -j 2
+          echo "PCRE2 library:"
+          ls -la libpcre2-8.a
 
       # ---- Clone PostgreSQL source for regression tests ----
       # Pin to the exact minor version to avoid test expectation mismatches
@@ -180,10 +161,9 @@ jobs:
           CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
 
-          # Vectorscan: source tree path only for ARM64 Linux (built from source)
-          # x86_64 Linux and macOS use system packages found by CMake find_path/find_library
-          if [[ "$RUNNER_ARCH" == "ARM64" && "$RUNNER_OS" == "Linux" ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DVECTORSCAN_DIR=${{ github.workspace }}/deps/vectorscan"
+          # PCRE2: always built from source
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DPCRE2_DIR=${{ github.workspace }}/deps/pcre2"
           fi
 
           # macOS: PG headers need gettext's libintl.h
@@ -197,10 +177,10 @@ jobs:
             GENERATOR_ARGS="-G Ninja"
           fi
 
-          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" $CMAKE_ARGS
+          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel --config Release
 
       # ---- Install pg_jitter & restart with it ----
       - name: Install pg_jitter and restart PostgreSQL

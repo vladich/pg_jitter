@@ -53,7 +53,7 @@ typedef struct {
 
 /*
  * Sentinel: pattern has floating segments with underscores.
- * Backend should skip both compiled LIKE and Vectorscan (use V1).
+ * Backend should skip both compiled LIKE and PCRE2 (use V1).
  */
 #define SIMD_LIKE_USE_V1 ((SzLikeCompiled *)(intptr_t)1)
 
@@ -84,5 +84,17 @@ struct ExprEvalStep;
 extern void pg_jitter_scalararrayop_loop(struct ExprEvalStep *op,
                                          void *arr, Datum scalar_value,
                                          bool scalar_null);
+
+/* ================================================================
+ * JSONB fast-path extraction (bypasses FunctionCallInfo overhead)
+ *
+ * JIT-callable wrapper for doc->>'key' with compile-time constant key.
+ * Calls getKeyJsonValueFromContainer directly, skipping PG_GETARG_TEXT_PP
+ * for the key argument and FunctionCallInfo setup entirely.
+ *
+ * Returns: text Datum on success, 0 with *isnull=true on NULL/not-found.
+ * ================================================================ */
+extern int64 jit_jsonb_object_field_text(int64 jb_datum, int64 key_ptr,
+                                          int32 key_len, int64 isnull_ptr);
 
 #endif /* PG_JITTER_SIMD_H */

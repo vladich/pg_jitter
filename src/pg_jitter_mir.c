@@ -24,7 +24,8 @@
 #include "pg_jitter_simd.h"
 #include "pg_jitter_simdjson.h"
 #include "utils/fmgrprotos.h"
-#include "pg_jitter_vectorscan.h"
+#include "pg_jitter_pcre2.h"
+#include "utils/guc.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
 #include "mb/pg_wchar.h"
@@ -937,18 +938,31 @@ static bool mir_compile_expr(ExprState *state) {
   }
   import_szcomp = MIR_new_import(ctx, "simd_like_match_compiled");
 
-#ifdef PG_JITTER_HAVE_VECTORSCAN
-  /* Proto + import for Vectorscan LIKE/regex fast path:
-   * int32 pg_jitter_vs_match_text(int64 datum, int64 entry_ptr) */
-  MIR_item_t proto_vs_match;
-  MIR_item_t import_vs_match;
+#ifdef PG_JITTER_HAVE_PCRE2
+  /* Proto + import for PCRE2 LIKE/regex fast path:
+   * int32 pg_jitter_pcre2_match_text(int64 datum, int64 entry_ptr) */
+  MIR_item_t proto_pcre2_match;
+  MIR_item_t import_pcre2_match;
   {
-    MIR_type_t vs_ret = MIR_T_I32;
-    proto_vs_match = MIR_new_proto(ctx, "p_vsmatch", 1, &vs_ret,
-                                   2, MIR_T_I64, "d", MIR_T_I64, "e");
+    MIR_type_t pcre2_ret = MIR_T_I32;
+    proto_pcre2_match = MIR_new_proto(ctx, "p_pcre2match", 1, &pcre2_ret,
+                                       2, MIR_T_I64, "d", MIR_T_I64, "e");
   }
-  import_vs_match = MIR_new_import(ctx, "vs_match_text");
-#endif /* PG_JITTER_HAVE_VECTORSCAN */
+  import_pcre2_match = MIR_new_import(ctx, "pcre2_match_text");
+#endif /* PG_JITTER_HAVE_PCRE2 */
+
+  /* Proto + import for JSONB fast-path extraction:
+   * int64 jit_jsonb_object_field_text(int64 datum, int64 key_ptr,
+   *                                    int32 key_len, int64 isnull_ptr) */
+  MIR_item_t proto_jsonb_field;
+  MIR_item_t import_jsonb_field;
+  {
+    MIR_type_t jb_ret = MIR_T_I64;
+    proto_jsonb_field = MIR_new_proto(ctx, "p_jbfield", 1, &jb_ret,
+                                      4, MIR_T_I64, "d", MIR_T_I64, "k",
+                                      MIR_T_I32, "l", MIR_T_I64, "n");
+  }
+  import_jsonb_field = MIR_new_import(ctx, "jit_jsonb_field_text");
 
   /*
    * Per-step imports for V1 function addresses.
@@ -2681,12 +2695,12 @@ static bool mir_compile_expr(ExprState *state) {
                            MIR_new_int_op(ctx, 0)));
         } else {
           /*
-           * TIER 2 — V1 FALLBACK (or Vectorscan LIKE/regex).
+           * TIER 2 — V1 FALLBACK (or PCRE2 LIKE/regex).
            */
           bool vs_handled = false;
 
           /*
-           * LIKE/regex FAST PATH: StringZilla + Vectorscan.
+           * LIKE/regex FAST PATH: StringZilla + PCRE2.
            * Detects textlike, textnlike, texticlike, texticnlike,
            * textregexeq, textregexne, texticregexeq, texticregexne
            * with a compile-time constant pattern.  Only in non-shared
@@ -2719,11 +2733,16 @@ static bool mir_compile_expr(ExprState *state) {
               }
 
               /*
-               * LIKE/regex: Vectorscan/StringZilla use POSIX character
-               * classes, not ICU.  Only safe for C/POSIX collation.
+               * LIKE/regex fast paths collation gating:
+               * - LIKE: StringZilla does pure byte-level matching — safe
+               *   for any deterministic collation.
+               * - Regex: PCRE2 with PCRE2_UCP handles Unicode POSIX
+               *   classes correctly — safe for any deterministic collation.
                */
-              if (pat_const && !fcinfo->args[1].isnull &&
-                  pg_jitter_collation_is_c(fcinfo->fncollation)) {
+              bool collation_ok =
+                  pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+
+              if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
                 text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
                 char *pat_str = VARDATA_ANY(pat_text);
                 int pat_len = VARSIZE_ANY_EXHDR(pat_text);
@@ -2837,12 +2856,12 @@ static bool mir_compile_expr(ExprState *state) {
                 }
 
                 /* Compiled LIKE path for anchored patterns */
-                bool skip_vectorscan = false;
+                bool skip_pcre2 = false;
                 if (!vs_handled && is_like_fn) {
                   SzLikeCompiled *compiled =
                       simd_like_compile(pat_str, pat_len);
                   if (compiled == SIMD_LIKE_USE_V1) {
-                    skip_vectorscan = true;
+                    skip_pcre2 = true;
                   } else if (compiled) {
                     char szcd_name[32], szce_name[32];
                     snprintf(szcd_name, sizeof(szcd_name), "szcd_%d", opno);
@@ -2907,22 +2926,20 @@ static bool mir_compile_expr(ExprState *state) {
                   }
                 }
 
-#ifdef PG_JITTER_HAVE_VECTORSCAN
-                /* Vectorscan path for complex LIKE or regex patterns */
-                if (!vs_handled && !skip_vectorscan) {
-                  bool is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
-                  VsCacheEntry *entry = pg_jitter_vs_compile(
-                      pat_str, pat_len,
-                      is_like_fn || is_ilike_fn, /* is_like */
-                      is_ilike_fn || is_iregex_fn, /* case_insensitive */
-                      is_utf8);
+#ifdef PG_JITTER_HAVE_PCRE2
+                /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex */
+                if (!vs_handled && !skip_pcre2) {
+                  bool is_like = is_like_fn || is_ilike_fn;
+                  bool case_insens = is_ilike_fn || is_iregex_fn;
+                  Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+                      pat_str, pat_len, is_like, case_insens);
 
-                  if (entry) {
-                    char vsd_name[32], vse_name[32];
-                    snprintf(vsd_name, sizeof(vsd_name), "vsd_%d", opno);
-                    snprintf(vse_name, sizeof(vse_name), "vse_%d", opno);
-                    MIR_reg_t r_datum = mir_new_reg(ctx, f, MIR_T_I64, vsd_name);
-                    MIR_reg_t r_entry = mir_new_reg(ctx, f, MIR_T_I64, vse_name);
+                  if (pe) {
+                    char rd_name[32], re_name[32];
+                    snprintf(rd_name, sizeof(rd_name), "rxd_%d", opno);
+                    snprintf(re_name, sizeof(re_name), "rxe_%d", opno);
+                    MIR_reg_t r_datum = mir_new_reg(ctx, f, MIR_T_I64, rd_name);
+                    MIR_reg_t r_entry = mir_new_reg(ctx, f, MIR_T_I64, re_name);
 
                     MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
                     int64_t off0 =
@@ -2938,13 +2955,13 @@ static bool mir_compile_expr(ExprState *state) {
                         ctx, func_item,
                         MIR_new_insn(ctx, MIR_MOV,
                                      MIR_new_reg_op(ctx, r_entry),
-                                     MIR_new_int_op(ctx, (int64_t)(uintptr_t)entry)));
+                                     MIR_new_int_op(ctx, (int64_t)(uintptr_t)pe)));
 
                     MIR_append_insn(
                         ctx, func_item,
                         MIR_new_call_insn(ctx, 5,
-                                          MIR_new_ref_op(ctx, proto_vs_match),
-                                          MIR_new_ref_op(ctx, import_vs_match),
+                                          MIR_new_ref_op(ctx, proto_pcre2_match),
+                                          MIR_new_ref_op(ctx, import_pcre2_match),
                                           MIR_new_reg_op(ctx, r_ret),
                                           MIR_new_reg_op(ctx, r_datum),
                                           MIR_new_reg_op(ctx, r_entry)));
@@ -2980,7 +2997,88 @@ static bool mir_compile_expr(ExprState *state) {
                     vs_handled = true;
                   }
                 }
-#endif /* PG_JITTER_HAVE_VECTORSCAN */
+#endif /* PG_JITTER_HAVE_PCRE2 */
+              }
+            }
+          }
+
+          /*
+           * JSONB fast path: doc->>'key' with constant key.
+           */
+          if (!vs_handled && !mir_shared_code_mode) {
+            PGFunction fn = op->d.func.fn_addr;
+            if (fn == jsonb_object_field_text && fcinfo->nargs == 2) {
+              bool key_const = true;
+              for (int j = opno - 1; j >= 0; j--) {
+                if (steps[j].resvalue == &fcinfo->args[1].value) {
+                  key_const = (steps[j].opcode == EEOP_CONST);
+                  break;
+                }
+              }
+
+              if (key_const && !fcinfo->args[1].isnull) {
+                text *key_text = DatumGetTextPP(fcinfo->args[1].value);
+                const char *key_str = VARDATA_ANY(key_text);
+                int key_len = VARSIZE_ANY_EXHDR(key_text);
+
+                char jbd_name[32], jbk_name[32], jbl_name[32], jbn_name[32];
+                snprintf(jbd_name, sizeof(jbd_name), "jbd_%d", opno);
+                snprintf(jbk_name, sizeof(jbk_name), "jbk_%d", opno);
+                snprintf(jbl_name, sizeof(jbl_name), "jbl_%d", opno);
+                snprintf(jbn_name, sizeof(jbn_name), "jbn_%d", opno);
+                MIR_reg_t r_datum = mir_new_reg(ctx, f, MIR_T_I64, jbd_name);
+                MIR_reg_t r_key = mir_new_reg(ctx, f, MIR_T_I64, jbk_name);
+                MIR_reg_t r_klen = mir_new_reg(ctx, f, MIR_T_I64, jbl_name);
+                MIR_reg_t r_nptr = mir_new_reg(ctx, f, MIR_T_I64, jbn_name);
+
+                /* Load args[0].value (jsonb datum) */
+                MIR_STEP_LOAD(r_fci, opno, d.func.fcinfo_data);
+                int64_t off0 =
+                    (int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
+                MIR_append_insn(
+                    ctx, func_item,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_reg_op(ctx, r_datum),
+                                 MIR_new_mem_op(ctx, MIR_T_I64, off0,
+                                                r_fci, 0, 1)));
+
+                /* Load key pointer + length as immediates */
+                MIR_append_insn(
+                    ctx, func_item,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_reg_op(ctx, r_key),
+                                 MIR_new_int_op(ctx, (int64_t)(uintptr_t)key_str)));
+                MIR_append_insn(
+                    ctx, func_item,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_reg_op(ctx, r_klen),
+                                 MIR_new_int_op(ctx, (int64_t)key_len)));
+
+                /* Load resnull pointer */
+                MIR_STEP_LOAD(r_nptr, opno, resnull);
+
+                /* Call jit_jsonb_object_field_text(datum, key, keylen, &resnull) */
+                MIR_append_insn(
+                    ctx, func_item,
+                    MIR_new_call_insn(ctx, 7,
+                                      MIR_new_ref_op(ctx, proto_jsonb_field),
+                                      MIR_new_ref_op(ctx, import_jsonb_field),
+                                      MIR_new_reg_op(ctx, r_ret),
+                                      MIR_new_reg_op(ctx, r_datum),
+                                      MIR_new_reg_op(ctx, r_key),
+                                      MIR_new_reg_op(ctx, r_klen),
+                                      MIR_new_reg_op(ctx, r_nptr)));
+
+                /* Store result */
+                MIR_STEP_LOAD(r_tmp3, opno, resvalue);
+                MIR_append_insn(
+                    ctx, func_item,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1),
+                                 MIR_new_reg_op(ctx, r_ret)));
+                /* resnull already set by the wrapper */
+
+                vs_handled = true;
               }
             }
           }
@@ -3052,7 +3150,7 @@ static bool mir_compile_expr(ExprState *state) {
                            MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
                            MIR_new_reg_op(ctx, r_tmp1)));
           } /* end if (!vs_handled) */
-        } /* end V1 fallback / vectorscan */
+        } /* end V1 fallback / pcre2 */
       } /* end direct-call dispatch */
 
       MIR_append_insn(ctx, func_item, done_label);
@@ -8384,11 +8482,14 @@ static bool mir_compile_expr(ExprState *state) {
     /* Compiled LIKE match helper */
     MIR_load_external(ctx, "simd_like_match_compiled",
                       mir_extern_addr((void *)simd_like_match_compiled));
-#ifdef PG_JITTER_HAVE_VECTORSCAN
-    /* Vectorscan LIKE/regex match helper */
-    MIR_load_external(ctx, "vs_match_text",
-                      mir_extern_addr((void *)pg_jitter_vs_match_text));
+#ifdef PG_JITTER_HAVE_PCRE2
+    /* PCRE2 LIKE/regex match helper */
+    MIR_load_external(ctx, "pcre2_match_text",
+                      mir_extern_addr((void *)pg_jitter_pcre2_match_text));
 #endif
+    /* JSONB fast-path extraction */
+    MIR_load_external(ctx, "jit_jsonb_field_text",
+                      mir_extern_addr((void *)jit_jsonb_object_field_text));
     /* Inline deform helpers */
 #ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
     /* Presorted distinct helpers */

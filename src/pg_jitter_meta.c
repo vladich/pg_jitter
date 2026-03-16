@@ -246,7 +246,6 @@ static int meta_min_expr_steps = 4;
 static bool meta_adaptive = true;
 static int meta_adaptive_samples = 64;
 static double meta_adaptive_epsilon = 0.05;
-
 #define PARALLEL_JIT_OFF        0
 #define PARALLEL_JIT_PER_WORKER 1
 #define PARALLEL_JIT_SHARED     2
