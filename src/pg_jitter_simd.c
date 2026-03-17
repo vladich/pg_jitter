@@ -32,6 +32,12 @@
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
+#ifdef _MSC_VER
+/* MSVC x64 always has SSE2; SSE4.2 intrinsics available via intrin.h */
+#include <intrin.h>
+#include <nmmintrin.h>
+#define PG_JITTER_HAVE_SSE2 1
+#else
 #ifdef __SSE2__
 #include <emmintrin.h>
 #define PG_JITTER_HAVE_SSE2 1
@@ -40,6 +46,7 @@
 #include <smmintrin.h>
 #define PG_JITTER_HAVE_SSE41 1
 #endif
+#endif /* _MSC_VER */
 #endif
 
 /* ================================================================
@@ -662,6 +669,9 @@ done:
  * CRC32 open-addressing hash table for large IN lists
  * ================================================================ */
 #include "port/pg_crc32c.h"
+#ifdef _WIN64
+#include "pg_crc32c_compat.h"
+#endif
 
 /* Empty slot sentinel — INT32_MIN is extremely unlikely as a real value */
 #define CRC32_HASH_EMPTY INT32_MIN
@@ -673,8 +683,8 @@ crc32_hash_int4(int32 val)
 	uint32 crc = 0xFFFFFFFF;
 	__asm__ volatile("crc32cw %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)val));
 	return crc;
-#elif defined(__x86_64__) && defined(__SSE4_2__)
-	return __builtin_ia32_crc32si(0xFFFFFFFF, (uint32)val);
+#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
+	return _mm_crc32_u32(0xFFFFFFFF, (uint32)val);
 #else
 	/* Fallback: use PG's CRC32C */
 	pg_crc32c crc;
@@ -763,7 +773,11 @@ sorted_array_probe_int4(int32 val, int64 array_ptr)
 	 */
 	while (n > 1) {
 		int half = n >> 1;
+#ifdef _MSC_VER
+		_mm_prefetch((const char *)(base + (n >> 2)), _MM_HINT_T0);
+#else
 		__builtin_prefetch(base + (n >> 2));
+#endif
 		base += (base[half - 1] < val) * half;
 		n -= half;
 	}
@@ -1069,17 +1083,17 @@ text_hybrid_hash(const char *data, int len)
         for (; i < len; i++)
             __asm__ volatile("crc32cb %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)(uint8)data[i]));
         h = crc;
-#elif defined(__x86_64__) && defined(__SSE4_2__)
+#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
         uint32 crc = 0xFFFFFFFF;
         int i = 0;
         for (; i + 4 <= len; i += 4)
         {
             uint32 word;
             memcpy(&word, data + i, 4);
-            crc = __builtin_ia32_crc32si(crc, word);
+            crc = _mm_crc32_u32(crc, word);
         }
         for (; i < len; i++)
-            crc = __builtin_ia32_crc32qi(crc, (uint8)data[i]);
+            crc = _mm_crc32_u8(crc, (uint8)data[i]);
         h = crc;
 #else
         /* Fallback: PG's CRC32C */

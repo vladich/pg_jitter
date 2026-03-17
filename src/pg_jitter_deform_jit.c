@@ -29,6 +29,9 @@
 #ifdef _WIN64
 #include "pg_crc32c_compat.h"
 #endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #ifdef __linux__
 #ifndef MAP_FIXED_NOREPLACE
@@ -800,7 +803,13 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
             uint8 bm = t_bits[bi];
             while (bm)
             {
+#ifdef _MSC_VER
+                unsigned long _bsf_idx;
+                _BitScanForward(&_bsf_idx, bm);
+                int bit = (int)_bsf_idx;
+#else
                 int bit = __builtin_ctz(bm);
+#endif
                 int col = base + bit;
                 const DeformColDesc *d = &descs[col];
 
