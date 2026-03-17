@@ -117,6 +117,8 @@ restore_provider() {
         ensure_pg_running
         "$PSQL" -p "$PGPORT" -d postgres -q -c \
             "ALTER SYSTEM SET jit_provider = '$ORIG_PROVIDER';" 2>/dev/null
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM RESET pg_jitter.backend;" 2>/dev/null
         "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
     fi
 }
@@ -221,8 +223,18 @@ for backend in $BACKENDS; do
     ensure_pg_running
     cleanup_database
 
-    # "auto" uses the meta provider with pg_jitter.backend = 'auto'
-    if [ "$backend" = "auto" ]; then
+    # PG17+ supports custom GUCs via ALTER SYSTEM, so we use the
+    # meta module (pg_jitter) + pg_jitter.backend GUC. This avoids
+    # a known PCRE2 regex crash with direct provider loading.
+    # PG14-16: must use direct provider loading (no custom GUC support).
+    PG_MAJOR=$("$PG_CONFIG" --version | sed 's/PostgreSQL //' | cut -d. -f1)
+    if [ "$PG_MAJOR" -ge 17 ] 2>/dev/null; then
+        EXPECTED_PROVIDER="pg_jitter"
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM SET pg_jitter.backend = '$backend';" 2>/dev/null
+    elif [ "$backend" = "auto" ]; then
         EXPECTED_PROVIDER="pg_jitter"
         "$PSQL" -p "$PGPORT" -d postgres -q -c \
             "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null

@@ -472,9 +472,12 @@ asmjit_compile_expr(ExprState *state)
 				/* Register Windows x64 unwind metadata for SEH-safe longjmp */
 				pg_jitter_win64_register_unwind(code_ptr, code_size);
 
-				/* Worker: set up binary search arrays for CASE optimization */
+				/* Worker: set up process-local data structures.
+				 * Leader stored pointers in step data; worker needs its own. */
 				pg_jitter_setup_case_bsearch_arrays(state, state->steps,
 													 state->steps_len);
+				pg_jitter_setup_shared_in_hash(state, state->steps,
+											   state->steps_len);
 
 				pg_jitter_install_expr(state,
 									  (ExprStateEvalFunc) code_ptr);

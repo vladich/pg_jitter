@@ -262,11 +262,20 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 #define PARALLEL_JIT_PER_WORKER 1
 #define PARALLEL_JIT_SHARED     2
 
+/* IN-list strategy for HASHED_SCALARARRAYOP */
+#define IN_HASH_PG       0  /* PG's built-in Jenkins hash probe */
+#define IN_HASH_CRC32    1  /* CRC32C open-addressing */
+
+/* Default threshold: ≤ this → inline bsearch tree, > this → CRC32 hash */
+#define IN_BSEARCH_MAX_DEFAULT 4096
+
 /* GUC variables shared across backends (defined in pg_jitter_common.c) */
 extern int pg_jitter_parallel_mode;
 extern int pg_jitter_shared_code_max_kb;
 extern bool pg_jitter_deform_cache;
 extern int pg_jitter_min_expr_steps;
+extern int pg_jitter_in_hash_strategy;
+extern int pg_jitter_in_bsearch_max;
 
 /*
  * Read the current parallel mode from the GUC system.
@@ -498,5 +507,18 @@ extern Datum pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc 
 
 /* Returns the appropriate helper function for the given pattern. */
 extern void *pg_jitter_select_bsearch_helper(const CaseBSearchInfo *cbi);
+
+/*
+ * Shared-mode setup for IN-list hash tables and PCRE2 patterns.
+ *
+ * Called by both leader (during compilation) and workers (after DSM
+ * attachment). Scans expression steps for HASHED_SCALARARRAYOP with
+ * text arrays and builds process-local TextHashTable, storing the
+ * pointer in fcinfo->args[1].value. Also rebuilds PCRE2 cache
+ * entries for any regex/LIKE patterns used in the expression.
+ */
+extern void pg_jitter_setup_shared_in_hash(ExprState *state,
+                                            ExprEvalStep *steps,
+                                            int steps_len);
 
 #endif /* PG_JITTER_COMMON_H */

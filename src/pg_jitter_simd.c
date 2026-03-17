@@ -31,6 +31,24 @@
 #define PG_JITTER_HAVE_NEON 1
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+#ifdef _MSC_VER
+/* MSVC x64 always has SSE2; SSE4.2 intrinsics available via intrin.h */
+#include <intrin.h>
+#include <nmmintrin.h>
+#define PG_JITTER_HAVE_SSE2 1
+#else
+#ifdef __SSE2__
+#include <emmintrin.h>
+#define PG_JITTER_HAVE_SSE2 1
+#endif
+#ifdef __SSE4_1__
+#include <smmintrin.h>
+#define PG_JITTER_HAVE_SSE41 1
+#endif
+#endif /* _MSC_VER */
+#endif
+
 /* ================================================================
  * Internal: detoast + extract text data
  * ================================================================ */
@@ -288,7 +306,7 @@ simd_like_classify(const char *pattern, int patlen,
 	else if (has_leading_pct && !has_trailing_pct)
 		return LIKE_MATCH_SUFFIX;
 	else
-		return LIKE_MATCH_INTERIOR; /* %literal% — sz_find SIMD substring search */
+		return LIKE_MATCH_INTERIOR; /* %literal% — StringZilla sz_find */
 }
 
 /* ================================================================
@@ -395,12 +413,13 @@ simd_like_compile(const char *pattern, int patlen)
 
 	/*
 	 * Route patterns based on what's fastest:
-	 * - Single-segment interior, no underscore (%literal%): PCRE2's
-	 *   literal matcher is fastest (85% on short, 29% on long strings).
-	 * - Everything else: V1 (PG's MatchText) — its tight inline loop
-	 *   beats compiled LIKE's function call + struct access overhead
-	 *   on short strings.  Compiled LIKE's memchr advantage only
-	 *   shows on strings >100 bytes, but those are rare in practice.
+	 * - Single-segment interior (%literal%), long literal (>= 5 bytes):
+	 *   Already handled by Tier 1 StringZilla sz_find (NEON).
+	 *   Return NULL here so PCRE2 catches any that Tier 1 missed.
+	 * - Single-segment interior, short literal (< 5 bytes):
+	 *   V1 MatchText is fastest (no function call overhead).
+	 * - Underscore/multi-% patterns:
+	 *   PCRE2 JIT handles these well. Return NULL to fall through.
 	 */
 	{
 		int anchored_count = 0;
@@ -409,13 +428,16 @@ simd_like_compile(const char *pattern, int patlen)
 		int num_floating = num_segments - anchored_count;
 
 		if (num_floating > 0 && num_segments == 1 && !has_underscore) {
-			/* Single-segment interior: PCRE2 literal matcher */
+			/* Single-segment interior (%literal%):
+			 * Long literals go to PCRE2, short literals to V1 */
 			pfree(kinds); pfree(chars);
-			return NULL;
+			if (total_literal < 5)
+				return SIMD_LIKE_USE_V1; /* V1 beats PCRE2 on short needles */
+			return NULL; /* PCRE2 handles it */
 		}
-		/* All other patterns: V1 is faster for short strings */
+		/* Underscore/multi-% patterns: let PCRE2 handle */
 		pfree(kinds); pfree(chars);
-		return SIMD_LIKE_USE_V1;
+		return NULL;
 	}
 
 	/* Allocate struct + trailing literal data */
@@ -644,6 +666,125 @@ done:
 }
 
 /* ================================================================
+ * CRC32 open-addressing hash table for large IN lists
+ * ================================================================ */
+#include "port/pg_crc32c.h"
+#ifdef _WIN64
+#include "pg_crc32c_compat.h"
+#endif
+
+/* Empty slot sentinel — INT32_MIN is extremely unlikely as a real value */
+#define CRC32_HASH_EMPTY INT32_MIN
+
+static inline uint32
+crc32_hash_int4(int32 val)
+{
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+	uint32 crc = 0xFFFFFFFF;
+	__asm__ volatile("crc32cw %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)val));
+	return crc;
+#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
+	return _mm_crc32_u32(0xFFFFFFFF, (uint32)val);
+#else
+	/* Fallback: use PG's CRC32C */
+	pg_crc32c crc;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &val, sizeof(val));
+	FIN_CRC32C(crc);
+	return (uint32)crc;
+#endif
+}
+
+Crc32HashTable *
+crc32_hash_build_int4(const int32 *vals, int nvals, bool has_nulls)
+{
+	/* Table size = next power of 2, at least 2x nvals for low collision rate */
+	int table_size = 16;
+	while (table_size < nvals * 2)
+		table_size <<= 1;
+
+	Size alloc = offsetof(Crc32HashTable, table) + table_size * sizeof(int32);
+	Crc32HashTable *ht = MemoryContextAlloc(TopMemoryContext, alloc);
+	ht->mask = table_size - 1;
+	ht->nitems = nvals;
+	ht->has_nulls = has_nulls;
+
+	/* Fill with empty sentinel */
+	for (int i = 0; i < table_size; i++)
+		ht->table[i] = CRC32_HASH_EMPTY;
+
+	/* Insert values with linear probing */
+	for (int i = 0; i < nvals; i++) {
+		uint32 h = crc32_hash_int4(vals[i]) & ht->mask;
+		while (ht->table[h] != CRC32_HASH_EMPTY)
+			h = (h + 1) & ht->mask;
+		ht->table[h] = vals[i];
+	}
+
+	return ht;
+}
+
+int32
+crc32_hash_probe_int4(int32 val, int64 table_ptr)
+{
+	Crc32HashTable *ht = (Crc32HashTable *)table_ptr;
+	uint32 h = crc32_hash_int4(val) & ht->mask;
+
+	for (;;) {
+		int32 slot = ht->table[h];
+		if (slot == CRC32_HASH_EMPTY)
+			return 0;  /* not found */
+		if (slot == val)
+			return 1;  /* found */
+		h = (h + 1) & ht->mask;
+	}
+}
+
+/* ================================================================
+ * Runtime binary search for large IN lists
+ * ================================================================ */
+SortedInt32Array *
+sorted_array_build_int4(const int32 *vals, int nvals, bool has_nulls)
+{
+	Size alloc = offsetof(SortedInt32Array, vals) + nvals * sizeof(int32);
+	SortedInt32Array *sa = MemoryContextAlloc(TopMemoryContext, alloc);
+	sa->nvals = nvals;
+	sa->has_nulls = has_nulls;
+	memcpy(sa->vals, vals, nvals * sizeof(int32));
+	/* vals are already sorted from the extraction step */
+	return sa;
+}
+
+int32
+sorted_array_probe_int4(int32 val, int64 array_ptr)
+{
+	SortedInt32Array *sa = (SortedInt32Array *)array_ptr;
+	const int32 *base = sa->vals;
+	int n = sa->nvals;
+
+	/*
+	 * Branchless binary search (Knuth/Morin style).
+	 *
+	 * Key: don't check equality during the loop. Narrow to one element,
+	 * then check. The conditional advance compiles to CSEL (ARM64) or
+	 * CMOV (x86) — no branch misprediction.
+	 *
+	 * 1.7-2.3x faster than branchy binary search in microbenchmarks.
+	 */
+	while (n > 1) {
+		int half = n >> 1;
+#ifdef _MSC_VER
+		_mm_prefetch((const char *)(base + (n >> 2)), _MM_HINT_T0);
+#else
+		__builtin_prefetch(base + (n >> 2));
+#endif
+		base += (base[half - 1] < val) * half;
+		n -= half;
+	}
+	return (n > 0 && *base == val) ? 1 : 0;
+}
+
+/* ================================================================
  * SIMD integer array search (for SCALARARRAYOP int IN())
  * ================================================================ */
 int32
@@ -742,6 +883,30 @@ simd_extract_int32_values(const char *tupdata, Datum *values, int count)
 		int64x2_t hi = vmovl_s32(vget_high_s32(v));
 		vst1q_s64((int64 *)(values + i), lo);
 		vst1q_s64((int64 *)(values + i + 2), hi);
+	}
+	for (; i < count; i++)
+		values[i] = Int32GetDatum(*(int32 *)(tupdata + i * 4));
+#elif defined(PG_JITTER_HAVE_SSE41)
+	/* SSE4.1: _mm_cvtepi32_epi64 sign-extends 2×int32 → 2×int64 */
+	int i = 0;
+	for (; i + 4 <= count; i += 4) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(tupdata + i * 4));
+		__m128i lo = _mm_cvtepi32_epi64(v);
+		_mm_storeu_si128((__m128i *)(values + i), lo);
+		__m128i v_hi = _mm_srli_si128(v, 8);
+		__m128i hi = _mm_cvtepi32_epi64(v_hi);
+		_mm_storeu_si128((__m128i *)(values + i + 2), hi);
+	}
+	for (; i < count; i++)
+		values[i] = Int32GetDatum(*(int32 *)(tupdata + i * 4));
+#elif defined(PG_JITTER_HAVE_SSE2)
+	/* SSE2: manual sign extension int32 → int64, 2 at a time */
+	int i = 0;
+	for (; i + 2 <= count; i += 2) {
+		__m128i v = _mm_loadl_epi64((const __m128i *)(tupdata + i * 4));
+		__m128i sign = _mm_srai_epi32(v, 31);
+		__m128i ext = _mm_unpacklo_epi32(v, sign);
+		_mm_storeu_si128((__m128i *)(values + i), ext);
 	}
 	for (; i < count; i++)
 		values[i] = Int32GetDatum(*(int32 *)(tupdata + i * 4));
@@ -886,6 +1051,144 @@ pg_jitter_scalararrayop_loop(ExprEvalStep *op, void *arr_ptr,
 
 	*op->resvalue = result;
 	*op->resnull = resultnull;
+}
+
+/* ================================================================
+ * Text IN-list hash table
+ *
+ * Hybrid hash: CRC32C for strings <= 16 bytes, StringZilla sz_hash
+ * for longer strings. Open-addressing with linear probing.
+ * Built at JIT compile time, probed at runtime.
+ * ================================================================ */
+
+static inline uint32
+text_hybrid_hash(const char *data, int len)
+{
+    uint32 h;
+
+    if (len <= 16)
+    {
+        /* Short strings: hardware CRC32C */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+        uint32 crc = 0xFFFFFFFF;
+        int i = 0;
+        /* Process 4 bytes at a time */
+        for (; i + 4 <= len; i += 4)
+        {
+            uint32 word;
+            memcpy(&word, data + i, 4);
+            __asm__ volatile("crc32cw %w0, %w0, %w1" : "+r"(crc) : "r"(word));
+        }
+        /* Process remaining bytes */
+        for (; i < len; i++)
+            __asm__ volatile("crc32cb %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)(uint8)data[i]));
+        h = crc;
+#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
+        uint32 crc = 0xFFFFFFFF;
+        int i = 0;
+        for (; i + 4 <= len; i += 4)
+        {
+            uint32 word;
+            memcpy(&word, data + i, 4);
+            crc = _mm_crc32_u32(crc, word);
+        }
+        for (; i < len; i++)
+            crc = _mm_crc32_u8(crc, (uint8)data[i]);
+        h = crc;
+#else
+        /* Fallback: PG's CRC32C */
+        pg_crc32c crc;
+        INIT_CRC32C(crc);
+        COMP_CRC32C(crc, data, len);
+        FIN_CRC32C(crc);
+        h = (uint32)crc;
+#endif
+    }
+    else
+    {
+        /* Long strings: StringZilla hash */
+        h = (uint32)sz_hash(data, len, 0);
+    }
+
+    /* Ensure hash is never 0 (reserved for empty slots) */
+    return h | 1;
+}
+
+TextHashTable *
+text_hash_build(Datum *text_datums, int nvals, bool has_nulls)
+{
+    /* Table size = next power of 2, at least 2x nvals */
+    int table_size = 16;
+    while (table_size < nvals * 2)
+        table_size <<= 1;
+
+    Size alloc = offsetof(TextHashTable, entries) +
+                 table_size * sizeof(TextHashEntry);
+    TextHashTable *ht = MemoryContextAllocZero(TopMemoryContext, alloc);
+    ht->mask = table_size - 1;
+    ht->nitems = nvals;
+    ht->has_nulls = has_nulls;
+    /* entries[] already zeroed (hash=0 = empty) */
+
+    for (int i = 0; i < nvals; i++)
+    {
+        text *t = DatumGetTextPP(text_datums[i]);
+        int len = VARSIZE_ANY_EXHDR(t);
+        const char *src = VARDATA_ANY(t);
+
+        uint32 h = text_hybrid_hash(src, len);
+        uint32 idx = h & ht->mask;
+
+        /* Linear probe for empty slot */
+        while (ht->entries[idx].hash != 0)
+            idx = (idx + 1) & ht->mask;
+
+        /* Copy text data to TopMemoryContext for lifetime safety */
+        char *datacopy = MemoryContextAlloc(TopMemoryContext, len);
+        memcpy(datacopy, src, len);
+
+        ht->entries[idx].hash = h;
+        ht->entries[idx].len = len;
+        ht->entries[idx].data = datacopy;
+
+        JIT_FREE_IF_COPY(t, text_datums[i]);
+    }
+
+    return ht;
+}
+
+int32
+text_hash_probe(int64 datum, int64 table_ptr)
+{
+    TextHashTable *ht = (TextHashTable *)(uintptr_t)table_ptr;
+    text *t = DatumGetTextPP((Datum)datum);
+    int len = VARSIZE_ANY_EXHDR(t);
+    const char *data = VARDATA_ANY(t);
+
+    uint32 h = text_hybrid_hash(data, len);
+    uint32 idx = h & ht->mask;
+
+    for (;;)
+    {
+        TextHashEntry *e = &ht->entries[idx];
+
+        if (e->hash == 0)
+        {
+            /* Empty slot — not found */
+            JIT_FREE_IF_COPY(t, (Datum)datum);
+            return 0;
+        }
+
+        if (e->hash == h && e->len == (uint32)len &&
+            sz_equal(data, e->data, len))
+        {
+            /* Found */
+            JIT_FREE_IF_COPY(t, (Datum)datum);
+            return 1;
+        }
+
+        idx = (idx + 1) & ht->mask;
+    }
 }
 
 /* ================================================================

@@ -5,6 +5,8 @@
  */
 #include "postgres.h"
 #include "pg_jitter_common.h"
+#include "pg_jitter_simd.h"
+#include "pg_jitter_pcre2.h"
 #include "pg_jit_funcs.h"
 
 #include "catalog/pg_collation_d.h"
@@ -19,6 +21,8 @@
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/lsyscache.h"
+#include "utils/array.h"
 #include "utils/pg_locale.h"
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
@@ -46,6 +50,12 @@ bool pg_jitter_deform_cache = true;
 
 /* GUC: pg_jitter.min_expr_steps — skip JIT for expressions with fewer steps */
 int pg_jitter_min_expr_steps = 4;
+
+/* GUC: pg_jitter.in_hash — hash table strategy for large IN lists */
+int pg_jitter_in_hash_strategy = IN_HASH_CRC32;
+
+/* GUC: pg_jitter.in_bsearch_max — max IN list size for inline bsearch tree */
+int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
@@ -4310,3 +4320,159 @@ void pg_jitter_win64_deregister_unwind(void *code) {
 
 #endif /* _WIN64 */
 
+/* ================================================================
+ * pg_jitter_setup_shared_in_hash — rebuild process-local text hash
+ * tables for HASHED_SCALARARRAYOP in shared JIT code mode.
+ *
+ * Scans expression steps for EEOP_HASHED_SCALARARRAYOP with text
+ * arrays. For each, extracts text constants from the Const array
+ * node and builds a TextHashTable, storing the pointer in
+ * fcinfo->args[1].value. This is called by both leader (during
+ * compilation) and workers (after DSM code attachment).
+ * ================================================================ */
+void
+pg_jitter_setup_shared_in_hash(ExprState *state,
+                                ExprEvalStep *steps, int steps_len)
+{
+#if PG_VERSION_NUM >= 150000
+  for (int i = 0; i < steps_len; i++)
+  {
+    ExprEvalStep *op = &steps[i];
+    if (op->opcode != EEOP_HASHED_SCALARARRAYOP)
+      continue;
+
+    FunctionCallInfo fcinfo = op->d.hashedscalararrayop.fcinfo_data;
+    ScalarArrayOpExpr *saop = op->d.hashedscalararrayop.saop;
+
+    /* Always (re)build — workers need their own process-local table,
+     * and this is cheap compared to expression evaluation. */
+
+    /* Check for constant text array */
+    Expr *arrayarg = (Expr *)lsecond(saop->args);
+    if (!IsA(arrayarg, Const))
+      continue;
+
+    Const *arrayconst = (Const *)arrayarg;
+    if (arrayconst->constisnull)
+      continue;
+
+    ArrayType *arr = DatumGetArrayTypeP(arrayconst->constvalue);
+    if (ARR_ELEMTYPE(arr) != TEXTOID)
+      continue;
+
+    int nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+    if (nitems <= 0 || nitems > 16384)
+      continue;
+
+    if (!pg_jitter_collation_is_deterministic(fcinfo->fncollation))
+      continue;
+
+    /* Extract text values from array */
+    int16 typlen;
+    bool typbyval;
+    char typalign;
+    get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
+
+    bits8 *bitmap = ARR_NULLBITMAP(arr);
+    char *s = (char *)ARR_DATA_PTR(arr);
+    int bitmask = 1;
+    Datum *text_vals = palloc(nitems * sizeof(Datum));
+    int nvals = 0;
+    bool has_nulls = false;
+
+    for (int k = 0; k < nitems; k++)
+    {
+      if (bitmap && (*bitmap & bitmask) == 0)
+      {
+        has_nulls = true;
+      }
+      else
+      {
+        text_vals[nvals++] = fetch_att(s, false, typlen);
+        s = att_addlength_pointer(s, typlen, s);
+        s = (char *)att_align_nominal(s, typalign);
+      }
+
+      if (bitmap)
+      {
+        bitmask <<= 1;
+        if (bitmask == 0x100)
+        {
+          bitmap++;
+          bitmask = 1;
+        }
+      }
+    }
+
+    if (nvals > 0)
+    {
+      TextHashTable *tht = text_hash_build(text_vals, nvals, has_nulls);
+      fcinfo->args[1].value = PointerGetDatum(tht);
+    }
+    pfree(text_vals);
+  }
+
+  /*
+   * Also rebuild PCRE2 cache entries for LIKE/regex patterns.
+   * Workers need their own process-local Pcre2CacheEntry in
+   * fcinfo->flinfo->fn_extra.
+   */
+#ifdef PG_JITTER_HAVE_PCRE2
+  for (int i = 0; i < steps_len; i++)
+  {
+    ExprEvalStep *op = &steps[i];
+    ExprEvalOp opc = op->opcode;
+
+    if (opc != EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+        && opc != EEOP_FUNCEXPR_STRICT_1
+        && opc != EEOP_FUNCEXPR_STRICT_2
+#endif
+        && opc != EEOP_FUNCEXPR)
+      continue;
+
+    FunctionCallInfo fcinfo2 = op->d.func.fcinfo_data;
+    if (fcinfo2->nargs != 2)
+      continue;
+
+    PGFunction fn = op->d.func.fn_addr;
+    bool is_like = (fn == textlike || fn == textnlike ||
+                    fn == texticlike || fn == texticnlike);
+    bool is_regex = (fn == textregexeq || fn == textregexne ||
+                     fn == texticregexeq || fn == texticregexne);
+
+    if (!is_like && !is_regex)
+      continue;
+
+    /* Check for constant pattern (same logic as JIT compile time) */
+    bool pat_const = true;
+    for (int j = i - 1; j >= 0; j--)
+    {
+      if (steps[j].resvalue == &fcinfo2->args[1].value)
+      {
+        pat_const = (steps[j].opcode == EEOP_CONST);
+        break;
+      }
+    }
+
+    if (!pat_const || fcinfo2->args[1].isnull)
+      continue;
+    if (!pg_jitter_collation_is_deterministic(fcinfo2->fncollation))
+      continue;
+
+    text *pat_text = DatumGetTextPP(fcinfo2->args[1].value);
+    char *pat_str = VARDATA_ANY(pat_text);
+    int pat_len = VARSIZE_ANY_EXHDR(pat_text);
+    bool case_insens = (fn == texticlike || fn == texticnlike ||
+                        fn == texticregexeq || fn == texticregexne);
+
+    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+        pat_str, pat_len, is_like, case_insens);
+
+    if (pe)
+      fcinfo2->flinfo->fn_extra = pe;
+  }
+#endif /* PG_JITTER_HAVE_PCRE2 */
+
+#endif /* PG_VERSION_NUM >= 150000 */
+}
