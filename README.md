@@ -118,6 +118,52 @@ SELECT pg_reload_conf();
 SET pg_jitter.backend = 'asmjit';  -- switch on the fly
 ```
 
+## Configuration
+
+All parameters are user-settable (`SET` in session, `ALTER SYSTEM` for persistent) and take effect without a restart unless noted.
+
+### Backend Selection
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pg_jitter.backend` | enum | `auto` (if 2+ backends installed, else the single available one) | Active JIT backend: `sljit`, `asmjit`, `mir`, or `auto`. The `auto` mode is **experimental** — it uses adaptive statistics to select the fastest backend per expression profile. |
+
+### Parallel Execution
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pg_jitter.parallel_mode` | enum | `per_worker` | Controls JIT in parallel workers. `off` — workers use the PG interpreter. `per_worker` — each worker JIT-compiles independently. `shared` — leader compiles once, workers reuse code via DSM (saves compilation time, slightly higher per-row overhead). The `shared` mode is **experimental** |
+| `pg_jitter.shared_code_max` | integer (KB) | `4096` (4 MB) | Maximum DSM segment size for shared JIT code. Range: 64 KB – 1 GB. |
+
+### Expression Tuning
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pg_jitter.min_expr_steps` | integer | `4` | Minimum expression step count for JIT compilation. Expressions with fewer steps skip JIT and use the interpreter. Range: 0–1000. |
+| `pg_jitter.deform_cache` | boolean | `on` | Cache compiled deform functions across queries within a backend process. When off, deform is recompiled each query. |
+| `pg_jitter.in_bsearch_max` | integer | `4096` | Maximum IN-list elements for inline binary search tree. Larger integer IN-lists use CRC32 hash probe. 0 disables inline binary search. Range: 0–8192. |
+| `pg_jitter.in_hash` | enum | `crc32` | Hash table strategy for large integer IN-lists: `pg` (PG's built-in Jenkins hash), `crc32` (hardware CRC32C open-addressing). |
+
+### Adaptive Backend Selection (experimental)
+
+These parameters only take effect when `pg_jitter.backend = 'auto'`. Statistics are not collected when a specific backend is selected.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pg_jitter.adaptive` | boolean | `on` | Enable adaptive backend selection based on runtime performance statistics. |
+| `pg_jitter.adaptive_samples` | integer | `64` | Number of expression evaluations to time before considering a backend profiled. Range: 4–10000. |
+| `pg_jitter.adaptive_epsilon` | real | `0.05` | Exploration probability (epsilon-greedy). 0.0 = always pick the best measured backend, 1.0 = always pick randomly. Range: 0.0–1.0. |
+
+### PostgreSQL JIT Parameters
+
+These are standard PostgreSQL parameters that control when JIT compilation is triggered:
+
+| Parameter | Default | Recommended for pg_jitter |
+|-----------|---------|---------------------------|
+| `jit_above_cost` | `100000` | `200`–`2000` (pg_jitter compiles in microseconds, not milliseconds) |
+| `jit_inline_above_cost` | `500000` | `500000` (keep default) |
+| `jit_optimize_above_cost` | `500000` | `500000` (keep default) |
+
 ## Architecture
 
 ### Expression Compilation
