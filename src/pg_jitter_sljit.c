@@ -4218,11 +4218,12 @@ static bool sljit_compile_expr(ExprState *state) {
                       l_slow = sljit_emit_label(C);
                       sljit_set_label(j_to_slow, l_slow);
 
-                      /* Reload datum (R0 may have been clobbered) */
-                      if (r1_has_fcinfo)
-                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                                       SLJIT_MEM1(SLJIT_R1), off0);
-                      else {
+                      /*
+                       * Reload datum from step data. Cannot use R1
+                       * (r1_has_fcinfo) here — R1 was clobbered by
+                       * the varlena header byte load above.
+                       */
+                      {
                         emit_load_step_field(
                             C, opno,
                             offsetof(ExprEvalStep, d.func.fcinfo_data),

@@ -722,7 +722,7 @@ echo ""
                 row_fmt+="%12s"
                 row_args+=("$v")
             else
-                speedup=$(echo "scale=2; $baseline / $v" | bc 2>/dev/null || echo "?")
+                speedup=$(printf "%.2f" "$(echo "scale=4; $baseline / $v" | bc 2>/dev/null)" 2>/dev/null || echo "?")
                 row_fmt+="%12s"
                 row_args+=("${v} ${speedup}x")
             fi
@@ -864,7 +864,7 @@ EOF
                 elif [ "$baseline" = "CRASH" ] || [ -z "$baseline" ] || [ "$baseline" = "0" ]; then
                     row+=" ${val} ms |"
                 else
-                    speedup=$(echo "scale=2; $baseline / $val" | bc 2>/dev/null || echo "?")
+                    speedup=$(printf "%.2f" "$(echo "scale=4; $baseline / $val" | bc 2>/dev/null)" 2>/dev/null || echo "?")
                     row+=" ${val} ms (${speedup}x) |"
                 fi
             done
