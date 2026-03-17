@@ -6,7 +6,7 @@
 - **PCRE2 regex/LIKE acceleration**: PCRE2 JIT for Unicode-correct, SIMD-accelerated pattern matching. 2-5x faster ILIKE/regex on all collations.
 - **Text IN-list hash tables**: JIT-compiled hash probe for text `IN (...)` expressions. 1.4x faster for 20-element text IN-lists.
 - **Sparse deform for wide nullable tables**: Byte-level bitmap processing with NEON bulk-zero for tables with 64-500 nullable columns. 1.2-1.5x faster deform.
-- **CASE binary search**: O(log N) binary search replaces O(N) linear scan for monotonic CASE expressions. 4-7x faster for 50-100 branch CASE.
+- **CASE binary search**: O(log N) binary search replaces O(N) linear scan for monotonic CASE expressions. Faster starting from 3-4 CASE branches.
 - **simdjson JSON acceleration**: SIMD-parallel JSON validation and parsing via simdjson for IS JSON, json_in, and jsonb_in.
 - **Parallel shared code correctness**: Fixed multiple shared-mode bugs and enabled text hash + PCRE2 optimizations in shared parallel mode.
 - **Windows support**: Full MSVC build, Win64 SEH unwind registration, CI on Windows.
