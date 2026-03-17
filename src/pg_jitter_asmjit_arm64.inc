@@ -3726,6 +3726,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				 * Text IN-list hash table (independent of eq_dfn).
 				 * For text arrays with deterministic collation, build an
 				 * open-addressing hash table at compile time and probe at runtime.
+				 *
+				 * In shared mode: store table pointer in fcinfo->args[1].value
+				 * (overwriting the const array datum). Workers rebuild the table
+				 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
 				 */
 				if (!sorted_vals)
 				{
@@ -3796,6 +3800,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 										text_vals, text_nvals,
 										text_has_nulls);
 									array_has_nulls = text_has_nulls;
+									/*
+									 * Store table pointer in fcinfo->args[1].value for
+									 * shared mode. Workers will rebuild the table and
+									 * store their own pointer here. In non-shared mode
+									 * this is harmless (overwritten const array datum
+									 * is no longer needed).
+									 */
+									fcinfo->args[1].value = PointerGetDatum(text_ht);
 								}
 								pfree(text_vals);
 							}
@@ -4006,7 +4018,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 					/* Load table pointer */
 					a64::Gp tht_reg = cc.new_gpx("tht");
-					cc.mov(tht_reg, (uint64_t)(uintptr_t)text_ht);
+					if (asmjit_shared_code_mode) {
+						/* Shared mode: load from fcinfo->args[1].value at runtime.
+						 * Each process stores its own TextHashTable* there. */
+						int64_t off_arg1_value =
+							(int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+						cc.ldr(tht_reg, a64::ptr(v_step_base, STEP_OFFSET(opno, d.hashedscalararrayop.fcinfo_data)));
+						cc.ldr(tht_reg, a64::ptr(tht_reg, off_arg1_value));
+					} else {
+						cc.mov(tht_reg, (uint64_t)(uintptr_t)text_ht);
+					}
 
 					/* Call text_hash_probe(datum, table_ptr) */
 					a64::Gp fn_th = cc.new_gpx();

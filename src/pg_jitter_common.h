@@ -508,4 +508,17 @@ extern Datum pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc 
 /* Returns the appropriate helper function for the given pattern. */
 extern void *pg_jitter_select_bsearch_helper(const CaseBSearchInfo *cbi);
 
+/*
+ * Shared-mode setup for IN-list hash tables and PCRE2 patterns.
+ *
+ * Called by both leader (during compilation) and workers (after DSM
+ * attachment). Scans expression steps for HASHED_SCALARARRAYOP with
+ * text arrays and builds process-local TextHashTable, storing the
+ * pointer in fcinfo->args[1].value. Also rebuilds PCRE2 cache
+ * entries for any regex/LIKE patterns used in the expression.
+ */
+extern void pg_jitter_setup_shared_in_hash(ExprState *state,
+                                            ExprEvalStep *steps,
+                                            int steps_len);
+
 #endif /* PG_JITTER_COMMON_H */

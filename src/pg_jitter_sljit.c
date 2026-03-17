@@ -2702,10 +2702,12 @@ static bool sljit_compile_expr(ExprState *state) {
 
         pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
 
-        /* Worker: set up binary search arrays for CASE optimization.
-         * Leader stored desc pointers in step data; worker needs its own. */
+        /* Worker: set up process-local data structures.
+         * Leader stored pointers in step data; worker needs its own. */
         pg_jitter_setup_case_bsearch_arrays(state, state->steps,
                                              state->steps_len);
+        pg_jitter_setup_shared_in_hash(state, state->steps,
+                                        state->steps_len);
 
         pg_jitter_install_expr(state, (ExprStateEvalFunc)code_ptr);
 
@@ -4354,6 +4356,83 @@ static bool sljit_compile_expr(ExprState *state) {
                 }
               }
             }
+
+            /*
+             * Shared-mode PCRE2 path: compile pattern, store pe in
+             * flinfo->fn_extra, emit C wrapper call that loads pe
+             * from step data at runtime.  Workers rebuild their own
+             * PCRE2 cache entries via pg_jitter_setup_shared_in_hash().
+             */
+#ifdef PG_JITTER_HAVE_PCRE2
+            if (!vs_handled && sljit_shared_code_mode) {
+              PGFunction fn = op->d.func.fn_addr;
+              bool is_like_fn = (fn == textlike || fn == textnlike);
+              bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
+              bool is_regex_fn = (fn == textregexeq || fn == textregexne);
+              bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
+
+              if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+                  fcinfo->nargs == 2) {
+                bool pat_const = true;
+                for (int j = opno - 1; j >= 0; j--) {
+                  if (steps[j].resvalue == &fcinfo->args[1].value) {
+                    pat_const = (steps[j].opcode == EEOP_CONST);
+                    break;
+                  }
+                }
+                bool collation_ok =
+                    pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+
+                if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
+                  text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
+                  char *pat_str = VARDATA_ANY(pat_text);
+                  int pat_len = VARSIZE_ANY_EXHDR(pat_text);
+                  bool is_like = is_like_fn || is_ilike_fn;
+                  bool case_insens = is_ilike_fn || is_iregex_fn;
+                  bool vs_negate = (fn == textnlike || fn == texticnlike ||
+                                    fn == textregexne || fn == texticregexne);
+
+                  Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+                      pat_str, pat_len, is_like, case_insens);
+
+                  if (pe) {
+                    /* Store pe in flinfo->fn_extra for workers */
+                    fcinfo->flinfo->fn_extra = pe;
+
+                    /* Load datum from fcinfo->args[0].value */
+                    sljit_sw off0 =
+                        (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
+                    emit_load_step_field(
+                        C, opno,
+                        offsetof(ExprEvalStep, d.func.fcinfo_data),
+                        SLJIT_R2);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(SLJIT_R2), off0);
+
+                    /* Load pe from fcinfo->flinfo->fn_extra */
+                    sljit_sw off_flinfo =
+                        offsetof(FunctionCallInfoBaseData, flinfo);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                   SLJIT_MEM1(SLJIT_R2), off_flinfo);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                   SLJIT_MEM1(SLJIT_R1),
+                                   offsetof(FmgrInfo, fn_extra));
+
+                    /* Call pg_jitter_pcre2_match_text(datum, pe) */
+                    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                               pg_jitter_pcre2_match_text);
+
+                    if (vs_negate)
+                      sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
+                                     SLJIT_R0, 0, SLJIT_IMM, 1);
+
+                    emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                    vs_handled = true;
+                  }
+                }
+              }
+            }
+#endif /* PG_JITTER_HAVE_PCRE2 */
 
             if (!vs_handled) {
               /*
@@ -6607,6 +6686,10 @@ static bool sljit_compile_expr(ExprState *state) {
        * Text IN-list hash table (independent of eq_dfn).
        * For text arrays with deterministic collation, build an
        * open-addressing hash table at compile time and probe at runtime.
+       *
+       * In shared mode: store table pointer in fcinfo->args[1].value
+       * (overwriting the const array datum). Workers rebuild the table
+       * via pg_jitter_setup_shared_in_hash() after DSM attachment.
        */
       if (!sorted_vals) {
         Expr *arrayarg_t = (Expr *)lsecond(saop->args);
@@ -6656,6 +6739,14 @@ static bool sljit_compile_expr(ExprState *state) {
                 text_ht = text_hash_build(text_vals, text_nvals,
                                            text_has_nulls);
                 array_has_nulls = text_has_nulls;
+                /*
+                 * Store table pointer in fcinfo->args[1].value for
+                 * shared mode. Workers will rebuild the table and
+                 * store their own pointer here. In non-shared mode
+                 * this is harmless (overwritten const array datum
+                 * is no longer needed).
+                 */
+                fcinfo->args[1].value = PointerGetDatum(text_ht);
               }
               pfree(text_vals);
             }
@@ -6883,8 +6974,9 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_set_label(j_done_null, lbl_done);
 
         pfree(sorted_vals);
-      } else if (sorted_vals && nvals > 0) {
-        /* sorted_vals is only set for typbyval int4/int8 types */
+      } else if (sorted_vals && nvals > 0 && !sljit_shared_code_mode) {
+        /* sorted_vals is only set for typbyval int4/int8 types.
+         * Skip in shared mode: ht_table pointer is process-local. */
         /*
          * ---- Inline CRC32 hash probe (> 512 elements) ----
          *
@@ -7083,8 +7175,21 @@ static bool sljit_compile_expr(ExprState *state) {
                        SLJIT_MEM1(SLJIT_R0), off_arg0_value_th);
 
         /* R1 = text hash table pointer */
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                       SLJIT_IMM, (sljit_sw)text_ht);
+        if (sljit_shared_code_mode) {
+          /* Shared mode: load from fcinfo->args[1].value at runtime.
+           * Each process stores its own TextHashTable* there. */
+          sljit_sw off_arg1_value =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno,
+              offsetof(ExprEvalStep, d.hashedscalararrayop.fcinfo_data),
+              SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                         SLJIT_MEM1(SLJIT_R1), off_arg1_value);
+        } else {
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                         SLJIT_IMM, (sljit_sw)text_ht);
+        }
 
         /* Call text_hash_probe(datum, table_ptr) → R0 = 0/1 */
         EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),

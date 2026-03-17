@@ -663,9 +663,12 @@ static bool mir_compile_expr(ExprState *state) {
 
         pg_jitter_register_compiled(jctx, pg_jitter_exec_free, handle);
 
-        /* Worker: set up binary search arrays for CASE optimization */
+        /* Worker: set up process-local data structures.
+         * Leader stored pointers in step data; worker needs its own. */
         pg_jitter_setup_case_bsearch_arrays(state, state->steps,
                                              state->steps_len);
+        pg_jitter_setup_shared_in_hash(state, state->steps,
+                                        state->steps_len);
 
         pg_jitter_install_expr(state, (ExprStateEvalFunc)code_ptr);
 
@@ -4648,6 +4651,12 @@ static bool mir_compile_expr(ExprState *state) {
 
       /*
        * Text IN-list hash table (independent of eq_dfn).
+       * For text arrays with deterministic collation, build an
+       * open-addressing hash table at compile time and probe at runtime.
+       *
+       * In shared mode: store table pointer in fcinfo->args[1].value
+       * (overwriting the const array datum). Workers rebuild the table
+       * via pg_jitter_setup_shared_in_hash() after DSM attachment.
        */
       if (!sorted_vals) {
         Expr *arrayarg_t = (Expr *)lsecond(saop->args);
@@ -4697,6 +4706,14 @@ static bool mir_compile_expr(ExprState *state) {
                 text_ht = text_hash_build(text_vals, text_nvals,
                                            text_has_nulls);
                 array_has_nulls = text_has_nulls;
+                /*
+                 * Store table pointer in fcinfo->args[1].value for
+                 * shared mode. Workers will rebuild the table and
+                 * store their own pointer here. In non-shared mode
+                 * this is harmless (overwritten const array datum
+                 * is no longer needed).
+                 */
+                fcinfo->args[1].value = PointerGetDatum(text_ht);
               }
               pfree(text_vals);
             }
@@ -4969,10 +4986,23 @@ static bool mir_compile_expr(ExprState *state) {
                 MIR_new_mem_op(ctx, MIR_T_I64, off_arg0_value_th, r_tmp1, 0, 1)));
 
         /* Load table pointer */
-        MIR_append_insn(
-            ctx, func_item,
-            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
-                         MIR_new_int_op(ctx, (int64_t)(uintptr_t)text_ht)));
+        if (mir_shared_code_mode) {
+          /* Shared mode: load from fcinfo->args[1].value at runtime.
+           * Each process stores its own TextHashTable* there. */
+          int64_t off_arg1_value_th =
+              (int64_t)((char *)&fcinfo->args[1].value - (char *)fcinfo);
+          MIR_STEP_LOAD(r_tmp2, opno, d.hashedscalararrayop.fcinfo_data);
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(
+                  ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                  MIR_new_mem_op(ctx, MIR_T_I64, off_arg1_value_th, r_tmp2, 0, 1)));
+        } else {
+          MIR_append_insn(
+              ctx, func_item,
+              MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
+                           MIR_new_int_op(ctx, (int64_t)(uintptr_t)text_ht)));
+        }
 
         /* Call text_hash_probe(datum, table_ptr) -> I32 result */
         {
