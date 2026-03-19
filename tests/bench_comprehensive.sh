@@ -528,6 +528,38 @@ branches = [f\"WHEN 'row_{i*20000+1}' THEN {i+1}\" for i in range(50)]
 print(f\"SELECT SUM(CASE txt {' '.join(branches)} ELSE 0 END) FROM bench_data\")
 ")"
 
+# Range CASE: WHEN val >= low AND val < high (contiguous intervals)
+add_query "CASE_range_50"      "$(python3 -c "
+branches = [f'WHEN val1 >= {i*200} AND val1 < {(i+1)*200} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# Timestamptz range CASE: 30 day-buckets with computed results (non-constant THEN)
+add_query "CASE_ts_range_30"   "$(python3 -c "
+from datetime import date, timedelta
+branches = []
+for i in range(30):
+    d = date(2000,1,1) + timedelta(days=i)
+    d2 = d + timedelta(days=1)
+    branches.append(f\"WHEN ts >= '{d}'::timestamptz AND ts < '{d2}'::timestamptz THEN ts + interval '{(i+1)*10} seconds'\")
+print(f\"SELECT count(*), min(adjusted), max(adjusted) FROM (SELECT CASE {' '.join(branches)} ELSE ts END AS adjusted FROM date_data) sub\")
+")"
+
+# WHEN val > N (descending thresholds, 50 branches)
+add_query "CASE_gt_50"         "$(python3 -c "
+branches = [f'WHEN val1 > {10000 - i*200} THEN {50-i}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# WHEN val BETWEEN low AND high (inclusive, 50 branches)
+add_query "CASE_between_50"    "$(python3 -c "
+branches = [f'WHEN val1 BETWEEN {i*200} AND {(i+1)*200-1} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# 3-level nested CASE (range + lt + equality, ~60% ELSE at each level)
+add_query "CASE_nested_3lvl"   "SELECT SUM(r) FROM (SELECT CASE WHEN val1 >= 0 AND val1 < 1000 THEN CASE WHEN val2 < 1000 THEN CASE val3 WHEN 1 THEN 100 WHEN 2 THEN 200 WHEN 3 THEN 300 WHEN 4 THEN 400 ELSE -1 END WHEN val2 < 2000 THEN 10 WHEN val2 < 3000 THEN 20 WHEN val2 < 4000 THEN 30 ELSE -2 END WHEN val1 >= 1000 AND val1 < 2000 THEN 1 WHEN val1 >= 2000 AND val1 < 3000 THEN 2 WHEN val1 >= 3000 AND val1 < 4000 THEN 3 ELSE -3 END AS r FROM bench_data) sub"
+
 NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""

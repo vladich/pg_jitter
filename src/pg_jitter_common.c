@@ -3039,6 +3039,8 @@ pg_jitter_detect_case_bsearch(ExprState *state,
       cbi->is_equality = is_equality;
       cbi->is_less = is_less;
       cbi->is_inclusive = is_inclusive;
+      cbi->is_range = false;
+      cbi->range_stride = STRIDE;
       cbi->cmp_fn = cmp_fn;
       cbi->bs_type = bs_type;
       cbi->var_opno = i;  /* representative VAR step */
@@ -3078,6 +3080,8 @@ pg_jitter_detect_case_bsearch(ExprState *state,
         desc->cmp_collation = (bs_type == CASE_BS_GENERIC)
             ? steps[i + 1].d.func.fcinfo_data->fncollation : InvalidOid;
         desc->default_val = steps[j].d.constval.value;
+        desc->range_min = (Datum)0;
+        desc->has_range_min = false;
 
         /* Copy thresholds from fcinfo->args[1].value */
         switch (bs_type)
@@ -3247,6 +3251,302 @@ pg_jitter_detect_case_bsearch(ExprState *state,
     i = end_jump_target;
   }
 
+  /*
+   * Second pass: detect range CASE patterns (WHEN val >= low AND val < high).
+   *
+   * Each branch has 8 steps:
+   *   [+0] VAR (val)
+   *   [+1] FUNCEXPR_STRICT (val >= low)
+   *   [+2] JUMP_IF_NOT_TRUE → next branch
+   *   [+3] VAR (val)
+   *   [+4] FUNCEXPR_STRICT (val < high)
+   *   [+5] JUMP_IF_NOT_TRUE → next branch
+   *   [+6] CONST (result)
+   *   [+7] JUMP → end
+   *
+   * If ranges are contiguous (high_i == low_{i+1}), we extract the
+   * upper boundaries and reuse the existing _lt binary search helper.
+   */
+  {
+    /*
+     * Range CASE: WHEN var >= low AND var < high THEN result
+     *
+     * WHEN prefix is always 7 steps:
+     *   [+0] VAR          [+1] FUNCEXPR_STRICT (>=)
+     *   [+2] AND_STEP     [+3] VAR
+     *   [+4] FUNCEXPR_STRICT (<)  [+5] AND_STEP
+     *   [+6] JUMP_IF_NOT_TRUE
+     *
+     * THEN expression: variable length (1+ steps), ends with EEOP_JUMP → end.
+     * We find each branch boundary by scanning for the JUMP → end target.
+     *
+     * Binary search returns branch index. JIT code dispatches to the
+     * matched THEN step via compare-and-jump sequence.
+     */
+    #define RANGE_WHEN_LEN 7  /* fixed WHEN prefix length */
+    #define MAX_RANGE_BRANCHES 128
+
+    i = 0;
+
+    while (i + RANGE_WHEN_LEN < steps_len && nfound < max_patterns)
+    {
+      ExprEvalOp op0 = ExecEvalStepOp(state, &steps[i]);
+      if (!is_var_opcode(op0)) { i++; continue; }
+      if (i + RANGE_WHEN_LEN >= steps_len) break;
+
+      ExprEvalOp op1 = ExecEvalStepOp(state, &steps[i + 1]);
+      ExprEvalOp op2 = ExecEvalStepOp(state, &steps[i + 2]);
+      ExprEvalOp op3 = ExecEvalStepOp(state, &steps[i + 3]);
+      ExprEvalOp op4 = ExecEvalStepOp(state, &steps[i + 4]);
+      ExprEvalOp op5 = ExecEvalStepOp(state, &steps[i + 5]);
+      ExprEvalOp op6 = ExecEvalStepOp(state, &steps[i + 6]);
+
+      bool op2_and = (op2 == EEOP_QUAL || op2 == EEOP_BOOL_AND_STEP_FIRST ||
+                      op2 == EEOP_BOOL_AND_STEP);
+      bool op5_and = (op5 == EEOP_QUAL || op5 == EEOP_BOOL_AND_STEP_LAST ||
+                      op5 == EEOP_BOOL_AND_STEP);
+
+      if (!is_funcexpr_strict(op1) || !op2_and ||
+          !is_var_opcode(op3) || !is_funcexpr_strict(op4) ||
+          !op5_and || op6 != EEOP_JUMP_IF_NOT_TRUE)
+      { i++; continue; }
+
+      if (!same_var(state, &steps[i], &steps[i + 3]))
+      { i++; continue; }
+
+      /* Classify comparisons */
+      PGFunction ge_fn = steps[i + 1].d.func.fn_addr;
+      PGFunction lt_fn = steps[i + 4].d.func.fn_addr;
+      bool ge_eq, ge_less, ge_incl, lt_eq, lt_less, lt_incl;
+      CaseBSearchType ge_type, lt_type;
+
+      if (!classify_cmp_fn(ge_fn, NULL, &ge_eq, &ge_less, &ge_incl, &ge_type) ||
+          !classify_cmp_fn(lt_fn, NULL, &lt_eq, &lt_less, &lt_incl, &lt_type))
+      { i++; continue; }
+
+      if (ge_eq || ge_less || !ge_incl) { i++; continue; }  /* must be >= */
+      if (lt_eq || !lt_less) { i++; continue; }              /* must be < or <= */
+      if (ge_type != lt_type) { i++; continue; }
+
+      bool upper_inclusive = lt_incl;
+      CaseBSearchType bs_type = lt_type;
+
+      if (steps[i + 1].d.func.fcinfo_data->args[1].isnull ||
+          steps[i + 4].d.func.fcinfo_data->args[1].isnull)
+      { i++; continue; }
+
+      /* Find end of first branch: scan for EEOP_JUMP after JINT */
+      int then_start = i + RANGE_WHEN_LEN;  /* first step of THEN */
+      int jump_pos = -1;
+      for (int s = then_start; s < steps_len && s < then_start + 20; s++)
+      {
+        if (ExecEvalStepOp(state, &steps[s]) == EEOP_JUMP)
+        { jump_pos = s; break; }
+      }
+      if (jump_pos < 0) { i++; continue; }
+
+      int end_jump_target = steps[jump_pos].d.jump.jumpdone;
+      int branch_stride = jump_pos + 1 - i;
+
+      /* Collect all branches */
+      int then_steps[MAX_RANGE_BRANCHES];
+      then_steps[0] = then_start;
+      int branch_count = 1;
+      int j = jump_pos + 1;  /* start of next branch */
+
+      while (j + RANGE_WHEN_LEN < steps_len && branch_count < MAX_RANGE_BRANCHES)
+      {
+        /* Check 7-step WHEN prefix */
+        ExprEvalOp b0 = ExecEvalStepOp(state, &steps[j]);
+        ExprEvalOp b1 = ExecEvalStepOp(state, &steps[j + 1]);
+        ExprEvalOp b2 = ExecEvalStepOp(state, &steps[j + 2]);
+        ExprEvalOp b3 = ExecEvalStepOp(state, &steps[j + 3]);
+        ExprEvalOp b4 = ExecEvalStepOp(state, &steps[j + 4]);
+        ExprEvalOp b5 = ExecEvalStepOp(state, &steps[j + 5]);
+        ExprEvalOp b6 = ExecEvalStepOp(state, &steps[j + 6]);
+
+        bool b2a = (b2 == EEOP_QUAL || b2 == EEOP_BOOL_AND_STEP_FIRST || b2 == EEOP_BOOL_AND_STEP);
+        bool b5a = (b5 == EEOP_QUAL || b5 == EEOP_BOOL_AND_STEP_LAST || b5 == EEOP_BOOL_AND_STEP);
+
+        if (!is_var_opcode(b0) || !is_funcexpr_strict(b1) || !b2a ||
+            !is_var_opcode(b3) || !is_funcexpr_strict(b4) || !b5a ||
+            b6 != EEOP_JUMP_IF_NOT_TRUE)
+          break;
+
+        if (!same_var(state, &steps[i], &steps[j]) ||
+            !same_var(state, &steps[i], &steps[j + 3]))
+          break;
+
+        if (steps[j + 1].d.func.fn_addr != ge_fn || steps[j + 4].d.func.fn_addr != lt_fn)
+          break;
+        if (steps[j + 1].d.func.fcinfo_data->args[1].isnull ||
+            steps[j + 4].d.func.fcinfo_data->args[1].isnull)
+          break;
+
+        /* Find JUMP → end for this branch */
+        int b_then = j + RANGE_WHEN_LEN;
+        int b_jump = -1;
+        for (int s = b_then; s < steps_len && s < b_then + 20; s++)
+        {
+          if (ExecEvalStepOp(state, &steps[s]) == EEOP_JUMP &&
+              steps[s].d.jump.jumpdone == end_jump_target)
+          { b_jump = s; break; }
+        }
+        if (b_jump < 0) break;
+
+        then_steps[branch_count] = b_then;
+        branch_count++;
+        j = b_jump + 1;
+      }
+
+      if (branch_count < CASE_BSEARCH_MIN_BRANCHES)
+      { i = j; continue; }
+
+      /* Verify contiguity */
+      bool contiguous = true;
+      for (int k = 0; k < branch_count - 1 && contiguous; k++)
+      {
+        int cur_upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+        int next_lower_step = then_steps[k + 1] - RANGE_WHEN_LEN + 1;
+        Datum high_k = steps[cur_upper_step].d.func.fcinfo_data->args[1].value;
+        Datum low_next = steps[next_lower_step].d.func.fcinfo_data->args[1].value;
+        int64 hi, lo;
+
+        switch (bs_type) {
+          case CASE_BS_I32: hi = DatumGetInt32(high_k); lo = DatumGetInt32(low_next); break;
+          case CASE_BS_I64: hi = DatumGetInt64(high_k); lo = DatumGetInt64(low_next); break;
+          case CASE_BS_I16: hi = (int16)DatumGetInt32(high_k); lo = (int16)DatumGetInt32(low_next); break;
+          default: contiguous = false; continue;
+        }
+        if ((upper_inclusive ? hi + 1 : hi) != lo) contiguous = false;
+      }
+
+      if (!contiguous) { i = j; continue; }
+
+      /* Check for ELSE at j */
+      if (j >= steps_len) { i++; continue; }
+
+      /* Build CaseBSearchInfo — store branch indices in results */
+      {
+        CaseBSearchInfo *cbi = &out[nfound];
+        int8 var_type = bs_type_to_var_type(bs_type);
+
+        cbi->start_opno = i;
+        cbi->end_opno = j;  /* ELSE start */
+        cbi->else_end_opno = end_jump_target;
+        cbi->num_branches = branch_count;
+        cbi->is_equality = false;
+        cbi->is_less = true;
+        cbi->is_inclusive = false;
+        cbi->is_range = true;
+        cbi->range_stride = 0;  /* variable stride — use then_steps[] */
+        cbi->cmp_fn = lt_fn;
+        cbi->bs_type = bs_type;
+        cbi->var_opno = i;
+        cbi->var_type = var_type;
+        cbi->default_result = Int64GetDatum(branch_count);  /* ELSE = index N */
+        cbi->default_is_null = false;
+
+        Size thresh_elem = (bs_type == CASE_BS_I64) ? sizeof(int64) : sizeof(int32);
+        Size desc_size = sizeof(CaseBSearchDesc) +
+                         thresh_elem * branch_count +
+                         sizeof(Datum) * branch_count;
+        CaseBSearchDesc *desc = palloc(desc_size);
+        char *ptr = (char *)desc + sizeof(CaseBSearchDesc);
+
+        desc->n = branch_count;
+        desc->bs_type = (uint8)bs_type;
+        desc->cmp_fn = NULL;
+        desc->cmp_order_fn = NULL;
+        desc->cmp_collation = InvalidOid;
+        desc->default_val = Int64GetDatum(branch_count);
+
+        /* Store first range's lower bound for boundary check */
+        {
+          int first_lower_step = then_steps[0] - RANGE_WHEN_LEN + 1;
+          desc->range_min = steps[first_lower_step].d.func.fcinfo_data->args[1].value;
+          desc->has_range_min = true;
+        }
+
+        /* Extract upper boundaries */
+        switch (bs_type)
+        {
+          case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16: {
+            int32 *thresh = (int32 *)ptr;
+            for (int k = 0; k < branch_count; k++) {
+              int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+              int32 v = DatumGetInt32(steps[upper_step].d.func.fcinfo_data->args[1].value);
+              thresh[k] = upper_inclusive ? v + 1 : v;
+            }
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          case CASE_BS_I64: {
+            int64 *thresh = (int64 *)ptr;
+            for (int k = 0; k < branch_count; k++) {
+              int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+              int64 v = DatumGetInt64(steps[upper_step].d.func.fcinfo_data->args[1].value);
+              thresh[k] = upper_inclusive ? v + 1 : v;
+            }
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          default: {
+            Datum *thresh = (Datum *)ptr;
+            for (int k = 0; k < branch_count; k++) {
+              int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+              thresh[k] = steps[upper_step].d.func.fcinfo_data->args[1].value;
+            }
+            cbi->thresholds = thresh;
+            break;
+          }
+        }
+        ptr += thresh_elem * branch_count;
+
+        /* Check if all THEN steps are EEOP_CONST.
+         * If so, store values directly → O(log N) binary search returns result.
+         * If not, store step indices → O(N) compare-and-jump dispatch. */
+        {
+          bool all_const = true;
+          for (int k = 0; k < branch_count; k++) {
+            if (ExecEvalStepOp(state, &steps[then_steps[k]]) != EEOP_CONST ||
+                steps[then_steps[k]].d.constval.isnull) {
+              all_const = false;
+              break;
+            }
+          }
+
+          Datum *res = (Datum *)ptr;
+          if (all_const) {
+            /* Direct return: store CONST values, use non-range path */
+            for (int k = 0; k < branch_count; k++)
+              res[k] = steps[then_steps[k]].d.constval.value;
+            cbi->is_range = false;
+            /* Also fix default for ELSE */
+            if (j < steps_len && ExecEvalStepOp(state, &steps[j]) == EEOP_CONST) {
+              cbi->default_result = steps[j].d.constval.value;
+              cbi->default_is_null = steps[j].d.constval.isnull;
+              desc->default_val = steps[j].d.constval.value;
+            }
+          } else {
+            /*
+             * Non-constant THEN: only SLJIT supports the is_range
+             * jump dispatch. MIR/AsmJIT would misinterpret step
+             * indices as result values. Skip this pattern.
+             */
+            pfree(desc);
+            i = end_jump_target;
+            continue;
+          }
+          cbi->results = res;
+        }
+
+        nfound++;
+      }
+      i = end_jump_target;
+    }
+  }
+
   return nfound;
 }
 
@@ -3319,6 +3619,11 @@ pg_jitter_case_bsearch_lt_i32(int32 val, const CaseBSearchDesc *desc)
   const int32 *thresholds = BSEARCH_THRESH_I32(desc);
   const Datum *results = BSEARCH_RESULTS_I32(desc);
   int n = desc->n;
+
+  /* Range CASE: check first range's lower bound */
+  if (desc->has_range_min && val < DatumGetInt32(desc->range_min))
+    return desc->default_val;
+
   int lo = 0, hi = n;
   while (lo < hi)
   {
@@ -3355,6 +3660,11 @@ pg_jitter_case_bsearch_lt_i64(int64 val, const CaseBSearchDesc *desc)
   const int64 *thresholds = BSEARCH_THRESH_I64(desc);
   const Datum *results = BSEARCH_RESULTS_I64(desc);
   int n = desc->n;
+
+  /* Range CASE: check first range's lower bound */
+  if (desc->has_range_min && val < DatumGetInt64(desc->range_min))
+    return desc->default_val;
+
   int lo = 0, hi = n;
   while (lo < hi)
   {
