@@ -411,6 +411,8 @@ typedef struct CaseBSearchInfo {
 	bool        is_equality;    /* Pattern B (=) vs Pattern A (</<=/>/>=) */
 	bool        is_less;        /* true for </<=, false for >/>=  */
 	bool        is_inclusive;   /* true for <=/>= */
+	bool        is_range;       /* true for range CASE (WHEN x >= lo AND x < hi) */
+	int         range_stride;   /* steps per branch (9 for range, 5 for single) */
 	PGFunction  cmp_fn;         /* comparison function address */
 	CaseBSearchType bs_type;    /* type discriminator for helper selection */
 	/* Arrays allocated in CurrentMemoryContext, length = num_branches */
@@ -448,6 +450,8 @@ typedef struct CaseBSearchDesc {
 	PGFunction  cmp_order_fn;   /* for CASE_BS_GENERIC eq: _lt function for binary search order */
 	Oid         cmp_collation;  /* for CASE_BS_GENERIC: collation OID */
 	Datum       default_val;    /* ELSE result */
+	Datum       range_min;      /* for range CASE: lower bound of first range */
+	bool        has_range_min;  /* true if range_min should be checked */
 	/* thresholds: int32[n] or int64[n] or Datum[n] immediately after this header */
 	/* results:    Datum[n] after thresholds */
 } CaseBSearchDesc;

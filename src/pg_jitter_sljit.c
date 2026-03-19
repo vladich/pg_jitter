@@ -3062,50 +3062,89 @@ static bool sljit_compile_expr(ExprState *state) {
       /* Call helper: R0=val, R1=desc → returns Datum in R0 */
       EMIT_ICALL(C, SLJIT_CALL, call_type, helper_fn);
 
-      /* Store result to the ELSE step's resvalue/resnull (= CASE output).
-       * The ELSE CONST step at end_opno is the last CONST before else_end_opno. */
-      {
+      if (cbi->is_range) {
+        /*
+         * Range CASE: R0 = THEN step index (from results[]).
+         * default_val = branch_count = ELSE.
+         * Dispatch to the matched branch's THEN step via
+         * compare-and-jump. Each THEN evaluates, then its
+         * existing JUMP → end_of_case handles the rest.
+         */
+        int n = cbi->num_branches;
+        for (int k = 0; k < n; k++) {
+          int then_step = (int)DatumGetInt64(cbi->results[k]);
+          struct sljit_jump *j = sljit_emit_cmp(C, SLJIT_EQUAL,
+              SLJIT_R0, 0, SLJIT_IMM, then_step);
+          pending_jumps[npending].jump = j;
+          pending_jumps[npending].target = then_step;
+          npending++;
+        }
+        /* Default: ELSE step */
+        {
+          struct sljit_jump *j = sljit_emit_jump(C, SLJIT_JUMP);
+          pending_jumps[npending].jump = j;
+          pending_jumps[npending].target = cbi->end_opno;
+          npending++;
+        }
+
+        /* Null path → ELSE */
+        sljit_set_label(null_jump, sljit_emit_label(C));
+        {
+          struct sljit_jump *j = sljit_emit_jump(C, SLJIT_JUMP);
+          pending_jumps[npending].jump = j;
+          pending_jumps[npending].target = cbi->end_opno;
+          npending++;
+        }
+
+        /* Don't skip steps — they compile normally so THEN
+         * expressions are reachable via the dispatch jumps.
+         * But skip the fall-through to avoid executing the
+         * WHEN conditions linearly after the binary search. */
+        {
+          struct sljit_jump *skip_linear = sljit_emit_jump(C, SLJIT_JUMP);
+          pending_jumps[npending].jump = skip_linear;
+          pending_jumps[npending].target = cbi->else_end_opno;
+          npending++;
+        }
+        next_bsearch_idx++;
+        /* Fall through to compile start_opno+1 (dead code at runtime) */
+
+      } else {
+        /* Single-comparison CASE: R0 = result Datum */
         ExprEvalStep *else_op = &steps[cbi->end_opno];
-        /* R0 has the result from helper. emit_store_resvalue clobbers R1. */
         emit_store_resvalue(C, state, cbi->end_opno, else_op, SLJIT_R0);
         emit_store_resnull_false(C, state, cbi->end_opno, else_op);
+
+        struct sljit_jump *done_jump = sljit_emit_jump(C, SLJIT_JUMP);
+        pending_jumps[npending].jump = done_jump;
+        pending_jumps[npending].target = cbi->else_end_opno;
+        npending++;
+
+        /* Null path */
+        sljit_set_label(null_jump, sljit_emit_label(C));
+        {
+          ExprEvalStep *else_op2 = &steps[cbi->end_opno];
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM,
+                         (sljit_sw)cbi->default_result);
+          emit_store_resvalue(C, state, cbi->end_opno, else_op2, SLJIT_R0);
+          if (cbi->default_is_null)
+            emit_store_resnull_true(C, state, cbi->end_opno, else_op2);
+          else
+            emit_store_resnull_false(C, state, cbi->end_opno, else_op2);
+        }
+
+        struct sljit_jump *null_done = sljit_emit_jump(C, SLJIT_JUMP);
+        pending_jumps[npending].jump = null_done;
+        pending_jumps[npending].target = cbi->else_end_opno;
+        npending++;
+
+        /* Skip pattern steps */
+        for (int skip = opno + 1; skip < cbi->else_end_opno && skip < steps_len; skip++)
+          step_labels[skip] = sljit_emit_label(C);
+        opno = cbi->else_end_opno - 1;
+        next_bsearch_idx++;
+        continue;
       }
-
-      /* Jump to else_end_opno (after the CASE) */
-      struct sljit_jump *done_jump = sljit_emit_jump(C, SLJIT_JUMP);
-      pending_jumps[npending].jump = done_jump;
-      pending_jumps[npending].target = cbi->else_end_opno;
-      npending++;
-
-      /* Null path: variable was NULL → use default result */
-      sljit_set_label(null_jump, sljit_emit_label(C));
-      {
-        ExprEvalStep *else_op = &steps[cbi->end_opno];
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM,
-                       (sljit_sw)cbi->default_result);
-        emit_store_resvalue(C, state, cbi->end_opno, else_op, SLJIT_R0);
-        if (cbi->default_is_null)
-          emit_store_resnull_true(C, state, cbi->end_opno, else_op);
-        else
-          emit_store_resnull_false(C, state, cbi->end_opno, else_op);
-      }
-
-      struct sljit_jump *null_done = sljit_emit_jump(C, SLJIT_JUMP);
-      pending_jumps[npending].jump = null_done;
-      pending_jumps[npending].target = cbi->else_end_opno;
-      npending++;
-
-      /* Skip the remaining steps of this pattern.
-       * Bind labels for skipped steps so jumps from other patterns
-       * (or the pattern's own JINTs) can still resolve. */
-      for (int skip = opno + 1; skip < cbi->else_end_opno && skip < steps_len; skip++) {
-        step_labels[skip] = sljit_emit_label(C);
-      }
-
-      /* Advance opno past the pattern (loop will increment) */
-      opno = cbi->else_end_opno - 1;
-      next_bsearch_idx++;
-      continue;
     }
 
     /*
