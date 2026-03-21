@@ -2375,51 +2375,46 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   /* 9. data_len > 7: SIMD path for 8-16 bytes, memcmp for >16 */
   sljit_set_label(j_big, sljit_emit_label(C));
   {
-    struct sljit_jump *j_very_big, *j_simd_ne, *j_memcmp_eq2;
-    j_very_big = sljit_emit_cmp(C, SLJIT_GREATER, SLJIT_R2, 0, SLJIT_IMM, 16);
+    struct sljit_jump *j_simd_ne = NULL, *j_memcmp_eq2;
+    int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
+    bool has_simd_cmpeq = (sljit_emit_simd_op2(C,
+        simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
+        SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
 
-    /*
-     * SIMD 8-16 byte comparison:
-     *   1. Load 16 bytes from each string (skip 1-byte header)
-     *   2. CMPEQ byte-by-byte: matching bytes → 0xFF, different → 0x00
-     *   3. Extract sign bits (MSB of each byte)
-     *   4. Mask to data_len bits, check if all set (all equal)
-     */
-    {
-      int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
+    /* If SIMD available: data_len > 16 → memcmp. Otherwise all > 7 → memcmp. */
+    struct sljit_jump *j_memcmp_path = sljit_emit_cmp(C, SLJIT_GREATER,
+        SLJIT_R2, 0, SLJIT_IMM, has_simd_cmpeq ? 16 : 0);
+
+    if (has_simd_cmpeq) {
+      /* SIMD 8-16 byte path: load 16 bytes, CMPEQ, sign, mask */
       sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
       sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
       sljit_emit_simd_mov(C, simd_type | SLJIT_SIMD_LOAD, SLJIT_FR0,
                            SLJIT_MEM1(SLJIT_R0), 0);
       sljit_emit_simd_mov(C, simd_type | SLJIT_SIMD_LOAD, SLJIT_FR1,
                            SLJIT_MEM1(SLJIT_R1), 0);
-      /* CMPEQ: equal bytes → 0xFF (all bits set), different → 0x00 */
       sljit_emit_simd_op2(C, simd_type | SLJIT_SIMD_OP2_CMPEQ, SLJIT_FR0,
                            SLJIT_FR0, SLJIT_FR1, 0);
-      /* Sign bits: bit i = MSB of byte i = 1 if equal, 0 if different */
       sljit_emit_simd_sign(C, simd_type | SLJIT_SIMD_STORE, SLJIT_FR0,
                             SLJIT_R0, 0);
-      /* Build mask for data_len bits: mask = (1 << data_len) - 1 */
       sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0, SLJIT_IMM, 1, SLJIT_R2, 0);
       sljit_emit_op2(C, SLJIT_SUB, SLJIT_R3, 0, SLJIT_R3, 0, SLJIT_IMM, 1);
-      /* Check: (sign_bits & mask) == mask → all data bytes matched */
       sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R3, 0);
+      j_memcmp_eq = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_R3, 0);
+      j_simd_ne = sljit_emit_jump(C, SLJIT_JUMP);
     }
-    j_memcmp_eq = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_R3, 0);
-    j_simd_ne = sljit_emit_jump(C, SLJIT_JUMP);
 
-    /* memcmp fallback for data_len > 16 */
-    sljit_set_label(j_very_big, sljit_emit_label(C));
+    /* memcmp fallback (data_len > 16, or all > 7 if no SIMD) */
+    sljit_set_label(j_memcmp_path, sljit_emit_label(C));
     sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
     sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
     EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, W, W), memcmp);
     j_memcmp_eq2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
     /* fall through = not equal */
-    sljit_set_label(j_simd_ne, sljit_emit_label(C));
-    /* both j_simd_ne and memcmp!=0 fall through to result_ne */
+    if (j_simd_ne)
+      sljit_set_label(j_simd_ne, sljit_emit_label(C));
 
-    /* Wire both eq jumps to result_eq below — stash j_memcmp_eq2 in j_big */
-    j_big = j_memcmp_eq2;
+    j_big = j_memcmp_eq2; /* stash for result_eq wiring */
   }
 
   /* --- result_ne --- */
