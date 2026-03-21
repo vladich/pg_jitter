@@ -207,6 +207,7 @@ CLEANUP_SQL
     echo "Cleanup complete."
 }
 
+"$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
 cleanup_database
 echo ""
 
@@ -221,6 +222,8 @@ for backend in $BACKENDS; do
 
     # Clean up leftover state between backends
     ensure_pg_running
+    # Drop the regression database to ensure a clean slate
+    "$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
     cleanup_database
 
     # PG17+ supports custom GUCs via ALTER SYSTEM, so we use the

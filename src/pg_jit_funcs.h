@@ -58,6 +58,17 @@ typedef enum JitInlineOp
 	/* text equality (short-varlena fast path + memcmp, slow path calls jit_fn) */
 	JIT_INLINE_TEXT_EQ,
 	JIT_INLINE_TEXT_NE,
+	/* type casts (1-arg, inline machine instructions) */
+	JIT_INLINE_INT4_TO_INT8,     /* sign extend int32→int64 */
+	JIT_INLINE_INT8_TO_INT4,     /* truncate + range check */
+	JIT_INLINE_INT2_TO_INT4,     /* sign extend int16→int32 */
+	JIT_INLINE_INT4_TO_INT2,     /* truncate + range check */
+	JIT_INLINE_INT2_TO_INT8,     /* sign extend int16→int64 */
+	JIT_INLINE_INT8_TO_INT2,     /* truncate + range check */
+	JIT_INLINE_FLOAT4_TO_FLOAT8, /* widen float */
+	JIT_INLINE_FLOAT8_TO_FLOAT4, /* narrow float + overflow check */
+	JIT_INLINE_INT4_TO_FLOAT8,   /* int→float conversion */
+	JIT_INLINE_INT8_TO_FLOAT8,   /* int→float conversion */
 } JitInlineOp;
 
 /*

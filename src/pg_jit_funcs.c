@@ -30,6 +30,7 @@
 #include "utils/varlena.h"     /* varstr_cmp */
 #include "utils/pg_locale.h"   /* pg_newlocale_from_collation, pg_locale_t */
 #include "access/detoast.h"    /* toast_raw_datum_size */
+#include "utils/array.h"       /* ARR_OVERHEAD_NONULLS, ArrayType */
 #include "mb/pg_wchar.h"       /* pg_mbstrlen_with_len */
 
 #include "pg_jit_funcs.h"
@@ -648,6 +649,179 @@ int64 jit_float8smaller(int64 a, int64 b) {
 }
 
 /* ================================================================
+ * TIER 1: Type cast functions (14 functions)
+ * Bypass fmgr for trivial type conversions.
+ * ================================================================ */
+
+/* int widening (sign-extend, cannot overflow) */
+int64 jit_int48_cast(int32 a)  { return (int64)a; }
+int64 jit_int28_cast(int32 a)  { return (int64)(int16)a; }
+int32 jit_int24_cast(int32 a)  { return (int32)(int16)a; }
+
+/* int narrowing (range-checked) */
+int32 jit_int84_cast(int64 a)  {
+  if (unlikely(a < PG_INT32_MIN || a > PG_INT32_MAX))
+    jit_error_int4_overflow();
+  return (int32)a;
+}
+int32 jit_int82_cast(int64 a)  {
+  if (unlikely(a < PG_INT16_MIN || a > PG_INT16_MAX))
+    jit_error_int2_overflow();
+  return (int32)(int16)a;
+}
+int32 jit_int42_cast(int32 a)  {
+  if (unlikely(a < PG_INT16_MIN || a > PG_INT16_MAX))
+    jit_error_int2_overflow();
+  return (int32)(int16)a;
+}
+
+/* float<->float */
+int64 jit_ftod(int64 a) {
+  return float8_to_datum((float8)DatumGetFloat4((Datum)a));
+}
+int64 jit_dtof(int64 a) {
+  float8 v = datum_to_float8(a);
+  if (unlikely(isinf((float4)v) && !isinf(v)))
+    jit_error_float_overflow();
+  return (int64)Float4GetDatum((float4)v);
+}
+
+/* int->float */
+int64 jit_i4tod(int32 a) { return float8_to_datum((float8)a); }
+int64 jit_i4tof(int32 a) { return (int64)Float4GetDatum((float4)a); }
+int64 jit_i8tod(int64 a) { return float8_to_datum((float8)a); }
+int64 jit_i2tod(int32 a) { return float8_to_datum((float8)(int16)a); }
+int64 jit_i2tof(int32 a) { return (int64)Float4GetDatum((float4)(int16)a); }
+
+/* float->int (range-checked, NaN-checked, uses rint for banker's rounding) */
+int32 jit_dtoi4(int64 a) {
+  float8 v = datum_to_float8(a);
+  if (unlikely(isnan(v) || !FLOAT8_FITS_IN_INT32(v)))
+    jit_error_int4_overflow();
+  return (int32)rint(v);
+}
+int32 jit_ftoi4(int64 a) {
+  float4 v = DatumGetFloat4((Datum)a);
+  if (unlikely(isnan(v) || !FLOAT4_FITS_IN_INT32(v)))
+    jit_error_int4_overflow();
+  return (int32)rint(v);
+}
+int64 jit_dtoi8(int64 a) {
+  float8 v = datum_to_float8(a);
+  if (unlikely(isnan(v) || !FLOAT8_FITS_IN_INT64(v)))
+    jit_error_int8_overflow();
+  return (int64)rint(v);
+}
+int32 jit_ftoi2(int64 a) {
+  float4 v = DatumGetFloat4((Datum)a);
+  if (unlikely(isnan(v) || !FLOAT4_FITS_IN_INT16(v)))
+    jit_error_int2_overflow();
+  return (int32)(int16)rint(v);
+}
+int32 jit_dtoi2(int64 a) {
+  float8 v = datum_to_float8(a);
+  if (unlikely(isnan(v) || !FLOAT8_FITS_IN_INT16(v)))
+    jit_error_int2_overflow();
+  return (int32)(int16)rint(v);
+}
+
+/* ================================================================
+ * TIER 1: Cross-type float comparison (12 functions)
+ * Promote float4 to float8, then compare.
+ * ================================================================ */
+
+#define DEF_FLOAT48_CMP(name, op) \
+int32 jit_##name(int64 a, int64 b) { \
+  float8 fa = (float8)DatumGetFloat4((Datum)a); \
+  float8 fb = datum_to_float8(b); \
+  return float8_cmp_jit(fa, fb) op ? 1 : 0; \
+}
+DEF_FLOAT48_CMP(float48eq, == 0)
+DEF_FLOAT48_CMP(float48ne, != 0)
+DEF_FLOAT48_CMP(float48lt, < 0)
+DEF_FLOAT48_CMP(float48le, <= 0)
+DEF_FLOAT48_CMP(float48gt, > 0)
+DEF_FLOAT48_CMP(float48ge, >= 0)
+
+#define DEF_FLOAT84_CMP(name, op) \
+int32 jit_##name(int64 a, int64 b) { \
+  float8 fa = datum_to_float8(a); \
+  float8 fb = (float8)DatumGetFloat4((Datum)b); \
+  return float8_cmp_jit(fa, fb) op ? 1 : 0; \
+}
+DEF_FLOAT84_CMP(float84eq, == 0)
+DEF_FLOAT84_CMP(float84ne, != 0)
+DEF_FLOAT84_CMP(float84lt, < 0)
+DEF_FLOAT84_CMP(float84le, <= 0)
+DEF_FLOAT84_CMP(float84gt, > 0)
+DEF_FLOAT84_CMP(float84ge, >= 0)
+
+/* ================================================================
+ * TIER 1: Cross-type float arithmetic (8 functions)
+ * Promote float4 to float8, operate, check overflow.
+ * ================================================================ */
+
+#define DEF_FLOAT48_ARITH(name, op) \
+int64 jit_##name(int64 a, int64 b) { \
+  float8 fa = (float8)DatumGetFloat4((Datum)a); \
+  float8 fb = datum_to_float8(b); \
+  float8 r = fa op fb; \
+  if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb)) \
+    jit_error_float_overflow(); \
+  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0)) \
+    jit_error_float_underflow(); \
+  return float8_to_datum(r); \
+}
+DEF_FLOAT48_ARITH(float48pl, +)
+DEF_FLOAT48_ARITH(float48mi, -)
+DEF_FLOAT48_ARITH(float48mul, *)
+
+int64 jit_float48div(int64 a, int64 b) {
+  float8 fa = (float8)DatumGetFloat4((Datum)a);
+  float8 fb = datum_to_float8(b);
+  if (unlikely(fb == 0.0))
+    jit_error_division_by_zero();
+  float8 r = fa / fb;
+  if (unlikely(isinf(r)) && !isinf(fa))
+    jit_error_float_overflow();
+  if (unlikely(r == 0.0 && fa != 0.0))
+    jit_error_float_underflow();
+  return float8_to_datum(r);
+}
+
+#define DEF_FLOAT84_ARITH(name, op) \
+int64 jit_##name(int64 a, int64 b) { \
+  float8 fa = datum_to_float8(a); \
+  float8 fb = (float8)DatumGetFloat4((Datum)b); \
+  float8 r = fa op fb; \
+  if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb)) \
+    jit_error_float_overflow(); \
+  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0)) \
+    jit_error_float_underflow(); \
+  return float8_to_datum(r); \
+}
+DEF_FLOAT84_ARITH(float84pl, +)
+DEF_FLOAT84_ARITH(float84mi, -)
+DEF_FLOAT84_ARITH(float84mul, *)
+
+int64 jit_float84div(int64 a, int64 b) {
+  float8 fa = datum_to_float8(a);
+  float8 fb = (float8)DatumGetFloat4((Datum)b);
+  if (unlikely(fb == 0.0))
+    jit_error_division_by_zero();
+  float8 r = fa / fb;
+  if (unlikely(isinf(r)) && !isinf(fa))
+    jit_error_float_overflow();
+  if (unlikely(r == 0.0 && fa != 0.0))
+    jit_error_float_underflow();
+  return float8_to_datum(r);
+}
+
+/* Extended hash functions use DEFERRED — call PG's V1 functions directly.
+ * Getting the exact hash algorithm right is critical for hash partitioning
+ * correctness, so we don't re-implement. */
+
+/* ================================================================
  * TIER 1: bool comparison + aggregates (8 functions)
  * bool is stored as Datum: 0 or 1.
  * ================================================================ */
@@ -815,6 +989,40 @@ int64 jit_int4_sum(int64 oldsum, int64 newval) {
   if (unlikely(pg_add_s64_overflow(oldsum, (int64)(int32)newval, &r)))
     jit_error_int8_overflow();
   return r;
+}
+
+/*
+ * int4_avg_accum: transition function for avg(int4).
+ * Trans state is ArrayType* containing Int8TransTypeData = {count, sum}.
+ * In aggregate context (always true here), modifies array in-place.
+ * Args: trans_datum (pointer to ArrayType), newval (int32).
+ * Returns: same trans_datum (modified in-place).
+ */
+int64 jit_int4_avg_accum(int64 trans_datum, int32 newval) {
+  /* ArrayType header: vl_len, ndim, dataoffset, elemtype, ...
+   * Data starts at ARR_DATA_PTR = (char*)array + ARR_OVERHEAD_NONULLS(1)
+   * ARR_OVERHEAD_NONULLS(1) = sizeof(ArrayType) + sizeof(int) (one dim)
+   * = 12 + 4 = 16 on 32-bit, 16 on 64-bit (packed struct) */
+  char *arr = (char *)(uintptr_t)trans_datum;
+  /* Int8TransTypeData starts at offset ARR_OVERHEAD_NONULLS(1) */
+  int64 *count_ptr = (int64 *)(arr + ARR_OVERHEAD_NONULLS(1));
+  int64 *sum_ptr = count_ptr + 1;
+  (*count_ptr)++;
+  *sum_ptr += (int64)newval;
+  return trans_datum;  /* same pointer, modified in-place */
+}
+
+/*
+ * int8_avg_accum: transition function for avg(int8).
+ * Same layout as int4_avg_accum but input is int64.
+ */
+int64 jit_int8_avg_accum(int64 trans_datum, int64 newval) {
+  char *arr = (char *)(uintptr_t)trans_datum;
+  int64 *count_ptr = (int64 *)(arr + ARR_OVERHEAD_NONULLS(1));
+  int64 *sum_ptr = count_ptr + 1;
+  (*count_ptr)++;
+  *sum_ptr += newval;
+  return trans_datum;
 }
 
 /* int8_sum: accumulates int64 values into numeric — too complex, skip */
@@ -1388,6 +1596,58 @@ const JitDirectFn jit_direct_fns[] = {
     E2(float8larger, jit_float8larger, T64, T64, T64),
     E2(float8smaller, jit_float8smaller, T64, T64, T64),
 
+    /* ---- cross-type float comparison ---- */
+    E2(float48eq, jit_float48eq, T32, T64, T64),
+    E2(float48ne, jit_float48ne, T32, T64, T64),
+    E2(float48lt, jit_float48lt, T32, T64, T64),
+    E2(float48le, jit_float48le, T32, T64, T64),
+    E2(float48gt, jit_float48gt, T32, T64, T64),
+    E2(float48ge, jit_float48ge, T32, T64, T64),
+    E2(float84eq, jit_float84eq, T32, T64, T64),
+    E2(float84ne, jit_float84ne, T32, T64, T64),
+    E2(float84lt, jit_float84lt, T32, T64, T64),
+    E2(float84le, jit_float84le, T32, T64, T64),
+    E2(float84gt, jit_float84gt, T32, T64, T64),
+    E2(float84ge, jit_float84ge, T32, T64, T64),
+
+    /* ---- cross-type float arithmetic ---- */
+    E2(float48pl, jit_float48pl, T64, T64, T64),
+    E2(float48mi, jit_float48mi, T64, T64, T64),
+    E2(float48mul, jit_float48mul, T64, T64, T64),
+    E2(float48div, jit_float48div, T64, T64, T64),
+    E2(float84pl, jit_float84pl, T64, T64, T64),
+    E2(float84mi, jit_float84mi, T64, T64, T64),
+    E2(float84mul, jit_float84mul, T64, T64, T64),
+    E2(float84div, jit_float84div, T64, T64, T64),
+
+    /* ---- type cast functions (inlineable casts use EI1) ---- */
+    EI1(int48, jit_int48_cast, T64, T32, JIT_INLINE_INT4_TO_INT8),
+    EI1(int84, jit_int84_cast, T32, T64, JIT_INLINE_INT8_TO_INT4),
+    EI1(i2toi4, jit_int24_cast, T32, T32, JIT_INLINE_INT2_TO_INT4),
+    EI1(i4toi2, jit_int42_cast, T32, T32, JIT_INLINE_INT4_TO_INT2),
+    EI1(int28, jit_int28_cast, T64, T32, JIT_INLINE_INT2_TO_INT8),
+    EI1(int82, jit_int82_cast, T32, T64, JIT_INLINE_INT8_TO_INT2),
+    EI1(ftod, jit_ftod, T64, T64, JIT_INLINE_FLOAT4_TO_FLOAT8),
+    EI1(dtof, jit_dtof, T64, T64, JIT_INLINE_FLOAT8_TO_FLOAT4),
+    EI1(i4tod, jit_i4tod, T64, T32, JIT_INLINE_INT4_TO_FLOAT8),
+    E1(dtoi4, jit_dtoi4, T32, T64),
+    E1(i4tof, jit_i4tof, T64, T32),
+    E1(ftoi4, jit_ftoi4, T32, T64),
+    EI1(i8tod, jit_i8tod, T64, T64, JIT_INLINE_INT8_TO_FLOAT8),
+    E1(dtoi8, jit_dtoi8, T64, T64),
+    E1(i2tod, jit_i2tod, T64, T32),
+    E1(dtoi2, jit_dtoi2, T32, T64),
+    E1(i2tof, jit_i2tof, T64, T32),
+    E1(ftoi2, jit_ftoi2, T32, T64),
+
+    /* ---- extended hash functions (DEFERRED — V1 call for correctness) ---- */
+    E2(hashint4extended, DEFERRED, T64, T32, T64),
+    E2(hashint8extended, DEFERRED, T64, T64, T64),
+    E2(hashint2extended, DEFERRED, T64, T64, T64),
+    E2(hashoidextended, DEFERRED, T64, T32, T64),
+    E2(hashfloat4extended, DEFERRED, T64, T64, T64),
+    E2(hashfloat8extended, DEFERRED, T64, T64, T64),
+
     /* ---- bool comparison + aggregates ---- */
     E2(booleq, jit_booleq, T32, T64, T64),
     E2(boolne, jit_boolne, T32, T64, T64),
@@ -1467,6 +1727,8 @@ const JitDirectFn jit_direct_fns[] = {
     E2(int8dec_any, jit_int8dec_any, T64, T64, T64),
     E2(int2_sum, jit_int2_sum, T64, T64, T64),
     E2(int4_sum, jit_int4_sum, T64, T64, T64),
+    E2(int4_avg_accum, jit_int4_avg_accum, T64, T64, T32),
+    E2(int8_avg_accum, jit_int8_avg_accum, T64, T64, T64),
 
     /* ================================================================
      * TIER 2: Pass-by-reference operators — deferred (jit_fn = NULL)
@@ -1673,9 +1935,7 @@ const JitDirectFn jit_direct_fns[] = {
     /* ---- numeric aggregates ---- */
     E2(numeric_accum, DEFERRED, T64, T64, T64),
     E2(numeric_avg_accum, DEFERRED, T64, T64, T64),
-    E2(int8_avg_accum, DEFERRED, T64, T64, T64),
     E2(int2_avg_accum, DEFERRED, T64, T64, T64),
-    E2(int4_avg_accum, DEFERRED, T64, T64, T64),
     E1(numeric_avg, DEFERRED, T64, T64),
     E1(numeric_sum, DEFERRED, T64, T64),
 
@@ -1683,6 +1943,84 @@ const JitDirectFn jit_direct_fns[] = {
     E2(float8_accum, DEFERRED, T64, T64, T64),
     E2(float4_accum, DEFERRED, T64, T64, T64),
     E2(float8_combine, DEFERRED, T64, T64, T64),
+
+    /* ---- text/string functions ---- */
+    EC2(textcat, DEFERRED, T64, T64, T64),
+    E1(textlen, DEFERRED, T32, T64),
+    EC2(text_substr, DEFERRED, T64, T64, T32),
+    EC2(text_substr_no_len, DEFERRED, T64, T64, T32),
+    E1(text_reverse, DEFERRED, T64, T64),
+    E1(ascii, DEFERRED, T32, T64),
+    E1(chr, DEFERRED, T64, T32),
+    EC2(upper, DEFERRED, T64, T64, T64),
+    EC2(lower, DEFERRED, T64, T64, T64),
+    EC2(initcap, DEFERRED, T64, T64, T64),
+    EC2(btrim1, DEFERRED, T64, T64, T64),
+    EC2(ltrim1, DEFERRED, T64, T64, T64),
+    EC2(rtrim1, DEFERRED, T64, T64, T64),
+    EC2(btrim, DEFERRED, T64, T64, T64),
+    EC2(ltrim, DEFERRED, T64, T64, T64),
+    EC2(rtrim, DEFERRED, T64, T64, T64),
+    E2(text_left, DEFERRED, T64, T64, T32),
+    E2(text_right, DEFERRED, T64, T64, T32),
+    E2(textpos, DEFERRED, T32, T64, T64),
+    E2(text_to_array, DEFERRED, T64, T64, T64),
+
+    /* ---- array functions ---- */
+    E2(array_length, DEFERRED, T32, T64, T32),
+    E2(array_append, DEFERRED, T64, T64, T64),
+    E2(array_prepend, DEFERRED, T64, T64, T64),
+    E2(array_cat, DEFERRED, T64, T64, T64),
+    E2(array_position, DEFERRED, T32, T64, T64),
+    E2(array_remove, DEFERRED, T64, T64, T64),
+    E1(array_ndims, DEFERRED, T32, T64),
+    E1(array_dims, DEFERRED, T64, T64),
+    E2(array_lower, DEFERRED, T32, T64, T32),
+    E2(array_upper, DEFERRED, T32, T64, T32),
+    E1(array_cardinality, DEFERRED, T32, T64),
+
+    /* ---- date/time functions ---- */
+    E2(timestamp_part, DEFERRED, T64, T64, T64),
+    E2(timestamptz_part, DEFERRED, T64, T64, T64),
+    E2(timestamp_trunc, DEFERRED, T64, T64, T64),
+    E2(timestamptz_trunc, DEFERRED, T64, T64, T64),
+    E2(timestamp_age, DEFERRED, T64, T64, T64),
+    E1(date_timestamp, DEFERRED, T64, T32),
+    E1(timestamptz_timestamp, DEFERRED, T64, T64),
+    E1(timestamp_timestamptz, DEFERRED, T64, T64),
+    E2(interval_pl, DEFERRED, T64, T64, T64),
+    E2(interval_mi, DEFERRED, T64, T64, T64),
+    E1(interval_um, DEFERRED, T64, T64),
+
+    /* ---- aggregate transition functions ---- */
+    E2(int8_sum, DEFERRED, T64, T64, T64),
+    E2(numeric_avg_accum, DEFERRED, T64, T64, T64),
+    E2(numeric_accum, DEFERRED, T64, T64, T64),
+
+    /* ---- formatting/conversion ---- */
+    E1(pg_typeof, DEFERRED, T64, T64),
+    E2(timestamp_to_char, DEFERRED, T64, T64, T64),
+    E2(numeric_to_number, DEFERRED, T64, T64, T64),
+    E2(to_date, DEFERRED, T64, T64, T64),
+    E2(to_timestamp, DEFERRED, T64, T64, T64),
+
+    /* ---- misc string ---- */
+    E2(regexp_match, DEFERRED, T64, T64, T64),
+    E1(md5_text, DEFERRED, T64, T64),
+    E2(binary_encode, DEFERRED, T64, T64, T64),
+    E2(binary_decode, DEFERRED, T64, T64, T64),
+
+    /* ---- math ---- */
+    E1(numeric_abs, DEFERRED, T64, T64),
+    E1(numeric_ceil, DEFERRED, T64, T64),
+    E1(numeric_floor, DEFERRED, T64, T64),
+    E2(numeric_round, DEFERRED, T64, T64, T32),
+    E2(numeric_trunc, DEFERRED, T64, T64, T32),
+    E2(numeric_power, DEFERRED, T64, T64, T64),
+    E1(numeric_sqrt, DEFERRED, T64, T64),
+    E1(numeric_exp, DEFERRED, T64, T64),
+    E1(numeric_ln, DEFERRED, T64, T64),
+    E2(numeric_log, DEFERRED, T64, T64, T64),
 };
 
 const int jit_direct_fns_count = lengthof(jit_direct_fns);

@@ -136,9 +136,39 @@ like_to_regex(const char *like_pat, int like_len, int *regex_len_out)
 	char *buf = MemoryContextAlloc(TopMemoryContext, max_len);
 	int pos = 0;
 
-	buf[pos++] = '^';
+	/*
+	 * Optimization: strip leading/trailing % and omit ^/$ anchors
+	 * accordingly. This avoids PCRE2 generating a greedy ^.* that
+	 * scans to end-of-string and backtracks. Instead, PCRE2 uses
+	 * its built-in first-char optimization (memchr) to find the
+	 * first literal, then scans forward.
+	 *
+	 * LIKE 'abc'     → ^abc$     (exact match)
+	 * LIKE '%abc'    → abc$      (suffix match, no leading .*)
+	 * LIKE 'abc%'    → ^abc      (prefix match, no trailing .*)
+	 * LIKE '%abc%'   → abc       (interior, unanchored)
+	 * LIKE '%a%b%'   → a.*b      (no leading/trailing .*)
+	 */
+	bool anchored_start = true;
+	bool anchored_end = true;
+	int start = 0;
+	int end = like_len;
 
-	for (int i = 0; i < like_len; i++)
+	/* Strip leading % */
+	while (start < end && like_pat[start] == '%') {
+		anchored_start = false;
+		start++;
+	}
+	/* Strip trailing % */
+	while (end > start && like_pat[end - 1] == '%') {
+		anchored_end = false;
+		end--;
+	}
+
+	if (anchored_start)
+		buf[pos++] = '^';
+
+	for (int i = start; i < end; i++)
 	{
 		char c = like_pat[i];
 
@@ -151,7 +181,7 @@ like_to_regex(const char *like_pat, int like_len, int *regex_len_out)
 		{
 			buf[pos++] = '.';
 		}
-		else if (c == '\\' && i + 1 < like_len)
+		else if (c == '\\' && i + 1 < end)
 		{
 			i++;
 			c = like_pat[i];
@@ -173,7 +203,8 @@ like_to_regex(const char *like_pat, int like_len, int *regex_len_out)
 		}
 	}
 
-	buf[pos++] = '$';
+	if (anchored_end)
+		buf[pos++] = '$';
 	buf[pos] = '\0';
 
 	*regex_len_out = pos;

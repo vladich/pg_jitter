@@ -928,7 +928,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	 */
 	sljit_emit_enter(C, 0,
 					 SLJIT_ARGS1V(P),
-					 4, DEFORM_NSAVED, DLOFF_TOTAL);
+					 4 | SLJIT_ENTER_VECTOR(2), DEFORM_NSAVED, DLOFF_TOTAL);
 
 	/* S1 = slot->tts_values */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_S1, 0,
@@ -1128,18 +1128,85 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_fast_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-			/* R0 = tupdata + offset (S3 + S4) */
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-						   SLJIT_S3, 0, SLJIT_S4, 0);
-			/* R1 = values + attnum*8 (S1 + S5*8) */
-			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-						   SLJIT_S5, 0, SLJIT_IMM, 3);
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-						   SLJIT_S1, 0, SLJIT_R1, 0);
-			/* R2 = count (already set) */
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-							 SLJIT_IMM,
-							 (sljit_sw) simd_extract_int32_values);
+			if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
+				/*
+				 * Inline SLJIT SIMD: load 4x int32, sign-extend to
+				 * 2x int64, store as Datums. Eliminates C function
+				 * call overhead (~100 cycles per invocation).
+				 */
+				/* R0 = tupdata + offset, R1 = values + attnum*8 */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S1, 0, SLJIT_R1, 0);
+				/* R2 = count */
+				/* R3 = end pointer (values + (attnum+count)*8) */
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+							   SLJIT_R2, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+							   SLJIT_R1, 0, SLJIT_R3, 0);
+
+				/* SIMD loop: 4 int32 per iteration */
+				struct sljit_label *l_simd_top;
+				struct sljit_jump *j_simd_done;
+
+				j_simd_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
+											  SLJIT_R1, 0, SLJIT_R3, 0);
+				l_simd_top = sljit_emit_label(C);
+
+				/* VR0 = load 4x int32 from tupdata */
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
+					SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
+
+				/* VR1 = sign-extend lower 2x int32 → 2x int64 */
+				sljit_emit_simd_extend(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+					SLJIT_VR1, SLJIT_VR0, 0);
+
+				/* Store lower 2 Datums */
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
+
+				/* For upper 2: extract upper half and extend.
+				 * simd_extend with offset gets upper elements. */
+				/* Move upper 64 bits to lower: lane_replicate lane 1 */
+				sljit_emit_simd_lane_replicate(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR0, SLJIT_VR0, 1);
+				/* Now VR0 has upper 2 int32s in the lower 64 bits */
+				sljit_emit_simd_extend(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+					SLJIT_VR1, SLJIT_VR0, 0);
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
+
+				/* Advance: R0 += 16 (4 int32), R1 += 32 (4 Datums) */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_R0, 0, SLJIT_IMM, 16);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_R1, 0, SLJIT_IMM, 32);
+
+				sljit_set_label(
+					sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
+					l_simd_top);
+				sljit_set_label(j_simd_done, sljit_emit_label(C));
+			} else {
+				/* Fallback: call C function */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S1, 0, SLJIT_R1, 0);
+				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+								 SLJIT_IMM,
+								 (sljit_sw) simd_extract_int32_values);
+			}
 
 			/* Update S4 (offset): S4 += count * 4 */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -1276,15 +1343,63 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_semi_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-						   SLJIT_S3, 0, SLJIT_S4, 0);
-			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-						   SLJIT_S5, 0, SLJIT_IMM, 3);
-			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-						   SLJIT_S1, 0, SLJIT_R1, 0);
-			sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-							 SLJIT_IMM,
-							 (sljit_sw) simd_extract_int32_values);
+			if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
+				/* Inline SIMD: same as all_notnull path */
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S1, 0, SLJIT_R1, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+							   SLJIT_R2, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+							   SLJIT_R1, 0, SLJIT_R3, 0);
+
+				struct sljit_label *l_st;
+				struct sljit_jump *j_sd;
+				j_sd = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
+									   SLJIT_R1, 0, SLJIT_R3, 0);
+				l_st = sljit_emit_label(C);
+
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
+					SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
+				sljit_emit_simd_extend(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+					SLJIT_VR1, SLJIT_VR0, 0);
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
+				sljit_emit_simd_lane_replicate(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR0, SLJIT_VR0, 1);
+				sljit_emit_simd_extend(C,
+					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+					SLJIT_VR1, SLJIT_VR0, 0);
+				sljit_emit_simd_mov(C,
+					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
+
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_R0, 0, SLJIT_IMM, 16);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_R1, 0, SLJIT_IMM, 32);
+				sljit_set_label(
+					sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
+					l_st);
+				sljit_set_label(j_sd, sljit_emit_label(C));
+			} else {
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+							   SLJIT_S3, 0, SLJIT_S4, 0);
+				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+							   SLJIT_S5, 0, SLJIT_IMM, 3);
+				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+							   SLJIT_S1, 0, SLJIT_R1, 0);
+				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+								 SLJIT_IMM,
+								 (sljit_sw) simd_extract_int32_values);
+			}
 
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
@@ -2201,7 +2316,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 								   SLJIT_R0, 0);
 				}
 
-				/* simd_extract_int32_values(S3 + S4, &values[S5], count)
+				/* Extract int32→int64: inline SIMD or C fallback.
 				 * R2 = count (set above) */
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
 							   SLJIT_S3, 0, SLJIT_S4, 0);
@@ -2209,9 +2324,47 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 							   SLJIT_S5, 0, SLJIT_IMM, 3);
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
 							   SLJIT_S1, 0, SLJIT_R1, 0);
-				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-								 SLJIT_IMM,
-								 (sljit_sw) simd_extract_int32_values);
+				if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
+					sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+								   SLJIT_R2, 0, SLJIT_IMM, 3);
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+								   SLJIT_R1, 0, SLJIT_R3, 0);
+					struct sljit_label *l_bt;
+					struct sljit_jump *j_bd;
+					j_bd = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
+										   SLJIT_R1, 0, SLJIT_R3, 0);
+					l_bt = sljit_emit_label(C);
+					sljit_emit_simd_mov(C,
+						SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
+						SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
+					sljit_emit_simd_extend(C,
+						SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+						SLJIT_VR1, SLJIT_VR0, 0);
+					sljit_emit_simd_mov(C,
+						SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+						SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
+					sljit_emit_simd_lane_replicate(C,
+						SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+						SLJIT_VR0, SLJIT_VR0, 1);
+					sljit_emit_simd_extend(C,
+						SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
+						SLJIT_VR1, SLJIT_VR0, 0);
+					sljit_emit_simd_mov(C,
+						SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+						SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+								   SLJIT_R0, 0, SLJIT_IMM, 16);
+					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+								   SLJIT_R1, 0, SLJIT_IMM, 32);
+					sljit_set_label(
+						sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
+						l_bt);
+					sljit_set_label(j_bd, sljit_emit_label(C));
+				} else {
+					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+									 SLJIT_IMM,
+									 (sljit_sw) simd_extract_int32_values);
+				}
 
 				/* Reload count for offset/attnum advance */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
