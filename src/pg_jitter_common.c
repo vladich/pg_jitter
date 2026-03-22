@@ -4220,6 +4220,7 @@ static Win64UnwindCtx *win64_unwind_list = NULL;
 #define UWOP_ALLOC_LARGE     1
 #define UWOP_ALLOC_SMALL     2
 #define UWOP_SET_FPREG       3
+#define UWOP_SAVE_NONVOL     4
 
 /*
  * x64 register numbers for UNWIND_CODE (same as Windows convention):
@@ -4378,6 +4379,12 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
   }
   /* If no SUB RSP found: might be a very small leaf function */
 
+  /* MOV-based register saves (MIR style) */
+  int save_reg[8];
+  uint32_t save_rsp_off[8];
+  uint8_t save_code_off[8];
+  int nsaves = 0;
+
   /*
    * Detect MIR-style frame pointer setup after SUB RSP:
    *   MOV [RSP+disp8], RBP    → 48 89 6C 24 XX (5 bytes)
@@ -4391,11 +4398,17 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
    */
   if (alloc_size > 0 && p + 7 <= end) {
     const uint8_t *q = NULL;
+    uint32_t rbp_save_rsp_off = 0;
+    uint8_t rbp_save_code_off = 0;
     if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x6C && p[3] == 0x24) {
       /* MOV [RSP+disp8], RBP — 48 89 6C 24 XX (5 bytes) */
+      rbp_save_rsp_off = (uint8_t)p[4];
+      rbp_save_code_off = (uint8_t)(p + 5 - code);
       q = p + 5;
     } else if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x2C && p[3] == 0x24) {
       /* MOV [RSP], RBP — 48 89 2C 24 (4 bytes, zero displacement) */
+      rbp_save_rsp_off = 0;
+      rbp_save_code_off = (uint8_t)(p + 4 - code);
       q = p + 4;
     }
     if (q != NULL) {
@@ -4409,6 +4422,46 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
         p = q + 3;
         *frame_reg_out = 5; /* RBP */
         *frame_offset_out = (uint8_t)(fp_rsp_offset / 16);
+
+        /* Also record RBP as a SAVE_NONVOL — the unwinder needs to
+         * know where the OLD RBP is saved to restore it during longjmp.
+         * UWOP_SET_FPREG only establishes the RBP↔RSP relationship. */
+        save_reg[nsaves] = 5;  /* RBP */
+        save_rsp_off[nsaves] = rbp_save_rsp_off;
+        save_code_off[nsaves] = rbp_save_code_off;
+        nsaves++;
+      }
+    }
+  }
+
+  /*
+   * Parse MIR-style callee-saved register saves after frame pointer setup:
+   *   MOV [RBP+disp8], REG    → 48 89 <modrm> <disp8>
+   *
+   * MIR saves non-volatile registers via MOV (not PUSH), requiring
+   * UWOP_SAVE_NONVOL unwind codes for proper longjmp/exception handling.
+   */
+
+  if (*frame_reg_out == 5 && alloc_size > 0) {
+    while (p + 4 <= end && nsaves < 8) {
+      int rex_r = 0;
+      if (p[0] == 0x4C) rex_r = 8;  /* REX.WR for R8-R15 */
+      else if (p[0] != 0x48) break;
+
+      if (p[1] == 0x89 && (p[2] & 0xC7) == 0x45) {
+        /* MOV [RBP+disp8], r64 */
+        int reg = rex_r + ((p[2] >> 3) & 7);
+        int8_t disp = (int8_t)p[3];
+        int32_t rsp_off = (int32_t)alloc_size - 8 + disp;
+        if (rsp_off >= 0) {
+          save_reg[nsaves] = reg;
+          save_rsp_off[nsaves] = (uint32_t)rsp_off;
+          save_code_off[nsaves] = (uint8_t)(p + 4 - code);
+          nsaves++;
+        }
+        p += 4;
+      } else {
+        break;
       }
     }
   }
@@ -4436,14 +4489,25 @@ win64_parse_prologue(const uint8_t *code, size_t code_size,
     bool alloc_emitted = (alloc_size == 0);
     bool fpreg_emitted = (set_fpreg_offset == 0);
     int pi = npushes - 1;  /* current push index, descending */
+    int si = nsaves - 1;   /* current MOV-save index, descending */
 
-    while (!alloc_emitted || !fpreg_emitted || pi >= 0) {
+    while (!alloc_emitted || !fpreg_emitted || pi >= 0 || si >= 0) {
       uint8_t push_off = (pi >= 0) ? (uint8_t)(pushes_offset[pi] + 1) : 0;
+      uint8_t save_off = (si >= 0) ? save_code_off[si] : 0;
       uint8_t a_off = alloc_emitted ? 0 : alloc_offset;
       uint8_t f_off = fpreg_emitted ? 0 : set_fpreg_offset;
 
       /* Find which has the highest offset */
-      if (!alloc_emitted && a_off >= f_off && a_off >= push_off) {
+      if (si >= 0 && save_off >= a_off && save_off >= f_off && save_off >= push_off) {
+        /* Emit SAVE_NONVOL (2-slot code) for MOV-based register save */
+        if (ncodes + 1 >= max_codes) return 0;
+        unwind_codes[ncodes * 2]     = save_code_off[si];
+        unwind_codes[ncodes * 2 + 1] = (uint8_t)(UWOP_SAVE_NONVOL | (save_reg[si] << 4));
+        ncodes++;
+        *(uint16_t *)(unwind_codes + ncodes * 2) = (uint16_t)(save_rsp_off[si] / 8);
+        ncodes++;
+        si--;
+      } else if (!alloc_emitted && a_off >= f_off && a_off >= push_off) {
         /* Emit ALLOC */
         if (alloc_size <= 128 && (alloc_size % 8) == 0) {
           if (ncodes >= max_codes) return 0;

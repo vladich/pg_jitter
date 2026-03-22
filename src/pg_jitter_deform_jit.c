@@ -2763,6 +2763,7 @@ deform_code_gen:
  * ================================================================ */
 
 #define DEFORM_DISPATCH_CACHE_SIZE 32
+#define DEFORM_MAX_CACHED_ATTRS 16  /* max columns stored for validation */
 
 typedef struct DeformDispatchEntry
 {
@@ -2770,13 +2771,18 @@ typedef struct DeformDispatchEntry
 	int			natts;
 	const TupleTableSlotOps *ops;
 	void	   *fn;
+	CompactAttribute attrs[DEFORM_MAX_CACHED_ATTRS]; /* copy for collision check */
 } DeformDispatchEntry;
 
 /*
  * Compute a hash over the CompactAttribute entries relevant to deform code
  * generation.  Two descriptors produce identical deform code iff they agree
  * on every column's attlen, attalign, attbyval, attnotnull, attisdropped,
- * and atthasmissing — all of which live in the CompactAttribute struct.
+ * and atthasmissing.
+ *
+ * IMPORTANT: skip attcacheoff (first field).  It starts as -1 and is lazily
+ * set during first deform, so hashing it causes false matches between
+ * tables with different physical layouts but identical column types.
  */
 static uint32
 deform_attrs_hash(TupleDesc desc, int natts)
@@ -2787,7 +2793,10 @@ deform_attrs_hash(TupleDesc desc, int natts)
 	for (int i = 0; i < natts; i++)
 	{
 		CompactAttribute *att = TupleDescCompactAttr(desc, i);
-		COMP_CRC32C(crc, att, sizeof(CompactAttribute));
+		/* Skip attcacheoff (first 4 bytes) — hash from attlen onward */
+		COMP_CRC32C(crc,
+					(const char *)att + offsetof(CompactAttribute, attlen),
+					sizeof(CompactAttribute) - offsetof(CompactAttribute, attlen));
 	}
 	FIN_CRC32C(crc);
 	return (uint32) crc;
@@ -2848,6 +2857,19 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	uint32 ahash = 0;
 	int i;
 
+#ifdef _WIN64
+	/*
+	 * Verify slot integrity before deform.  If the slot pointer or its
+	 * tts_values/tts_isnull are corrupt, bail to the safe PG deform.
+	 */
+	if (unlikely(!slot || !slot->tts_values || !slot->tts_isnull ||
+				 !desc || natts <= 0))
+	{
+		slot_getsomeattrs_int(slot, natts);
+		return;
+	}
+#endif
+
 	if (natts > pg_jitter_wide_deform_limit())
 	{
 		slot_getsomeattrs_int(slot, natts);
@@ -2865,11 +2887,17 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	{
 		/* TupleDesc-pointer fast path — O(1) for repeated calls within a query.
 		 * Pointer is stable within a query; cache is cleared at query end
-		 * (pg_jitter_release_context) to prevent stale pointer matches. */
+		 * (pg_jitter_release_context) to prevent stale pointer matches.
+		 *
+		 * Additional safety: validate the attrs_hash matches.  DDL statements
+		 * (CREATE/DROP TABLE) may not create a JitContext, so the fast-path
+		 * can persist across DDL that reuses a TupleDesc address for a
+		 * different table layout. */
 		for (i = 0; i < n_dispatch_fast; i++)
 		{
 			DispatchFastEntry *fe = &dispatch_fast[i];
-			if (fe->desc == desc && fe->ops == ops && fe->natts == natts)
+			if (fe->desc == desc && fe->ops == ops && fe->natts == natts &&
+				fe->attrs_hash == deform_attrs_hash(desc, natts))
 			{
 				/* Move to front (MRU) for hot-path O(1) */
 				if (i > 0)
@@ -2884,15 +2912,31 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 			}
 		}
 
-		/* Full lookup with FNV hash (first call or different table/RECORD) */
+		/* Full lookup with CRC32C hash + full attribute validation */
 		ahash = deform_attrs_hash(desc, natts);
 		for (i = 0; i < n_deform_dispatch; i++)
 		{
 			DeformDispatchEntry *e = &deform_dispatch_cache[i];
 			if (e->natts == natts && e->ops == ops && e->attrs_hash == ahash)
 			{
-				fn = e->fn;
-				goto found;
+				/* Verify full attribute equality to prevent hash collisions */
+				bool match = true;
+				for (int a = 0; a < natts; a++)
+				{
+					CompactAttribute *ca = TupleDescCompactAttr(desc, a);
+					if (memcmp((char *)ca + offsetof(CompactAttribute, attlen),
+							   (char *)&e->attrs[a] + offsetof(CompactAttribute, attlen),
+							   sizeof(CompactAttribute) - offsetof(CompactAttribute, attlen)) != 0)
+					{
+						match = false;
+						break;
+					}
+				}
+				if (match)
+				{
+					fn = e->fn;
+					goto found;
+				}
 			}
 		}
 	}
@@ -2908,13 +2952,17 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		if (pg_jitter_deform_cache)
 		{
 			/* Cache for future calls (code persists for backend lifetime) */
-			if (n_deform_dispatch < DEFORM_DISPATCH_CACHE_SIZE)
+			if (n_deform_dispatch < DEFORM_DISPATCH_CACHE_SIZE &&
+				natts <= DEFORM_MAX_CACHED_ATTRS)
 			{
 				DeformDispatchEntry *e = &deform_dispatch_cache[n_deform_dispatch++];
 				e->attrs_hash = ahash;
 				e->natts = natts;
 				e->ops = ops;
 				e->fn = fn;
+				/* Store attribute metadata for collision validation */
+				for (int a = 0; a < natts; a++)
+					e->attrs[a] = *TupleDescCompactAttr(desc, a);
 			}
 found:
 			/* Add to TupleDesc-pointer fast-path cache (MRU front insertion) */

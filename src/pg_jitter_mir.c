@@ -471,6 +471,7 @@ static bool expr_has_fast_path(ExprState *state) {
  * deform functions. This is faster than MIR inline deform, especially
  * for wide tables (100+ cols: 37% faster). */
 
+
 /*
  * Helper: emit MIR instruction to load the address of a step field into
  * a register.  In PIC mode (mir_shared_code_mode), computes the address
@@ -1097,8 +1098,7 @@ static bool mir_compile_expr(ExprState *state) {
              /* SCALARARRAYOP uses dedicated inline with separate imports */
              opcode == EEOP_CURRENTOFEXPR || opcode == EEOP_NEXTVALUEEXPR ||
              opcode == EEOP_ROW ||
-             opcode == EEOP_MINMAX || opcode == EEOP_DOMAIN_NOTNULL ||
-             opcode == EEOP_DOMAIN_CHECK || opcode == EEOP_XMLEXPR ||
+             opcode == EEOP_MINMAX || opcode == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
              opcode == EEOP_IS_JSON ||
 #endif
@@ -1603,6 +1603,19 @@ static bool mir_compile_expr(ExprState *state) {
                             MIR_new_ref_op(ctx, import_getsomeattrs),
                             MIR_new_reg_op(ctx, r_slot),
                             MIR_new_int_op(ctx, op->d.fetch.last_var)));
+
+      /*
+       * Reload r_slot from econtext after the call.  MIR's register
+       * allocator may place r_slot in a caller-saved register on the
+       * skip path (where no call happens), creating an inconsistency
+       * at the merge label — the call path clobbers that register.
+       * Reloading here forces a consistent state.
+       */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_slot),
+                       MIR_new_mem_op(ctx, MIR_T_P, soff, r_econtext, 0,
+                                      1)));
 
       MIR_append_insn(ctx, func_item, skip_label);
       break;
@@ -6591,26 +6604,27 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
     /*
-     * ---- DOMAIN_NOTNULL (inlined) ----
-     * Fast path: if *op->resnull is false, done.
-     * Slow path: call ExecEvalConstraintNotNull(state, op).
+     * DOMAIN_NOTNULL / DOMAIN_CHECK: route through fallback on Windows.
+     * These opcodes may call ereport(ERROR) which requires SEH unwind
+     * through the JIT frame.  MIR's MOV-based callee-save prologue on
+     * Windows x64 produces UWOP_SAVE_NONVOL codes that RtlUnwindEx
+     * doesn't fully support for longjmp.  The fallback executes in C
+     * code with proper compiler-generated unwind info.
      */
+#ifndef _WIN64
     case EEOP_DOMAIN_NOTNULL: {
       MIR_insn_t ok_label = MIR_new_label(ctx);
 
-      /* r_tmp1 = *op->resnull */
       MIR_STEP_LOAD(r_tmp3, opno, resnull);
       MIR_append_insn(
           ctx, func_item,
           MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
                        MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      /* if (!resnull) goto ok */
       MIR_append_insn(
           ctx, func_item,
           MIR_new_insn(ctx, MIR_BEQ, MIR_new_label_op(ctx, ok_label),
                        MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
 
-      /* Slow path: call ExecEvalConstraintNotNull(state, op) */
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
@@ -6622,51 +6636,10 @@ static bool mir_compile_expr(ExprState *state) {
       MIR_append_insn(ctx, func_item, ok_label);
       break;
     }
-
-    /*
-     * ---- DOMAIN_CHECK (inlined) ----
-     * Fast path: if *checknull → done. Else if DatumGetBool(*checkvalue) → done.
-     * Slow path: call ExecEvalConstraintCheck(state, op).
-     */
-    case EEOP_DOMAIN_CHECK: {
-      MIR_insn_t done_label = MIR_new_label(ctx);
-
-      /* r_tmp1 = *op->d.domaincheck.checknull */
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checknull);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      /* if (checknull) goto done */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      /* r_tmp1 = DatumGetBool(*op->d.domaincheck.checkvalue) */
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checkvalue);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
-      /* if (checkvalue != 0) goto done */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      /* Slow path: call ExecEvalConstraintCheck(state, op) */
-      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
-                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
-                            MIR_new_reg_op(ctx, r_state),
-                            MIR_new_reg_op(ctx, r_tmp1)));
-
-      MIR_append_insn(ctx, func_item, done_label);
-      break;
-    }
+#endif
+    /* EEOP_DOMAIN_CHECK and (on Windows) EEOP_DOMAIN_NOTNULL are handled
+     * by the default fallback — they may ereport(ERROR) which requires
+     * proper SEH unwind through the JIT frame. */
 
     /*
      * ---- SCALARARRAYOP (partially inlined) ----
@@ -8872,7 +8845,9 @@ static bool mir_compile_expr(ExprState *state) {
                  /* SCALARARRAYOP uses dedicated inline with separate imports */
                  op == EEOP_CURRENTOFEXPR || op == EEOP_NEXTVALUEEXPR ||
                  op == EEOP_ARRAYEXPR || op == EEOP_ROW || op == EEOP_MINMAX ||
-                 op == EEOP_DOMAIN_NOTNULL || op == EEOP_DOMAIN_CHECK ||
+#ifndef _WIN64
+                 op == EEOP_DOMAIN_NOTNULL ||
+#endif
                  op == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
                  op == EEOP_IS_JSON ||

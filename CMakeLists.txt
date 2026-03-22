@@ -270,31 +270,6 @@ endif()
 include(${CMAKE_SOURCE_DIR}/cmake/precompiled.cmake)
 
 # ==========================================================================
-# Pre-compiled deform templates
-# ==========================================================================
-if(PG_JITTER_BUILD_SLJIT OR PG_JITTER_BUILD_ASMJIT)
-    set(DEFORM_GEN_SCRIPT "${CMAKE_SOURCE_DIR}/tools/gen_deform_templates.py")
-    set(DEFORM_TEMPLATE_C "${CMAKE_SOURCE_DIR}/src/pg_jit_deform_templates.c")
-    set(DEFORM_TEMPLATE_H "${CMAKE_SOURCE_DIR}/src/pg_jit_deform_templates.h")
-
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_FOUND)
-        add_custom_command(
-            OUTPUT ${DEFORM_TEMPLATE_C}
-            COMMAND ${Python3_EXECUTABLE} ${DEFORM_GEN_SCRIPT}
-                    --output-c ${DEFORM_TEMPLATE_C}
-            DEPENDS ${DEFORM_GEN_SCRIPT}
-            COMMENT "Generating pre-compiled deform templates (68 functions)"
-        )
-        # Single target so the generator runs exactly once in parallel builds
-        add_custom_target(generate_deform_templates DEPENDS ${DEFORM_TEMPLATE_C})
-    else()
-        # Fallback: use pre-generated file (already in src/)
-        message(STATUS "Python3 not found; using pre-generated deform templates")
-    endif()
-endif()
-
-# ==========================================================================
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
@@ -354,27 +329,21 @@ set(PG_JITTER_TARGETS "")
 # ---------- pg_jitter_sljit ----------
 if(PG_JITTER_BUILD_SLJIT)
     add_library(pg_jitter_sljit MODULE ${COMMON_SRC} src/pg_jitter_sljit.c
-                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
+                src/pg_jitter_deform_jit.c)
     target_link_libraries(pg_jitter_sljit PRIVATE sljit)
     target_compile_definitions(pg_jitter_sljit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_sljit)
-    if(TARGET generate_deform_templates)
-        add_dependencies(pg_jitter_sljit generate_deform_templates)
-    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_sljit)
 endif()
 
 # ---------- pg_jitter_asmjit ----------
 if(PG_JITTER_BUILD_ASMJIT)
     add_library(pg_jitter_asmjit MODULE ${COMMON_SRC} src/pg_jitter_asmjit.cpp
-                src/pg_jit_deform_templates.c src/pg_jitter_deform_jit.c)
+                src/pg_jitter_deform_jit.c)
     target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
     target_compile_definitions(pg_jitter_asmjit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_asmjit)
     set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
-    if(TARGET generate_deform_templates)
-        add_dependencies(pg_jitter_asmjit generate_deform_templates)
-    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_asmjit)
 endif()
 
@@ -385,9 +354,6 @@ if(PG_JITTER_BUILD_MIR)
     target_link_libraries(pg_jitter_mir PRIVATE mir_lib sljit)
     target_compile_definitions(pg_jitter_mir PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_mir)
-    if(TARGET generate_deform_templates)
-        add_dependencies(pg_jitter_mir generate_deform_templates)
-    endif()
     list(APPEND PG_JITTER_TARGETS pg_jitter_mir)
 endif()
 

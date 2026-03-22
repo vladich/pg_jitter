@@ -15,7 +15,6 @@
 #include "utils/expandeddatum.h"
 #include "utils/palloc.h"
 
-#include "pg_jit_deform_templates.h"
 #include "pg_jit_funcs.h"
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
@@ -472,43 +471,6 @@ static void *sljit_compile_deform_loop(TupleDesc desc,
                                        const TupleTableSlotOps *ops,
                                        int natts) {
   return pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
-}
-
-/*
- * Try to match a pre-compiled deform template for the given tuple descriptor.
- * Returns a template function pointer if all columns are fixed-width, byval,
- * NOT NULL, and within the coverage matrix; NULL otherwise.
- *
- * Pre-compiled templates live in the shared library's .text section, so all
- * parallel workers share the same virtual address — eliminating L1 I-cache
- * coldness from per-worker sljit compilation.
- */
-static deform_template_fn
-deform_match_template(TupleDesc desc, const TupleTableSlotOps *ops, int natts) {
-  int16 attlens[5];
-
-  if (natts < 1 || natts > 5)
-    return NULL;
-
-  /* All physical slot types supported (heap, buffer-heap, minimal) */
-  if (ops == &TTSOpsVirtual)
-    return NULL;
-
-  for (int i = 0; i < natts; i++) {
-    CompactAttribute *att = TupleDescCompactAttr(desc, i);
-
-    if (!att->attbyval)
-      return NULL;
-    if (att->attlen != 1 && att->attlen != 2 && att->attlen != 4 &&
-        att->attlen != 8)
-      return NULL;
-    if (att->attisdropped || att->atthasmissing)
-      return NULL;
-
-    attlens[i] = att->attlen;
-  }
-
-  return jit_deform_find_template(deform_signature(natts, attlens));
 }
 
 /*
@@ -2804,7 +2766,9 @@ static bool sljit_compile_expr(ExprState *state) {
         case EEOP_HASHED_SCALARARRAYOP:
         case EEOP_SCALARARRAYOP:
         /* JSON (simdjson acceleration) */
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
         case EEOP_IS_JSON:
+#endif
         case EEOP_IOCOERCE:
           has_inlineable = true;
           break;
@@ -3457,22 +3421,11 @@ static bool sljit_compile_expr(ExprState *state) {
       if (op->d.fetch.fixed && op->d.fetch.known_desc &&
           (ctx->base.flags & PGJIT_DEFORM)) {
         /*
-         * Try pre-compiled template first (I-cache friendly:
-         * same virtual address across all parallel workers).
+         * Try inline deform (zero call overhead, contiguous
+         * I-cache). Emits code directly into the expression
+         * function body.
          */
-        deform_template_fn tmpl = deform_match_template(
-            op->d.fetch.known_desc, op->d.fetch.kind, op->d.fetch.last_var);
-
-        if (tmpl) {
-          /* R0 still has slot pointer; call template(slot) */
-          EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1V(P), tmpl);
-          deform_emitted = true;
-        } else {
-          /*
-           * Try inline deform (zero call overhead, contiguous
-           * I-cache). Emits code directly into the expression
-           * function body.
-           */
+        {
           instr_time deform_start, deform_end;
 
           INSTR_TIME_SET_CURRENT(deform_start);
@@ -7222,7 +7175,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
         /* SIMD loop: check 4 elements per iteration */
         int nchunks = ((nvals + 3) & ~3) / 4;
-        struct sljit_jump *found_jumps[nchunks];
+        struct sljit_jump **found_jumps = palloc(nchunks * sizeof(struct sljit_jump *));
         int n_found = 0;
 
         /* R2 = constant array base pointer */
@@ -7291,6 +7244,7 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_set_label(j_to_done_simd2, lbl_done_simd);
         sljit_set_label(j_null_done_simd, lbl_done_simd);
 
+        pfree(found_jumps);
         pfree(sorted_vals);
       } else if (sorted_vals && nvals > 0 && nvals <= pg_jitter_in_bsearch_max) {
         /*
