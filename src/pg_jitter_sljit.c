@@ -2766,7 +2766,11 @@ static bool sljit_compile_expr(ExprState *state) {
         case EEOP_HASHED_SCALARARRAYOP:
         case EEOP_SCALARARRAYOP:
         /* JSON (simdjson acceleration) */
+<<<<<<< Updated upstream
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+=======
+#if PG_VERSION_NUM >= 160000
+>>>>>>> Stashed changes
         case EEOP_IS_JSON:
 #endif
         case EEOP_IOCOERCE:
