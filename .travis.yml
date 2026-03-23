@@ -26,8 +26,8 @@ before_install:
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       sudo apt-get update -qq
       # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
-      sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-server-dev-${PG_VERSION} || \
-        sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-server-dev-14
+      sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-${PG_VERSION} postgresql-server-dev-${PG_VERSION} || \
+        sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-14 postgresql-server-dev-14
     elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
       sudo pkg update -q
       sudo pkg install -y cmake icu pcre2 postgresql${PG_VERSION}-server postgresql${PG_VERSION}-client
@@ -38,24 +38,307 @@ install:
   - git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
   - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
+  - git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
 
-script:
+  # Determine pg_config path
   - |
     if [ "$TRAVIS_OS_NAME" = "linux" ]; then
       PG_CONFIG=$(find /usr/lib/postgresql -name pg_config 2>/dev/null | sort -V | tail -1)
     elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
       PG_CONFIG=/usr/local/bin/pg_config
     fi
-  - echo "Using $PG_CONFIG"
-  - $PG_CONFIG --version
-  - >-
-    cmake -B build
-    -DPG_CONFIG=${PG_CONFIG}
-    -DPG_JITTER_BACKENDS="sljit;mir"
-    -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit
-    -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir
-    -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla
-    -DWITH_PCRE2=ON
-    -DCMAKE_BUILD_TYPE=Release
-  - cmake --build build --parallel 2
-  - ls -la build/pg_jitter*.so
+    echo "PG_CONFIG=$PG_CONFIG" >> "$HOME/.travis_env"
+    echo "Using $PG_CONFIG"
+    $PG_CONFIG --version
+
+  # Determine actual PG major version installed
+  - |
+    . "$HOME/.travis_env"
+    PG_MAJOR=$($PG_CONFIG --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')
+    echo "PG_MAJOR=$PG_MAJOR" >> "$HOME/.travis_env"
+    echo "Detected PG major version: $PG_MAJOR"
+
+  # Clone PostgreSQL source (pinned to exact installed version) for regression tests
+  - |
+    . "$HOME/.travis_env"
+    PG_FULL=$($PG_CONFIG --version)
+    PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
+    PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
+    echo "Cloning PostgreSQL source: $PG_TAG"
+    git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
+
+  # Build pg_jitter (asmjit available on x86_64/arm64 only)
+  - |
+    . "$HOME/.travis_env"
+    ARCH=$(uname -m)
+    CMAKE_ARGS="-DPG_CONFIG=${PG_CONFIG}"
+    CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit"
+    CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir"
+    CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla"
+    CMAKE_ARGS="$CMAKE_ARGS -DWITH_PCRE2=ON"
+    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release"
+    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
+      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;asmjit;mir"
+      CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${TRAVIS_BUILD_DIR}/deps/asmjit"
+      echo "HAS_ASMJIT=1" >> "$HOME/.travis_env"
+    else
+      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;mir"
+    fi
+    cmake -B build $CMAKE_ARGS
+    cmake --build build --parallel 2
+    ls -la build/pg_jitter*.so
+
+script:
+  - |
+    . "$HOME/.travis_env"
+
+    # ---- Initialize and start PostgreSQL cluster ----
+    PGDATA="/tmp/pg_jitter_travis"
+    PGPORT=5432
+    PGUSER=$(whoami)
+
+    if [ "$TRAVIS_OS_NAME" = "linux" ]; then
+      PGBIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
+    elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
+      PGBIN="/usr/local/bin"
+    fi
+    export PATH="$PGBIN:$PATH"
+
+    # Init cluster with C locale for stable regression test output
+    initdb -D "$PGDATA" --locale=en_US.UTF-8 --username="$PGUSER" -A trust
+
+    # Install pg_jitter into pkglibdir
+    PKGLIBDIR=$($PG_CONFIG --pkglibdir)
+    sudo cp build/pg_jitter*.so "$PKGLIBDIR/"
+    ls "$PKGLIBDIR"/pg_jitter*
+
+    # Configure pg_jitter
+    cat >> "$PGDATA/postgresql.conf" <<CONF
+    listen_addresses = 'localhost'
+    port = $PGPORT
+    jit_provider = 'pg_jitter'
+    jit_above_cost = 0
+    jit_inline_above_cost = 0
+    jit_optimize_above_cost = 0
+    log_statement = 'all'
+    log_min_messages = 'INFO'
+    CONF
+
+    pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+    sleep 1
+    psql -h localhost -p $PGPORT -c "SHOW jit_provider;" postgres
+
+    # ---- Build regression test shared libraries ----
+    PGSRC="${TRAVIS_BUILD_DIR}/postgres-src"
+    DLPATH="$PGSRC/src/test/regress"
+    INCSERVER="$($PG_CONFIG --includedir-server)"
+    INC="$($PG_CONFIG --includedir)"
+
+    SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
+
+    cd "$PGSRC"
+    for src in $SOURCES; do
+      base=$(basename "$src" .c)
+      EXTRA_CFLAGS=""
+      if [ "$base" = "refint" ]; then
+        EXTRA_CFLAGS="-DREFINT_VERBOSE"
+      fi
+      cc -fPIC -I"$INCSERVER" -I"$INC" $EXTRA_CFLAGS -c "$src" -o "$base.o"
+      cc -shared "$base.o" -o "$DLPATH/$base.so"
+    done
+    echo "Built regress libraries:"
+    ls "$DLPATH"/*.so 2>/dev/null || true
+    cd "$TRAVIS_BUILD_DIR"
+
+    # ---- Find pg_regress ----
+    PG_REGRESS=""
+    for candidate in \
+      "$($PG_CONFIG --pkglibdir)/pgxs/src/test/regress/pg_regress" \
+      "$($PG_CONFIG --bindir)/../lib/pgxs/src/test/regress/pg_regress" \
+      "$($PG_CONFIG --bindir)/pg_regress" \
+      "/usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/regress/pg_regress" \
+    ; do
+      if [ -f "$candidate" ]; then
+        PG_REGRESS="$candidate"
+        break
+      fi
+    done
+
+    if [ -z "$PG_REGRESS" ]; then
+      echo "ERROR: pg_regress not found"
+      exit 1
+    fi
+    echo "Using pg_regress: $PG_REGRESS"
+
+    # ---- Enable core dumps (Linux) ----
+    if [ "$TRAVIS_OS_NAME" = "linux" ]; then
+      ulimit -c unlimited 2>/dev/null || true
+      echo '/tmp/core.%p' | sudo tee /proc/sys/kernel/core_pattern || true
+      sudo apt-get install -y -qq gdb 2>/dev/null || true
+    fi
+
+    # ---- Cleanup function ----
+    cleanup_database() {
+      psql -q -X -h localhost -p $PGPORT postgres <<'CLEANUP_SQL'
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT evtname FROM pg_event_trigger LOOP
+            EXECUTE format('DROP EVENT TRIGGER IF EXISTS %I CASCADE', r.evtname);
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT pubname FROM pg_publication LOOP
+            EXECUTE format('DROP PUBLICATION IF EXISTS %I CASCADE', r.pubname);
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT subname FROM pg_subscription LOOP
+            BEGIN
+                EXECUTE format('ALTER SUBSCRIPTION %I DISABLE', r.subname);
+                EXECUTE format('ALTER SUBSCRIPTION %I SET (slot_name = NONE)', r.subname);
+                EXECUTE format('DROP SUBSCRIPTION IF EXISTS %I', r.subname);
+            EXCEPTION WHEN OTHERS THEN NULL;
+            END;
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT srvname FROM pg_foreign_server LOOP
+            EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', r.srvname);
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT nspname FROM pg_namespace
+                 WHERE nspname NOT IN ('pg_catalog','information_schema','public')
+                   AND nspname NOT LIKE 'pg_temp%'
+                   AND nspname NOT LIKE 'pg_toast%' LOOP
+            EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', r.nspname);
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT spcname FROM pg_tablespace
+                 WHERE spcname NOT IN ('pg_default','pg_global') LOOP
+            EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
+        END LOOP;
+    END $$;
+    DO $$ DECLARE r RECORD; BEGIN
+        FOR r IN SELECT rolname FROM pg_roles
+                 WHERE rolname LIKE 'regress_%'
+                   AND rolname NOT IN (SELECT usename FROM pg_stat_activity) LOOP
+            BEGIN
+                EXECUTE format('REASSIGN OWNED BY %I TO CURRENT_USER', r.rolname);
+                EXECUTE format('DROP OWNED BY %I', r.rolname);
+                EXECUTE format('DROP ROLE IF EXISTS %I', r.rolname);
+            EXCEPTION WHEN OTHERS THEN NULL;
+            END;
+        END LOOP;
+    END $$;
+    CLEANUP_SQL
+    }
+
+    # ---- Run regression tests per backend ----
+    BACKENDS="sljit mir auto"
+    if [ "${HAS_ASMJIT:-}" = "1" ]; then
+      BACKENDS="sljit asmjit mir auto"
+    fi
+    PASSED=0
+    FAILED=0
+    RESULTS=""
+
+    for backend in $BACKENDS; do
+      echo "============================================"
+      echo "  Regression tests: $backend"
+      echo "============================================"
+
+      # Ensure server is running (may have crashed from previous backend)
+      if ! pg_isready -h localhost -p "$PGPORT" -q 2>/dev/null; then
+        echo "  Server is down — restarting..."
+        pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w || true
+        sleep 2
+      fi
+
+      cleanup_database || true
+
+      # Switch backend
+      grep -v '^pg_jitter\.' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" 2>/dev/null || true
+      mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf" 2>/dev/null || true
+      echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
+      pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
+      sleep 1
+
+      echo "Active backend: $backend"
+
+      # Save log position
+      LOG_OFFSET=0
+      if [ -f "$PGDATA/logfile" ]; then
+        LOG_OFFSET=$(wc -c < "$PGDATA/logfile" | tr -d ' ')
+      fi
+
+      # Sanity check
+      psql -h localhost -p $PGPORT -c "SELECT 1+1 AS jit_test;" postgres || echo "WARNING: basic JIT query failed for $backend"
+
+      OUTDIR="${TRAVIS_BUILD_DIR}/regress-output-$backend"
+      mkdir -p "$OUTDIR/testtablespace"
+
+      set +e
+      "$PG_REGRESS" \
+        --inputdir="$DLPATH/../.." \
+        --outputdir="$OUTDIR" \
+        --bindir="$PGBIN" \
+        --dlpath="$DLPATH" \
+        --schedule="$DLPATH/parallel_schedule" \
+        --host=localhost \
+        --port="$PGPORT" \
+        --user="$PGUSER" \
+        --dbname=regression > "$OUTDIR/pg_regress.log" 2>&1
+      RC=$?
+      set -e
+      tail -50 "$OUTDIR/pg_regress.log"
+
+      if [ $RC -eq 0 ]; then
+        echo "  => $backend: PASSED"
+        RESULTS="$RESULTS  $backend: PASSED (all tests)\n"
+        PASSED=$((PASSED + 1))
+      else
+        FAIL_LINE=$(grep -E '[0-9]+ of [0-9]+ tests failed' "$OUTDIR/regression.out" 2>/dev/null | tail -1 || true)
+        echo "  => $backend: FAILED — $FAIL_LINE"
+        RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
+        grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
+        if [ -f "$OUTDIR/regression.diffs" ]; then
+          echo "--- First 500 lines of regression.diffs ---"
+          head -500 "$OUTDIR/regression.diffs"
+        fi
+        FAILED=$((FAILED + 1))
+
+        # Dump crash-related log lines
+        if [ -f "$PGDATA/logfile" ]; then
+          echo "--- Crash/error lines from PostgreSQL server log ---"
+          tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
+            | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|exit code [1-9]|signal [0-9]' \
+            | head -50 || true
+          echo "--- Last 100 log lines from this backend ---"
+          tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -100 || true
+        fi
+
+        # Core dump backtrace (Linux)
+        if [ "$TRAVIS_OS_NAME" = "linux" ]; then
+          for corefile in /tmp/core.*; do
+            [ -f "$corefile" ] || continue
+            echo "--- Backtrace from $corefile ---"
+            PGBIN_PATH=$($PG_CONFIG --bindir)/postgres
+            gdb -batch -ex "thread apply all bt" "$PGBIN_PATH" "$corefile" 2>&1 | head -100
+            rm -f "$corefile"
+          done
+        fi
+      fi
+
+      echo ""
+    done
+
+    echo "============================================"
+    echo "  SUMMARY"
+    echo "============================================"
+    printf "$RESULTS"
+    echo ""
+    echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
+    echo "============================================"
+
+    [ $FAILED -eq 0 ]
