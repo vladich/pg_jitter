@@ -53,7 +53,7 @@ jobs:
       - name: Clone sljit
         uses: actions/checkout@v4
         with:
-          repository: zherczeg/sljit
+          repository: vladich/sljit
           path: deps/sljit
 
       - name: Clone AsmJIT

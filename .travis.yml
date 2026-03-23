@@ -35,7 +35,7 @@ before_install:
 
 install:
   # Clone dependencies
-  - git clone --depth 1 https://github.com/zherczeg/sljit.git deps/sljit
+  - git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
   - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
 
