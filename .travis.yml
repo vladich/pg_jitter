@@ -40,8 +40,9 @@ before_install:
       sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       echo "deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee -a /etc/apt/sources.list.d/pgdg.list
-      # Enable Ubuntu deb-src for s390x (PGDG has no s390x, so PG comes from Ubuntu)
-      sudo sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list 2>/dev/null || true
+      # Enable Ubuntu deb-src (s390x gets PG from Ubuntu, not PGDG)
+      echo "deb-src http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main universe" | sudo tee /etc/apt/sources.list.d/ubuntu-src.list
+      echo "deb-src http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main universe" | sudo tee -a /etc/apt/sources.list.d/ubuntu-src.list
       sudo apt-get update -qq
       # Prevent PG postinst from starting a service — we init our own cluster later
       sudo sh -c 'echo "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d'
@@ -88,33 +89,29 @@ install:
     echo "PG_MAJOR=$PG_MAJOR" >> "$HOME/.travis_env"
     echo "Detected PG major version: $PG_MAJOR"
 
-  # Clone PostgreSQL source for regression tests
-  - |
-    . "$HOME/.travis_env"
-    PG_FULL=$($PG_CONFIG --version)
-    PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
-    PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
-    echo "Cloning PostgreSQL source: $PG_TAG"
-    git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
-
-  # Linux: distro/PGDG packages may have patches that change expected output.
-  # Overlay expected files from the apt source package matching the installed binary.
+  # Get PostgreSQL source for regression tests.
+  # Linux: use apt-get source for exact match with installed binary (includes distro patches).
+  # FreeBSD: clone upstream git tag pinned to installed version.
   - |
     . "$HOME/.travis_env"
     if [ "$TRAVIS_OS_NAME" = "linux" ]; then
       sudo apt-get install -y -qq dpkg-dev
-      # Pin source to exact installed binary version to avoid version skew
       PG_PKG_VER=$(dpkg-query -W -f='${Version}' postgresql-${PG_MAJOR} 2>/dev/null)
       echo "Installed postgresql-${PG_MAJOR} package version: $PG_PKG_VER"
       mkdir -p /tmp/pg-apt-src && cd /tmp/pg-apt-src
       apt-get source --download-only postgresql-${PG_MAJOR}=${PG_PKG_VER} 2>/dev/null || \
         apt-get source --download-only postgresql-${PG_MAJOR} 2>/dev/null
-      dpkg-source -x *.dsc pg-patched
-      cp pg-patched/src/test/regress/expected/* \
-         "$TRAVIS_BUILD_DIR/postgres-src/src/test/regress/expected/"
+      dpkg-source -x *.dsc postgres-src
+      mv postgres-src "$TRAVIS_BUILD_DIR/postgres-src"
       cd "$TRAVIS_BUILD_DIR"
       rm -rf /tmp/pg-apt-src
-      echo "Overlaid distro-patched expected files"
+      echo "Using distro source for PG ${PG_MAJOR} (${PG_PKG_VER})"
+    else
+      PG_FULL=$($PG_CONFIG --version)
+      PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
+      PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
+      echo "Cloning PostgreSQL source: $PG_TAG"
+      git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
     fi
 
   # Build pg_jitter (asmjit available on x86_64/arm64 only)
