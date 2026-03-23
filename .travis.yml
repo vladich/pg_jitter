@@ -290,8 +290,14 @@ script:
 
     # ---- Run regression tests per backend ----
     # ppc64le/s390x: sljit only (full suite takes >50min timeout with multiple backends)
+    # s390x: serial schedule (parallel causes catalog visibility flakiness on slow runners)
     # FreeBSD x86_64: all backends including asmjit
     ARCH=$(uname -m)
+    if [ "$ARCH" = "s390x" ]; then
+      REGRESS_SCHEDULE="serial_schedule"
+    else
+      REGRESS_SCHEDULE="parallel_schedule"
+    fi
     if [ "${HAS_ASMJIT:-}" = "1" ]; then
       BACKENDS="sljit asmjit mir auto"
     elif [ "$ARCH" = "ppc64le" ] || [ "$ARCH" = "s390x" ]; then
@@ -344,7 +350,7 @@ script:
         --outputdir="$OUTDIR" \
         --bindir="$PGBIN" \
         --dlpath="$DLPATH" \
-        --schedule="$DLPATH/parallel_schedule" \
+        --schedule="$DLPATH/$REGRESS_SCHEDULE" \
         --host=localhost \
         --port="$PGPORT" \
         --user="$PGUSER" \
