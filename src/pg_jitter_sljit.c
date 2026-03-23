@@ -4137,7 +4137,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (sljit_inline_enabled &&
+          if (false && sljit_inline_enabled &&
               dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
             /*
