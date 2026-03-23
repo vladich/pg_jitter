@@ -26,11 +26,11 @@ before_install:
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       sudo apt-get update -qq
       # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
-      sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-${PG_VERSION} || \
-        sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-14
+      sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-server-dev-${PG_VERSION} || \
+        sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-server-dev-14
     elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
       sudo pkg update -q
-      sudo pkg install -y cmake icu postgresql${PG_VERSION}-server postgresql${PG_VERSION}-client
+      sudo pkg install -y cmake icu pcre2 postgresql${PG_VERSION}-server postgresql${PG_VERSION}-client
     fi
 
 install:
@@ -38,21 +38,6 @@ install:
   - git clone --depth 1 https://github.com/zherczeg/sljit.git deps/sljit
   - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
-  # PCRE2 with JIT (SLJIT supports ppc64le, s390x, and FreeBSD)
-  - git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
-  - mkdir -p deps/pcre2/build
-  - >-
-    cmake -S deps/pcre2 -B deps/pcre2/build
-    -DCMAKE_BUILD_TYPE=Release
-    -DPCRE2_SUPPORT_JIT=ON
-    -DPCRE2_SUPPORT_UNICODE=ON
-    -DPCRE2_BUILD_PCRE2_8=ON
-    -DBUILD_SHARED_LIBS=OFF
-    -DPCRE2_BUILD_PCRE2GREP=OFF
-    -DPCRE2_BUILD_TESTS=OFF
-    -DPCRE2_STATIC_PIC=ON
-  # Limit parallelism — Travis CI runners have limited RAM
-  - cmake --build deps/pcre2/build --target pcre2-8-static -j 2
 
 script:
   - |
@@ -70,7 +55,7 @@ script:
     -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit
     -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir
     -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla
-    -DPCRE2_DIR=${TRAVIS_BUILD_DIR}/deps/pcre2
+    -DWITH_PCRE2=ON
     -DCMAKE_BUILD_TYPE=Release
   - cmake --build build --parallel 2
   - ls -la build/pg_jitter*.so
