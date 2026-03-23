@@ -5,6 +5,9 @@
  * Hot-path opcodes (~30) get native code; everything else falls back to
  * pg_jitter_fallback_step().
  */
+/* BISECT: uncomment to disable new type cast inlines on ppc64le */
+#define PG_JITTER_BISECT_DISABLE_CAST_INLINES
+
 #include "postgres.h"
 #include "fmgr.h"
 #include "jit/jit.h"
@@ -2153,20 +2156,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
   }
 
   /* ---- type casts (1-arg: value in R0, result in R0) ---- */
-#ifdef PG_JITTER_BISECT_DISABLE_CAST_INLINES
-  case JIT_INLINE_INT4_TO_INT8:
-  case JIT_INLINE_INT2_TO_INT4:
-  case JIT_INLINE_INT2_TO_INT8:
-  case JIT_INLINE_INT8_TO_INT4:
-  case JIT_INLINE_INT4_TO_INT2:
-  case JIT_INLINE_INT8_TO_INT2:
-  case JIT_INLINE_FLOAT4_TO_FLOAT8:
-  case JIT_INLINE_FLOAT8_TO_FLOAT4:
-  case JIT_INLINE_INT4_TO_FLOAT8:
-  case JIT_INLINE_INT8_TO_FLOAT8:
-    return false;
-#endif
-
+#ifndef PG_JITTER_BISECT_DISABLE_CAST_INLINES
   case JIT_INLINE_INT4_TO_INT8:
     /* Sign-extend int32 in R0 to int64. On 64-bit, SLJIT_MOV_S32 does this. */
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
@@ -2265,6 +2255,7 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_R0, SLJIT_FR0);
     return true;
   }
+#endif /* !PG_JITTER_BISECT_DISABLE_CAST_INLINES */
 
   default:
     return false;
