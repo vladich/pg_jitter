@@ -2276,7 +2276,7 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   struct sljit_jump *j_slow1, *j_slow2, *j_slow3, *j_slow4;
   struct sljit_jump *j_len_ne, *j_empty, *j_big, *j_small_eq;
   struct sljit_jump *j_to_ne, *j_to_store, *j_to_store2;
-  struct sljit_jump *j_memcmp_eq;
+  struct sljit_jump *j_memcmp_eq = NULL;
   struct sljit_label *l_result_eq, *l_result_ne, *l_slow, *l_store;
 
   sljit_sw off0 = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -2398,7 +2398,8 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   sljit_set_label(j_ptr_eq, l_result_eq);
   sljit_set_label(j_empty, l_result_eq);
   sljit_set_label(j_small_eq, l_result_eq);
-  sljit_set_label(j_memcmp_eq, l_result_eq);
+  if (j_memcmp_eq)
+    sljit_set_label(j_memcmp_eq, l_result_eq);
   sljit_set_label(j_big, l_result_eq);  /* memcmp_eq2 for >16 byte path */
   sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 1 : 0);
   j_to_store2 = sljit_emit_jump(C, SLJIT_JUMP);
@@ -4137,11 +4138,15 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          /* BISECT: text inline disabled — fall through to direct call */
           if (sljit_inline_enabled &&
               dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
-            goto sljit_funcexpr_v1_fallback;
+            if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
+              bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
+              emit_inline_text_cmp(C, state, opno, op, fcinfo, is_eq);
+            } else {
+              goto sljit_funcexpr_v1_fallback;
+            }
           } else if (sljit_inline_enabled &&
                      dfn && dfn->inline_op != JIT_INLINE_NONE) {
             /*

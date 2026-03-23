@@ -178,7 +178,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(PG_JITTER_BUILD_SLJIT)
     add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
     target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
-    target_compile_definitions(sljit PRIVATE SLJIT_DEBUG=0)
     target_compile_options(sljit PRIVATE -w)
 endif()
 
