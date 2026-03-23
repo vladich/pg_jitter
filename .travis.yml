@@ -130,6 +130,7 @@ install:
     CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla"
     CMAKE_ARGS="$CMAKE_ARGS -DWITH_PCRE2=ON"
     CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release"
+    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=-DPG_JITTER_BISECT_DISABLE_CAST_INLINES"
     if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
       BACKENDS_LIST="sljit;asmjit;mir"
       CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${TRAVIS_BUILD_DIR}/deps/asmjit"
@@ -239,7 +240,7 @@ script:
     {
       echo "jit_provider = 'pg_jitter'"
       echo "jit_above_cost = 0"
-      echo "jit_inline_above_cost = -1"
+      echo "jit_inline_above_cost = 0"
       echo "jit_optimize_above_cost = 0"
     } >> "$PGDATA/postgresql.conf"
     pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w

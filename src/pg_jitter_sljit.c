@@ -2153,6 +2153,19 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
   }
 
   /* ---- type casts (1-arg: value in R0, result in R0) ---- */
+#ifdef PG_JITTER_BISECT_DISABLE_CAST_INLINES
+  case JIT_INLINE_INT4_TO_INT8:
+  case JIT_INLINE_INT2_TO_INT4:
+  case JIT_INLINE_INT2_TO_INT8:
+  case JIT_INLINE_INT8_TO_INT4:
+  case JIT_INLINE_INT4_TO_INT2:
+  case JIT_INLINE_INT8_TO_INT2:
+  case JIT_INLINE_FLOAT4_TO_FLOAT8:
+  case JIT_INLINE_FLOAT8_TO_FLOAT4:
+  case JIT_INLINE_INT4_TO_FLOAT8:
+  case JIT_INLINE_INT8_TO_FLOAT8:
+    return false;
+#endif
 
   case JIT_INLINE_INT4_TO_INT8:
     /* Sign-extend int32 in R0 to int64. On 64-bit, SLJIT_MOV_S32 does this. */
