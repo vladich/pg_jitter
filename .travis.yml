@@ -408,8 +408,12 @@ script:
         RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
         grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
         if [ -f "$OUTDIR/regression.diffs" ]; then
-          echo "--- regression.diffs ---"
-          cat "$OUTDIR/regression.diffs"
+          if [ -n "$BASELINE_OUTDIR" ]; then
+            echo "--- regression.diffs skipped (baseline comparison is authoritative) ---"
+          else
+            echo "--- regression.diffs ---"
+            cat "$OUTDIR/regression.diffs"
+          fi
         fi
         FAILED=$((FAILED + 1))
 
