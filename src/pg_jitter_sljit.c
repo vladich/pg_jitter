@@ -2345,9 +2345,10 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   {
     struct sljit_jump *j_simd_ne = NULL, *j_memcmp_eq2;
     int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
-    bool has_simd_cmpeq = (sljit_emit_simd_op2(C,
-        simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
-        SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
+    bool has_simd_cmpeq = sljit_has_cpu_feature(SLJIT_HAS_SIMD) &&
+        (sljit_emit_simd_op2(C,
+            simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
+            SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
 
     /* If SIMD available: data_len > 16 → memcmp. Otherwise all > 7 → memcmp. */
     struct sljit_jump *j_memcmp_path = sljit_emit_cmp(C, SLJIT_GREATER,
