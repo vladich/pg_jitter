@@ -7,16 +7,31 @@ if: type = api
 
 jobs:
   include:
-    # Linux ppc64le
+    # Linux ppc64le — PG 14-18 (PGDG)
+    - arch: ppc64le
+      env: PG_VERSION=14
+    - arch: ppc64le
+      env: PG_VERSION=15
+    - arch: ppc64le
+      env: PG_VERSION=16
     - arch: ppc64le
       env: PG_VERSION=17
-    # Linux s390x
+    - arch: ppc64le
+      env: PG_VERSION=18
+    # Linux s390x — PG 14 only (Ubuntu Jammy default, no PGDG)
     - arch: s390x
       env: PG_VERSION=14
-    # FreeBSD x86_64
+    # FreeBSD x86_64 — PG 14-18
+    - os: freebsd
+      env: PG_VERSION=14
+    - os: freebsd
+      env: PG_VERSION=15
     - os: freebsd
       env: PG_VERSION=16
-    # FreeBSD ARM64 — not available on Travis CI
+    - os: freebsd
+      env: PG_VERSION=17
+    - os: freebsd
+      env: PG_VERSION=18
 
 before_install:
   - |
