@@ -38,6 +38,7 @@ install:
   - git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
   - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
+  - git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
 
   # Determine pg_config path
   - |
@@ -66,17 +67,24 @@ install:
     echo "Cloning PostgreSQL source: $PG_TAG"
     git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
 
-  # Build pg_jitter
+  # Build pg_jitter (asmjit available on x86_64/arm64 only)
   - |
     . "$HOME/.travis_env"
-    cmake -B build \
-      -DPG_CONFIG=${PG_CONFIG} \
-      -DPG_JITTER_BACKENDS="sljit;mir" \
-      -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit \
-      -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir \
-      -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla \
-      -DWITH_PCRE2=ON \
-      -DCMAKE_BUILD_TYPE=Release
+    ARCH=$(uname -m)
+    CMAKE_ARGS="-DPG_CONFIG=${PG_CONFIG}"
+    CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit"
+    CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir"
+    CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla"
+    CMAKE_ARGS="$CMAKE_ARGS -DWITH_PCRE2=ON"
+    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release"
+    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
+      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;asmjit;mir"
+      CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${TRAVIS_BUILD_DIR}/deps/asmjit"
+      echo "HAS_ASMJIT=1" >> "$HOME/.travis_env"
+    else
+      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;mir"
+    fi
+    cmake -B build $CMAKE_ARGS
     cmake --build build --parallel 2
     ls -la build/pg_jitter*.so
 
@@ -228,6 +236,9 @@ script:
 
     # ---- Run regression tests per backend ----
     BACKENDS="sljit mir auto"
+    if [ "${HAS_ASMJIT:-}" = "1" ]; then
+      BACKENDS="sljit asmjit mir auto"
+    fi
     PASSED=0
     FAILED=0
     RESULTS=""
