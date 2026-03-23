@@ -101,7 +101,7 @@ script:
 
     # ---- Initialize and start PostgreSQL cluster ----
     PGDATA="/tmp/pg_jitter_travis"
-    PGPORT=5432
+    PGPORT=5444
     PGUSER=$(whoami)
 
     if [ "$TRAVIS_OS_NAME" = "linux" ]; then
@@ -120,18 +120,22 @@ script:
     ls "$PKGLIBDIR"/pg_jitter*
 
     # Configure pg_jitter
-    cat >> "$PGDATA/postgresql.conf" <<CONF
-    listen_addresses = 'localhost'
-    port = $PGPORT
-    jit_provider = 'pg_jitter'
-    jit_above_cost = 0
-    jit_inline_above_cost = 0
-    jit_optimize_above_cost = 0
-    log_statement = 'all'
-    log_min_messages = 'INFO'
-    CONF
+    {
+      echo "listen_addresses = 'localhost'"
+      echo "port = $PGPORT"
+      echo "jit_provider = 'pg_jitter'"
+      echo "jit_above_cost = 0"
+      echo "jit_inline_above_cost = 0"
+      echo "jit_optimize_above_cost = 0"
+      echo "log_statement = 'all'"
+      echo "log_min_messages = 'INFO'"
+    } >> "$PGDATA/postgresql.conf"
 
-    pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+    pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w || {
+      echo "=== pg_ctl start failed — logfile contents ==="
+      cat "$PGDATA/logfile"
+      exit 1
+    }
     sleep 1
     psql -h localhost -p $PGPORT -c "SHOW jit_provider;" postgres
 
