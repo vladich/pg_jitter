@@ -25,7 +25,6 @@ extern "C" {
 #include "mb/pg_wchar.h"
 #include "catalog/pg_collation_d.h"
 #include "pg_jit_funcs.h"
-#include "pg_jit_deform_templates.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
@@ -89,29 +88,6 @@ using namespace asmjit;
  * Try to match a tuple descriptor against pre-compiled deform templates.
  * Returns a function pointer to a shared-text deform function, or NULL.
  */
-static deform_template_fn
-asmjit_deform_match_template(TupleDesc desc, const TupleTableSlotOps *ops, int natts)
-{
-	int16	attlens[5];
-
-	if (natts < 1 || natts > 5)
-		return NULL;
-	if (ops == &TTSOpsVirtual)
-		return NULL;
-	for (int i = 0; i < natts; i++)
-	{
-		CompactAttribute *att = TupleDescCompactAttr(desc, i);
-		if (!att->attbyval)
-			return NULL;
-		if (att->attlen != 1 && att->attlen != 2 &&
-			att->attlen != 4 && att->attlen != 8)
-			return NULL;
-		if (att->attisdropped || att->atthasmissing)
-			return NULL;
-		attlens[i] = att->attlen;
-	}
-	return jit_deform_find_template(deform_signature(natts, attlens));
-}
 
 /* GUC enum options for pg_jitter.parallel_mode */
 static const struct config_enum_entry parallel_jit_options[] = {

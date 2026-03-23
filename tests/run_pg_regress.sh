@@ -74,7 +74,15 @@ if [ -z "$PG_SRC" ] || [ ! -f "$PG_SRC/src/test/regress/pg_regress" ]; then
     exit 1
 fi
 
-REGRESS_DIR="$PG_SRC/src/test/regress"
+# Use a per-port working copy of the regress directory so parallel
+# runs across PG versions don't stomp on each other's results.
+REGRESS_DIR_ORIG="$PG_SRC/src/test/regress"
+REGRESS_DIR="/tmp/pg_jitter_regress_work_${PGPORT}"
+if [ ! -d "$REGRESS_DIR" ] || [ "$REGRESS_DIR_ORIG/pg_regress" -nt "$REGRESS_DIR/pg_regress" ]; then
+    rm -rf "$REGRESS_DIR"
+    cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
+    mkdir -p "$REGRESS_DIR/testtablespace"
+fi
 
 # Verify all backend dylibs exist
 for backend in $BACKENDS; do
@@ -207,6 +215,7 @@ CLEANUP_SQL
     echo "Cleanup complete."
 }
 
+"$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
 cleanup_database
 echo ""
 
@@ -221,6 +230,8 @@ for backend in $BACKENDS; do
 
     # Clean up leftover state between backends
     ensure_pg_running
+    # Drop the regression database to ensure a clean slate
+    "$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
     cleanup_database
 
     # PG17+ supports custom GUCs via ALTER SYSTEM, so we use the
@@ -255,7 +266,11 @@ for backend in $BACKENDS; do
     # Run installcheck, capture output
     LOGFILE="$REGRESS_DIR/regression_${backend}.log"
     set +e
-    (cd "$PG_SRC" && make installcheck PGPORT="$PGPORT" bindir="$PGBIN" 2>&1) | tee "$LOGFILE" | tail -3
+    PG_REGRESS="$("$PG_CONFIG" --pgxs | sed 's|/pgxs/.*|/pgxs/src/test/regress/pg_regress|')"
+    (cd "$REGRESS_DIR" && PGPORT="$PGPORT" "$PG_REGRESS" --inputdir=. --bindir="$PGBIN" \
+        --dlpath=. --max-concurrent-tests=20 \
+        --schedule=./parallel_schedule --max-connections=1 \
+        --port="$PGPORT" --host=/tmp 2>&1) | tee "$LOGFILE" | tail -3
     RC=${PIPESTATUS[0]}
     set -e
 

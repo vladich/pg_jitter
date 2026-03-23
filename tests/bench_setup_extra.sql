@@ -247,8 +247,8 @@ CREATE INDEX IF NOT EXISTS idx_date_data_ts_brin     ON date_data  USING brin(ts
 CREATE INDEX IF NOT EXISTS idx_bench_data_grp_hash   ON bench_data USING hash(grp);
 CREATE INDEX IF NOT EXISTS idx_text_data_hash_hash   ON text_data  USING hash(hash_text);
 
--- GIN indexes (jsonb, tsvector, array)
-CREATE INDEX IF NOT EXISTS idx_jsonb_data_doc_gin    ON jsonb_data USING gin(doc);
+-- GIN indexes (tsvector, array)
+-- NOTE: jsonb_data GIN index intentionally omitted to force seq scan in benchmarks
 CREATE INDEX IF NOT EXISTS idx_fts_data_tsv_gin      ON fts_data   USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_array_data_tags_gin   ON array_data USING gin(tags);
 

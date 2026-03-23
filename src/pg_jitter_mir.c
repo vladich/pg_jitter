@@ -471,6 +471,7 @@ static bool expr_has_fast_path(ExprState *state) {
  * deform functions. This is faster than MIR inline deform, especially
  * for wide tables (100+ cols: 37% faster). */
 
+
 /*
  * Helper: emit MIR instruction to load the address of a step field into
  * a register.  In PIC mode (mir_shared_code_mode), computes the address
@@ -847,6 +848,7 @@ static bool mir_compile_expr(ExprState *state) {
   MIR_item_t import_htgd = MIR_new_import(ctx, "htgd_fn");
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
   /* Proto for simdjson IS_JSON: (Datum, int32) -> int32 */
   MIR_item_t proto_sj_is_json;
   {
@@ -854,6 +856,7 @@ static bool mir_compile_expr(ExprState *state) {
     proto_sj_is_json = MIR_new_proto(ctx, "p_sjisj", 1, &rt32, 2,
                                       MIR_T_I64, "datum", MIR_T_I32, "itype");
   }
+#endif
 
   /* Proto for simdjson json_in/jsonb_in: (Datum, FunctionCallInfo) -> Datum */
   MIR_item_t proto_sj_json_in;
@@ -879,7 +882,9 @@ static bool mir_compile_expr(ExprState *state) {
 #endif
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
   MIR_item_t import_sj_is_json = MIR_new_import(ctx, "sj_is_json");
+#endif
   MIR_item_t import_sj_json_in = MIR_new_import(ctx, "sj_json_in");
   MIR_item_t import_sj_jsonb_in = MIR_new_import(ctx, "sj_jsonb_in");
 #endif
@@ -1097,8 +1102,7 @@ static bool mir_compile_expr(ExprState *state) {
              /* SCALARARRAYOP uses dedicated inline with separate imports */
              opcode == EEOP_CURRENTOFEXPR || opcode == EEOP_NEXTVALUEEXPR ||
              opcode == EEOP_ROW ||
-             opcode == EEOP_MINMAX || opcode == EEOP_DOMAIN_NOTNULL ||
-             opcode == EEOP_DOMAIN_CHECK || opcode == EEOP_XMLEXPR ||
+             opcode == EEOP_MINMAX || opcode == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
              opcode == EEOP_IS_JSON ||
 #endif
@@ -1603,6 +1607,19 @@ static bool mir_compile_expr(ExprState *state) {
                             MIR_new_ref_op(ctx, import_getsomeattrs),
                             MIR_new_reg_op(ctx, r_slot),
                             MIR_new_int_op(ctx, op->d.fetch.last_var)));
+
+      /*
+       * Reload r_slot from econtext after the call.  MIR's register
+       * allocator may place r_slot in a caller-saved register on the
+       * skip path (where no call happens), creating an inconsistency
+       * at the merge label — the call path clobbers that register.
+       * Reloading here forces a consistent state.
+       */
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_slot),
+                       MIR_new_mem_op(ctx, MIR_T_P, soff, r_econtext, 0,
+                                      1)));
 
       MIR_append_insn(ctx, func_item, skip_label);
       break;
@@ -5610,6 +5627,13 @@ static bool mir_compile_expr(ExprState *state) {
      * ---- DOMAIN_TESTVAL ----
      * Same as CASE_TESTVAL (uses same union d.casetest).
      */
+    /*
+     * DOMAIN_TESTVAL / DOMAIN_TESTVAL_EXT / DOMAIN_NOTNULL / DOMAIN_CHECK:
+     * Route to fallback. The inline versions crash on ARM64 due to
+     * MIR codegen issues with the pointer indirection patterns used
+     * by domain constraint checking.
+     */
+#if 0  /* disabled — crashes on ARM64, route to default fallback */
     case EEOP_DOMAIN_TESTVAL: {
       /*
        * If d.casetest.value is non-NULL, dereference it.
@@ -6590,83 +6614,34 @@ static bool mir_compile_expr(ExprState *state) {
       break;
     }
 
-    /*
-     * ---- DOMAIN_NOTNULL (inlined) ----
-     * Fast path: if *op->resnull is false, done.
-     * Slow path: call ExecEvalConstraintNotNull(state, op).
-     */
+#ifndef _WIN64
+    /* DOMAIN_NOTNULL: route to fallback — inline version crashes on ARM64. */
     case EEOP_DOMAIN_NOTNULL: {
-      MIR_insn_t ok_label = MIR_new_label(ctx);
-
-      /* r_tmp1 = *op->resnull */
-      MIR_STEP_LOAD(r_tmp3, opno, resnull);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      /* if (!resnull) goto ok */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BEQ, MIR_new_label_op(ctx, ok_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      /* Slow path: call ExecEvalConstraintNotNull(state, op) */
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
                             MIR_new_ref_op(ctx, step_fn_imports[opno]),
                             MIR_new_reg_op(ctx, r_state),
-                            MIR_new_reg_op(ctx, r_tmp1)));
-
-      MIR_append_insn(ctx, func_item, ok_label);
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
       break;
     }
 
-    /*
-     * ---- DOMAIN_CHECK (inlined) ----
-     * Fast path: if *checknull → done. Else if DatumGetBool(*checkvalue) → done.
-     * Slow path: call ExecEvalConstraintCheck(state, op).
-     */
+    /* DOMAIN_CHECK: route to fallback — inline version crashes on ARM64 */
     case EEOP_DOMAIN_CHECK: {
-      MIR_insn_t done_label = MIR_new_label(ctx);
-
-      /* r_tmp1 = *op->d.domaincheck.checknull */
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checknull);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      /* if (checknull) goto done */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      /* r_tmp1 = DatumGetBool(*op->d.domaincheck.checkvalue) */
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checkvalue);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
-      /* if (checkvalue != 0) goto done */
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      /* Slow path: call ExecEvalConstraintCheck(state, op) */
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
                             MIR_new_ref_op(ctx, step_fn_imports[opno]),
                             MIR_new_reg_op(ctx, r_state),
-                            MIR_new_reg_op(ctx, r_tmp1)));
-
-      MIR_append_insn(ctx, func_item, done_label);
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
       break;
     }
+#endif /* disabled domain inline */
+#endif /* !_WIN64 */
 
     /*
      * ---- SCALARARRAYOP (partially inlined) ----
@@ -8670,8 +8645,19 @@ static bool mir_compile_expr(ExprState *state) {
     /* Load external symbols (sentinels in shared mode) */
     MIR_load_external(ctx, "fallback_step",
                       mir_extern_addr((void *)pg_jitter_fallback_step));
+    /*
+     * On Windows x64, use PG's built-in deform instead of compiled deform.
+     * The sljit-compiled deform interacts badly with MIR's calling code
+     * due to deform dispatch cache collisions when TupleDesc pointers are
+     * reused across DDL operations within a session.
+     */
+#ifdef _WIN64
+    MIR_load_external(ctx, "getsomeattrs",
+                      mir_extern_addr((void *)slot_getsomeattrs_int));
+#else
     MIR_load_external(ctx, "getsomeattrs",
                       mir_extern_addr((void *)pg_jitter_compiled_deform_dispatch));
+#endif
 
     MIR_load_external(
         ctx, "make_ro",
@@ -8872,7 +8858,9 @@ static bool mir_compile_expr(ExprState *state) {
                  /* SCALARARRAYOP uses dedicated inline with separate imports */
                  op == EEOP_CURRENTOFEXPR || op == EEOP_NEXTVALUEEXPR ||
                  op == EEOP_ARRAYEXPR || op == EEOP_ROW || op == EEOP_MINMAX ||
+#ifndef _WIN64
                  op == EEOP_DOMAIN_NOTNULL || op == EEOP_DOMAIN_CHECK ||
+#endif
                  op == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
                  op == EEOP_IS_JSON ||
@@ -9082,8 +9070,10 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
     MIR_load_external(ctx, "sj_is_json",
                       mir_extern_addr((void *)pg_jitter_sj_is_json_datum));
+#endif
     MIR_load_external(ctx, "sj_json_in",
                       mir_extern_addr((void *)pg_jitter_sj_json_in));
     MIR_load_external(ctx, "sj_jsonb_in",

@@ -19,21 +19,6 @@ add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
 target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
 target_compile_options(sljit PRIVATE -w)
 
-# ---------- Pre-compiled deform templates ----------
-set(DEFORM_GEN_SCRIPT "${ROOT}/tools/gen_deform_templates.py")
-set(DEFORM_TEMPLATE_C "${ROOT}/src/pg_jit_deform_templates.c")
-
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if(Python3_FOUND)
-    add_custom_command(
-        OUTPUT ${DEFORM_TEMPLATE_C}
-        COMMAND ${Python3_EXECUTABLE} ${DEFORM_GEN_SCRIPT}
-                --output-c ${DEFORM_TEMPLATE_C}
-        DEPENDS ${DEFORM_GEN_SCRIPT}
-        COMMENT "Generating pre-compiled deform templates"
-    )
-endif()
-
 # ---------- Pre-compilation infrastructure (LLVM / c2mir) ----------
 set(CMAKE_SOURCE_DIR "${ROOT}")
 include(${ROOT}/cmake/precompiled.cmake)
@@ -44,8 +29,7 @@ set(COMMON_SRC ${ROOT}/src/pg_jitter_common.c ${ROOT}/src/pg_jit_funcs.c
 
 add_library(pg_jitter_sljit MODULE ${COMMON_SRC}
             ${ROOT}/src/pg_jitter_sljit.c
-            ${ROOT}/src/pg_jitter_deform_jit.c
-            ${ROOT}/src/pg_jit_deform_templates.c)
+            ${ROOT}/src/pg_jitter_deform_jit.c)
 target_include_directories(pg_jitter_sljit PRIVATE ${PG_INCLUDEDIR_SERVER} ${ROOT}/src)
 target_link_libraries(pg_jitter_sljit PRIVATE sljit)
 pg_jitter_add_precompiled(pg_jitter_sljit)

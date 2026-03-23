@@ -1209,47 +1209,18 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (op->d.fetch.fixed && op->d.fetch.known_desc &&
 					(ctx->base.flags & PGJIT_DEFORM))
 				{
-					/*
-					 * Try pre-compiled template first (I-cache friendly:
-					 * same virtual address across all parallel workers).
-					 *
-					 * Skip in shared mode: templates are in dylib .text,
-					 * workers have different ASLR base, and template
-					 * addresses fall outside the ±512KB relocation range.
-					 */
-					deform_template_fn tmpl = (!asmjit_shared_code_mode)
-						? asmjit_deform_match_template(
-							op->d.fetch.known_desc,
-							op->d.fetch.kind,
-							op->d.fetch.last_var)
-						: NULL;
+					instr_time  deform_start, deform_end;
 
-					if (tmpl)
-					{
-						/* slot_reg already has the slot pointer; call tmpl(slot) */
-						a64::Gp tmpl_fn = cc.new_gpx();
-						ASMJIT_MOV_FN(cc, tmpl_fn, (void *) tmpl);
-						InvokeNode *inv;
-						cc.invoke(Out(inv), tmpl_fn,
-								  FuncSignature::build<void, void *>());
-						inv->set_arg(0, slot_reg);
-						deform_emitted = true;
-					}
-					else
-					{
-						instr_time  deform_start, deform_end;
-
-						INSTR_TIME_SET_CURRENT(deform_start);
-						deform_emitted = asmjit_emit_deform_inline(cc,
-						                                            op->d.fetch.known_desc,
-						                                            op->d.fetch.kind,
-						                                            op->d.fetch.last_var,
-						                                            slot_reg,
-						                                            tmp1, tmp2, tmp3);
-						INSTR_TIME_SET_CURRENT(deform_end);
-						JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
-						                      deform_end, deform_start);
-					}
+					INSTR_TIME_SET_CURRENT(deform_start);
+					deform_emitted = asmjit_emit_deform_inline(cc,
+					                                            op->d.fetch.known_desc,
+					                                            op->d.fetch.kind,
+					                                            op->d.fetch.last_var,
+					                                            slot_reg,
+					                                            tmp1, tmp2, tmp3);
+					INSTR_TIME_SET_CURRENT(deform_end);
+					JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
+					                      deform_end, deform_start);
 				}
 
 				if (!deform_emitted)

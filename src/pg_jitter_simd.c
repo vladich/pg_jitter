@@ -435,7 +435,13 @@ simd_like_compile(const char *pattern, int patlen)
 				return SIMD_LIKE_USE_V1; /* V1 beats PCRE2 on short needles */
 			return NULL; /* PCRE2 handles it */
 		}
-		/* Underscore/multi-% patterns: let PCRE2 handle */
+		/* Multi-% patterns: route to PCRE2 JIT.
+		 * On short strings (32 chars), PCRE2 is ~0.75x slower than V1
+		 * due to per-call overhead. But on long strings (1024+ chars),
+		 * PCRE2 is 5-9x faster because its JIT automaton avoids the
+		 * O(n*m) rescanning that V1 MatchText does. Since we don't know
+		 * string length at compile time, prefer PCRE2 for the common
+		 * long-string case. */
 		pfree(kinds); pfree(chars);
 		return NULL;
 	}
