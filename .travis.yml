@@ -223,7 +223,6 @@ script:
         --user="$PGUSER" \
         --dbname=regression > "$BASELINE_OUTDIR/pg_regress.log" 2>&1
       BASELINE_RC=$?
-      set -e
       tail -20 "$BASELINE_OUTDIR/pg_regress.log"
 
       if [ $BASELINE_RC -eq 0 ]; then
@@ -395,7 +394,6 @@ script:
         --user="$PGUSER" \
         --dbname=regression > "$OUTDIR/pg_regress.log" 2>&1
       RC=$?
-      set -e
       tail -50 "$OUTDIR/pg_regress.log"
 
       if [ $RC -eq 0 ]; then
@@ -440,13 +438,10 @@ script:
       echo ""
     done
 
-    # Disable set -e for summary and comparison — must not abort before comparison runs
-    set +e
-
     echo "============================================"
     echo "  SUMMARY"
     echo "============================================"
-    printf "$RESULTS"
+    printf '%b' "$RESULTS"
     echo ""
     echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
     echo "============================================"
