@@ -80,18 +80,29 @@ install:
     echo "PG_MAJOR=$PG_MAJOR" >> "$HOME/.travis_env"
     echo "Detected PG major version: $PG_MAJOR"
 
-  # Clone PostgreSQL source (pinned to exact installed version) for regression tests
-  # Skip on s390x (build-only — no matching PG source for Ubuntu's patched packages)
+  # Clone PostgreSQL source for regression tests
+  - |
+    . "$HOME/.travis_env"
+    PG_FULL=$($PG_CONFIG --version)
+    PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
+    PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
+    echo "Cloning PostgreSQL source: $PG_TAG"
+    git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
+
+  # s390x: Ubuntu patches PG, so expected output differs from upstream.
+  # Overlay with the expected files from the Ubuntu source package.
   - |
     . "$HOME/.travis_env"
     if [ "$(uname -m)" = "s390x" ]; then
-      echo "Skipping PG source clone on s390x (build-only)"
-    else
-      PG_FULL=$($PG_CONFIG --version)
-      PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
-      PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
-      echo "Cloning PostgreSQL source: $PG_TAG"
-      git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
+      sudo apt-get install -y -qq dpkg-dev
+      mkdir -p /tmp/pg-apt-src && cd /tmp/pg-apt-src
+      apt-get source --download-only postgresql-${PG_MAJOR} 2>/dev/null
+      dpkg-source -x *.dsc pg-patched
+      cp pg-patched/src/test/regress/expected/* \
+         "$TRAVIS_BUILD_DIR/postgres-src/src/test/regress/expected/"
+      cd "$TRAVIS_BUILD_DIR"
+      rm -rf /tmp/pg-apt-src
+      echo "Overlaid Ubuntu-patched expected files for s390x"
     fi
 
   # Build pg_jitter (asmjit available on x86_64/arm64 only)
@@ -118,15 +129,6 @@ install:
 script:
   - |
     . "$HOME/.travis_env"
-
-    # s390x: build-only (Ubuntu's PG 14 has patches that cause expected-output mismatches)
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "s390x" ]; then
-      echo "s390x: build-only (no PGDG repo — Ubuntu PG expected output differs from upstream)"
-      echo "Build artifacts:"
-      ls -la build/pg_jitter*.so
-      exit 0
-    fi
 
     # ---- Initialize and start PostgreSQL cluster ----
     PGDATA="/tmp/pg_jitter_travis"
@@ -276,11 +278,12 @@ script:
     }
 
     # ---- Run regression tests per backend ----
-    # ppc64le: sljit only (full suite takes >50min timeout with multiple backends)
+    # ppc64le/s390x: sljit only (full suite takes >50min timeout with multiple backends)
     # FreeBSD x86_64: all backends including asmjit
+    ARCH=$(uname -m)
     if [ "${HAS_ASMJIT:-}" = "1" ]; then
       BACKENDS="sljit asmjit mir auto"
-    elif [ "$(uname -m)" = "ppc64le" ]; then
+    elif [ "$ARCH" = "ppc64le" ] || [ "$ARCH" = "s390x" ]; then
       BACKENDS="sljit"
     else
       BACKENDS="sljit mir auto"
