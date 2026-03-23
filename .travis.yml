@@ -283,7 +283,7 @@ script:
 
       set +e
       "$PG_REGRESS" \
-        --inputdir="$DLPATH/../.." \
+        --inputdir="$DLPATH" \
         --outputdir="$OUTDIR" \
         --bindir="$PGBIN" \
         --dlpath="$DLPATH" \
