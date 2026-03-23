@@ -165,15 +165,11 @@ script:
     sudo cp build/pg_jitter*.so "$PKGLIBDIR/"
     ls "$PKGLIBDIR"/pg_jitter*
 
-    # Configure pg_jitter
+    # Configure cluster (start WITHOUT jit_provider for baseline test)
     {
       echo "listen_addresses = 'localhost'"
       echo "port = $PGPORT"
       echo "unix_socket_directories = '$PGDATA'"
-      echo "jit_provider = 'pg_jitter'"
-      echo "jit_above_cost = 0"
-      echo "jit_inline_above_cost = 0"
-      echo "jit_optimize_above_cost = 0"
       echo "log_statement = 'all'"
       echo "log_min_messages = 'INFO'"
     } >> "$PGDATA/postgresql.conf"
@@ -184,7 +180,6 @@ script:
       exit 1
     }
     sleep 1
-    psql -h localhost -p $PGPORT -c "SHOW jit_provider;" postgres
 
     # ---- Build regression test shared libraries ----
     PGSRC="${TRAVIS_BUILD_DIR}/postgres-src"
@@ -207,6 +202,50 @@ script:
     echo "Built regress libraries:"
     ls "$DLPATH"/*.so 2>/dev/null || true
     cd "$TRAVIS_BUILD_DIR"
+
+    # ---- Baseline run: no JIT ----
+    echo "============================================"
+    echo "  Baseline regression tests (no JIT)"
+    echo "============================================"
+    BASELINE_OUTDIR="${TRAVIS_BUILD_DIR}/regress-output-baseline"
+    mkdir -p "$BASELINE_OUTDIR/testtablespace"
+
+    set +e
+    "$PG_REGRESS" \
+      --inputdir="$DLPATH" \
+      --outputdir="$BASELINE_OUTDIR" \
+      --bindir="$PGBIN" \
+      --dlpath="$DLPATH" \
+      --schedule="$DLPATH/$REGRESS_SCHEDULE" \
+      --host=localhost \
+      --port="$PGPORT" \
+      --user="$PGUSER" \
+      --dbname=regression > "$BASELINE_OUTDIR/pg_regress.log" 2>&1
+    BASELINE_RC=$?
+    set -e
+    tail -20 "$BASELINE_OUTDIR/pg_regress.log"
+
+    if [ $BASELINE_RC -eq 0 ]; then
+      echo "  => Baseline (no JIT): PASSED"
+    else
+      echo "  => Baseline (no JIT): FAILED"
+      if [ -f "$BASELINE_OUTDIR/regression.diffs" ]; then
+        echo "--- Baseline regression.diffs ---"
+        cat "$BASELINE_OUTDIR/regression.diffs"
+      fi
+    fi
+
+    # ---- Enable pg_jitter for JIT test runs ----
+    pg_ctl -D "$PGDATA" stop -m fast -w
+    {
+      echo "jit_provider = 'pg_jitter'"
+      echo "jit_above_cost = 0"
+      echo "jit_inline_above_cost = 0"
+      echo "jit_optimize_above_cost = 0"
+    } >> "$PGDATA/postgresql.conf"
+    pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
+    sleep 1
+    psql -h localhost -p $PGPORT -c "SHOW jit_provider;" postgres
 
     # ---- Find pg_regress ----
     PG_REGRESS=""
@@ -369,8 +408,8 @@ script:
         RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
         grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
         if [ -f "$OUTDIR/regression.diffs" ]; then
-          echo "--- First 500 lines of regression.diffs ---"
-          head -500 "$OUTDIR/regression.diffs"
+          echo "--- regression.diffs (full) ---"
+          cat "$OUTDIR/regression.diffs"
         fi
         FAILED=$((FAILED + 1))
 
