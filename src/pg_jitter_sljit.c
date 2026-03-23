@@ -4137,21 +4137,11 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (false && sljit_inline_enabled &&
+          /* BISECT: text inline disabled — fall through to direct call */
+          if (sljit_inline_enabled &&
               dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
-            /*
-             * TIER 0a — INLINE TEXT EQ/NE: short-varlena fast path
-             * with memcmp, slow path calls jit_texteq/jit_textne.
-             * Only for deterministic collations; non-deterministic
-             * falls through to V1.
-             */
-            if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
-              bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
-              emit_inline_text_cmp(C, state, opno, op, fcinfo, is_eq);
-            } else {
-              goto sljit_funcexpr_v1_fallback;
-            }
+            goto sljit_funcexpr_v1_fallback;
           } else if (sljit_inline_enabled &&
                      dfn && dfn->inline_op != JIT_INLINE_NONE) {
             /*
