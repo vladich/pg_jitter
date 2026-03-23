@@ -1,0 +1,24 @@
+name: "Trigger Travis CI (ppc64le + s390x)"
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Travis CI build
+        env:
+          TRAVIS_API_TOKEN: ${{ secrets.TRAVIS_API_TOKEN }}
+        run: |
+          response=$(curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "Travis-API-Version: 3" \
+            -H "Authorization: token ${TRAVIS_API_TOKEN}" \
+            -d "{\"request\":{\"branch\":\"master\",\"message\":\"Triggered by GitHub Actions commit ${GITHUB_SHA::8}\"}}" \
+            "https://api.travis-ci.com/repo/vladich%2Fpg_jitter/requests")
+          echo "$response" | jq .
+          # Verify the request was accepted
+          echo "$response" | jq -e '.request.id' > /dev/null

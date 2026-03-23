@@ -1,0 +1,55 @@
+language: c
+os: linux
+dist: jammy
+
+# Only build when triggered via API (from GitHub Actions) — not on push/PR directly
+if: type = api
+
+jobs:
+  include:
+    - arch: ppc64le
+      env: PG_VERSION=17
+    - arch: s390x
+      env: PG_VERSION=17
+
+before_install:
+  # PGDG apt repository
+  - sudo install -d /usr/share/postgresql-common/pgdg
+  - sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  - echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+  - sudo apt-get update -qq
+  - sudo apt-get install -y -qq cmake g++ postgresql-server-dev-${PG_VERSION} libicu-dev
+
+install:
+  # Clone dependencies
+  - git clone --depth 1 https://github.com/zherczeg/sljit.git deps/sljit
+  - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
+  - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
+  - git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
+  # Build PCRE2 static library with JIT
+  - mkdir -p deps/pcre2/build
+  - >-
+    cmake -S deps/pcre2 -B deps/pcre2/build
+    -DCMAKE_BUILD_TYPE=Release
+    -DPCRE2_SUPPORT_JIT=ON
+    -DPCRE2_SUPPORT_UNICODE=ON
+    -DPCRE2_BUILD_PCRE2_8=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DPCRE2_BUILD_PCRE2GREP=OFF
+    -DPCRE2_BUILD_TESTS=OFF
+    -DPCRE2_STATIC_PIC=ON
+  - cmake --build deps/pcre2/build --target pcre2-8-static -j $(nproc)
+
+script:
+  - /usr/lib/postgresql/${PG_VERSION}/bin/pg_config --version
+  - >-
+    cmake -B build
+    -DPG_CONFIG=/usr/lib/postgresql/${PG_VERSION}/bin/pg_config
+    -DPG_JITTER_BACKENDS="sljit;mir"
+    -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit
+    -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir
+    -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla
+    -DPCRE2_DIR=${TRAVIS_BUILD_DIR}/deps/pcre2
+    -DCMAKE_BUILD_TYPE=Release
+  - cmake --build build --parallel $(nproc)
+  - ls -la build/pg_jitter*.so
