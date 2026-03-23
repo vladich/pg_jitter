@@ -170,8 +170,7 @@ script:
       echo "listen_addresses = 'localhost'"
       echo "port = $PGPORT"
       echo "unix_socket_directories = '$PGDATA'"
-      echo "log_statement = 'all'"
-      echo "log_min_messages = 'INFO'"
+      echo "log_min_messages = 'WARNING'"
     } >> "$PGDATA/postgresql.conf"
 
     pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w || {
@@ -409,8 +408,12 @@ script:
         RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
         grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
         if [ -f "$OUTDIR/regression.diffs" ]; then
-          echo "--- regression.diffs (full) ---"
-          cat "$OUTDIR/regression.diffs"
+          if [ -n "$BASELINE_OUTDIR" ]; then
+            echo "--- regression.diffs skipped (baseline comparison is authoritative) ---"
+          else
+            echo "--- regression.diffs ---"
+            cat "$OUTDIR/regression.diffs"
+          fi
         fi
         FAILED=$((FAILED + 1))
 
@@ -420,8 +423,6 @@ script:
           tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
             | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|exit code [1-9]|signal [0-9]' \
             | head -50 || true
-          echo "--- Last 100 log lines from this backend ---"
-          tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -100 || true
         fi
 
         # Core dump backtrace (Linux)
@@ -465,7 +466,7 @@ script:
           if [ -f "$baseline_result" ]; then
             if ! diff -q "$baseline_result" "$jit_result" > /dev/null 2>&1; then
               echo "    DIFFERS from baseline: $test_name"
-              diff -u "$baseline_result" "$jit_result" | head -40
+              diff -u "$baseline_result" "$jit_result"
               DIFFS_FOUND=1
             fi
           else
