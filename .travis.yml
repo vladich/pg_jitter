@@ -239,7 +239,7 @@ script:
     {
       echo "jit_provider = 'pg_jitter'"
       echo "jit_above_cost = 0"
-      echo "jit_inline_above_cost = -1"
+      echo "jit_inline_above_cost = 0"
       echo "jit_optimize_above_cost = 0"
     } >> "$PGDATA/postgresql.conf"
     pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
