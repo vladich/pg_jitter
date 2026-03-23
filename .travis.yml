@@ -89,11 +89,11 @@ install:
     echo "Cloning PostgreSQL source: $PG_TAG"
     git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
 
-  # s390x: Ubuntu patches PG, so expected output differs from upstream.
-  # Overlay with the expected files from the Ubuntu source package.
+  # Linux: distro/PGDG packages may have patches that change expected output.
+  # Overlay expected files from the apt source package to match the installed binary.
   - |
     . "$HOME/.travis_env"
-    if [ "$(uname -m)" = "s390x" ]; then
+    if [ "$TRAVIS_OS_NAME" = "linux" ]; then
       sudo apt-get install -y -qq dpkg-dev
       mkdir -p /tmp/pg-apt-src && cd /tmp/pg-apt-src
       apt-get source --download-only postgresql-${PG_MAJOR} 2>/dev/null
@@ -102,7 +102,7 @@ install:
          "$TRAVIS_BUILD_DIR/postgres-src/src/test/regress/expected/"
       cd "$TRAVIS_BUILD_DIR"
       rm -rf /tmp/pg-apt-src
-      echo "Overlaid Ubuntu-patched expected files for s390x"
+      echo "Overlaid distro-patched expected files"
     fi
 
   # Build pg_jitter (asmjit available on x86_64/arm64 only)
