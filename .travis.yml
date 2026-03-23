@@ -170,8 +170,7 @@ script:
       echo "listen_addresses = 'localhost'"
       echo "port = $PGPORT"
       echo "unix_socket_directories = '$PGDATA'"
-      echo "log_statement = 'all'"
-      echo "log_min_messages = 'INFO'"
+      echo "log_min_messages = 'WARNING'"
     } >> "$PGDATA/postgresql.conf"
 
     pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w || {
@@ -409,8 +408,8 @@ script:
         RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
         grep -E 'not ok|FAILED' "$OUTDIR/pg_regress.log" 2>/dev/null || true
         if [ -f "$OUTDIR/regression.diffs" ]; then
-          echo "--- regression.diffs (full) ---"
-          cat "$OUTDIR/regression.diffs"
+          echo "--- regression.diffs (first 200 lines) ---"
+          head -200 "$OUTDIR/regression.diffs"
         fi
         FAILED=$((FAILED + 1))
 
@@ -420,8 +419,8 @@ script:
           tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" \
             | grep -E 'PANIC|server process|was terminated|abnormal|terminated by|child process|exception|exit code [1-9]|signal [0-9]' \
             | head -50 || true
-          echo "--- Last 100 log lines from this backend ---"
-          tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -100 || true
+          echo "--- Last 30 log lines from this backend ---"
+          tail -c +"$((LOG_OFFSET + 1))" "$PGDATA/logfile" | tail -30 || true
         fi
 
         # Core dump backtrace (Linux)
