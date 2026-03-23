@@ -45,8 +45,13 @@ before_install:
       sudo sh -c 'echo "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d'
       sudo chmod +x /usr/sbin/policy-rc.d
       # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
-      sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-${PG_VERSION} postgresql-server-dev-${PG_VERSION} || \
-        sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-14 postgresql-server-dev-14
+      # Use jammy-pgdg target to force PGDG version (Ubuntu pre-installs PG 14 at
+      # an older minor that won't match PGDG source for expected output overlay)
+      sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev \
+        postgresql-${PG_VERSION}/$(lsb_release -cs)-pgdg \
+        postgresql-server-dev-${PG_VERSION}/$(lsb_release -cs)-pgdg || \
+        sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev \
+          postgresql-14 postgresql-server-dev-14
       sudo rm -f /usr/sbin/policy-rc.d
       # Stop any auto-created cluster — we init our own
       sudo pg_ctlcluster ${PG_VERSION} main stop 2>/dev/null || true
@@ -91,13 +96,17 @@ install:
     git clone --depth 1 --branch "$PG_TAG" https://github.com/postgres/postgres.git postgres-src
 
   # Linux: distro/PGDG packages may have patches that change expected output.
-  # Overlay expected files from the apt source package to match the installed binary.
+  # Overlay expected files from the apt source package matching the installed binary.
   - |
     . "$HOME/.travis_env"
     if [ "$TRAVIS_OS_NAME" = "linux" ]; then
       sudo apt-get install -y -qq dpkg-dev
+      # Pin source to exact installed binary version to avoid version skew
+      PG_PKG_VER=$(dpkg-query -W -f='${Version}' postgresql-${PG_MAJOR} 2>/dev/null)
+      echo "Installed postgresql-${PG_MAJOR} package version: $PG_PKG_VER"
       mkdir -p /tmp/pg-apt-src && cd /tmp/pg-apt-src
-      apt-get source --download-only postgresql-${PG_MAJOR} 2>/dev/null
+      apt-get source --download-only postgresql-${PG_MAJOR}=${PG_PKG_VER} 2>/dev/null || \
+        apt-get source --download-only postgresql-${PG_MAJOR} 2>/dev/null
       dpkg-source -x *.dsc pg-patched
       cp pg-patched/src/test/regress/expected/* \
          "$TRAVIS_BUILD_DIR/postgres-src/src/test/regress/expected/"
