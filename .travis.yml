@@ -294,6 +294,10 @@ script:
     # FreeBSD x86_64: all backends including asmjit
     ARCH=$(uname -m)
     if [ "$ARCH" = "s390x" ]; then
+      # Generate serial schedule from parallel (PG doesn't ship one).
+      # Convert "test: a b c" lines into separate "test: a\ntest: b\ntest: c" lines.
+      awk '/^test:/ { for (i=2; i<=NF; i++) print "test:", $i } /^#/ || /^$/ { print }' \
+        "$DLPATH/parallel_schedule" > "$DLPATH/serial_schedule"
       REGRESS_SCHEDULE="serial_schedule"
     else
       REGRESS_SCHEDULE="parallel_schedule"
