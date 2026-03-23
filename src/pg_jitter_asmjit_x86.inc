@@ -547,36 +547,18 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (op->d.fetch.fixed && op->d.fetch.known_desc &&
 					(ctx->base.flags & PGJIT_DEFORM))
 				{
-					deform_template_fn tmpl = asmjit_deform_match_template(
-						op->d.fetch.known_desc,
-						op->d.fetch.kind,
-						op->d.fetch.last_var);
+					instr_time  deform_start, deform_end;
 
-					if (tmpl)
-					{
-						x86::Gp tmpl_fn = cc.new_gp64();
-						cc.mov(tmpl_fn, (uint64_t)(void *) tmpl);
-						InvokeNode *inv;
-						cc.invoke(Out(inv), tmpl_fn,
-								  FuncSignature::build<void, void *>());
-						inv->set_arg(0, slot_reg);
-						deform_emitted = true;
-					}
-					else
-					{
-						instr_time  deform_start, deform_end;
-
-						INSTR_TIME_SET_CURRENT(deform_start);
-						deform_emitted = asmjit_emit_deform_inline(cc,
-						                                            op->d.fetch.known_desc,
-						                                            op->d.fetch.kind,
-						                                            op->d.fetch.last_var,
-						                                            slot_reg,
-						                                            tmp1, tmp2, tmp3);
-						INSTR_TIME_SET_CURRENT(deform_end);
-						JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
-						                      deform_end, deform_start);
-					}
+					INSTR_TIME_SET_CURRENT(deform_start);
+					deform_emitted = asmjit_emit_deform_inline(cc,
+					                                            op->d.fetch.known_desc,
+					                                            op->d.fetch.kind,
+					                                            op->d.fetch.last_var,
+					                                            slot_reg,
+					                                            tmp1, tmp2, tmp3);
+					INSTR_TIME_SET_CURRENT(deform_end);
+					JITTER_INSTR_DEFORM_ACCUM(ctx->base.instr,
+					                      deform_end, deform_start);
 				}
 
 				if (!deform_emitted)

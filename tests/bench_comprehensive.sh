@@ -127,12 +127,24 @@ else
     DLSUFFIX=".so"
 fi
 
-# Check if meta-provider is installed
+# Check if meta-provider is installed and ensure it's active
 JIT_PROVIDER=$(psql_cmd -t -A -c "SHOW jit_provider;" 2>/dev/null || echo "")
 META_MODE=0
-if [ "$JIT_PROVIDER" = "pg_jitter" ]; then
+
+# If pg_jitter meta module is available, ensure it's the active provider
+if [ -f "$PKGLIBDIR/pg_jitter${DLSUFFIX}" ]; then
+    if [ "$JIT_PROVIDER" != "pg_jitter" ]; then
+        echo "Switching jit_provider to pg_jitter (was: $JIT_PROVIDER)..."
+        psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
+        "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
+        sleep 1
+        JIT_PROVIDER="pg_jitter"
+    fi
     META_MODE=1
     # Trigger provider init so GUC is available
+    psql_cmd -t -A -c "SET jit_above_cost = 0; SELECT 1;" >/dev/null 2>&1
+elif [ "$JIT_PROVIDER" = "pg_jitter" ]; then
+    META_MODE=1
     psql_cmd -t -A -c "SET jit_above_cost = 0; SELECT 1;" >/dev/null 2>&1
 fi
 
@@ -244,16 +256,23 @@ run_explain_json() {
     local jit_on="$2"
     local backend="$3"
     local set_backend=""
+    local inline_cost=0
+    local opt_cost=0
 
     if [ "$META_MODE" -eq 1 ] && [ "$backend" != "interp" ] && [ "$backend" != "llvmjit" ]; then
         set_backend="SET pg_jitter.backend = '$backend';"
     fi
 
+    if [ "$backend" != "llvmjit" ]; then
+        inline_cost=500000
+        opt_cost=500000
+    fi
+
     psql_cmd -t -A -c "
 SET jit = $jit_on;
 SET jit_above_cost = 0;
-SET jit_inline_above_cost = 0;
-SET jit_optimize_above_cost = 0;
+SET jit_inline_above_cost = $inline_cost;
+SET jit_optimize_above_cost = $opt_cost;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
 SET max_parallel_workers_per_gather = 0;
@@ -266,12 +285,22 @@ get_exec_time() {
     local query="$1"
     local jit_on="$2"
     local backend="$3"
+    local inline_cost=0
+    local opt_cost=0
+
+    # jit_inline/optimize only benefit llvmjit; for pg_jitter backends
+    # they add ~30ms overhead (LLVM infrastructure runs even though pg_jitter
+    # has its own pipeline). Disable for non-llvmjit backends.
+    if [ "$backend" != "llvmjit" ]; then
+        inline_cost=500000
+        opt_cost=500000
+    fi
 
     psql_cmd -t -A -c "
 SET jit = $jit_on;
 SET jit_above_cost = 0;
-SET jit_inline_above_cost = 0;
-SET jit_optimize_above_cost = 0;
+SET jit_inline_above_cost = $inline_cost;
+SET jit_optimize_above_cost = $opt_cost;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
 SET max_parallel_workers_per_gather = 0;
@@ -528,6 +557,38 @@ branches = [f\"WHEN 'row_{i*20000+1}' THEN {i+1}\" for i in range(50)]
 print(f\"SELECT SUM(CASE txt {' '.join(branches)} ELSE 0 END) FROM bench_data\")
 ")"
 
+# Range CASE: WHEN val >= low AND val < high (contiguous intervals)
+add_query "CASE_range_50"      "$(python3 -c "
+branches = [f'WHEN val1 >= {i*200} AND val1 < {(i+1)*200} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# Timestamptz range CASE: 30 day-buckets with computed results (non-constant THEN)
+add_query "CASE_ts_range_30"   "$(python3 -c "
+from datetime import date, timedelta
+branches = []
+for i in range(30):
+    d = date(2000,1,1) + timedelta(days=i)
+    d2 = d + timedelta(days=1)
+    branches.append(f\"WHEN ts >= '{d}'::timestamptz AND ts < '{d2}'::timestamptz THEN ts + interval '{(i+1)*10} seconds'\")
+print(f\"SELECT count(*), min(adjusted), max(adjusted) FROM (SELECT CASE {' '.join(branches)} ELSE ts END AS adjusted FROM date_data) sub\")
+")"
+
+# WHEN val > N (descending thresholds, 50 branches)
+add_query "CASE_gt_50"         "$(python3 -c "
+branches = [f'WHEN val1 > {10000 - i*200} THEN {50-i}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# WHEN val BETWEEN low AND high (inclusive, 50 branches)
+add_query "CASE_between_50"    "$(python3 -c "
+branches = [f'WHEN val1 BETWEEN {i*200} AND {(i+1)*200-1} THEN {i+1}' for i in range(50)]
+print(f\"SELECT SUM(CASE {' '.join(branches)} ELSE 0 END) FROM bench_data\")
+")"
+
+# 3-level nested CASE (range + lt + equality, ~60% ELSE at each level)
+add_query "CASE_nested_3lvl"   "SELECT SUM(r) FROM (SELECT CASE WHEN val1 >= 0 AND val1 < 1000 THEN CASE WHEN val2 < 1000 THEN CASE val3 WHEN 1 THEN 100 WHEN 2 THEN 200 WHEN 3 THEN 300 WHEN 4 THEN 400 ELSE -1 END WHEN val2 < 2000 THEN 10 WHEN val2 < 3000 THEN 20 WHEN val2 < 4000 THEN 30 ELSE -2 END WHEN val1 >= 1000 AND val1 < 2000 THEN 1 WHEN val1 >= 2000 AND val1 < 3000 THEN 2 WHEN val1 >= 3000 AND val1 < 4000 THEN 3 ELSE -3 END AS r FROM bench_data) sub"
+
 NQUERIES=${#LABELS[@]}
 echo "$NQUERIES queries defined."
 echo ""
@@ -574,101 +635,146 @@ prewarm_tables
 echo "query,backend,exec_time,jit_gen,jit_inline,jit_opt,jit_emit,jit_total" > "$CSV_FILE"
 
 # ================================================================
-# Run all queries per backend
+# Run queries with backends interleaved per-query.
+# This ensures load spikes affect all backends equally, producing
+# fair relative comparisons even under variable system load.
 # ================================================================
 SWITCHED_AWAY=0
 
+# Pre-check: switch to any non-meta backends once to warm them
 for bi in "${!BACKENDS[@]}"; do
     backend="${BACKENDS[$bi]}"
     bname="${NAMES[$bi]}"
+    if [ "$backend" = "llvmjit" ] || { [ "$META_MODE" -eq 0 ] && [ "$backend" != "interp" ]; }; then
+        switch_backend "$backend"
+        prewarm_tables
+        SWITCHED_AWAY=1
+    fi
+done
+# Switch back to meta if needed
+if [ "$SWITCHED_AWAY" -eq 1 ] && [ "$META_MODE" -eq 1 ]; then
+    switch_backend "sljit"  # triggers meta restore
+    prewarm_tables
+fi
 
+# ================================================================
+# Helper: benchmark one query on one backend
+# ================================================================
+run_one_benchmark() {
+    local qi="$1" bi="$2"
+    local label="${LABELS[$qi]}"
+    local query="${QUERIES[$qi]}"
+    local backend="${BACKENDS[$bi]}"
+    local bname="${NAMES[$bi]}"
+
+    local crash_count=${crash_counts[$bi]}
+    if [ "$crash_count" -ge 3 ]; then
+        echo "${label},$bname,CRASH,0,0,0,0,0" >> "$CSV_FILE"
+        return
+    fi
+
+    local jit_on="on"
     if [ "$backend" = "interp" ]; then
         jit_on="off"
-        echo "Running $bname (jit=off)..."
-    else
-        jit_on="on"
-        if [ "$backend" = "llvmjit" ]; then
-            echo "Switching to $bname (ALTER SYSTEM + restart)..."
-            switch_backend "$backend"
-            prewarm_tables
-            SWITCHED_AWAY=1
-        elif [ "$META_MODE" -eq 1 ]; then
-            echo "Running $bname (SET pg_jitter.backend)..."
-        else
-            echo "Switching to $bname (ALTER SYSTEM + restart)..."
-            switch_backend "$backend"
-            prewarm_tables
-            SWITCHED_AWAY=1
+    fi
+
+    ensure_pg_running
+
+    # Warmup runs (JIT compilation + icache warm)
+    for w in $(seq 1 "$NWARMUP"); do
+        get_exec_time "$query" "$jit_on" "$backend" > /dev/null 2>&1 || true
+        ensure_pg_running
+    done
+
+    # Timed runs — collect exec times
+    local exec_times=()
+    for r in $(seq 1 "$NRUNS"); do
+        local t
+        t=$(get_exec_time "$query" "$jit_on" "$backend")
+        exec_times+=("$t")
+    done
+
+    # Check for crash
+    local all_empty=1
+    for t in "${exec_times[@]}"; do
+        [ -n "$t" ] && all_empty=0
+    done
+
+    if [ "$all_empty" -eq 1 ]; then
+        echo "${label},$bname,CRASH,0,0,0,0,0" >> "$CSV_FILE"
+        crash_counts[$bi]=$((crash_count + 1))
+        ensure_pg_running
+        printf "X"
+        return
+    fi
+
+    local median_exec
+    median_exec=$(median "${exec_times[@]}")
+
+    # One extra JSON EXPLAIN run to get JIT timing breakdown
+    local jit_gen=0 jit_inline=0 jit_opt=0 jit_emit=0 jit_total=0
+    if [ "$jit_on" = "on" ]; then
+        local json_output
+        json_output=$(run_explain_json "$query" "$jit_on" "$backend" 2>/dev/null || echo "")
+        if [ -n "$json_output" ]; then
+            local parsed
+            parsed=$(echo "$json_output" | python3 "$PARSE_JSON" 2>/dev/null || echo "0,0,0,0,0,0")
+            IFS=',' read -r _ jit_gen jit_inline jit_opt jit_emit jit_total <<< "$parsed"
         fi
     fi
 
-    crash_count=0
+    echo "${label},$bname,$median_exec,$jit_gen,$jit_inline,$jit_opt,$jit_emit,$jit_total" >> "$CSV_FILE"
+    printf "."
+}
+
+# ================================================================
+# Phase 1: Run llvmjit separately (requires ALTER SYSTEM + restart)
+# ================================================================
+LLVMJIT_BI=""
+for bi in "${!BACKENDS[@]}"; do
+    if [ "${BACKENDS[$bi]}" = "llvmjit" ]; then
+        LLVMJIT_BI=$bi
+        break
+    fi
+done
+
+if [ -n "$LLVMJIT_BI" ]; then
+    echo "Running llvmjit backend (requires separate jit_provider)..."
+    switch_backend "llvmjit"
+    prewarm_tables
+
+    crash_counts=()
+    for bi in "${!BACKENDS[@]}"; do crash_counts[$bi]=0; done
+
     for qi in $(seq 0 $((NQUERIES - 1))); do
-        if [ "$crash_count" -ge 3 ]; then
-            echo ""
-            echo "  Backend $bname crashed 3+ times, skipping remaining queries."
-            for rqi in $(seq "$qi" $((NQUERIES - 1))); do
-                echo "${LABELS[$rqi]},$bname,CRASH,0,0,0,0,0" >> "$CSV_FILE"
-            done
-            break
-        fi
-
-        label="${LABELS[$qi]}"
-        query="${QUERIES[$qi]}"
-        ensure_pg_running
-
-        # Warmup runs (JIT compilation + icache warm, buffers already prewarmed)
-        for w in $(seq 1 "$NWARMUP"); do
-            get_exec_time "$query" "$jit_on" "$backend" > /dev/null 2>&1 || true
-            ensure_pg_running
-        done
-
-        # Timed runs — collect exec times
-        exec_times=()
-        for r in $(seq 1 "$NRUNS"); do
-            t=$(get_exec_time "$query" "$jit_on" "$backend")
-            exec_times+=("$t")
-        done
-
-        # Check for crash
-        all_empty=1
-        for t in "${exec_times[@]}"; do
-            [ -n "$t" ] && all_empty=0
-        done
-
-        if [ "$all_empty" -eq 1 ]; then
-            echo "${label},$bname,CRASH,0,0,0,0,0" >> "$CSV_FILE"
-            crash_count=$((crash_count + 1))
-            ensure_pg_running
-            printf "X"
-            continue
-        fi
-
-        median_exec=$(median "${exec_times[@]}")
-
-        # One extra JSON EXPLAIN run to get JIT timing breakdown
-        jit_gen=0; jit_inline=0; jit_opt=0; jit_emit=0; jit_total=0
-        if [ "$jit_on" = "on" ]; then
-            json_output=$(run_explain_json "$query" "$jit_on" "$backend" 2>/dev/null || echo "")
-            if [ -n "$json_output" ]; then
-                parsed=$(echo "$json_output" | python3 "$PARSE_JSON" 2>/dev/null || echo "0,0,0,0,0,0")
-                IFS=',' read -r _ jit_gen jit_inline jit_opt jit_emit jit_total <<< "$parsed"
-            fi
-        fi
-
-        echo "${label},$bname,$median_exec,$jit_gen,$jit_inline,$jit_opt,$jit_emit,$jit_total" >> "$CSV_FILE"
-        printf "."
+        run_one_benchmark "$qi" "$LLVMJIT_BI"
     done
     echo " done."
 
-    # Restore meta-provider after llvmjit
-    if [ "$backend" = "llvmjit" ] && [ "$META_MODE" -eq 1 ]; then
-        echo "Restoring pg_jitter meta-provider..."
-        restore_provider
-        prewarm_tables
-        SWITCHED_AWAY=0
-    fi
+    # Restore pg_jitter provider
+    restore_provider
+    prewarm_tables
+    echo "Restored jit_provider = pg_jitter"
+    SWITCHED_AWAY=0  # already restored
+fi
+
+# ================================================================
+# Phase 2: Run all other backends interleaved per query
+# ================================================================
+echo "Running all backends interleaved per query..."
+
+crash_counts=()
+for bi in "${!BACKENDS[@]}"; do crash_counts[$bi]=0; done
+
+for qi in $(seq 0 $((NQUERIES - 1))); do
+    for bi in "${!BACKENDS[@]}"; do
+        # Skip llvmjit (already done in Phase 1)
+        [ "${BACKENDS[$bi]}" = "llvmjit" ] && continue
+        run_one_benchmark "$qi" "$bi"
+    done
+    printf " "
 done
+echo "done."
 
 echo ""
 echo "CSV results saved to: $CSV_FILE"
