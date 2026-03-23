@@ -123,6 +123,7 @@ script:
     {
       echo "listen_addresses = 'localhost'"
       echo "port = $PGPORT"
+      echo "unix_socket_directories = '$PGDATA'"
       echo "jit_provider = 'pg_jitter'"
       echo "jit_above_cost = 0"
       echo "jit_inline_above_cost = 0"
