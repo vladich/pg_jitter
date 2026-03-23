@@ -40,8 +40,9 @@ before_install:
       sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       echo "deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee -a /etc/apt/sources.list.d/pgdg.list
-      # Enable Ubuntu deb-src for s390x (PGDG has no s390x, so PG comes from Ubuntu)
-      sudo sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list 2>/dev/null || true
+      # Enable Ubuntu deb-src (s390x gets PG from Ubuntu, not PGDG)
+      echo "deb-src http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main universe" | sudo tee /etc/apt/sources.list.d/ubuntu-src.list
+      echo "deb-src http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main universe" | sudo tee -a /etc/apt/sources.list.d/ubuntu-src.list
       sudo apt-get update -qq
       # Prevent PG postinst from starting a service — we init our own cluster later
       sudo sh -c 'echo "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d'
