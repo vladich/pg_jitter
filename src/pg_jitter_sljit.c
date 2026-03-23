@@ -4169,14 +4169,17 @@ static bool sljit_compile_expr(ExprState *state) {
             /* Load args into registers for inline op */
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(fcinfo_reg),
                            off0);
-            /* BISECT #4: always load R1 (revert nargs>=2 guard) */
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(fcinfo_reg),
-                           off1);
+            if (dfn->nargs >= 2)
+              sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(fcinfo_reg),
+                             off1);
 
-            emit_inline_funcexpr(C, (JitInlineOp)dfn->inline_op);
-
-            /* Store *op->resvalue = R0, *op->resnull = false */
-            emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+            if (emit_inline_funcexpr(C, (JitInlineOp)dfn->inline_op)) {
+              /* Store *op->resvalue = R0, *op->resnull = false */
+              emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+            } else {
+              /* Inline not supported — fall back to direct call */
+              goto sljit_funcexpr_v1_fallback;
+            }
           } else if (dfn && (dfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
                              || (dfn->jit_fn_name &&
