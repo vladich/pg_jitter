@@ -27,7 +27,9 @@ extern "C" {
  * Caller must check for NULL before calling — this function assumes the
  * datum is a valid non-NULL text value.
  */
+#if PG_VERSION_NUM >= 160000
 extern int32 pg_jitter_sj_is_json_datum(Datum datum, int32 item_type);
+#endif
 
 /*
  * text→json: validate cstring with simdjson, return text Datum.

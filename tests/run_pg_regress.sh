@@ -81,6 +81,7 @@ REGRESS_DIR="/tmp/pg_jitter_regress_work_${PGPORT}"
 if [ ! -d "$REGRESS_DIR" ] || [ "$REGRESS_DIR_ORIG/pg_regress" -nt "$REGRESS_DIR/pg_regress" ]; then
     rm -rf "$REGRESS_DIR"
     cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
+    mkdir -p "$REGRESS_DIR/testtablespace"
 fi
 
 # Verify all backend dylibs exist

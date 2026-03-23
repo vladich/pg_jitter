@@ -848,6 +848,7 @@ static bool mir_compile_expr(ExprState *state) {
   MIR_item_t import_htgd = MIR_new_import(ctx, "htgd_fn");
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
   /* Proto for simdjson IS_JSON: (Datum, int32) -> int32 */
   MIR_item_t proto_sj_is_json;
   {
@@ -855,6 +856,7 @@ static bool mir_compile_expr(ExprState *state) {
     proto_sj_is_json = MIR_new_proto(ctx, "p_sjisj", 1, &rt32, 2,
                                       MIR_T_I64, "datum", MIR_T_I32, "itype");
   }
+#endif
 
   /* Proto for simdjson json_in/jsonb_in: (Datum, FunctionCallInfo) -> Datum */
   MIR_item_t proto_sj_json_in;
@@ -880,7 +882,9 @@ static bool mir_compile_expr(ExprState *state) {
 #endif
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
   MIR_item_t import_sj_is_json = MIR_new_import(ctx, "sj_is_json");
+#endif
   MIR_item_t import_sj_json_in = MIR_new_import(ctx, "sj_json_in");
   MIR_item_t import_sj_jsonb_in = MIR_new_import(ctx, "sj_jsonb_in");
 #endif
@@ -5623,6 +5627,13 @@ static bool mir_compile_expr(ExprState *state) {
      * ---- DOMAIN_TESTVAL ----
      * Same as CASE_TESTVAL (uses same union d.casetest).
      */
+    /*
+     * DOMAIN_TESTVAL / DOMAIN_TESTVAL_EXT / DOMAIN_NOTNULL / DOMAIN_CHECK:
+     * Route to fallback. The inline versions crash on ARM64 due to
+     * MIR codegen issues with the pointer indirection patterns used
+     * by domain constraint checking.
+     */
+#if 0  /* disabled — crashes on ARM64, route to default fallback */
     case EEOP_DOMAIN_TESTVAL: {
       /*
        * If d.casetest.value is non-NULL, dereference it.
@@ -6604,65 +6615,32 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
 #ifndef _WIN64
+    /* DOMAIN_NOTNULL: route to fallback — inline version crashes on ARM64. */
     case EEOP_DOMAIN_NOTNULL: {
-      MIR_insn_t ok_label = MIR_new_label(ctx);
-
-      MIR_STEP_LOAD(r_tmp3, opno, resnull);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BEQ, MIR_new_label_op(ctx, ok_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
                             MIR_new_ref_op(ctx, step_fn_imports[opno]),
                             MIR_new_reg_op(ctx, r_state),
-                            MIR_new_reg_op(ctx, r_tmp1)));
-
-      MIR_append_insn(ctx, func_item, ok_label);
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
       break;
     }
 
+    /* DOMAIN_CHECK: route to fallback — inline version crashes on ARM64 */
     case EEOP_DOMAIN_CHECK: {
-      MIR_insn_t done_label = MIR_new_label(ctx);
-
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checknull);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
-      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checkvalue);
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
-                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
-      MIR_append_insn(
-          ctx, func_item,
-          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
-                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
-
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
-          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+          MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_3arg_void),
                             MIR_new_ref_op(ctx, step_fn_imports[opno]),
                             MIR_new_reg_op(ctx, r_state),
-                            MIR_new_reg_op(ctx, r_tmp1)));
-
-      MIR_append_insn(ctx, func_item, done_label);
+                            MIR_new_reg_op(ctx, r_tmp1),
+                            MIR_new_reg_op(ctx, r_econtext)));
       break;
     }
+#endif /* disabled domain inline */
 #endif /* !_WIN64 */
 
     /*
@@ -9092,8 +9070,10 @@ static bool mir_compile_expr(ExprState *state) {
     }
 
 #ifdef PG_JITTER_HAVE_SIMDJSON
+#if PG_VERSION_NUM >= 160000
     MIR_load_external(ctx, "sj_is_json",
                       mir_extern_addr((void *)pg_jitter_sj_is_json_datum));
+#endif
     MIR_load_external(ctx, "sj_json_in",
                       mir_extern_addr((void *)pg_jitter_sj_json_in));
     MIR_load_external(ctx, "sj_jsonb_in",

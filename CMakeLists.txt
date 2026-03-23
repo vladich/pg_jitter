@@ -75,6 +75,13 @@ execute_process(COMMAND ${PG_CONFIG} --pkglibdir
 execute_process(COMMAND ${PG_CONFIG} --libdir
     OUTPUT_VARIABLE PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
+# Extract PG major version for feature gating
+execute_process(COMMAND ${PG_CONFIG} --version
+    OUTPUT_VARIABLE _pg_ver_str OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(REGEX MATCH "[0-9]+" PG_MAJOR_VERSION "${_pg_ver_str}")
+math(EXPR PG_VERSION_NUM "${PG_MAJOR_VERSION} * 10000")
+message(STATUS "PG version: ${PG_MAJOR_VERSION} (${PG_VERSION_NUM})")
+
 # Extract CPPFLAGS from pg_config for additional include paths (e.g. libintl)
 # Note: Windows binary installs (PG 14-16) return "not recorded" here.
 execute_process(COMMAND ${PG_CONFIG} --cppflags
@@ -288,16 +295,23 @@ function(pg_jitter_configure_target TARGET_NAME)
             target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
         endif()
         # Force linker to keep simdjson symbols (referenced by JIT at runtime)
+        # pg_jitter_sj_is_json_datum requires PG16+ (EEOP_IS_JSON)
         if(APPLE)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,_pg_jitter_sj_is_json_datum
                 -Wl,-u,_pg_jitter_sj_json_in
                 -Wl,-u,_pg_jitter_sj_jsonb_in)
+            if(PG_VERSION_NUM GREATER_EQUAL 160000)
+                target_link_options(${TARGET_NAME} PRIVATE
+                    -Wl,-u,_pg_jitter_sj_is_json_datum)
+            endif()
         elseif(UNIX)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,pg_jitter_sj_is_json_datum
                 -Wl,-u,pg_jitter_sj_json_in
                 -Wl,-u,pg_jitter_sj_jsonb_in)
+            if(PG_VERSION_NUM GREATER_EQUAL 160000)
+                target_link_options(${TARGET_NAME} PRIVATE
+                    -Wl,-u,pg_jitter_sj_is_json_datum)
+            endif()
         endif()
     endif()
     if(WIN32)

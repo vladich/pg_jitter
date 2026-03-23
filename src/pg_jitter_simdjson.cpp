@@ -273,6 +273,7 @@ sj_walk_value(ondemand::value val, JsonbParseState **pstate,
 
 extern "C" {
 
+#if PG_VERSION_NUM >= 160000
 /*
  * IS JSON validation for text Datum.
  * Returns 1 (valid) or 0 (invalid).
@@ -346,6 +347,7 @@ pg_jitter_sj_is_json_datum(Datum datum, int32 item_type)
 
 	return 1;  /* valid JSON of any type */
 }
+#endif /* PG_VERSION_NUM >= 160000 */
 
 /*
  * text→json: validate cstring with simdjson, return text Datum.
