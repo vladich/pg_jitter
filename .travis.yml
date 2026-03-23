@@ -7,26 +7,38 @@ if: type = api
 
 jobs:
   include:
+    # Linux ppc64le
     - arch: ppc64le
       env: PG_VERSION=17
+    # Linux s390x
     - arch: s390x
       env: PG_VERSION=14
+    # FreeBSD x86_64
+    - os: freebsd
+      env: PG_VERSION=16
+    # FreeBSD ARM64 — not available on Travis CI
 
 before_install:
-  # PGDG apt repository
-  - sudo install -d /usr/share/postgresql-common/pgdg
-  - sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
-  - echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-  - sudo apt-get update -qq
-  # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
-  - sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-${PG_VERSION} || sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-14
+  - |
+    if [ "$TRAVIS_OS_NAME" = "linux" ]; then
+      sudo install -d /usr/share/postgresql-common/pgdg
+      sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+      echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+      sudo apt-get update -qq
+      # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
+      sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-${PG_VERSION} || \
+        sudo apt-get install -y -qq cmake g++ libicu-dev postgresql-server-dev-14
+    elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
+      sudo pkg update -q
+      sudo pkg install -y cmake icu postgresql${PG_VERSION}-server postgresql${PG_VERSION}-client
+    fi
 
 install:
   # Clone dependencies
   - git clone --depth 1 https://github.com/zherczeg/sljit.git deps/sljit
   - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
-  # PCRE2 with JIT (SLJIT supports both ppc64le and s390x)
+  # PCRE2 with JIT (SLJIT supports ppc64le, s390x, and FreeBSD)
   - git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
   - mkdir -p deps/pcre2/build
   - >-
@@ -39,11 +51,16 @@ install:
     -DPCRE2_BUILD_PCRE2GREP=OFF
     -DPCRE2_BUILD_TESTS=OFF
     -DPCRE2_STATIC_PIC=ON
-  # Limit parallelism — Travis CI ppc64le/s390x runners have limited RAM
+  # Limit parallelism — Travis CI runners have limited RAM
   - cmake --build deps/pcre2/build --target pcre2-8-static -j 2
 
 script:
-  - PG_CONFIG=$(find /usr/lib/postgresql -name pg_config 2>/dev/null | sort -V | tail -1)
+  - |
+    if [ "$TRAVIS_OS_NAME" = "linux" ]; then
+      PG_CONFIG=$(find /usr/lib/postgresql -name pg_config 2>/dev/null | sort -V | tail -1)
+    elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
+      PG_CONFIG=/usr/local/bin/pg_config
+    fi
   - echo "Using $PG_CONFIG"
   - $PG_CONFIG --version
   - >-
