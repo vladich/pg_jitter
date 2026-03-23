@@ -446,17 +446,21 @@ script:
     printf "$RESULTS"
     echo ""
     echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
+    echo "============================================"
 
     # s390x: Compare JIT results against baseline results file-by-file.
     # JIT is OK if its output matches baseline exactly (same diffs = platform issue, not JIT).
     if [ -n "$BASELINE_OUTDIR" ] && [ -d "$BASELINE_OUTDIR/results" ]; then
+      echo ""
+      echo "============================================"
+      echo "  BASELINE COMPARISON"
+      echo "============================================"
       JIT_REGRESSION=0
       for backend_dir in ${TRAVIS_BUILD_DIR}/regress-output-*; do
         [ -d "$backend_dir" ] || continue
         [ "$(basename "$backend_dir")" = "regress-output-baseline" ] && continue
         [ -d "$backend_dir/results" ] || continue
         BACKEND_NAME=$(basename "$backend_dir" | sed 's/regress-output-//')
-        echo ""
         echo "  Comparing $BACKEND_NAME results vs baseline..."
         DIFFS_FOUND=0
         for jit_result in "$backend_dir/results/"*.out; do
@@ -475,21 +479,18 @@ script:
           fi
         done
         if [ $DIFFS_FOUND -eq 0 ]; then
-          echo "    All results identical to baseline"
+          echo "  All results identical to baseline — no JIT regressions"
         else
           JIT_REGRESSION=1
         fi
       done
+      echo "============================================"
       if [ $JIT_REGRESSION -eq 0 ]; then
-        echo ""
-        echo "  JIT output matches baseline exactly — all failures are platform-specific"
-        echo "============================================"
         exit 0
       else
-        echo ""
-        echo "  JIT output DIFFERS from baseline — possible JIT regression"
+        echo "JIT output DIFFERS from baseline"
+        exit 1
       fi
     fi
-    echo "============================================"
 
     [ $FAILED -eq 0 ]
