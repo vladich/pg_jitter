@@ -445,26 +445,47 @@ script:
     echo ""
     echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
 
-    # If JIT run failed, check if failures are only baseline (platform) failures.
-    # JIT is OK if it introduces no NEW failures beyond the baseline.
-    if [ $FAILED -gt 0 ] && [ -s /tmp/baseline_failures.txt ]; then
-      JIT_ONLY_FAILURES=0
+    # Compare JIT results against baseline results file-by-file.
+    # JIT is OK if its output matches baseline exactly (same diffs = platform issue, not JIT).
+    if [ -d "$BASELINE_OUTDIR/results" ]; then
+      JIT_REGRESSION=0
       for backend_dir in ${TRAVIS_BUILD_DIR}/regress-output-*; do
         [ -d "$backend_dir" ] || continue
         [ "$(basename "$backend_dir")" = "regress-output-baseline" ] && continue
-        if [ -f "$backend_dir/pg_regress.log" ]; then
-          grep 'FAILED' "$backend_dir/pg_regress.log" | awk '{print $2}' | sort > /tmp/jit_failures.txt
-          NEW_FAILS=$(comm -13 /tmp/baseline_failures.txt /tmp/jit_failures.txt)
-          if [ -n "$NEW_FAILS" ]; then
-            echo "  JIT-ONLY failures (not in baseline): $NEW_FAILS"
-            JIT_ONLY_FAILURES=1
+        [ -d "$backend_dir/results" ] || continue
+        BACKEND_NAME=$(basename "$backend_dir" | sed 's/regress-output-//')
+        echo ""
+        echo "  Comparing $BACKEND_NAME results vs baseline..."
+        DIFFS_FOUND=0
+        for jit_result in "$backend_dir/results/"*.out; do
+          [ -f "$jit_result" ] || continue
+          test_name=$(basename "$jit_result")
+          baseline_result="$BASELINE_OUTDIR/results/$test_name"
+          if [ -f "$baseline_result" ]; then
+            if ! diff -q "$baseline_result" "$jit_result" > /dev/null 2>&1; then
+              echo "    DIFFERS from baseline: $test_name"
+              diff -u "$baseline_result" "$jit_result" | head -40
+              DIFFS_FOUND=1
+            fi
+          else
+            echo "    NEW (no baseline): $test_name"
+            DIFFS_FOUND=1
           fi
+        done
+        if [ $DIFFS_FOUND -eq 0 ]; then
+          echo "    All results identical to baseline"
+        else
+          JIT_REGRESSION=1
         fi
       done
-      if [ $JIT_ONLY_FAILURES -eq 0 ]; then
-        echo "  All JIT failures also fail in baseline (platform-specific) — OK"
+      if [ $JIT_REGRESSION -eq 0 ]; then
+        echo ""
+        echo "  JIT output matches baseline exactly — all failures are platform-specific"
         echo "============================================"
         exit 0
+      else
+        echo ""
+        echo "  JIT output DIFFERS from baseline — possible JIT regression"
       fi
     fi
     echo "============================================"
