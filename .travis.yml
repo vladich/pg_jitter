@@ -440,6 +440,9 @@ script:
       echo ""
     done
 
+    # Disable set -e for summary and comparison — must not abort before comparison runs
+    set +e
+
     echo "============================================"
     echo "  SUMMARY"
     echo "============================================"
