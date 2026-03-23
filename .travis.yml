@@ -40,6 +40,8 @@ before_install:
       sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       echo "deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee -a /etc/apt/sources.list.d/pgdg.list
+      # Enable Ubuntu deb-src for s390x (PGDG has no s390x, so PG comes from Ubuntu)
+      sudo sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list 2>/dev/null || true
       sudo apt-get update -qq
       # Prevent PG postinst from starting a service — we init our own cluster later
       sudo sh -c 'echo "#!/bin/sh\nexit 101" > /usr/sbin/policy-rc.d'
@@ -126,13 +128,13 @@ install:
     CMAKE_ARGS="$CMAKE_ARGS -DWITH_PCRE2=ON"
     CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release"
     if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
-      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;asmjit;mir"
+      BACKENDS_LIST="sljit;asmjit;mir"
       CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${TRAVIS_BUILD_DIR}/deps/asmjit"
       echo "HAS_ASMJIT=1" >> "$HOME/.travis_env"
     else
-      CMAKE_ARGS="$CMAKE_ARGS -DPG_JITTER_BACKENDS=sljit;mir"
+      BACKENDS_LIST="sljit;mir"
     fi
-    cmake -B build $CMAKE_ARGS
+    cmake -B build $CMAKE_ARGS "-DPG_JITTER_BACKENDS=$BACKENDS_LIST"
     cmake --build build --parallel 2
     ls -la build/pg_jitter*.so
 
