@@ -2825,7 +2825,9 @@ typedef struct DispatchFastEntry
 	TupleDesc	desc;		/* TupleDesc pointer — fast match key */
 	const TupleTableSlotOps *ops;  /* slot type — must match exactly */
 	int			natts;
-	uint32		attrs_hash;	/* FNV hash for cross-query validation */
+	uint32		attrs_hash;	/* CRC32C hash for cross-query validation */
+	Oid			tdtypeid;	/* type OID — changes on table recreate */
+	int32		tdtypmod;	/* type modifier */
 	void	   *fn;
 } DispatchFastEntry;
 
@@ -2897,7 +2899,7 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		{
 			DispatchFastEntry *fe = &dispatch_fast[i];
 			if (fe->desc == desc && fe->ops == ops && fe->natts == natts &&
-				fe->attrs_hash == deform_attrs_hash(desc, natts))
+				fe->tdtypeid == desc->tdtypeid && fe->tdtypmod == desc->tdtypmod)
 			{
 				/* Move to front (MRU) for hot-path O(1) */
 				if (i > 0)
@@ -2976,6 +2978,8 @@ found:
 				dispatch_fast[0].ops = ops;
 				dispatch_fast[0].natts = natts;
 				dispatch_fast[0].attrs_hash = ahash;
+				dispatch_fast[0].tdtypeid = desc->tdtypeid;
+				dispatch_fast[0].tdtypmod = desc->tdtypmod;
 				dispatch_fast[0].fn = fn;
 			}
 		}

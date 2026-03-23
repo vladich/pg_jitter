@@ -6603,14 +6603,6 @@ static bool mir_compile_expr(ExprState *state) {
       break;
     }
 
-    /*
-     * DOMAIN_NOTNULL / DOMAIN_CHECK: route through fallback on Windows.
-     * These opcodes may call ereport(ERROR) which requires SEH unwind
-     * through the JIT frame.  MIR's MOV-based callee-save prologue on
-     * Windows x64 produces UWOP_SAVE_NONVOL codes that RtlUnwindEx
-     * doesn't fully support for longjmp.  The fallback executes in C
-     * code with proper compiler-generated unwind info.
-     */
 #ifndef _WIN64
     case EEOP_DOMAIN_NOTNULL: {
       MIR_insn_t ok_label = MIR_new_label(ctx);
@@ -6636,10 +6628,42 @@ static bool mir_compile_expr(ExprState *state) {
       MIR_append_insn(ctx, func_item, ok_label);
       break;
     }
-#endif
-    /* EEOP_DOMAIN_CHECK and (on Windows) EEOP_DOMAIN_NOTNULL are handled
-     * by the default fallback — they may ereport(ERROR) which requires
-     * proper SEH unwind through the JIT frame. */
+
+    case EEOP_DOMAIN_CHECK: {
+      MIR_insn_t done_label = MIR_new_label(ctx);
+
+      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checknull);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                       MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1)));
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
+                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
+
+      MIR_STEP_LOAD(r_tmp3, opno, d.domaincheck.checkvalue);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp1),
+                       MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp3, 0, 1)));
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, done_label),
+                       MIR_new_reg_op(ctx, r_tmp1), MIR_new_int_op(ctx, 0)));
+
+      MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
+      MIR_append_insn(
+          ctx, func_item,
+          MIR_new_call_insn(ctx, 4, MIR_new_ref_op(ctx, proto_agg_helper),
+                            MIR_new_ref_op(ctx, step_fn_imports[opno]),
+                            MIR_new_reg_op(ctx, r_state),
+                            MIR_new_reg_op(ctx, r_tmp1)));
+
+      MIR_append_insn(ctx, func_item, done_label);
+      break;
+    }
+#endif /* !_WIN64 */
 
     /*
      * ---- SCALARARRAYOP (partially inlined) ----
@@ -8643,8 +8667,19 @@ static bool mir_compile_expr(ExprState *state) {
     /* Load external symbols (sentinels in shared mode) */
     MIR_load_external(ctx, "fallback_step",
                       mir_extern_addr((void *)pg_jitter_fallback_step));
+    /*
+     * On Windows x64, use PG's built-in deform instead of compiled deform.
+     * The sljit-compiled deform interacts badly with MIR's calling code
+     * due to deform dispatch cache collisions when TupleDesc pointers are
+     * reused across DDL operations within a session.
+     */
+#ifdef _WIN64
+    MIR_load_external(ctx, "getsomeattrs",
+                      mir_extern_addr((void *)slot_getsomeattrs_int));
+#else
     MIR_load_external(ctx, "getsomeattrs",
                       mir_extern_addr((void *)pg_jitter_compiled_deform_dispatch));
+#endif
 
     MIR_load_external(
         ctx, "make_ro",
@@ -8846,7 +8881,7 @@ static bool mir_compile_expr(ExprState *state) {
                  op == EEOP_CURRENTOFEXPR || op == EEOP_NEXTVALUEEXPR ||
                  op == EEOP_ARRAYEXPR || op == EEOP_ROW || op == EEOP_MINMAX ||
 #ifndef _WIN64
-                 op == EEOP_DOMAIN_NOTNULL ||
+                 op == EEOP_DOMAIN_NOTNULL || op == EEOP_DOMAIN_CHECK ||
 #endif
                  op == EEOP_XMLEXPR ||
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
