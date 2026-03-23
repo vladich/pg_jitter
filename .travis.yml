@@ -464,7 +464,7 @@ script:
           if [ -f "$baseline_result" ]; then
             if ! diff -q "$baseline_result" "$jit_result" > /dev/null 2>&1; then
               echo "    DIFFERS from baseline: $test_name"
-              diff -u "$baseline_result" "$jit_result" | head -40
+              diff -u "$baseline_result" "$jit_result"
               DIFFS_FOUND=1
             fi
           else
