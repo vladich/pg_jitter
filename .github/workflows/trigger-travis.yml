@@ -3,6 +3,12 @@ on:
   push:
     branches: [master]
     paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build on Travis CI'
+        required: false
+        default: ''
 
 jobs:
   trigger:
@@ -12,13 +18,14 @@ jobs:
         env:
           TRAVIS_API_TOKEN: ${{ secrets.TRAVIS_API_TOKEN }}
         run: |
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          echo "Triggering Travis CI on branch: $BRANCH"
           response=$(curl -sf -X POST \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
             -H "Travis-API-Version: 3" \
             -H "Authorization: token ${TRAVIS_API_TOKEN}" \
-            -d "{\"request\":{\"branch\":\"master\",\"message\":\"Triggered by GitHub Actions commit ${GITHUB_SHA::8}\"}}" \
+            -d "{\"request\":{\"branch\":\"${BRANCH}\",\"message\":\"Triggered by GitHub Actions (${BRANCH}) commit ${GITHUB_SHA::8}\"}}" \
             "https://api.travis-ci.com/repo/vladich%2Fpg_jitter/requests")
           echo "$response" | jq .
-          # Verify the request was accepted
           echo "$response" | jq -e '.request.id' > /dev/null
