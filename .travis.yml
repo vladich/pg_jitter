@@ -25,9 +25,12 @@ before_install:
       sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
       echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
       sudo apt-get update -qq
+      # Prevent PG postinst from starting a cluster — we init our own later
+      sudo systemctl mask postgresql
       # s390x: PGDG may not carry all PG versions — fall back to Ubuntu's default PG 14
       sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-${PG_VERSION} postgresql-server-dev-${PG_VERSION} || \
         sudo apt-get install -y -qq cmake g++ libicu-dev libpcre2-dev postgresql-14 postgresql-server-dev-14
+      sudo systemctl unmask postgresql
     elif [ "$TRAVIS_OS_NAME" = "freebsd" ]; then
       sudo pkg update -q
       sudo pkg install -y cmake icu pcre2 postgresql${PG_VERSION}-server postgresql${PG_VERSION}-client
