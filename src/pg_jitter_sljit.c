@@ -89,6 +89,13 @@ static const struct config_enum_entry parallel_jit_options[] = {
 static bool sljit_shared_code_mode = false;
 
 /*
+ * Per-compilation flag: when true, TIER 0 inline ops and SIMD text
+ * comparison are enabled. Controlled by PGJIT_INLINE flag from PG's
+ * jit_inline_above_cost GUC.
+ */
+static bool sljit_inline_enabled = false;
+
+/*
  * Per-compilation cached register for state->steps base pointer.
  * When non-zero, emit_load_step_field() uses this register directly
  * instead of reloading from SOFF_STEPS on the stack (saves 1 load per
@@ -2816,6 +2823,8 @@ static bool sljit_compile_expr(ExprState *state) {
    * Worker: attaches to DSM via GUC, looks up pre-compiled code.
    */
   if (state->parent->state->es_jit_flags & PGJIT_EXPR) {
+    sljit_inline_enabled =
+        (state->parent->state->es_jit_flags & PGJIT_INLINE) != 0;
     pg_jitter_get_expr_identity(ctx, state, &shared_node_id, &shared_expr_idx);
 
     sljit_shared_code_mode =
@@ -4128,7 +4137,8 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
+          if (sljit_inline_enabled &&
+              dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
             /*
              * TIER 0a — INLINE TEXT EQ/NE: short-varlena fast path
@@ -4142,7 +4152,8 @@ static bool sljit_compile_expr(ExprState *state) {
             } else {
               goto sljit_funcexpr_v1_fallback;
             }
-          } else if (dfn && dfn->inline_op != JIT_INLINE_NONE) {
+          } else if (sljit_inline_enabled &&
+                     dfn && dfn->inline_op != JIT_INLINE_NONE) {
             /*
              * TIER 0 — INLINE: emit the operation as sljit
              * instructions, no function call at all.
@@ -9079,8 +9090,9 @@ static bool sljit_compile_expr(ExprState *state) {
   pfree(step_labels);
   pfree(pending_jumps);
 
-  /* Reset shared code mode for next compilation */
+  /* Reset per-compilation flags for next compilation */
   sljit_shared_code_mode = false;
+  sljit_inline_enabled = false;
 
   INSTR_TIME_SET_CURRENT(endtime);
   INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter, endtime, starttime);
