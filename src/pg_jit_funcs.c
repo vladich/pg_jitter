@@ -761,20 +761,30 @@ DEF_FLOAT84_CMP(float84ge, >= 0)
  * Promote float4 to float8, operate, check overflow.
  * ================================================================ */
 
-#define DEF_FLOAT48_ARITH(name, op) \
+/* Add/sub: zero result from non-zero inputs is valid (e.g., -5.0 + 5 = 0) */
+#define DEF_FLOAT48_ADDSUB(name, op) \
 int64 jit_##name(int64 a, int64 b) { \
   float8 fa = (float8)DatumGetFloat4((Datum)a); \
   float8 fb = datum_to_float8(b); \
   float8 r = fa op fb; \
   if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb)) \
     jit_error_float_overflow(); \
-  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0)) \
-    jit_error_float_underflow(); \
   return float8_to_datum(r); \
 }
-DEF_FLOAT48_ARITH(float48pl, +)
-DEF_FLOAT48_ARITH(float48mi, -)
-DEF_FLOAT48_ARITH(float48mul, *)
+DEF_FLOAT48_ADDSUB(float48pl, +)
+DEF_FLOAT48_ADDSUB(float48mi, -)
+
+/* Mul: zero from non-zero inputs IS underflow (precision loss) */
+int64 jit_float48mul(int64 a, int64 b) {
+  float8 fa = (float8)DatumGetFloat4((Datum)a);
+  float8 fb = datum_to_float8(b);
+  float8 r = fa * fb;
+  if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb))
+    jit_error_float_overflow();
+  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0))
+    jit_error_float_underflow();
+  return float8_to_datum(r);
+}
 
 int64 jit_float48div(int64 a, int64 b) {
   float8 fa = (float8)DatumGetFloat4((Datum)a);
@@ -789,20 +799,28 @@ int64 jit_float48div(int64 a, int64 b) {
   return float8_to_datum(r);
 }
 
-#define DEF_FLOAT84_ARITH(name, op) \
+#define DEF_FLOAT84_ADDSUB(name, op) \
 int64 jit_##name(int64 a, int64 b) { \
   float8 fa = datum_to_float8(a); \
   float8 fb = (float8)DatumGetFloat4((Datum)b); \
   float8 r = fa op fb; \
   if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb)) \
     jit_error_float_overflow(); \
-  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0)) \
-    jit_error_float_underflow(); \
   return float8_to_datum(r); \
 }
-DEF_FLOAT84_ARITH(float84pl, +)
-DEF_FLOAT84_ARITH(float84mi, -)
-DEF_FLOAT84_ARITH(float84mul, *)
+DEF_FLOAT84_ADDSUB(float84pl, +)
+DEF_FLOAT84_ADDSUB(float84mi, -)
+
+int64 jit_float84mul(int64 a, int64 b) {
+  float8 fa = datum_to_float8(a);
+  float8 fb = (float8)DatumGetFloat4((Datum)b);
+  float8 r = fa * fb;
+  if (unlikely(isinf(r)) && !isinf(fa) && !isinf(fb))
+    jit_error_float_overflow();
+  if (unlikely(r == 0.0 && fa != 0.0 && fb != 0.0))
+    jit_error_float_underflow();
+  return float8_to_datum(r);
+}
 
 int64 jit_float84div(int64 a, int64 b) {
   float8 fa = datum_to_float8(a);
