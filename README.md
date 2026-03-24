@@ -259,8 +259,8 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 All copyrights belong to their respective owners.
 
-## Builds / regression tests
-Full Postgres regression tests (pg_regress) run on each commit to the master branch for each supported combination of platform and version of Postgres (20 combinations total).
+## Main builds
+Full Postgres regression tests (pg_regress) run on each commit to the master branch for each supported combination of main platforms and versions of Postgres (20 combinations total).
 For each branch commit, they run for a single version only (PG17). Here is the state of the last master run.
 
 | PG | Linux x86_64 | Linux ARM64 | macOS ARM64 | Windows x86_64 |
@@ -270,3 +270,10 @@ For each branch commit, they run for a single version only (PG17). Here is the s
 | 16 | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-linux.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-linux-arm.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-macos.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg16-windows.yml/badge.svg?branch=master&event=push) |
 | 17 | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-linux.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-linux-arm.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-macos.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg17-windows.yml/badge.svg?branch=master&event=push) |
 | 18 | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux-arm.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-macos.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-windows.yml/badge.svg?branch=master&event=push) |
+
+## PPC64 / s390x / FreeBSD builds
+We run regression tests for exotic platforms on each commit to the master branch on Travis CI. Here is the status:
+
+![](https://app.travis-ci.com/vladich/pg_jitter.svg?token=ChVbp9UxCxARfx1f2YNh&branch=master)
+
+Linux/PPC64 and FreeBSD/x86_64 builds run for each supported Postgres version, Linux/s390x builds run for PG14 only
