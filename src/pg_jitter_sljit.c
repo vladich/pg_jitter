@@ -89,6 +89,13 @@ static const struct config_enum_entry parallel_jit_options[] = {
 static bool sljit_shared_code_mode = false;
 
 /*
+ * Per-compilation flag: when true, TIER 0 inline ops and SIMD text
+ * comparison are enabled. Controlled by PGJIT_INLINE flag from PG's
+ * jit_inline_above_cost GUC.
+ */
+static bool sljit_inline_enabled = false;
+
+/*
  * Per-compilation cached register for state->steps base pointer.
  * When non-zero, emit_load_step_field() uses this register directly
  * instead of reloading from SOFF_STEPS on the stack (saves 1 load per
@@ -2146,7 +2153,6 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
   }
 
   /* ---- type casts (1-arg: value in R0, result in R0) ---- */
-
   case JIT_INLINE_INT4_TO_INT8:
     /* Sign-extend int32 in R0 to int64. On 64-bit, SLJIT_MOV_S32 does this. */
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
@@ -2270,7 +2276,7 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   struct sljit_jump *j_slow1, *j_slow2, *j_slow3, *j_slow4;
   struct sljit_jump *j_len_ne, *j_empty, *j_big, *j_small_eq;
   struct sljit_jump *j_to_ne, *j_to_store, *j_to_store2;
-  struct sljit_jump *j_memcmp_eq;
+  struct sljit_jump *j_memcmp_eq = NULL;
   struct sljit_label *l_result_eq, *l_result_ne, *l_slow, *l_store;
 
   sljit_sw off0 = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -2339,9 +2345,10 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   {
     struct sljit_jump *j_simd_ne = NULL, *j_memcmp_eq2;
     int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
-    bool has_simd_cmpeq = (sljit_emit_simd_op2(C,
-        simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
-        SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
+    bool has_simd_cmpeq = sljit_has_cpu_feature(SLJIT_HAS_SIMD) &&
+        (sljit_emit_simd_op2(C,
+            simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
+            SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
 
     /* If SIMD available: data_len > 16 → memcmp. Otherwise all > 7 → memcmp. */
     struct sljit_jump *j_memcmp_path = sljit_emit_cmp(C, SLJIT_GREATER,
@@ -2391,7 +2398,8 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   sljit_set_label(j_ptr_eq, l_result_eq);
   sljit_set_label(j_empty, l_result_eq);
   sljit_set_label(j_small_eq, l_result_eq);
-  sljit_set_label(j_memcmp_eq, l_result_eq);
+  if (j_memcmp_eq)
+    sljit_set_label(j_memcmp_eq, l_result_eq);
   sljit_set_label(j_big, l_result_eq);  /* memcmp_eq2 for >16 byte path */
   sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 1 : 0);
   j_to_store2 = sljit_emit_jump(C, SLJIT_JUMP);
@@ -2816,6 +2824,8 @@ static bool sljit_compile_expr(ExprState *state) {
    * Worker: attaches to DSM via GUC, looks up pre-compiled code.
    */
   if (state->parent->state->es_jit_flags & PGJIT_EXPR) {
+    sljit_inline_enabled =
+        (state->parent->state->es_jit_flags & PGJIT_INLINE) != 0;
     pg_jitter_get_expr_identity(ctx, state, &shared_node_id, &shared_expr_idx);
 
     sljit_shared_code_mode =
@@ -3127,7 +3137,7 @@ static bool sljit_compile_expr(ExprState *state) {
      * position-independent calls (no extra scratch register needed).
      */
     sljit_emit_enter(C, 0, SLJIT_ARGS3(W, P, P, P),
-                     4 | SLJIT_ENTER_FLOAT(6) | SLJIT_ENTER_VECTOR(3),
+                     4 | SLJIT_ENTER_FLOAT(6) | (sljit_has_cpu_feature(SLJIT_HAS_SIMD) ? SLJIT_ENTER_VECTOR(3) : 0),
                      nsaved, SOFF_TOTAL);
 
     if (has_agg) {
@@ -4128,21 +4138,17 @@ static bool sljit_compile_expr(ExprState *state) {
 
         if (!used_precompiled) {
 #endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
+          if (sljit_inline_enabled &&
+              dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
-            /*
-             * TIER 0a — INLINE TEXT EQ/NE: short-varlena fast path
-             * with memcmp, slow path calls jit_texteq/jit_textne.
-             * Only for deterministic collations; non-deterministic
-             * falls through to V1.
-             */
             if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
               bool is_eq = (dfn->inline_op == JIT_INLINE_TEXT_EQ);
               emit_inline_text_cmp(C, state, opno, op, fcinfo, is_eq);
             } else {
               goto sljit_funcexpr_v1_fallback;
             }
-          } else if (dfn && dfn->inline_op != JIT_INLINE_NONE) {
+          } else if (sljit_inline_enabled &&
+                     dfn && dfn->inline_op != JIT_INLINE_NONE) {
             /*
              * TIER 0 — INLINE: emit the operation as sljit
              * instructions, no function call at all.
@@ -4163,10 +4169,13 @@ static bool sljit_compile_expr(ExprState *state) {
               sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(fcinfo_reg),
                              off1);
 
-            emit_inline_funcexpr(C, (JitInlineOp)dfn->inline_op);
-
-            /* Store *op->resvalue = R0, *op->resnull = false */
-            emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+            if (emit_inline_funcexpr(C, (JitInlineOp)dfn->inline_op)) {
+              /* Store *op->resvalue = R0, *op->resnull = false */
+              emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+            } else {
+              /* Inline not supported — fall back to direct call */
+              goto sljit_funcexpr_v1_fallback;
+            }
           } else if (dfn && (dfn->jit_fn
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
                              || (dfn->jit_fn_name &&
@@ -9079,8 +9088,9 @@ static bool sljit_compile_expr(ExprState *state) {
   pfree(step_labels);
   pfree(pending_jumps);
 
-  /* Reset shared code mode for next compilation */
+  /* Reset per-compilation flags for next compilation */
   sljit_shared_code_mode = false;
+  sljit_inline_enabled = false;
 
   INSTR_TIME_SET_CURRENT(endtime);
   INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter, endtime, starttime);

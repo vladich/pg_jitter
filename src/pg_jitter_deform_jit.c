@@ -928,7 +928,8 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	 */
 	sljit_emit_enter(C, 0,
 					 SLJIT_ARGS1V(P),
-					 4 | SLJIT_ENTER_VECTOR(2), DEFORM_NSAVED, DLOFF_TOTAL);
+					 4 | (sljit_has_cpu_feature(SLJIT_HAS_SIMD) ? SLJIT_ENTER_VECTOR(2) : 0),
+					 DEFORM_NSAVED, DLOFF_TOTAL);
 
 	/* S1 = slot->tts_values */
 	sljit_emit_op1(C, SLJIT_MOV, SLJIT_S1, 0,
