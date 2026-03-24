@@ -272,7 +272,7 @@ For each branch commit, they run for a single version only (PG17). Here is the s
 | 18 | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-linux-arm.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-macos.yml/badge.svg?branch=master&event=push) | ![](https://github.com/vladich/pg_jitter/actions/workflows/pg18-windows.yml/badge.svg?branch=master&event=push) |
 
 ## PPC64 / s390x / FreeBSD builds
-We run regression tests for exotic platforms on each commit to the master branch on Travis CI. Here is the status:
+Regression tests for exotic platforms run on each commit to the master branch on Travis CI. Here is the status:
 
 ![](https://app.travis-ci.com/vladich/pg_jitter.svg?token=ChVbp9UxCxARfx1f2YNh&branch=master)
 
