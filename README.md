@@ -51,7 +51,8 @@ Some of them are pretty interesting, for example the "super wide table" section 
 
 ## Stability
 
-The current source code can be considered beta-quality. It passes all standard Postgres regression tests and shows good improvements in performance tests. But it lacks large-scale production verification (yet).
+The current source code can be considered beta-quality. It passes all standard Postgres regression tests on all supported platforms and shows good improvements in performance tests.
+It also successfully passes ~7M test cases of SqlLogicTest. But it lacks large-scale production verification (yet).
 Stay tuned.
 
 ## Quick Start
