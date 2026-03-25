@@ -277,4 +277,4 @@ Regression tests for exotic platforms run on each commit to the master branch on
 
 ![](https://app.travis-ci.com/vladich/pg_jitter.svg?token=ChVbp9UxCxARfx1f2YNh&branch=master)
 
-Linux/PPC64 and FreeBSD/x86_64 builds run for each supported Postgres version, Linux/s390x builds run for PG14 only
+Linux/PPC64 and FreeBSD/x86_64 builds run for each supported Postgres version, Linux/s390x builds run for PG14 and PG16 only
