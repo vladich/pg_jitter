@@ -47,7 +47,7 @@ Some of them are pretty interesting, for example the "super wide table" section 
 - **Two-tier function optimization** - hot-path PG functions compiled as direct native calls
 - **No LLVM dependency** - pure C/C++ with small, embeddable libraries
 - **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
-- **Supported platforms** - aside from AsmJit, other providers can be used on most platforms supported by Postgres. **pg_jitter** builds and passes basic regression testing on Linux/MacOS (ARM64), Linux/FreeBSD/Windows (x86_64), Linux (PPC64LE) - sljit only, Linux (s390x) - sljit only, although it was not extensively user-tested outside of ARM64 and x86_64.
+- **Supported platforms** - aside from AsmJit (which supports only ARM64/x86_64), other providers can be used on most platforms supported by Postgres. **pg_jitter** builds and passes basic regression testing on Linux/MacOS (ARM64) - all providers, Linux/FreeBSD/Windows (x86_64) - all providers, Linux (PPC64LE) - sljit only, Linux (s390x) - sljit only. It was not yet extensively user-tested outside of ARM64 and x86_64.
 
 ## Stability
 
