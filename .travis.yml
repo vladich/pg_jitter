@@ -18,9 +18,14 @@ jobs:
       env: PG_VERSION=17
     - arch: ppc64le
       env: PG_VERSION=18
-    # Linux s390x — PG 14 only (Ubuntu Jammy default, no PGDG)
+    # Linux s390x — PG 14 (Jammy default) + PG 16 (Noble default)
+    # No PGDG packages for s390x, so limited to distro-default PG versions
     - arch: s390x
+      dist: jammy
       env: PG_VERSION=14
+    - arch: s390x
+      dist: noble
+      env: PG_VERSION=16
     # FreeBSD x86_64 — PG 14-18
     - os: freebsd
       env: PG_VERSION=14
