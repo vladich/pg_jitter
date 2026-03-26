@@ -177,7 +177,7 @@ These are standard PostgreSQL parameters that control when JIT compilation is tr
 pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When PostgreSQL decides to JIT-compile a query, it calls `compile_expr()` which:
 
 1. Walks the `ExprState->steps[]` array (PostgreSQL's expression evaluation opcodes)
-2. Emits native machine code for ~30 hot-path opcodes (arithmetic, comparisons, variable access, tuple deforming, aggregation, boolean logic, jumps)
+2. Emits native machine code for hot-path opcodes (arithmetic, comparisons, variable access, tuple deforming, aggregation, boolean logic, jumps)
 3. Delegates remaining opcodes to `pg_jitter_fallback_step()` which calls the corresponding `ExecEval*` C functions
 4. Installs the compiled function with a one-time validation wrapper that catches `ALTER COLUMN TYPE` invalidation
 
