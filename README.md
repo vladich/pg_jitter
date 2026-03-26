@@ -39,7 +39,7 @@ There are several scripts in the `/tests` folder to run different types of bench
 
 For the version 0.3.0, more benchmarks have been added:
 1. TPC-C - typical OLTP queries (average speedup 8%)
-2. TPC-H - typical OLAP queries (average speedup 6%) - this one is counter-intuitive, but it's actually low on JIT opportunities. another OLAP
+2. TPC-H - typical OLAP queries (average speedup 6%)
 3. ECOMMERCE - a synthetic OLTP benchmark for a hypothetical e-commerce app (average speedup 14%) 
 4. OLAP - a synthetic benchmark for a hypothetical analytics workload (average speedup 42%)
 5. CRM - a synthetic benchmark for a hypothetical CRM analytics (average speedup ~400%) - it was created to showcase the strongest areas of the JIT backends - text filtering / CASE / IN.
