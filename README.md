@@ -37,12 +37,14 @@ There are some operations that **pg_jitter** optimizes much better than typical 
 
 There are several scripts in the `/tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
 
-For the version 0.3.0 more benchmarks have been added:
+For the version 0.3.0, more benchmarks have been added:
 1. TPC-C - typical OLTP queries (average speedup 8%)
-2. TPC-H - typical OLAP queries (average speedup 6%)
-3. ECOMMERCE - a synthetic benchmark for a hypothetical e-commerce app (average speedup 14%) 
+2. TPC-H - typical OLAP queries (average speedup 6%) - this one is counter-intuitive, but it's actually low on JIT opportunities. another OLAP
+3. ECOMMERCE - a synthetic OLTP benchmark for a hypothetical e-commerce app (average speedup 14%) 
 4. OLAP - a synthetic benchmark for a hypothetical analytics workload (average speedup 42%)
 5. CRM - a synthetic benchmark for a hypothetical CRM analytics (average speedup ~400%) - it was created to showcase the strongest areas of the JIT backends - text filtering / CASE / IN.
+
+TPC-C and TPC-H numbers are a bit low, because they are single-pass, while the other 3 are continuous. If you run those TPC-C / TPC-H queries continuously, like what most workloads do, you will get better numbers.
 
 **[ARM64 / 0.3.0] (bench/ARM64)** -> 
 
