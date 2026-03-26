@@ -35,7 +35,7 @@ There are some operations that **pg_jitter** optimizes much better than typical 
 
 ## Benchmarks
 
-There are several scripts in the `/tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
+There are several scripts in the `/tests` folder to run different types of benchmarks.
 
 For the version 0.3.0, more benchmarks have been added:
 1. TPC-C - typical OLTP queries (average speedup 8%)
