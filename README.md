@@ -31,7 +31,7 @@ It's recommended to set this parameter value to something from ~200 to low thous
 There are some operations that **pg_jitter** optimizes much better than typical expressions:
 
 - LIKE / ILIKE / regexp - by using PCRE2 (compilation) and StringZilla (SIMD), they are typically 2x-5x faster, but could be up to 25x faster for complex patterns. PCRE2 uses **sljit** compilation internally, and that adds extra optimization opportunities when **sljit** is also used as a JIT backend
-- CASE / IN (ANY) kind of expressions. These have special optimizations (pre-compiled binary search tree instead of linear search and hash probing). That approach speeds them up from 1.5x - 2x for IN up to 10x for CASE in extreme cases.
+- CASE / IN (ANY) kind of expressions. These have special optimizations (pre-compiled binary search tree instead of linear search and hash probing). That approach speeds them up from 1.5x - 2x for IN up to 10x for CASE in extreme scenarios.
 
 ## Benchmarks
 
