@@ -78,7 +78,7 @@ parent/
 ```
 [SLJIT](https://github.com/zherczeg/sljit) | [AsmJit](https://github.com/asmjit/asmjit) | [MIR](https://github.com/vnmakarov/mir)
 
-For MIR, use the patched version from [MIR-patched](https://github.com/vladich/mir-patched) - it has a few changes about tracking the size of the generated native code per function, and per-function memory management.
+For **MIR** and **sljit**, use the patched versions from [MIR-patched](https://github.com/vladich/mir-patched) and [SLJIT-patched](https://github.com/vladich/sljit) - they have a number of bug fixes, extra SIMD opcodes, and memory management improvements.
 
 ### Build
 
@@ -224,8 +224,8 @@ JIT-compiled code is tied to PostgreSQL's ResourceOwner system:
 
 A single codebase supports PostgreSQL 14–18 via compile-time `#if PG_VERSION_NUM` guards in `src/pg_jitter_compat.h`. Key differences handled:
 
-- **PG17+**: Generic ResourceOwner API (`ResourceOwnerDesc`)
 - **PG14–16**: JIT-specific ResourceOwner API (`ResourceOwnerEnlargeJIT`/`RememberJIT`/`ForgetJIT`)
+- **PG17+**: Generic ResourceOwner API (`ResourceOwnerDesc`)
 - **PG18**: `CompactAttribute`, split `EEOP_DONE`, `CompareType` rename, new opcodes
 
 ### Precompiled Function Blobs
