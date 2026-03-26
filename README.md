@@ -35,16 +35,14 @@ There are some operations that **pg_jitter** optimizes much better than typical 
 
 ## Benchmarks
 
-There are several scripts in the `tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
-Here are some results for ARM64 (Apple Silicon M1 Pro) and x86_64 (Ryzen AI 9 HX PRO 370) for different versions of Postgres and different backends.
+There are several scripts in the `/tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
+
 For the version 0.3.0 more benchmarks have been added:
 1. TPC-C - typical OLTP queries (average speedup 8%)
 2. TPC-H - typical OLAP queries (average speedup 6%)
 3. ECOMMERCE - a synthetic benchmark for a hypothetical e-commerce app (average speedup 14%) 
 4. OLAP - a synthetic benchmark for a hypothetical analytics workload (average speedup 42%)
 5. CRM - a synthetic benchmark for a hypothetical CRM analytics (average speedup ~400%) - it was created to showcase the strongest areas of the JIT backends - text filtering / CASE / IN.
-
-The scrtipts to run all those benchmarks are in the `/tests` folder
 
 **[ARM64 / 0.3.0] (bench/ARM64)** -> 
 
