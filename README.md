@@ -46,8 +46,12 @@ For the version 0.3.0 more benchmarks have been added:
 
 The scrtipts to run all those benchmarks are in the `/tests` folder
 
-[ARM64 / 0.3.0] (bench/ARM64) -> [PG14](bench/ARM64/0.3.0/BENCHMARKS_v14.md) | [PG15](bench/ARM64/0.3.0/BENCHMARKS_v15.md) | [PG16](bench/ARM64/0.3.0/BENCHMARKS_v16.md) | [PG17](bench/ARM64/0.3.0/BENCHMARKS_v17.md) | [PG18](bench/ARM64/0.3.0/BENCHMARKS_v18.md) * [TPC-C](bench/ARM64/0.3.0/TPCC_BENCHMARKS.md) * [TPC-H](bench/ARM64/0.3.0/TPCH_BENCHMARKS.md) * [ECOMMERCE](bench/ARM64/0.3.0/ECOMMERCE_BENCHMARKS.md) * [OLAP](bench/ARM64/0.3.0/OLAP_BENCHMARKS.md) * [CRM](bench/ARM64/0.3.0/CRM_BENCHMARKS.md)
-[x86_64 / 0.3.0] TBD
+**[ARM64 / 0.3.0] (bench/ARM64)** -> 
+
+- [PG14](bench/ARM64/0.3.0/BENCHMARKS_v14.md) | [PG15](bench/ARM64/0.3.0/BENCHMARKS_v15.md) | [PG16](bench/ARM64/0.3.0/BENCHMARKS_v16.md) | [PG17](bench/ARM64/0.3.0/BENCHMARKS_v17.md) | [PG18](bench/ARM64/0.3.0/BENCHMARKS_v18.md)
+- [TPC-C](bench/ARM64/0.3.0/TPCC_BENCHMARKS.md) * [TPC-H](bench/ARM64/0.3.0/TPCH_BENCHMARKS.md) * [ECOMMERCE](bench/ARM64/0.3.0/ECOMMERCE_BENCHMARKS.md) * [OLAP](bench/ARM64/0.3.0/OLAP_BENCHMARKS.md) * [CRM](bench/ARM64/0.3.0/CRM_BENCHMARKS.md)
+
+**[x86_64 / 0.3.0] (bench/x86_64)** TBD
 
 ## Features
 
