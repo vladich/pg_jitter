@@ -28,6 +28,11 @@ It's recommended to set this parameter value to something from ~200 to low thous
 - **MIR** provides solid gains while being the most portable backend
 - **LLVM** was supposed to be fast at execution time, due to clang optimization advantages, but in fact, in most cases, it's slower than all 3 pg_jitter backends, even not counting compilation performance differences. This is due to zero-cost inlining using compile-time pre-extracted code and manual instruction-level optimization.
 
+There are some operations that **pg_jitter** optimizes much better than typical expressions:
+
+- LIKE / ILIKE / regexp - by using PCRE2 (compilation) and StringZilla (SIMD), they are typically 2x-5x faster, but could be up to 25x faster for complex patterns. PCRE2 uses **sljit** compilation internally, and that adds extra optimization opportunities when **sljit** is also used as a JIT backend
+- CASE / IN (ANY) kind of expressions. These have special optimizations (pre-compiled binary search tree instead of linear search and hash probing). That approach speeds them up from 1.5x - 2x for IN up to 10x for CASE in extreme cases.
+
 ## Benchmarks
 
 There are several scripts in the `tests` folder to run different types of benchmarks, one of them is [tests/bench_comprehensive.sh](tests/bench_comprehensive.sh), another [tests/gen_cross_version_benchmarks.py](tests/gen_cross_version_benchmarks.py).
