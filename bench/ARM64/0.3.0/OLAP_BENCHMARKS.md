@@ -29,6 +29,7 @@ Sustained analytical workload on a star-schema data warehouse with heavy aggrega
 
 ## Results
 
+```
 Backend         TPS    Lat(ms)       Txns   CPU avg CPU peak   RSS avg RSS peak
 -------      ------   --------   --------   ------- --------   ------- --------
 nojit      2.104910   1882.127        130    393.9%   404.9%    6812MB   7617MB  (baseline)
@@ -37,9 +38,11 @@ asmjit     2.780330   1431.764        169    393.0%   402.7%    6658MB   6888MB 
 mir        2.605753   1525.368        159    393.0%   400.0%    6562MB   6807MB  (+23.7900%)
 auto       2.646381   1504.271        162    398.1%   400.0%    6609MB   6773MB  (+25.7200%)
 
+
 Query mix: quarterly_revenue(20%) top_products(15%) customer_segments(15%)
            yoy_comparison(15%) rolling_averages(10%) wide_table_deform(10%)
            store_scoring(10%) pareto_analysis(5%)
+```
 
 ## Analysis
 

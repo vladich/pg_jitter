@@ -29,6 +29,7 @@ Sustained OLTP workload simulating an e-commerce platform with mixed read/write 
 
 ## Results
 
+```
 Backend         TPS    Lat(ms)       Txns   CPU avg CPU peak   RSS avg RSS peak
 -------      ------   --------   --------   ------- --------   ------- --------
 nojit      317.603705     25.032      19253    788.5%   806.7%   10139MB  10597MB  (baseline)
@@ -36,11 +37,13 @@ sljit      361.139140     22.009      21906    786.3%   800.0%    5529MB   5761M
 asmjit     344.211537     23.071      20941    787.9%   799.2%    5616MB   5810MB  (+8.3700%)
 mir        324.111718     24.546      19632    786.5%   799.1%    5528MB   5760MB  (+2.0400%)
 auto       355.384729     22.425      21467    781.0%   800.0%    5555MB   5786MB  (+11.8900%)
+```
 
+```
 Query mix: product_detail(30%) category_browse(20%) search_filter(15%)
            order_history(15%) order_detail(10%) reviews(5%)
            sales_dashboard(3%) top_products(2%)
-
+```
 ## Analysis
 
 sljit delivers the best OLTP throughput with lowest latency and lowest memory usage. The e-commerce workload has short, index-heavy transactions where JIT compilation overhead matters — sljit's ~50μs compilation time is amortized across many queries per connection.
