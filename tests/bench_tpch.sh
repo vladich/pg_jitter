@@ -365,6 +365,13 @@ for qi in $(seq 0 $((NQUERIES - 1))); do
     query="${Q_SQL[$qi]}"
     printf "  %-4s " "$label"
 
+    # Prewarm buffer cache before each query to eliminate I/O variance
+    psql_cmd -q -c "
+    SELECT pg_prewarm(c.oid::regclass, 'buffer')
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i');
+    " > /dev/null 2>&1 || true
+
     for bi in "${!BACKENDS[@]}"; do
         backend="${BACKENDS[$bi]}"
         bname="${NAMES[$bi]}"

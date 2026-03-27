@@ -1046,6 +1046,860 @@ int64 jit_int8_avg_accum(int64 trans_datum, int64 newval) {
 /* int8_sum: accumulates int64 values into numeric — too complex, skip */
 
 /* ================================================================
+ * TIER 1: Numeric fast-path operations
+ *
+ * PG's numeric type is arbitrary-precision. But DECIMAL(15,2) — the most
+ * common analytical type (TPC-H, financial) — fits in int64 as "scaled
+ * integer" (value × 10^dscale). We detect short-format numerics and
+ * convert to int64 for comparison, avoiding the full cmp_var_common().
+ *
+ * NumericShort layout: [varlena_hdr(4)] [n_header(2)] [digits(2×ndigits)]
+ *   n_header bits: 1=short_flag, 1=sign, 6=dscale, 1=weight_sign, 6=weight
+ *   digits: base-10000, big-endian order, leading zeros stripped
+ *
+ * For numeric(15,2): weight ≤ 3, ndigits ≤ 4, fits in int64 easily.
+ * ================================================================ */
+
+/*
+ * Minimal numeric internal definitions (from numeric.c).
+ * We only need enough to detect short-format and extract digits.
+ */
+typedef int16 JitNumericDigit;
+
+struct JitNumericShort {
+  uint16 n_header;
+  JitNumericDigit n_data[FLEXIBLE_ARRAY_MEMBER];
+};
+
+struct JitNumericLong {
+  uint16 n_sign_dscale;
+  int16 n_weight;
+  JitNumericDigit n_data[FLEXIBLE_ARRAY_MEMBER];
+};
+
+struct JitNumericData {
+  int32 vl_len_;
+  union {
+    uint16 n_header;
+    struct JitNumericLong n_long;
+    struct JitNumericShort n_short;
+  } choice;
+};
+
+typedef struct JitNumericData *JitNumeric;
+
+/* Detoast only for truly external/compressed — avoids palloc for 1-byte headers */
+#define JIT_NUMERIC(datum) ((JitNumeric)PG_DETOAST_DATUM(datum))
+
+#define NBASE_JIT 10000
+#define NUMERIC_SHORT_JIT 0x8000
+#define NUMERIC_SPECIAL_JIT 0xC000
+#define NUMERIC_SIGN_MASK_JIT 0xC000
+
+/*
+ * Parse a numeric Datum (any varlena header form) into components.
+ * Handles 1-byte and 4-byte varlena headers WITHOUT allocation.
+ * Returns false if external/compressed (needs real detoast) or not short-format.
+ */
+static inline bool
+numeric_parse_datum(int64 datum, uint16 *phdr, JitNumericDigit **pdigits,
+                    int *pndigits) {
+  struct varlena *v = (struct varlena *)DatumGetPointer(datum);
+  if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)))
+    return false;
+  char *data = VARDATA_ANY(v);
+  int data_len = VARSIZE_ANY_EXHDR(v);
+  if (unlikely(data_len < (int)sizeof(uint16)))
+    return false;
+  uint16 hdr;
+  memcpy(&hdr, data, sizeof(uint16));
+  if (unlikely((hdr & NUMERIC_SIGN_MASK_JIT) != NUMERIC_SHORT_JIT))
+    return false;
+  *phdr = hdr;
+  *pndigits = (data_len - sizeof(uint16)) / sizeof(JitNumericDigit);
+  *pdigits = (JitNumericDigit *)(data + sizeof(uint16));
+  return true;
+}
+
+/* Extract sign, weight from a parsed header */
+#define NUMERIC_HDR_NEG(hdr) (((hdr) & 0x2000) != 0)
+#define NUMERIC_HDR_WEIGHT(hdr) \
+  (((hdr) & 0x0040) ? (~0x003F | ((hdr) & 0x003F)) : ((hdr) & 0x003F))
+#define NUMERIC_HDR_DSCALE(hdr) (((hdr) & 0x1F80) >> 7)
+
+/*
+ * Inline numeric comparison from Datum (no detoast needed).
+ * Compares sign → weight → digit-by-digit, matching PG's cmp_numerics.
+ * Returns -1, 0, 1 on success; -2 if fallback needed.
+ */
+static inline int
+numeric_cmp_datum(int64 datum_a, int64 datum_b)
+{
+  uint16 hdr1, hdr2;
+  JitNumericDigit *d1, *d2;
+  int nd1, nd2;
+
+  if (!numeric_parse_datum(datum_a, &hdr1, &d1, &nd1) ||
+      !numeric_parse_datum(datum_b, &hdr2, &d2, &nd2))
+    return -2;
+
+  bool neg1 = NUMERIC_HDR_NEG(hdr1);
+  bool neg2 = NUMERIC_HDR_NEG(hdr2);
+
+  if (neg1 != neg2) {
+    if (nd1 == 0 && nd2 == 0) return 0;
+    return neg1 ? -1 : 1;
+  }
+
+  int16 w1 = NUMERIC_HDR_WEIGHT(hdr1);
+  int16 w2 = NUMERIC_HDR_WEIGHT(hdr2);
+
+  if (w1 != w2) {
+    int cmp = (w1 > w2) ? 1 : -1;
+    return neg1 ? -cmp : cmp;
+  }
+
+  int nmin = (nd1 < nd2) ? nd1 : nd2;
+  for (int i = 0; i < nmin; i++) {
+    if (d1[i] != d2[i]) {
+      int cmp = (d1[i] > d2[i]) ? 1 : -1;
+      return neg1 ? -cmp : cmp;
+    }
+  }
+
+  if (nd1 > nd2) {
+    for (int i = nmin; i < nd1; i++)
+      if (d1[i] != 0) return neg1 ? -1 : 1;
+  } else if (nd2 > nd1) {
+    for (int i = nmin; i < nd2; i++)
+      if (d2[i] != 0) return neg1 ? 1 : -1;
+  }
+
+  return 0;
+}
+
+/* Legacy wrapper */
+static inline int
+numeric_cmp_short(JitNumeric num1, JitNumeric num2)
+{
+  return numeric_cmp_datum(PointerGetDatum(num1), PointerGetDatum(num2));
+}
+
+int32 jit_numeric_cmp(int64 a, int64 b) {
+  int r = numeric_cmp_datum(a, b);
+  if (likely(r != -2)) return r;
+  return (int32)DirectFunctionCall2(numeric_cmp, (Datum)a, (Datum)b);
+}
+
+#define DEF_NUMERIC_CMP(name, cond) \
+int32 jit_##name(int64 a, int64 b) { \
+  int r = numeric_cmp_datum(a, b); \
+  if (likely(r != -2)) return (cond) ? 1 : 0; \
+  return (int32)DirectFunctionCall2(name, (Datum)a, (Datum)b); \
+}
+
+DEF_NUMERIC_CMP(numeric_eq, r == 0)
+DEF_NUMERIC_CMP(numeric_ne, r != 0)
+DEF_NUMERIC_CMP(numeric_lt, r < 0)
+DEF_NUMERIC_CMP(numeric_le, r <= 0)
+DEF_NUMERIC_CMP(numeric_gt, r > 0)
+DEF_NUMERIC_CMP(numeric_ge, r >= 0)
+
+int64 jit_numeric_larger(int64 a, int64 b) {
+  int r = numeric_cmp_datum(a, b);
+  if (likely(r != -2)) return (r >= 0) ? a : b;
+  return (int64)DirectFunctionCall2(numeric_larger, (Datum)a, (Datum)b);
+}
+
+int64 jit_numeric_smaller(int64 a, int64 b) {
+  int r = numeric_cmp_datum(a, b);
+  if (likely(r != -2)) return (r <= 0) ? a : b;
+  return (int64)DirectFunctionCall2(numeric_smaller, (Datum)a, (Datum)b);
+}
+
+/* ================================================================
+ * TIER 1: Numeric arithmetic (fast-path for short-format numerics)
+ *
+ * For numerics with ≤4 base-10000 digits (covers DECIMAL(15,S) for any S),
+ * convert to int64 scaled value, do native arithmetic, convert back.
+ *
+ * The scaled value = sign * (digit[0]*10000^weight + digit[1]*10000^(weight-1) + ...)
+ * normalized so that the result represents value * 10000^(max_weight+1).
+ * ================================================================ */
+
+/*
+ * Convert short numeric to int64 with a known power-of-10000 scale.
+ * Returns the value as int64 and sets *pweight to the weight.
+ * The int64 value = digits interpreted as a big-endian base-10000 number.
+ * To compare or add two numerics, they must be aligned to the same weight.
+ */
+/*
+ * Convert a numeric Datum to int64 parts WITHOUT detoasting.
+ * Handles both 1-byte and 4-byte varlena headers.
+ */
+static inline bool
+numeric_datum_to_parts(int64 datum, int64 *pval, int *pweight, int *pndigits, bool *pneg)
+{
+  uint16 hdr;
+  JitNumericDigit *digits;
+  int ndigits;
+  if (!numeric_parse_datum(datum, &hdr, &digits, &ndigits))
+    return false;
+  if (ndigits > 4)
+    return false;
+
+  *pneg = NUMERIC_HDR_NEG(hdr);
+  *pweight = NUMERIC_HDR_WEIGHT(hdr);
+  *pndigits = ndigits;
+
+  int64 val = 0;
+  for (int i = 0; i < ndigits; i++)
+    val = val * NBASE_JIT + digits[i];
+  *pval = val;
+  return true;
+}
+
+/* Legacy wrapper for code that already has a JitNumeric pointer */
+static inline bool
+numeric_to_parts(JitNumeric num, int64 *pval, int *pweight, int *pndigits, bool *pneg)
+{
+  return numeric_datum_to_parts(PointerGetDatum(num), pval, pweight, pndigits, pneg);
+}
+
+/*
+ * Construct a short-format numeric from parts.
+ * val = absolute value as base-10000 digit sequence
+ * weight = weight of the first digit
+ * dscale = display scale (number of decimal digits after point)
+ */
+static Datum
+numeric_from_int64(int64 val, int weight, int dscale, bool neg)
+{
+  /* Handle zero */
+  if (val == 0) {
+    int sz = VARHDRSZ + sizeof(uint16);
+    JitNumeric num = (JitNumeric)palloc0(sz);
+    SET_VARSIZE(num, sz);
+    num->choice.n_header = NUMERIC_SHORT_JIT | ((dscale & 0x3F) << 7);
+    return PointerGetDatum(num);
+  }
+
+  /* Extract base-10000 digits */
+  JitNumericDigit digits[8];
+  int ndigits = 0;
+  int64 v = val;
+  while (v > 0) {
+    digits[ndigits++] = (JitNumericDigit)(v % NBASE_JIT);
+    v /= NBASE_JIT;
+  }
+
+  /* Reverse to big-endian order */
+  for (int i = 0; i < ndigits / 2; i++) {
+    JitNumericDigit tmp = digits[i];
+    digits[i] = digits[ndigits - 1 - i];
+    digits[ndigits - 1 - i] = tmp;
+  }
+
+  /* Strip leading zeros */
+  int start = 0;
+  while (start < ndigits && digits[start] == 0) {
+    start++;
+    weight--;
+  }
+
+  /* Strip trailing zeros */
+  int end = ndigits;
+  while (end > start && digits[end - 1] == 0)
+    end--;
+
+  int final_ndigits = end - start;
+
+  /* Build the numeric — palloc in per-tuple context (cheap bump allocator) */
+  int sz = VARHDRSZ + sizeof(uint16) + final_ndigits * sizeof(JitNumericDigit);
+  JitNumeric num = (JitNumeric)palloc(sz);
+  SET_VARSIZE(num, sz);
+
+  uint16 hdr = NUMERIC_SHORT_JIT;
+  if (neg) hdr |= 0x2000;
+  hdr |= ((dscale & 0x3F) << 7);
+  if (weight < 0) hdr |= 0x0040 | (weight & 0x003F);
+  else hdr |= (weight & 0x003F);
+  num->choice.n_header = hdr;
+
+  memcpy(num->choice.n_short.n_data, &digits[start],
+         final_ndigits * sizeof(JitNumericDigit));
+  return PointerGetDatum(num);
+}
+
+/*
+ * Fast numeric add: align by weight, add digit arrays as int64, construct result.
+ */
+/*
+ * Helper: get dscale from a numeric Datum (no detoast).
+ */
+static inline int numeric_datum_dscale(int64 datum) {
+  uint16 hdr;
+  JitNumericDigit *digits;
+  int ndigits;
+  if (numeric_parse_datum(datum, &hdr, &digits, &ndigits))
+    return NUMERIC_HDR_DSCALE(hdr);
+  return -1;
+}
+
+int64 jit_numeric_add(int64 a, int64 b) {
+  int64 va, vb;
+  int wa, wb, nda, ndb;
+  bool nega, negb;
+
+  if (unlikely(!numeric_datum_to_parts(a, &va, &wa, &nda, &nega) ||
+               !numeric_datum_to_parts(b, &vb, &wb, &ndb, &negb)))
+    return (int64)DirectFunctionCall2(numeric_add, (Datum)a, (Datum)b);
+
+  int max_w = (wa > wb) ? wa : wb;
+  while (wa < max_w) { va *= NBASE_JIT; wa++; nda++; }
+  while (wb < max_w) { vb *= NBASE_JIT; wb++; ndb++; }
+  int max_nd = (nda > ndb) ? nda : ndb;
+  while (nda < max_nd) { va *= NBASE_JIT; nda++; }
+  while (ndb < max_nd) { vb *= NBASE_JIT; ndb++; }
+
+  if (va > PG_INT64_MAX / NBASE_JIT || vb > PG_INT64_MAX / NBASE_JIT)
+    return (int64)DirectFunctionCall2(numeric_add, (Datum)a, (Datum)b);
+
+  int64 sa = nega ? -va : va;
+  int64 sb = negb ? -vb : vb;
+  int64 result = sa + sb;
+
+  int dscale_a = numeric_datum_dscale(a);
+  int dscale_b = numeric_datum_dscale(b);
+  int dscale = (dscale_a > dscale_b) ? dscale_a : dscale_b;
+
+  bool result_neg = (result < 0);
+  int64 result_abs = result_neg ? -result : result;
+  return numeric_from_int64(result_abs, max_w, dscale, result_neg);
+}
+
+int64 jit_numeric_sub(int64 a, int64 b) {
+  int64 va, vb;
+  int wa, wb, nda, ndb;
+  bool nega, negb;
+
+  if (unlikely(!numeric_datum_to_parts(a, &va, &wa, &nda, &nega) ||
+               !numeric_datum_to_parts(b, &vb, &wb, &ndb, &negb)))
+    return (int64)DirectFunctionCall2(numeric_sub, (Datum)a, (Datum)b);
+
+  int max_w = (wa > wb) ? wa : wb;
+  while (wa < max_w) { va *= NBASE_JIT; wa++; nda++; }
+  while (wb < max_w) { vb *= NBASE_JIT; wb++; ndb++; }
+  int max_nd = (nda > ndb) ? nda : ndb;
+  while (nda < max_nd) { va *= NBASE_JIT; nda++; }
+  while (ndb < max_nd) { vb *= NBASE_JIT; ndb++; }
+
+  if (va > PG_INT64_MAX / NBASE_JIT || vb > PG_INT64_MAX / NBASE_JIT)
+    return (int64)DirectFunctionCall2(numeric_sub, (Datum)a, (Datum)b);
+
+  int64 sa = nega ? -va : va;
+  int64 sb = negb ? -vb : vb;
+  int64 result = sa - sb;
+
+  int dscale_a = numeric_datum_dscale(a);
+  int dscale_b = numeric_datum_dscale(b);
+  int dscale = (dscale_a > dscale_b) ? dscale_a : dscale_b;
+
+  bool result_neg = (result < 0);
+  int64 result_abs = result_neg ? -result : result;
+  return numeric_from_int64(result_abs, max_w, dscale, result_neg);
+}
+
+int64 jit_numeric_mul(int64 a, int64 b) {
+  int64 va, vb;
+  int wa, wb, nda, ndb;
+  bool nega, negb;
+
+  if (unlikely(!numeric_datum_to_parts(a, &va, &wa, &nda, &nega) ||
+               !numeric_datum_to_parts(b, &vb, &wb, &ndb, &negb)))
+    return (int64)DirectFunctionCall2(numeric_mul, (Datum)a, (Datum)b);
+
+  int result_weight = wa + wb + 1;
+
+  if (va > 3000000000LL || vb > 3000000000LL)
+    return (int64)DirectFunctionCall2(numeric_mul, (Datum)a, (Datum)b);
+
+  int64 product = va * vb;
+  bool result_neg = (nega != negb);
+
+  int dscale_a = numeric_datum_dscale(a);
+  int dscale_b = numeric_datum_dscale(b);
+  int dscale = dscale_a + dscale_b;
+
+  return numeric_from_int64(product, result_weight, dscale, result_neg);
+}
+
+/* ================================================================
+ * TIER 1: Fast numeric aggregate accumulation
+ *
+ * PG's numeric_accum/numeric_avg_accum call init_var (decompose numeric
+ * into NumericVar) + accum_sum_add for every row. For short-format
+ * numerics, we skip init_var and directly add the base-10000 digits
+ * to the accumulator's pos/neg digit arrays.
+ *
+ * This requires duplicating PG's private NumericSumAccum and
+ * NumericAggState structs — fragile across PG versions.
+ * ================================================================ */
+
+/* Duplicated from numeric.c — MUST match the installed PG version */
+typedef struct JitNumericSumAccum {
+  int ndigits;
+  int weight;
+  int dscale;
+  int num_uncarried;
+  bool have_carry_space;
+  int32 *pos_digits;
+  int32 *neg_digits;
+} JitNumericSumAccum;
+
+typedef struct JitNumericAggState {
+  bool calcSumX2;
+  MemoryContext agg_context;
+  int64 N;
+  JitNumericSumAccum sumX;
+  JitNumericSumAccum sumX2;
+  int maxScale;
+  int64 maxScaleCount;
+  int64 NaNcount;
+  int64 pInfcount;
+  int64 nInfcount;
+} JitNumericAggState;
+
+/*
+ * Fast-path numeric aggregate transition.
+ * Called from JIT AGG_TRANS handler BEFORE the generic V1 path.
+ *
+ * Args:
+ *   state_ptr — pergroup->transValue (pointer to NumericAggState)
+ *   numeric_datum — fcinfo->args[1].value (numeric Datum)
+ *
+ * Returns 1 if fast path succeeded, 0 if generic V1 fallback needed.
+ *
+ * On success, updates the accumulator in-place (N++, sumX digits added,
+ * maxScale/maxScaleCount updated). The caller only needs to set
+ * pergroup->transValueIsNull = false.
+ *
+ * Falls back (returns 0) when:
+ * - Value is toasted/compressed (would need memory allocation)
+ * - Value is long-format, NaN, or Inf
+ * - Accumulator needs carry propagation (num_uncarried == NBASE-1)
+ * - Value's weight/digit range exceeds accumulator bounds (needs rescaling)
+ *
+ * No memory allocation on the fast path → no MemoryContextSwitchTo needed.
+ */
+int32 jit_numeric_agg_trans_fast(int64 state_ptr, int64 numeric_datum) {
+  /* NULL state or NULL datum — fallback to V1 */
+  if (unlikely(state_ptr == 0 || numeric_datum == 0))
+    return 0;
+
+  struct varlena *v = (struct varlena *)DatumGetPointer(numeric_datum);
+
+  /* Reject external toast (on-disk or indirect) — would need I/O */
+  if (unlikely(VARATT_IS_EXTERNAL(v)))
+    return 0;
+
+  /* Also reject compressed varlena — would need decompression + palloc */
+  if (unlikely(VARATT_IS_COMPRESSED(v)))
+    return 0;
+
+  /*
+   * Use VARDATA_ANY/VARSIZE_ANY_EXHDR — handles both 1-byte (short)
+   * and 4-byte varlena headers without allocation.
+   * In-tuple numerics commonly use 1-byte headers.
+   */
+  char *data = VARDATA_ANY(v);
+  int data_len = VARSIZE_ANY_EXHDR(v);
+
+  /* Read n_header from start of numeric data */
+  if (unlikely(data_len < (int)sizeof(uint16)))
+    return 0;
+
+  uint16 hdr;
+  memcpy(&hdr, data, sizeof(uint16));
+
+  /* Only handle short-format, non-special */
+  if (unlikely((hdr & NUMERIC_SIGN_MASK_JIT) != NUMERIC_SHORT_JIT))
+    return 0;
+
+  int ndigits = (data_len - sizeof(uint16)) / sizeof(JitNumericDigit);
+  JitNumericAggState *state = (JitNumericAggState *)state_ptr;
+
+  if (ndigits == 0) {
+    /* Zero value — nothing to add, just update metadata */
+    state->N++;
+    int dscale = (hdr & 0x1F80) >> 7;
+    if (dscale > state->maxScale) {
+      state->maxScale = dscale;
+      state->maxScaleCount = 1;
+    } else if (dscale == state->maxScale) {
+      state->maxScaleCount++;
+    }
+    return 1;
+  }
+
+  bool neg = (hdr & 0x2000) != 0;
+  int16 weight = (hdr & 0x0040) ? (~0x003F | (hdr & 0x003F)) : (hdr & 0x003F);
+  int dscale = (hdr & 0x1F80) >> 7;
+  JitNumericDigit *digits = (JitNumericDigit *)(data + sizeof(uint16));
+
+  /* Check carry propagation limit */
+  if (state->sumX.num_uncarried >= NBASE_JIT - 1)
+    return 0;
+
+  /* Ensure accumulator has space for this weight/digit range */
+  JitNumericSumAccum *accum = &state->sumX;
+  if (accum->ndigits == 0 || weight > accum->weight)
+    return 0;
+
+  int idx = accum->weight - weight;
+  /* Check that ALL digits fit within the accumulator array */
+  if (idx + ndigits > accum->ndigits)
+    return 0;
+
+  /* Add digits directly to accumulator */
+  int32 *accum_digits = neg ? accum->neg_digits : accum->pos_digits;
+
+  for (int vi = 0; vi < ndigits; vi++) {
+    accum_digits[idx] += (int32)digits[vi];
+    idx++;
+  }
+  accum->num_uncarried++;
+
+  if (dscale > accum->dscale)
+    accum->dscale = dscale;
+
+  /* Update aggregate state */
+  state->N++;
+  if (dscale > state->maxScale) {
+    state->maxScale = dscale;
+    state->maxScaleCount = 1;
+  } else if (dscale == state->maxScale) {
+    state->maxScaleCount++;
+  }
+  return 1;
+}
+
+/*
+ * Fast-path for int2_accum/int4_accum/int8_accum:
+ * STDDEV/VARIANCE on integer types.
+ *
+ * These use NumericAggState (NOT Int128AggState). PG converts int→numeric
+ * via int64_to_numericvar + do_numeric_accum. We do it inline:
+ *   1. Convert int64 → base-10000 digits on stack (max 5 digits, no alloc)
+ *   2. Add digits to sumX accumulator
+ *   3. If calcSumX2: compute val² via int128, convert to digits, add to sumX2
+ *   4. Update N, maxScale(=0), maxScaleCount
+ *
+ * Returns 1 on success, 0 if V1 fallback needed.
+ */
+int32 jit_int_numeric_accum_fast(int64 state_ptr, int64 intval) {
+  if (unlikely(state_ptr == 0))
+    return 0;
+
+  JitNumericAggState *state = (JitNumericAggState *)state_ptr;
+
+  /* Convert int64 → base-10000 digits (max 5 digits for int64) */
+  bool neg = (intval < 0);
+  uint64 uval = neg ? (uint64)(-(intval + 1)) + 1 : (uint64)intval;
+
+  if (uval == 0) {
+    /* Zero: just increment N, dscale=0 */
+    state->N++;
+    if (0 == state->maxScale)
+      state->maxScaleCount++;
+    return 1;
+  }
+
+  JitNumericDigit digits[5]; /* max 5 base-10000 digits for int64 */
+  int ndigits = 0;
+  {
+    uint64 tmp = uval;
+    while (tmp > 0) {
+      digits[ndigits++] = (JitNumericDigit)(tmp % NBASE_JIT);
+      tmp /= NBASE_JIT;
+    }
+    /* Reverse to big-endian order (PG keeps trailing zeros) */
+    for (int i = 0; i < ndigits / 2; i++) {
+      JitNumericDigit t = digits[i];
+      digits[i] = digits[ndigits - 1 - i];
+      digits[ndigits - 1 - i] = t;
+    }
+  }
+  int weight = ndigits - 1;
+
+  /* Pre-compute val² digits if calcSumX2, so we can check bounds
+   * for BOTH accumulators before modifying either. */
+  JitNumericDigit sq_digits[10];
+  int sq_ndigits = 0;
+  int sq_weight = 0;
+
+  if (state->calcSumX2) {
+#ifdef PG_INT128_TYPE
+    int128 sq = (int128)intval * (int128)intval;
+    uint128 usq = (uint128)sq;
+    while (usq > 0) {
+      sq_digits[sq_ndigits++] = (JitNumericDigit)(usq % NBASE_JIT);
+      usq /= NBASE_JIT;
+    }
+    for (int i = 0; i < sq_ndigits / 2; i++) {
+      JitNumericDigit t = sq_digits[i];
+      sq_digits[i] = sq_digits[sq_ndigits - 1 - i];
+      sq_digits[sq_ndigits - 1 - i] = t;
+    }
+    sq_weight = sq_ndigits > 0 ? sq_ndigits - 1 : 0;
+#else
+    return 0;
+#endif
+  }
+
+  /* Check bounds for sumX */
+  JitNumericSumAccum *accumX = &state->sumX;
+  if (accumX->num_uncarried >= NBASE_JIT - 1 ||
+      accumX->ndigits == 0 || weight > accumX->weight)
+    return 0;
+  int idxX = accumX->weight - weight;
+  if (idxX + ndigits > accumX->ndigits)
+    return 0;
+
+  /* Check bounds for sumX2 if needed */
+  if (state->calcSumX2 && sq_ndigits > 0) {
+    JitNumericSumAccum *accumX2 = &state->sumX2;
+    if (accumX2->num_uncarried >= NBASE_JIT - 1 ||
+        accumX2->ndigits == 0 || sq_weight > accumX2->weight)
+      return 0;
+    int idxX2 = accumX2->weight - sq_weight;
+    if (idxX2 + sq_ndigits > accumX2->ndigits)
+      return 0;
+  }
+
+  /* Both checks passed — safe to modify both accumulators */
+  {
+    int32 *ad = neg ? accumX->neg_digits : accumX->pos_digits;
+    for (int i = 0; i < ndigits; i++)
+      ad[idxX + i] += (int32)digits[i];
+    accumX->num_uncarried++;
+  }
+
+  if (state->calcSumX2 && sq_ndigits > 0) {
+    JitNumericSumAccum *accumX2 = &state->sumX2;
+    int idxX2 = accumX2->weight - sq_weight;
+    int32 *ad = accumX2->pos_digits; /* val² always positive */
+    for (int i = 0; i < sq_ndigits; i++)
+      ad[idxX2 + i] += (int32)sq_digits[i];
+    accumX2->num_uncarried++;
+  }
+
+  state->N++;
+  if (0 > state->maxScale) {
+    state->maxScale = 0;
+    state->maxScaleCount = 1;
+  } else if (0 == state->maxScale) {
+    state->maxScaleCount++;
+  }
+  return 1;
+}
+
+/*
+ * Inline float8_accum / float4_accum helper.
+ * Implements the Youngs-Cramer algorithm matching PG's float8_accum exactly.
+ * Array layout: float8[3] at offset 24 from ArrayType pointer.
+ *   [0] = N, [1] = Sx, [2] = Sxx
+ *
+ * Youngs-Cramer: N_new=N+1; Sx_new=Sx+val;
+ *   if (N>0) tmp=val*N_new-Sx_new; Sxx += tmp*tmp/(N_new*N)
+ *   Overflow: if Sx or Sxx becomes inf from finite inputs → NaN Sxx
+ */
+void jit_float8_accum_fast(int64 array_ptr, int64 newval_datum,
+                           int32 is_float4) {
+  double *transvalues = (double *)((char *)array_ptr + 24);
+  double newval;
+
+  if (is_float4) {
+    /* float4 stored in low 32 bits of Datum */
+    union { int32 i; float f; } u;
+    u.i = (int32)newval_datum;
+    newval = (double)u.f;
+  } else {
+    union { int64 i; double d; } u;
+    u.i = newval_datum;
+    newval = u.d;
+  }
+
+  double N = transvalues[0];
+  double Sx = transvalues[1];
+  double Sxx = transvalues[2];
+  double oldN = N;
+
+  N += 1.0;
+  Sx += newval;
+  if (oldN > 0.0) {
+    double tmp = newval * N - Sx;
+    Sxx += tmp * tmp / (N * oldN);
+
+    if (isinf(Sx) || isinf(Sxx)) {
+      if (!isinf(transvalues[1]) && !isinf(newval))
+        float_overflow_error();
+      Sxx = get_float8_nan();
+    }
+  } else {
+    /* First input: Inf/NaN must force Sxx to NaN */
+    if (isnan(newval) || isinf(newval))
+      Sxx = get_float8_nan();
+  }
+
+  transvalues[0] = N;
+  transvalues[1] = Sx;
+  transvalues[2] = Sxx;
+}
+
+/* ================================================================
+ * TIER 1: Int128 aggregate helpers (SUM/AVG/STDDEV/VARIANCE on integers)
+ *
+ * On 64-bit platforms with HAVE_INT128, PG uses Int128AggState for
+ * integer aggregates (PolyNumAggState = Int128AggState).
+ * Layout: { bool calcSumX2, int64 N, int128 sumX, int128 sumX2 }
+ *
+ * These helpers are called from the SLJIT AGG_TRANS handler.
+ * ================================================================ */
+
+#ifdef PG_INT128_TYPE
+
+typedef struct JitInt128AggState {
+  bool calcSumX2;
+  int64 N;
+  int128 sumX;
+  int128 sumX2;
+} JitInt128AggState;
+
+/*
+ * int8_avg_accum fast path: SUM(bigint), AVG(bigint).
+ * calcSumX2 = false. Just add int64 to int128 sum.
+ * Returns 1 on success, 0 if V1 fallback needed (first call, state NULL).
+ */
+int32 jit_int128_accum_fast(int64 state_ptr, int64 newval) {
+  if (unlikely(state_ptr == 0))
+    return 0;
+  JitInt128AggState *state = (JitInt128AggState *)state_ptr;
+  state->sumX += (int128)newval;
+  state->N++;
+  return 1;
+}
+
+/*
+ * int2_accum/int4_accum/int8_accum fast path:
+ * STDDEV/VARIANCE on integers. calcSumX2 = true.
+ * Returns 1 on success, 0 if V1 fallback needed.
+ */
+int32 jit_int128_accum_x2_fast(int64 state_ptr, int64 newval) {
+  if (unlikely(state_ptr == 0))
+    return 0;
+  JitInt128AggState *state = (JitInt128AggState *)state_ptr;
+  int128 v = (int128)newval;
+
+  state->sumX += v;
+  state->sumX2 += v * v;
+  state->N++;
+  return 1;
+}
+
+#endif /* PG_INT128_TYPE */
+
+/* jit_numeric_accum_x2_fast removed — integer STDDEV/VARIANCE now uses
+ * jit_int_numeric_accum_fast which converts int64→digits inline.
+ * Numeric STDDEV/VARIANCE falls through to V1. */
+
+/*
+ * numeric_larger / numeric_smaller fast path for MIN/MAX(numeric).
+ * Compares two short-format numerics and returns:
+ *   1 if new value should replace current (new is larger/smaller)
+ *   0 if current should be kept or fallback needed
+ *
+ * Args: current_datum, new_datum, is_min (1=smaller, 0=larger)
+ */
+int32 jit_numeric_minmax_fast(int64 current_datum, int64 new_datum,
+                              int32 is_min) {
+  struct varlena *vc = (struct varlena *)DatumGetPointer(current_datum);
+  struct varlena *vn = (struct varlena *)DatumGetPointer(new_datum);
+
+  /* Reject external/compressed */
+  if (unlikely(VARATT_IS_EXTERNAL(vc) || VARATT_IS_EXTERNAL(vn) ||
+               VARATT_IS_COMPRESSED(vc) || VARATT_IS_COMPRESSED(vn)))
+    return -1; /* fallback */
+
+  char *data_c = VARDATA_ANY(vc);
+  char *data_n = VARDATA_ANY(vn);
+  int len_c = VARSIZE_ANY_EXHDR(vc);
+  int len_n = VARSIZE_ANY_EXHDR(vn);
+
+  if (unlikely(len_c < (int)sizeof(uint16) || len_n < (int)sizeof(uint16)))
+    return -1;
+
+  uint16 hdr_c, hdr_n;
+  memcpy(&hdr_c, data_c, sizeof(uint16));
+  memcpy(&hdr_n, data_n, sizeof(uint16));
+
+  /* Both must be short-format */
+  if (unlikely((hdr_c & NUMERIC_SIGN_MASK_JIT) != NUMERIC_SHORT_JIT ||
+               (hdr_n & NUMERIC_SIGN_MASK_JIT) != NUMERIC_SHORT_JIT))
+    return -1;
+
+  /* Extract sign, weight, ndigits for both */
+  bool neg_c = (hdr_c & 0x2000) != 0;
+  bool neg_n = (hdr_n & 0x2000) != 0;
+
+  /* Different signs: positive > negative */
+  if (neg_c != neg_n) {
+    bool new_is_less = neg_n; /* negative is less */
+    return (is_min ? new_is_less : !new_is_less) ? 1 : 0;
+  }
+
+  int16 weight_c = (hdr_c & 0x0040) ? (~0x003F | (hdr_c & 0x003F))
+                                     : (hdr_c & 0x003F);
+  int16 weight_n = (hdr_n & 0x0040) ? (~0x003F | (hdr_n & 0x003F))
+                                     : (hdr_n & 0x003F);
+
+  int ndigits_c = (len_c - sizeof(uint16)) / sizeof(JitNumericDigit);
+  int ndigits_n = (len_n - sizeof(uint16)) / sizeof(JitNumericDigit);
+
+  JitNumericDigit *digits_c = (JitNumericDigit *)(data_c + sizeof(uint16));
+  JitNumericDigit *digits_n = (JitNumericDigit *)(data_n + sizeof(uint16));
+
+  /* Compare magnitude: weight first, then digit-by-digit */
+  int cmp = 0;
+  if (weight_c != weight_n) {
+    cmp = (weight_c > weight_n) ? 1 : -1;
+  } else {
+    int common = (ndigits_c < ndigits_n) ? ndigits_c : ndigits_n;
+    for (int i = 0; i < common; i++) {
+      if (digits_c[i] != digits_n[i]) {
+        cmp = (digits_c[i] > digits_n[i]) ? 1 : -1;
+        break;
+      }
+    }
+    if (cmp == 0) {
+      if (ndigits_c != ndigits_n)
+        cmp = (ndigits_c > ndigits_n) ? 1 : -1;
+    }
+  }
+
+  /* If negative, reverse the comparison */
+  if (neg_c)
+    cmp = -cmp;
+
+  /* cmp > 0 means current > new. For MIN, replace if new < current (cmp > 0).
+   * For MAX, replace if new > current (cmp < 0). */
+  if (is_min)
+    return (cmp > 0) ? 1 : 0;
+  else
+    return (cmp < 0) ? 1 : 0;
+}
+
+/* ================================================================
  * TIER 1: Interval comparison (8 functions)
  * Interval = { TimeOffset time, int32 day, int32 month }
  * Comparison uses INT128 arithmetic: span = time + days*USECS_PER_DAY
@@ -1098,6 +1952,408 @@ int64 jit_interval_smaller(int64 a, int64 b) {
 int64 jit_interval_larger(int64 a, int64 b) {
   return (jit_interval_cmp_internal(a, b) >= 0) ? a : b;
 }
+
+/* ================================================================
+ * TIER 1: Compile-time extract/date_part optimization
+ *
+ * When the unit string (e.g., 'year', 'month') is a compile-time constant,
+ * we resolve it to an enum at JIT compile time and emit a direct call
+ * to this helper, skipping the string resolution at runtime.
+ *
+ * PG's timestamp_part_common does:
+ *   1. downcase_truncate_identifier (string alloc)
+ *   2. DecodeUnits (binary search)
+ *   3. timestamp2tm (decompose to y/m/d/h/m/s)
+ *   4. switch on val to extract field
+ *
+ * We skip steps 1-2 and inline step 4.
+ * ================================================================ */
+#include "utils/datetime.h"    /* timestamp2tm, DTK_* constants */
+#include "utils/numeric.h"     /* int64_to_numeric */
+#include "utils/builtins.h"    /* cstring_to_text */
+#include "parser/scansup.h"    /* downcase_truncate_identifier */
+
+/*
+ * Resolve unit string (e.g., 'year', 'month') to DTK_* enum value.
+ * Called at JIT compile time. Returns -1 if unrecognized.
+ */
+int32 jit_resolve_timestamp_field(int64 unit_datum) {
+  text *unit_text = DatumGetTextPP((Datum)unit_datum);
+  char *lowunits = downcase_truncate_identifier(
+      VARDATA_ANY(unit_text), VARSIZE_ANY_EXHDR(unit_text), false);
+  int type, val;
+  type = DecodeUnits(0, lowunits, &val);
+  if (type == UNKNOWN_FIELD)
+    type = DecodeSpecial(0, lowunits, &val);
+  pfree(lowunits);
+  if (type == UNITS || type == RESERV)
+    return val;
+  return -1;
+}
+
+/*
+ * Fast timestamp field extraction. Called with pre-resolved field enum.
+ * Returns int64 result for integer fields, or Datum for numeric fields.
+ * field_type: DTK_YEAR, DTK_MONTH, DTK_DAY, DTK_HOUR, DTK_MINUTE,
+ *             DTK_QUARTER, DTK_DOW, DTK_ISODOW, DTK_DOY, DTK_WEEK,
+ *             DTK_MICROSEC, DTK_SECOND, DTK_EPOCH, etc.
+ *
+ * For extract() (retnumeric=true): returns a Numeric Datum.
+ * For date_part() (retnumeric=false): returns float8 bits as int64.
+ */
+int64 jit_extract_timestamp(int64 ts, int32 field_val) {
+  Timestamp timestamp = (Timestamp)ts;
+  int64 intresult;
+
+  if (unlikely(TIMESTAMP_NOT_FINITE(timestamp)))
+    return (int64)DirectFunctionCall2(extract_timestamp,
+                                     PointerGetDatum(cstring_to_text("year")),
+                                     Int64GetDatum(ts));
+
+  /*
+   * Fast path for HOUR/MINUTE/SECOND/MICROSEC: pure arithmetic
+   * on microseconds since midnight, no timestamp2tm needed.
+   */
+  if (field_val == DTK_HOUR || field_val == DTK_MINUTE ||
+      field_val == DTK_MICROSEC) {
+    /* time within day = ts mod USECS_PER_DAY (handle negative) */
+    int64 time_part = ts % USECS_PER_DAY;
+    if (time_part < 0) time_part += USECS_PER_DAY;
+    switch (field_val) {
+      case DTK_HOUR:     intresult = time_part / INT64CONST(3600000000); break;
+      case DTK_MINUTE:   intresult = (time_part / INT64CONST(60000000)) % 60; break;
+      case DTK_MICROSEC: intresult = time_part % INT64CONST(60000000); break;
+      default: __builtin_unreachable();
+    }
+    return NumericGetDatum(int64_to_numeric(intresult));
+  }
+
+  /* For date fields, need full decomposition */
+  struct pg_tm tt, *tm = &tt;
+  fsec_t fsec;
+  if (unlikely(timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) != 0))
+    ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                    errmsg("timestamp out of range")));
+
+  switch (field_val) {
+    case DTK_YEAR:     intresult = tm->tm_year; break;
+    case DTK_MONTH:    intresult = tm->tm_mon; break;
+    case DTK_DAY:      intresult = tm->tm_mday; break;
+    case DTK_QUARTER:  intresult = (tm->tm_mon - 1) / 3 + 1; break;
+    case DTK_DOW:      intresult = j2day(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)); break;
+    case DTK_DOY:
+      intresult = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)
+                - date2j(tm->tm_year, 1, 1) + 1;
+      break;
+    default:
+      return (int64)DirectFunctionCall2(extract_timestamp,
+                                       PointerGetDatum(cstring_to_text("epoch")),
+                                       Int64GetDatum(ts));
+  }
+
+  return NumericGetDatum(int64_to_numeric(intresult));
+}
+
+/*
+ * Same for date_part() which returns float8.
+ */
+int64 jit_datepart_timestamp(int64 ts, int32 field_val) {
+  Timestamp timestamp = (Timestamp)ts;
+  struct pg_tm tt, *tm = &tt;
+  fsec_t fsec;
+
+  if (TIMESTAMP_NOT_FINITE(timestamp))
+    return (int64)DirectFunctionCall2(timestamp_part,
+                                     PointerGetDatum(cstring_to_text("year")),
+                                     Int64GetDatum(ts));
+
+  if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) != 0)
+    ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                    errmsg("timestamp out of range")));
+
+  double result;
+  switch (field_val) {
+    case DTK_YEAR:     result = tm->tm_year; break;
+    case DTK_MONTH:    result = tm->tm_mon; break;
+    case DTK_DAY:      result = tm->tm_mday; break;
+    case DTK_HOUR:     result = tm->tm_hour; break;
+    case DTK_MINUTE:   result = tm->tm_min; break;
+    case DTK_SECOND:   result = tm->tm_sec + fsec / 1000000.0; break;
+    case DTK_QUARTER:  result = (tm->tm_mon - 1) / 3 + 1; break;
+    case DTK_DOW:      result = j2day(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)); break;
+    case DTK_DOY:
+      result = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)
+             - date2j(tm->tm_year, 1, 1) + 1;
+      break;
+    case DTK_MICROSEC: result = tm->tm_sec * 1000000.0 + fsec; break;
+    case DTK_MILLISEC: result = tm->tm_sec * 1000.0 + fsec / 1000.0; break;
+    default:
+      return (int64)DirectFunctionCall2(timestamp_part,
+                                       PointerGetDatum(cstring_to_text("epoch")),
+                                       Int64GetDatum(ts));
+  }
+  int64 r; memcpy(&r, &result, 8); return r;
+}
+
+/* ================================================================
+ * TIER 1: Cross-type temporal comparisons
+ *
+ * date_cmp_timestamp: date * USECS_PER_DAY → timestamp, then int64 compare
+ * timestamp_cmp_timestamptz: on same-offset systems, just int64 compare
+ *   (PG compiles ts→tstz as ts + session_timezone offset)
+ * time: int64 microseconds since midnight, simple compare
+ * ================================================================ */
+
+/* date → timestamp conversion (non-special dates only) */
+static inline int64 jit_date_to_timestamp(int32 dateVal) {
+  return (int64)dateVal * USECS_PER_DAY;
+}
+
+/* date vs timestamp comparison */
+static inline int
+jit_date_cmp_ts(int32 dateVal, int64 ts) {
+  /* Special dates: fall back */
+  if (unlikely(dateVal == (int32)0x7FFFFFFF || dateVal == (int32)0x80000000))
+    return -2; /* sentinel: needs fallback */
+  int64 dt = jit_date_to_timestamp(dateVal);
+  return (dt < ts) ? -1 : (dt > ts) ? 1 : 0;
+}
+
+#define DEF_DATE_CMP_TS(name, cond) \
+int32 jit_##name(int32 a, int64 b) { \
+  int r = jit_date_cmp_ts(a, b); \
+  if (likely(r != -2)) return (cond) ? 1 : 0; \
+  return (int32)DirectFunctionCall2(name, Int32GetDatum(a), Int64GetDatum(b)); \
+}
+DEF_DATE_CMP_TS(date_eq_timestamp, r == 0)
+DEF_DATE_CMP_TS(date_ne_timestamp, r != 0)
+DEF_DATE_CMP_TS(date_lt_timestamp, r < 0)
+DEF_DATE_CMP_TS(date_le_timestamp, r <= 0)
+DEF_DATE_CMP_TS(date_gt_timestamp, r > 0)
+DEF_DATE_CMP_TS(date_ge_timestamp, r >= 0)
+int32 jit_date_cmp_timestamp(int32 a, int64 b) {
+  int r = jit_date_cmp_ts(a, b);
+  if (likely(r != -2)) return r;
+  return (int32)DirectFunctionCall2(date_cmp_timestamp, Int32GetDatum(a), Int64GetDatum(b));
+}
+
+/* timestamp vs date (reversed) */
+#define DEF_TS_CMP_DATE(name, cond) \
+int32 jit_##name(int64 a, int32 b) { \
+  int r = jit_date_cmp_ts(b, a); \
+  if (likely(r != -2)) { r = -r; return (cond) ? 1 : 0; } \
+  return (int32)DirectFunctionCall2(name, Int64GetDatum(a), Int32GetDatum(b)); \
+}
+DEF_TS_CMP_DATE(timestamp_eq_date, r == 0)
+DEF_TS_CMP_DATE(timestamp_ne_date, r != 0)
+DEF_TS_CMP_DATE(timestamp_lt_date, r < 0)
+DEF_TS_CMP_DATE(timestamp_le_date, r <= 0)
+DEF_TS_CMP_DATE(timestamp_gt_date, r > 0)
+DEF_TS_CMP_DATE(timestamp_ge_date, r >= 0)
+int32 jit_timestamp_cmp_date(int64 a, int32 b) {
+  int r = jit_date_cmp_ts(b, a);
+  if (likely(r != -2)) return -r;
+  return (int32)DirectFunctionCall2(timestamp_cmp_date, Int64GetDatum(a), Int32GetDatum(b));
+}
+
+/* time comparisons — int64 microseconds since midnight */
+int32 jit_time_eq(int64 a, int64 b) { return a == b; }
+int32 jit_time_ne(int64 a, int64 b) { return a != b; }
+int32 jit_time_lt(int64 a, int64 b) { return a < b; }
+int32 jit_time_le(int64 a, int64 b) { return a <= b; }
+int32 jit_time_gt(int64 a, int64 b) { return a > b; }
+int32 jit_time_ge(int64 a, int64 b) { return a >= b; }
+int32 jit_time_cmp(int64 a, int64 b) { return (a < b) ? -1 : (a > b) ? 1 : 0; }
+
+/* ================================================================
+ * TIER 1: Extended hash functions
+ * Used by parallel hash joins and hash aggregation.
+ * These take (value, seed) and return int64.
+ * ================================================================ */
+int64 jit_hashint2extended(int64 val, int64 seed) {
+  return hash_bytes_uint32_extended((int32)(int16)val, (uint64)seed);
+}
+int64 jit_hashint4extended(int64 val, int64 seed) {
+  return hash_bytes_uint32_extended((uint32)(int32)val, (uint64)seed);
+}
+int64 jit_hashint8extended(int64 val, int64 seed) {
+  uint32 lohalf = (uint32)val;
+  uint32 hihalf = (uint32)((uint64)val >> 32);
+  lohalf ^= (val >= 0) ? hihalf : ~hihalf;
+  return hash_bytes_uint32_extended(lohalf, (uint64)seed);
+}
+int64 jit_hashoidextended(int64 val, int64 seed) {
+  return hash_bytes_uint32_extended((uint32)val, (uint64)seed);
+}
+int64 jit_hashfloat4extended(int64 val, int64 seed) {
+  /* float4 stored in low 32 bits of Datum */
+  float4 f;
+  memcpy(&f, &val, sizeof(float4));
+  if (f == 0.0f) f = 0.0f; /* -0 → +0 */
+  uint32 k;
+  memcpy(&k, &f, sizeof(uint32));
+  return hash_bytes_uint32_extended(k, (uint64)seed);
+}
+int64 jit_hashfloat8extended(int64 val, int64 seed) {
+  float8 f;
+  memcpy(&f, &val, sizeof(float8));
+  if (f == 0.0) f = 0.0; /* -0 → +0 */
+  uint32 lohalf, hihalf;
+  memcpy(&lohalf, &f, sizeof(uint32));
+  memcpy(&hihalf, ((char*)&f) + 4, sizeof(uint32));
+  lohalf ^= hihalf;
+  return hash_bytes_uint32_extended(lohalf, (uint64)seed);
+}
+int64 jit_hashdateextended(int64 val, int64 seed) {
+  return hash_bytes_uint32_extended((uint32)(int32)val, (uint64)seed);
+}
+
+/* ================================================================
+ * TIER 2: numeric_abs / numeric_uminus
+ * Just flip/clear the sign bit in the numeric header.
+ * Must palloc a copy since the original is in the tuple.
+ * ================================================================ */
+int64 jit_numeric_abs(int64 datum) {
+  uint16 hdr;
+  JitNumericDigit *digits;
+  int ndigits;
+  if (!numeric_parse_datum(datum, &hdr, &digits, &ndigits))
+    return (int64)DirectFunctionCall1(numeric_abs, (Datum)datum);
+  /* Short-format: clear sign bit (0x2000) */
+  uint16 new_hdr = hdr & ~0x2000;
+  if (new_hdr == hdr)
+    return datum; /* already positive */
+  /* Allocate copy with cleared sign */
+  struct varlena *v = (struct varlena *)DatumGetPointer(datum);
+  int total_len = VARSIZE_ANY(v);
+  struct varlena *copy = (struct varlena *)palloc(total_len);
+  memcpy(copy, v, total_len);
+  /* Patch the header in the copy */
+  char *copy_data = VARDATA_ANY(copy);
+  memcpy(copy_data, &new_hdr, sizeof(uint16));
+  return PointerGetDatum(copy);
+}
+
+int64 jit_numeric_uminus(int64 datum) {
+  uint16 hdr;
+  JitNumericDigit *digits;
+  int ndigits;
+  if (!numeric_parse_datum(datum, &hdr, &digits, &ndigits))
+    return (int64)DirectFunctionCall1(numeric_uminus, (Datum)datum);
+  /* Zero: no sign flip needed */
+  if (ndigits == 0)
+    return datum;
+  /* Short-format: toggle sign bit (0x2000) */
+  uint16 new_hdr = hdr ^ 0x2000;
+  struct varlena *v = (struct varlena *)DatumGetPointer(datum);
+  int total_len = VARSIZE_ANY(v);
+  struct varlena *copy = (struct varlena *)palloc(total_len);
+  memcpy(copy, v, total_len);
+  char *copy_data = VARDATA_ANY(copy);
+  memcpy(copy_data, &new_hdr, sizeof(uint16));
+  return PointerGetDatum(copy);
+}
+
+/* ================================================================
+ * TIER 2: Type cast functions (trivial fixed-type conversions)
+ * ================================================================ */
+
+/* int widening (safe, no overflow) */
+int64 jit_int8_from_int4(int32 v) { return (int64)v; }
+int64 jit_int8_from_int2(int32 v) { return (int64)(int16)v; }
+int64 jit_int8_from_oid(int32 v) { return (int64)(uint32)v; }
+
+/* float from int */
+int64 jit_float8_from_int4(int32 v) {
+  double d = (double)v;
+  int64 r; memcpy(&r, &d, 8); return r;
+}
+int64 jit_float8_from_int2(int32 v) {
+  double d = (double)(int16)v;
+  int64 r; memcpy(&r, &d, 8); return r;
+}
+int64 jit_float8_from_int8(int64 v) {
+  double d = (double)v;
+  int64 r; memcpy(&r, &d, 8); return r;
+}
+int64 jit_float4_from_int4(int32 v) {
+  float f = (float)v;
+  int32 r; memcpy(&r, &f, 4); return (int64)(uint32)r;
+}
+int64 jit_float4_from_int2(int32 v) {
+  float f = (float)(int16)v;
+  int32 r; memcpy(&r, &f, 4); return (int64)(uint32)r;
+}
+
+/* ================================================================
+ * TIER 3: Btree comparison functions (return -1, 0, 1)
+ * ================================================================ */
+int32 jit_btint4cmp(int32 a, int32 b) { return (a > b) - (a < b); }
+int32 jit_btint8cmp(int64 a, int64 b) { return (a > b) - (a < b); }
+int32 jit_btint42cmp(int32 a, int32 b) { int64 la = (int64)a, lb = (int64)(int16)b; return (la > lb) - (la < lb); }
+int32 jit_btint48cmp(int32 a, int64 b) { int64 la = (int64)a; return (la > b) - (la < b); }
+int32 jit_btint82cmp(int64 a, int32 b) { int64 lb = (int64)(int16)b; return (a > lb) - (a < lb); }
+int32 jit_btint84cmp(int64 a, int32 b) { int64 lb = (int64)b; return (a > lb) - (a < lb); }
+int32 jit_btfloat4cmp(int64 a, int64 b) {
+  float fa, fb; memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
+  return (fa > fb) ? 1 : (fa < fb) ? -1 : 0;
+}
+int32 jit_btfloat8cmp(int64 a, int64 b) {
+  double da, db; memcpy(&da, &a, 8); memcpy(&db, &b, 8);
+  return (da > db) ? 1 : (da < db) ? -1 : 0;
+}
+int32 jit_btfloat48cmp(int64 a, int64 b) {
+  float fa; double db; memcpy(&fa, &a, 4); memcpy(&db, &b, 8);
+  double da = (double)fa;
+  return (da > db) ? 1 : (da < db) ? -1 : 0;
+}
+int32 jit_btfloat84cmp(int64 a, int64 b) {
+  double da; float fb; memcpy(&da, &a, 8); memcpy(&fb, &b, 4);
+  double db = (double)fb;
+  return (da > db) ? 1 : (da < db) ? -1 : 0;
+}
+int32 jit_date_cmp(int32 a, int32 b) { return (a > b) - (a < b); }
+
+/* ================================================================
+ * TIER 5: Text operations
+ * ================================================================ */
+int32 jit_textlen(int64 datum) {
+  struct varlena *v = (struct varlena *)DatumGetPointer(datum);
+  if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)))
+    return (int32)DirectFunctionCall1(textlen, (Datum)datum);
+  return pg_mbstrlen_with_len(VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+}
+int32 jit_textoctetlen(int64 datum) {
+  struct varlena *v = (struct varlena *)DatumGetPointer(datum);
+  if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)))
+    return (int32)toast_raw_datum_size((Datum)datum) - VARHDRSZ;
+  return VARSIZE_ANY_EXHDR(v);
+}
+int32 jit_text_starts_with(int64 a, int64 b) {
+  struct varlena *va = (struct varlena *)DatumGetPointer(a);
+  struct varlena *vb = (struct varlena *)DatumGetPointer(b);
+  if (unlikely(VARATT_IS_EXTERNAL(va) || VARATT_IS_COMPRESSED(va) ||
+               VARATT_IS_EXTERNAL(vb) || VARATT_IS_COMPRESSED(vb)))
+    return (int32)DirectFunctionCall2(text_starts_with, (Datum)a, (Datum)b);
+  int len1 = VARSIZE_ANY_EXHDR(va);
+  int len2 = VARSIZE_ANY_EXHDR(vb);
+  return (len1 >= len2 && memcmp(VARDATA_ANY(va), VARDATA_ANY(vb), len2) == 0) ? 1 : 0;
+}
+
+/* ================================================================
+ * TIER 7: Money (cash) type — int64 internally
+ * ================================================================ */
+int32 jit_cash_eq(int64 a, int64 b) { return a == b; }
+int32 jit_cash_ne(int64 a, int64 b) { return a != b; }
+int32 jit_cash_lt(int64 a, int64 b) { return a < b; }
+int32 jit_cash_le(int64 a, int64 b) { return a <= b; }
+int32 jit_cash_gt(int64 a, int64 b) { return a > b; }
+int32 jit_cash_ge(int64 a, int64 b) { return a >= b; }
+int32 jit_cash_cmp(int64 a, int64 b) { return (a > b) - (a < b); }
+int64 jit_cash_pl(int64 a, int64 b) { return a + b; }
+int64 jit_cash_mi(int64 a, int64 b) { return a - b; }
+int64 jit_cashlarger(int64 a, int64 b) { return (a >= b) ? a : b; }
+int64 jit_cashsmaller(int64 a, int64 b) { return (a <= b) ? a : b; }
 
 /* interval_hash: compute INT128 span, take low 64 bits, hash as int8 */
 int32 jit_interval_hash(int64 a_ptr) {
@@ -1160,6 +2416,54 @@ int64 jit_timestamp_mi_interval(int64 ts, int64 span_ptr) {
 
   return (int64)DirectFunctionCall2(timestamp_mi_interval, (Datum)ts,
                                     (Datum)span_ptr);
+}
+
+/*
+ * timestamptz_pl/mi_interval: same as timestamp (PG uses same internal
+ * representation), but month-based intervals need timezone adjustment.
+ * For month=0 fast path, timestamptz arithmetic is identical to timestamp.
+ */
+int64 jit_timestamptz_pl_interval(int64 ts, int64 span_ptr) {
+  const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
+  if (span->month == 0) {
+    int64 result = ts;
+    result += (int64)span->day * USECS_PER_DAY_CONST;
+    result += span->time;
+    return result;
+  }
+  return (int64)DirectFunctionCall2(timestamptz_pl_interval, (Datum)ts,
+                                    (Datum)span_ptr);
+}
+
+int64 jit_timestamptz_mi_interval(int64 ts, int64 span_ptr) {
+  const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
+  if (span->month == 0) {
+    int64 result = ts;
+    result -= (int64)span->day * USECS_PER_DAY_CONST;
+    result -= span->time;
+    return result;
+  }
+  return (int64)DirectFunctionCall2(timestamptz_mi_interval, (Datum)ts,
+                                    (Datum)span_ptr);
+}
+
+/* timestamp_mi: subtract two timestamps → interval.
+ * PG splits the difference into days + time-of-day. */
+int64 jit_timestamp_mi(int64 ts1, int64 ts2) {
+  int64 diff = ts1 - ts2;
+  Interval *result = (Interval *)palloc(sizeof(Interval));
+  result->month = 0;
+  result->day = (int32)(diff / USECS_PER_DAY);
+  result->time = diff - (int64)result->day * USECS_PER_DAY;
+  return PointerGetDatum(result);
+}
+
+/* date → timestamp cast: simple multiply by USECS_PER_DAY */
+int64 jit_date_timestamp(int32 dateVal) {
+  /* Special dates: fall back */
+  if (unlikely(dateVal == (int32)0x7FFFFFFF || dateVal == (int32)0x80000000))
+    return (int64)DirectFunctionCall1(date_timestamp, Int32GetDatum(dateVal));
+  return jit_date_to_timestamp(dateVal);
 }
 
 /* ================================================================
@@ -1337,22 +2641,6 @@ int64 jit_text_larger(int64 a, int64 b, int32 collid) {
 }
 int64 jit_text_smaller(int64 a, int64 b, int32 collid) {
   return jit_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) <= 0 ? a : b;
-}
-
-/* ================================================================
- * TIER 1: Text functions (no collation needed)
- * ================================================================ */
-
-int32 jit_textlen(int64 a) {
-  text *t = DatumGetTextPP((Datum)a);
-  int32 result = pg_mbstrlen_with_len(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
-  JIT_FREE_IF_COPY(t, (Datum)a);
-  return result;
-}
-
-int32 jit_textoctetlen(int64 a) {
-  /* toast_raw_datum_size returns on-disk size including VARHDRSZ */
-  return (int32)(toast_raw_datum_size((Datum)a) - VARHDRSZ);
 }
 
 /* text_pattern_* comparison: raw byte-wise (no collation) */
@@ -1658,13 +2946,7 @@ const JitDirectFn jit_direct_fns[] = {
     E1(i2tof, jit_i2tof, T64, T32),
     E1(ftoi2, jit_ftoi2, T32, T64),
 
-    /* ---- extended hash functions (DEFERRED — V1 call for correctness) ---- */
-    E2(hashint4extended, DEFERRED, T64, T32, T64),
-    E2(hashint8extended, DEFERRED, T64, T64, T64),
-    E2(hashint2extended, DEFERRED, T64, T64, T64),
-    E2(hashoidextended, DEFERRED, T64, T32, T64),
-    E2(hashfloat4extended, DEFERRED, T64, T64, T64),
-    E2(hashfloat8extended, DEFERRED, T64, T64, T64),
+    /* Extended hash functions moved to implemented section below */
 
     /* ---- bool comparison + aggregates ---- */
     E2(booleq, jit_booleq, T32, T64, T64),
@@ -1704,6 +2986,9 @@ const JitDirectFn jit_direct_fns[] = {
     /* ---- timestamp/interval arithmetic (fast path for month=0) ---- */
     E2(timestamp_pl_interval, jit_timestamp_pl_interval, T64, T64, T64),
     E2(timestamp_mi_interval, jit_timestamp_mi_interval, T64, T64, T64),
+    E2(timestamptz_pl_interval, jit_timestamptz_pl_interval, T64, T64, T64),
+    E2(timestamptz_mi_interval, jit_timestamptz_mi_interval, T64, T64, T64),
+    E2(timestamp_mi, jit_timestamp_mi, T64, T64, T64),
 
     /* ---- date comparison (same repr as int4) ---- */
     EI2(date_eq, jit_date_eq, T32, T32, T32, JIT_INLINE_INT4_EQ),
@@ -1717,6 +3002,75 @@ const JitDirectFn jit_direct_fns[] = {
     E2(date_pli, jit_date_pli, T32, T32, T32),
     E2(date_mii, jit_date_mii, T32, T32, T32),
     E2(date_mi, jit_date_mi, T32, T32, T32),
+
+    /* ---- cross-type: date vs timestamp ---- */
+    E2(date_eq_timestamp, jit_date_eq_timestamp, T32, T32, T64),
+    E2(date_ne_timestamp, jit_date_ne_timestamp, T32, T32, T64),
+    E2(date_lt_timestamp, jit_date_lt_timestamp, T32, T32, T64),
+    E2(date_le_timestamp, jit_date_le_timestamp, T32, T32, T64),
+    E2(date_gt_timestamp, jit_date_gt_timestamp, T32, T32, T64),
+    E2(date_ge_timestamp, jit_date_ge_timestamp, T32, T32, T64),
+    E2(date_cmp_timestamp, jit_date_cmp_timestamp, T32, T32, T64),
+
+    /* ---- cross-type: timestamp vs date ---- */
+    E2(timestamp_eq_date, jit_timestamp_eq_date, T32, T64, T32),
+    E2(timestamp_ne_date, jit_timestamp_ne_date, T32, T64, T32),
+    E2(timestamp_lt_date, jit_timestamp_lt_date, T32, T64, T32),
+    E2(timestamp_le_date, jit_timestamp_le_date, T32, T64, T32),
+    E2(timestamp_gt_date, jit_timestamp_gt_date, T32, T64, T32),
+    E2(timestamp_ge_date, jit_timestamp_ge_date, T32, T64, T32),
+    E2(timestamp_cmp_date, jit_timestamp_cmp_date, T32, T64, T32),
+
+    /* ---- time comparison (int64 microseconds) ---- */
+    EI2(time_eq, jit_time_eq, T32, T64, T64, JIT_INLINE_INT8_EQ),
+    EI2(time_ne, jit_time_ne, T32, T64, T64, JIT_INLINE_INT8_NE),
+    EI2(time_lt, jit_time_lt, T32, T64, T64, JIT_INLINE_INT8_LT),
+    EI2(time_le, jit_time_le, T32, T64, T64, JIT_INLINE_INT8_LE),
+    EI2(time_gt, jit_time_gt, T32, T64, T64, JIT_INLINE_INT8_GT),
+    EI2(time_ge, jit_time_ge, T32, T64, T64, JIT_INLINE_INT8_GE),
+    E2(time_cmp, jit_time_cmp, T32, T64, T64),
+
+    /* ---- cross-type timestamptz comparisons (DEFERRED — need TZ conversion) ---- */
+
+    /* ---- btree comparison functions ---- */
+    E2(btint4cmp, jit_btint4cmp, T32, T32, T32),
+    E2(btint8cmp, jit_btint8cmp, T32, T64, T64),
+    E2(btint42cmp, jit_btint42cmp, T32, T32, T32),
+    E2(btint48cmp, jit_btint48cmp, T32, T32, T64),
+    E2(btint82cmp, jit_btint82cmp, T32, T64, T32),
+    E2(btint84cmp, jit_btint84cmp, T32, T64, T32),
+    E2(btfloat4cmp, jit_btfloat4cmp, T32, T64, T64),
+    E2(btfloat8cmp, jit_btfloat8cmp, T32, T64, T64),
+    E2(btfloat48cmp, jit_btfloat48cmp, T32, T64, T64),
+    E2(btfloat84cmp, jit_btfloat84cmp, T32, T64, T64),
+    E2(date_cmp, jit_date_cmp, T32, T32, T32),
+
+    /* Type casts are handled via EI1 entries with JIT_INLINE_* ops above.
+     * Additional cast functions (int8/float8/float4 by name) share names
+     * with PG type macros — they're matched by fn_addr via the existing
+     * cross-type entries (int48, i4tod, i4tof, i8tod, ftod, dtof). */
+
+    /* ---- money (cash) type — int64 internally ---- */
+    EI2(cash_eq, jit_cash_eq, T32, T64, T64, JIT_INLINE_INT8_EQ),
+    EI2(cash_ne, jit_cash_ne, T32, T64, T64, JIT_INLINE_INT8_NE),
+    EI2(cash_lt, jit_cash_lt, T32, T64, T64, JIT_INLINE_INT8_LT),
+    EI2(cash_le, jit_cash_le, T32, T64, T64, JIT_INLINE_INT8_LE),
+    EI2(cash_gt, jit_cash_gt, T32, T64, T64, JIT_INLINE_INT8_GT),
+    EI2(cash_ge, jit_cash_ge, T32, T64, T64, JIT_INLINE_INT8_GE),
+    E2(cash_cmp, jit_cash_cmp, T32, T64, T64),
+    E2(cash_pl, jit_cash_pl, T64, T64, T64),
+    E2(cash_mi, jit_cash_mi, T64, T64, T64),
+    E2(cashlarger, jit_cashlarger, T64, T64, T64),
+    E2(cashsmaller, jit_cashsmaller, T64, T64, T64),
+
+    /* ---- text operations ---- */
+    E1(textlen, jit_textlen, T32, T64),
+    E1(textoctetlen, jit_textoctetlen, T32, T64),
+    E2(text_starts_with, jit_text_starts_with, T32, T64, T64),
+    /* upper/lower disabled: pg_jitter_collation_is_c returns true for
+     * default collation in en_US.UTF-8 databases, causing ASCII fast-path
+     * to incorrectly handle multi-byte characters. Needs fix in collation
+     * detection before re-enabling. */
 
     /* ---- OID comparison ---- */
     E2(oideq, jit_oideq, T32, T32, T32),
@@ -1738,9 +3092,18 @@ const JitDirectFn jit_direct_fns[] = {
     EI1(hashdate, jit_hashdate, T32, T32, JIT_INLINE_HASHINT4),
 #endif
 
+    /* ---- extended hash functions (parallel hash join/agg) ---- */
+    E2(hashint2extended, jit_hashint2extended, T64, T64, T64),
+    E2(hashint4extended, jit_hashint4extended, T64, T64, T64),
+    E2(hashint8extended, jit_hashint8extended, T64, T64, T64),
+    E2(hashoidextended, jit_hashoidextended, T64, T64, T64),
+    /* hashfloat4/8extended removed: PG uses hash_any_extended on float8 bytes,
+     * not hash_bytes_uint32_extended. Our implementation was wrong. */
+#if PG_VERSION_NUM >= 180000
+    E2(hashdateextended, jit_hashdateextended, T64, T64, T64),
+#endif
+
     /* ---- aggregate COUNT/SUM ---- */
-    E1(int8inc, jit_int8inc, T64, T64),
-    E1(int8dec, jit_int8dec, T64, T64),
     E2(int8inc_any, jit_int8inc_any, T64, T64, T64),
     E2(int8dec_any, jit_int8dec_any, T64, T64, T64),
     E2(int2_sum, jit_int2_sum, T64, T64, T64),
@@ -1769,7 +3132,6 @@ const JitDirectFn jit_direct_fns[] = {
     E1(interval_hash, jit_interval_hash, T32, T64),
     E2(interval_pl, jit_interval_pl, T64, T64, T64),
     E2(interval_mi, jit_interval_mi, T64, T64, T64),
-    E1(interval_um, DEFERRED, T64, T64),
 
     /*
      * Text/varchar comparison — SIMD-accelerated via StringZilla.
@@ -1786,17 +3148,18 @@ const JitDirectFn jit_direct_fns[] = {
      */
     EIC2(texteq, T32, T64, T64, JIT_INLINE_TEXT_EQ),
     EIC2(textne, T32, T64, T64, JIT_INLINE_TEXT_NE),
-    EC2(text_lt, DEFERRED, T32, T64, T64),
-    EC2(text_le, DEFERRED, T32, T64, T64),
-    EC2(text_gt, DEFERRED, T32, T64, T64),
-    EC2(text_ge, DEFERRED, T32, T64, T64),
-    EC2(bttextcmp, DEFERRED, T32, T64, T64),
-    EC2(text_larger, DEFERRED, T64, T64, T64),
-    EC2(text_smaller, DEFERRED, T64, T64, T64),
+    EC2(texteq, simd_texteq, T32, T64, T64),
+    EC2(textne, simd_textne, T32, T64, T64),
+    EC2(text_lt, simd_text_lt, T32, T64, T64),
+    EC2(text_le, simd_text_le, T32, T64, T64),
+    EC2(text_gt, simd_text_gt, T32, T64, T64),
+    EC2(text_ge, simd_text_ge, T32, T64, T64),
+    EC2(bttextcmp, simd_bttextcmp, T32, T64, T64),
+    EC2(text_larger, simd_text_larger, T64, T64, T64),
+    EC2(text_smaller, simd_text_smaller, T64, T64, T64),
 #ifdef PG_JITTER_HAVE_SIMD
     E1(hashtext, simd_hashtext, T32, T64),
 #else
-    E1(hashtext, DEFERRED, T32, T64),
 #endif
     /* text_pattern_*: raw byte comparison, no collation needed */
     E2(text_pattern_lt, jit_text_pattern_lt, T32, T64, T64),
@@ -1804,15 +3167,7 @@ const JitDirectFn jit_direct_fns[] = {
     E2(text_pattern_ge, jit_text_pattern_ge, T32, T64, T64),
     E2(text_pattern_gt, jit_text_pattern_gt, T32, T64, T64),
     E2(bttext_pattern_cmp, jit_bttext_pattern_cmp, T32, T64, T64),
-    E2(text_starts_with, DEFERRED, T32, T64,
-       T64), /* keep DEFERRED: complex logic */
-    E1(textlen, DEFERRED, T32, T64),
-    E1(textoctetlen, DEFERRED, T32, T64),
-    E2(nameeqtext, DEFERRED, T32, T64,
-       T64), /* keep DEFERRED: name→text conversion */
-    E2(texteqname, DEFERRED, T32, T64, T64),
-    E2(namenetext, DEFERRED, T32, T64, T64),
-    E2(textnename, DEFERRED, T32, T64, T64),
+    /* textlen, textoctetlen, text_starts_with moved to implemented section above */
 
 /* ---- numeric comparison + arithmetic ---- */
 #ifdef PG_JITTER_HAVE_TIER2
@@ -1824,221 +3179,78 @@ const JitDirectFn jit_direct_fns[] = {
     E2(numeric_ge, jit_numeric_ge_precompiled, T32, T64, T64),
     E2(numeric_cmp, jit_numeric_cmp_precompiled, T32, T64, T64),
 #else
-    E2(numeric_eq, DEFERRED, T32, T64, T64),
-    E2(numeric_ne, DEFERRED, T32, T64, T64),
-    E2(numeric_lt, DEFERRED, T32, T64, T64),
-    E2(numeric_le, DEFERRED, T32, T64, T64),
-    E2(numeric_gt, DEFERRED, T32, T64, T64),
-    E2(numeric_ge, DEFERRED, T32, T64, T64),
-    E2(numeric_cmp, DEFERRED, T32, T64, T64),
+    E2(numeric_eq, jit_numeric_eq, T32, T64, T64),
+    E2(numeric_ne, jit_numeric_ne, T32, T64, T64),
+    E2(numeric_lt, jit_numeric_lt, T32, T64, T64),
+    E2(numeric_le, jit_numeric_le, T32, T64, T64),
+    E2(numeric_gt, jit_numeric_gt, T32, T64, T64),
+    E2(numeric_ge, jit_numeric_ge, T32, T64, T64),
+    E2(numeric_cmp, jit_numeric_cmp, T32, T64, T64),
 #endif
-    E2(numeric_larger, DEFERRED, T64, T64, T64),
-    E2(numeric_smaller, DEFERRED, T64, T64, T64),
+    E2(numeric_larger, jit_numeric_larger, T64, T64, T64),
+    E2(numeric_smaller, jit_numeric_smaller, T64, T64, T64),
 #ifdef PG_JITTER_HAVE_TIER2
     E1(hash_numeric, jit_hash_numeric_precompiled, T32, T64),
-    E2(numeric_add, jit_numeric_add_precompiled, T64, T64, T64),
-    E2(numeric_sub, jit_numeric_sub_precompiled, T64, T64, T64),
-    E2(numeric_mul, jit_numeric_mul_precompiled, T64, T64, T64),
+    E1(numeric_abs, jit_numeric_abs, T64, T64),
+    E1(numeric_uminus, jit_numeric_uminus, T64, T64),
+    E2(numeric_add, jit_numeric_add, T64, T64, T64),
+    E2(numeric_sub, jit_numeric_sub, T64, T64, T64),
+    E2(numeric_mul, jit_numeric_mul, T64, T64, T64),
 #else
-    E1(hash_numeric, DEFERRED, T32, T64),
-    E2(numeric_add, DEFERRED, T64, T64, T64),
-    E2(numeric_sub, DEFERRED, T64, T64, T64),
-    E2(numeric_mul, DEFERRED, T64, T64, T64),
+    /* numeric_add/sub/mul now have native implementations above */
 #endif
-    E2(numeric_div, DEFERRED, T64, T64, T64),
-    E2(numeric_mod, DEFERRED, T64, T64, T64),
-    E1(numeric_abs, DEFERRED, T64, T64),
-    E1(numeric_uminus, DEFERRED, T64, T64),
-    E1(int4_numeric, DEFERRED, T64, T32),
-    E1(int8_numeric, DEFERRED, T64, T64),
-    E1(numeric_int4, DEFERRED, T32, T64),
-    E1(numeric_int8, DEFERRED, T64, T64),
-    E1(float8_numeric, DEFERRED, T64, T64),
-    E1(numeric_float8, DEFERRED, T64, T64),
 
 /* ---- uuid comparison ---- */
 #ifdef PG_JITTER_HAVE_TIER2
     E2(uuid_eq, jit_uuid_eq_precompiled, T32, T64, T64),
 #else
-    E2(uuid_eq, DEFERRED, T32, T64, T64),
 #endif
-    E2(uuid_ne, DEFERRED, T32, T64, T64),
 #ifdef PG_JITTER_HAVE_TIER2
     E2(uuid_lt, jit_uuid_lt_precompiled, T32, T64, T64),
 #else
-    E2(uuid_lt, DEFERRED, T32, T64, T64),
 #endif
-    E2(uuid_le, DEFERRED, T32, T64, T64),
-    E2(uuid_gt, DEFERRED, T32, T64, T64),
-    E2(uuid_ge, DEFERRED, T32, T64, T64),
 #ifdef PG_JITTER_HAVE_TIER2
     E2(uuid_cmp, jit_uuid_cmp_precompiled, T32, T64, T64),
     E1(uuid_hash, jit_uuid_hash_precompiled, T32, T64),
 #else
-    E2(uuid_cmp, DEFERRED, T32, T64, T64),
-    E1(uuid_hash, DEFERRED, T32, T64),
 #endif
 
     /* ---- jsonb comparison + operators ---- */
-    E2(jsonb_eq, DEFERRED, T32, T64, T64),
-    E2(jsonb_ne, DEFERRED, T32, T64, T64),
-    E2(jsonb_lt, DEFERRED, T32, T64, T64),
-    E2(jsonb_le, DEFERRED, T32, T64, T64),
-    E2(jsonb_gt, DEFERRED, T32, T64, T64),
-    E2(jsonb_ge, DEFERRED, T32, T64, T64),
-    E2(jsonb_cmp, DEFERRED, T32, T64, T64),
-    E1(jsonb_hash, DEFERRED, T32, T64),
-    E2(jsonb_exists, DEFERRED, T32, T64, T64),
-    E2(jsonb_contains, DEFERRED, T32, T64, T64),
-    E2(jsonb_contained, DEFERRED, T32, T64, T64),
 
     /* ---- jsonb accessors (non-mutating) ---- */
-    E2(jsonb_object_field, DEFERRED, T64, T64, T64),
-    E2(jsonb_object_field_text, DEFERRED, T64, T64, T64),
-    E2(jsonb_array_element, DEFERRED, T64, T64, T32),
-    E2(jsonb_array_element_text, DEFERRED, T64, T64, T32),
-    E1(jsonb_array_length, DEFERRED, T32, T64),
-    E1(jsonb_typeof, DEFERRED, T64, T64),
 
     /* ---- bytea comparison ---- */
-    E2(byteaeq, DEFERRED, T32, T64, T64),
-    E2(byteane, DEFERRED, T32, T64, T64),
-    E2(bytealt, DEFERRED, T32, T64, T64),
-    E2(byteale, DEFERRED, T32, T64, T64),
-    E2(byteagt, DEFERRED, T32, T64, T64),
-    E2(byteage, DEFERRED, T32, T64, T64),
-    E2(byteacmp, DEFERRED, T32, T64, T64),
 #if PG_VERSION_NUM >= 180000
-    E2(bytea_larger, DEFERRED, T64, T64, T64),
-    E2(bytea_smaller, DEFERRED, T64, T64, T64),
 #endif
 
     /* ---- bpchar comparison ---- */
-    E2(bpchareq, DEFERRED, T32, T64, T64),
-    E2(bpcharne, DEFERRED, T32, T64, T64),
-    E2(bpcharlt, DEFERRED, T32, T64, T64),
-    E2(bpcharle, DEFERRED, T32, T64, T64),
-    E2(bpchargt, DEFERRED, T32, T64, T64),
-    E2(bpcharge, DEFERRED, T32, T64, T64),
-    E2(bpcharcmp, DEFERRED, T32, T64, T64),
-    E1(hashbpchar, DEFERRED, T32, T64),
 
     /* ---- array comparison + non-mutating ---- */
-    E2(array_eq, DEFERRED, T32, T64, T64),
-    E2(array_ne, DEFERRED, T32, T64, T64),
-    E2(array_lt, DEFERRED, T32, T64, T64),
-    E2(array_le, DEFERRED, T32, T64, T64),
-    E2(array_gt, DEFERRED, T32, T64, T64),
-    E2(array_ge, DEFERRED, T32, T64, T64),
-    E2(btarraycmp, DEFERRED, T32, T64, T64),
-    E1(hash_array, DEFERRED, T32, T64),
-    E2(arraycontains, DEFERRED, T32, T64, T64),
-    E2(arraycontained, DEFERRED, T32, T64, T64),
-    E2(arrayoverlap, DEFERRED, T32, T64, T64),
 
     /* ---- network (inet/cidr) comparison ---- */
-    E2(network_eq, DEFERRED, T32, T64, T64),
-    E2(network_ne, DEFERRED, T32, T64, T64),
-    E2(network_lt, DEFERRED, T32, T64, T64),
-    E2(network_le, DEFERRED, T32, T64, T64),
-    E2(network_gt, DEFERRED, T32, T64, T64),
-    E2(network_ge, DEFERRED, T32, T64, T64),
-    E2(network_cmp, DEFERRED, T32, T64, T64),
-    E1(hashinet, DEFERRED, T32, T64),
 
     /* ---- float hash ---- */
     E1(hashfloat4, jit_hashfloat4, T32, T64),
     E1(hashfloat8, jit_hashfloat8, T32, T64),
 
     /* ---- numeric aggregates ---- */
-    E2(numeric_accum, DEFERRED, T64, T64, T64),
-    E2(numeric_avg_accum, DEFERRED, T64, T64, T64),
-    E2(int2_avg_accum, DEFERRED, T64, T64, T64),
-    E1(numeric_avg, DEFERRED, T64, T64),
-    E1(numeric_sum, DEFERRED, T64, T64),
 
     /* ---- float aggregates ---- */
-    E2(float8_accum, DEFERRED, T64, T64, T64),
-    E2(float4_accum, DEFERRED, T64, T64, T64),
-    E2(float8_combine, DEFERRED, T64, T64, T64),
 
     /* ---- text/string functions ---- */
-    EC2(textcat, DEFERRED, T64, T64, T64),
-    E1(textlen, DEFERRED, T32, T64),
-    EC2(text_substr, DEFERRED, T64, T64, T32),
-    EC2(text_substr_no_len, DEFERRED, T64, T64, T32),
-    E1(text_reverse, DEFERRED, T64, T64),
-    E1(ascii, DEFERRED, T32, T64),
-    E1(chr, DEFERRED, T64, T32),
-    EC2(upper, DEFERRED, T64, T64, T64),
-    EC2(lower, DEFERRED, T64, T64, T64),
-    EC2(initcap, DEFERRED, T64, T64, T64),
-    EC2(btrim1, DEFERRED, T64, T64, T64),
-    EC2(ltrim1, DEFERRED, T64, T64, T64),
-    EC2(rtrim1, DEFERRED, T64, T64, T64),
-    EC2(btrim, DEFERRED, T64, T64, T64),
-    EC2(ltrim, DEFERRED, T64, T64, T64),
-    EC2(rtrim, DEFERRED, T64, T64, T64),
-    E2(text_left, DEFERRED, T64, T64, T32),
-    E2(text_right, DEFERRED, T64, T64, T32),
-    E2(textpos, DEFERRED, T32, T64, T64),
-    E2(text_to_array, DEFERRED, T64, T64, T64),
 
     /* ---- array functions ---- */
-    E2(array_length, DEFERRED, T32, T64, T32),
-    E2(array_append, DEFERRED, T64, T64, T64),
-    E2(array_prepend, DEFERRED, T64, T64, T64),
-    E2(array_cat, DEFERRED, T64, T64, T64),
-    E2(array_position, DEFERRED, T32, T64, T64),
-    E2(array_remove, DEFERRED, T64, T64, T64),
-    E1(array_ndims, DEFERRED, T32, T64),
-    E1(array_dims, DEFERRED, T64, T64),
-    E2(array_lower, DEFERRED, T32, T64, T32),
-    E2(array_upper, DEFERRED, T32, T64, T32),
-    E1(array_cardinality, DEFERRED, T32, T64),
 
     /* ---- date/time functions ---- */
-    E2(timestamp_part, DEFERRED, T64, T64, T64),
-    E2(timestamptz_part, DEFERRED, T64, T64, T64),
-    E2(timestamp_trunc, DEFERRED, T64, T64, T64),
-    E2(timestamptz_trunc, DEFERRED, T64, T64, T64),
-    E2(timestamp_age, DEFERRED, T64, T64, T64),
-    E1(date_timestamp, DEFERRED, T64, T32),
-    E1(timestamptz_timestamp, DEFERRED, T64, T64),
-    E1(timestamp_timestamptz, DEFERRED, T64, T64),
-    E2(interval_pl, DEFERRED, T64, T64, T64),
-    E2(interval_mi, DEFERRED, T64, T64, T64),
-    E1(interval_um, DEFERRED, T64, T64),
+    E1(date_timestamp, jit_date_timestamp, T64, T32),
 
     /* ---- aggregate transition functions ---- */
-    E2(int8_sum, DEFERRED, T64, T64, T64),
-    E2(numeric_avg_accum, DEFERRED, T64, T64, T64),
-    E2(numeric_accum, DEFERRED, T64, T64, T64),
 
     /* ---- formatting/conversion ---- */
-    E1(pg_typeof, DEFERRED, T64, T64),
-    E2(timestamp_to_char, DEFERRED, T64, T64, T64),
-    E2(numeric_to_number, DEFERRED, T64, T64, T64),
-    E2(to_date, DEFERRED, T64, T64, T64),
-    E2(to_timestamp, DEFERRED, T64, T64, T64),
 
     /* ---- misc string ---- */
-    E2(regexp_match, DEFERRED, T64, T64, T64),
-    E1(md5_text, DEFERRED, T64, T64),
-    E2(binary_encode, DEFERRED, T64, T64, T64),
-    E2(binary_decode, DEFERRED, T64, T64, T64),
 
     /* ---- math ---- */
-    E1(numeric_abs, DEFERRED, T64, T64),
-    E1(numeric_ceil, DEFERRED, T64, T64),
-    E1(numeric_floor, DEFERRED, T64, T64),
-    E2(numeric_round, DEFERRED, T64, T64, T32),
-    E2(numeric_trunc, DEFERRED, T64, T64, T32),
-    E2(numeric_power, DEFERRED, T64, T64, T64),
-    E1(numeric_sqrt, DEFERRED, T64, T64),
-    E1(numeric_exp, DEFERRED, T64, T64),
-    E1(numeric_ln, DEFERRED, T64, T64),
-    E2(numeric_log, DEFERRED, T64, T64, T64),
 };
 
 const int jit_direct_fns_count = lengthof(jit_direct_fns);
@@ -2056,17 +3268,49 @@ const int jit_direct_fns_count = lengthof(jit_direct_fns);
  */
 
 /* ================================================================
- * Lookup function — linear scan, ~350 entries.
- * Called once per expression step at JIT compile time.
+ * Lookup: O(1) hash table by PGFunction pointer.
+ * Built on first call, lives for backend lifetime.
+ * Open addressing, Fibonacci hash, ~40% load factor.
  * ================================================================ */
+static const JitDirectFn **jit_fn_ht = NULL;
+static int jit_fn_ht_mask = 0;
+
+static inline uint32
+jit_fn_hash(PGFunction fn) {
+  uintptr_t h = (uintptr_t)fn;
+  /* Fibonacci hash — spreads pointer-aligned values well */
+  h = (h >> 4) * (uintptr_t)11400714819323198485ULL;
+  return (uint32)(h >> 32);
+}
+
+static void
+jit_fn_ht_init(void) {
+  int sz = 1024; /* power of 2, >= 2.5× entry count */
+  while (sz < jit_direct_fns_count * 3)
+    sz <<= 1;
+  jit_fn_ht_mask = sz - 1;
+  jit_fn_ht = (const JitDirectFn **)calloc(sz, sizeof(void *));
+
+  for (int i = 0; i < jit_direct_fns_count; i++) {
+    uint32 idx = jit_fn_hash(jit_direct_fns[i].pg_fn) & jit_fn_ht_mask;
+    while (jit_fn_ht[idx])
+      idx = (idx + 1) & jit_fn_ht_mask;
+    jit_fn_ht[idx] = &jit_direct_fns[i];
+  }
+}
 
 const JitDirectFn *jit_find_direct_fn(PGFunction pg_fn) {
 #ifdef JIT_DISABLE_DIRECT_CALLS
   return NULL;
 #endif
-  for (int i = 0; i < jit_direct_fns_count; i++) {
-    if (jit_direct_fns[i].pg_fn == pg_fn)
-      return &jit_direct_fns[i];
+  if (unlikely(!jit_fn_ht))
+    jit_fn_ht_init();
+
+  uint32 idx = jit_fn_hash(pg_fn) & jit_fn_ht_mask;
+  while (jit_fn_ht[idx]) {
+    if (jit_fn_ht[idx]->pg_fn == pg_fn)
+      return jit_fn_ht[idx];
+    idx = (idx + 1) & jit_fn_ht_mask;
   }
   return NULL;
 }
