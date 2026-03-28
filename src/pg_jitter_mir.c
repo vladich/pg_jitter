@@ -1946,6 +1946,7 @@ static bool mir_compile_expr(ExprState *state) {
       FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
       int nargs = op->d.func.nargs;
       MIR_insn_t done_label = MIR_new_label(ctx);
+      MIR_insn_t null_arg_label = NULL; /* only used for STRICT */
       MIR_reg_t r_ret = mir_new_reg(ctx, f, MIR_T_I64, "fret");
       MIR_reg_t r_fci = mir_new_reg(ctx, f, MIR_T_I64, "fci");
 
@@ -1955,13 +1956,10 @@ static bool mir_compile_expr(ExprState *state) {
           opcode == EEOP_FUNCEXPR_STRICT_2
 #endif
       ) {
-        /* Set resnull = true */
-        MIR_STEP_LOAD(r_tmp3, opno, resnull);
-        MIR_append_insn(
-            ctx, func_item,
-            MIR_new_insn(ctx, MIR_MOV,
-                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
-                         MIR_new_int_op(ctx, 1)));
+        /* resnull = true: set in null-arg branch only, not before the check.
+         * Moving this here avoids MIR ARM64 bug where MIR_T_U8 store at the
+         * resnull address corrupts adjacent fncollation field. */
+        null_arg_label = MIR_new_label(ctx);
 
         /*
          * Batched null check: OR all isnull flags, single branch.
@@ -1991,7 +1989,7 @@ static bool mir_compile_expr(ExprState *state) {
           }
           MIR_append_insn(ctx, func_item,
                           MIR_new_insn(ctx, MIR_BNE,
-                                       MIR_new_label_op(ctx, done_label),
+                                       MIR_new_label_op(ctx, null_arg_label),
                                        MIR_new_reg_op(ctx, r_tmp1),
                                        MIR_new_int_op(ctx, 0)));
         } else {
@@ -2005,7 +2003,7 @@ static bool mir_compile_expr(ExprState *state) {
                                                         r_fci, 0, 1)));
             MIR_append_insn(ctx, func_item,
                             MIR_new_insn(ctx, MIR_BNE,
-                                         MIR_new_label_op(ctx, done_label),
+                                         MIR_new_label_op(ctx, null_arg_label),
                                          MIR_new_reg_op(ctx, r_tmp1),
                                          MIR_new_int_op(ctx, 0)));
           }
@@ -3173,7 +3171,36 @@ static bool mir_compile_expr(ExprState *state) {
         } /* end V1 fallback / pcre2 */
       } /* end direct-call dispatch */
 
+      /* Normal path reaches done_label after function call + result store */
       MIR_append_insn(ctx, func_item, done_label);
+
+      /* Null-arg path: set resnull=true, then fall through to done_label.
+       * Placed AFTER done_label so it doesn't execute for non-null rows.
+       * The null_arg_label is only declared for STRICT variants. */
+      if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+          || opcode == EEOP_FUNCEXPR_STRICT_1 ||
+          opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+      ) {
+        /* skip_null: jump over the null handler for non-null rows */
+        MIR_insn_t skip_null = MIR_new_label(ctx);
+        MIR_append_insn(ctx, func_item,
+                        MIR_new_insn(ctx, MIR_JMP,
+                                     MIR_new_label_op(ctx, skip_null)));
+
+        /* null_arg_label: reached when any STRICT arg is null */
+        MIR_append_insn(ctx, func_item, null_arg_label);
+        MIR_reg_t r_rn = mir_new_reg(ctx, f, MIR_T_I64, "rn_fix");
+        MIR_STEP_LOAD(r_rn, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_rn, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
+
+        MIR_append_insn(ctx, func_item, skip_null);
+      }
       break;
     }
 

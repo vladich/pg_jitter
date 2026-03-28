@@ -695,6 +695,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
 				int nargs = op->d.func.nargs;
 				Label done_label = cc.new_label();
+				Label null_arg_label; /* only used for STRICT */
 
 				if (opcode == EEOP_FUNCEXPR_STRICT
 #ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
@@ -703,10 +704,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 #endif
 					)
 				{
-					/* Set resnull = true */
-					cc.mov(tmp1, (uint64_t) op->resnull);
-					cc.mov(tmp2.r32(), 1);
-					cc.mov(x86::byte_ptr(tmp1), tmp2.r8());
+					/* resnull = true moved to null_arg_label (see end of FUNCEXPR block)
+					 * to avoid byte store corrupting adjacent fncollation field. */
+					Label null_arg_label = cc.new_label();
 
 					cc.mov(tmp1, (uint64_t) fcinfo);
 					if (nargs > 1 && nargs <= 4)
@@ -722,7 +722,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							cc.movzx(t.r32(), x86::byte_ptr(tmp1, (int32_t) null_off));
 							cc.or_(tmp2, t);
 						}
-						x86_cbnz(cc, tmp2, done_label);
+						x86_cbnz(cc, tmp2, null_arg_label);
 					}
 					else
 					{
@@ -731,7 +731,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							int64_t null_off =
 								(int64_t)((char *)&fcinfo->args[argno].isnull - (char *)fcinfo);
 							cc.movzx(tmp2.r32(), x86::byte_ptr(tmp1, (int32_t) null_off));
-							x86_cbnz(cc, tmp2, done_label);
+							x86_cbnz(cc, tmp2, null_arg_label);
 						}
 					}
 				}
@@ -1083,6 +1083,26 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				} /* end direct-call dispatch */
 
 				cc.bind(done_label);
+
+				/* Null-arg handler: set resnull=true, skip past normal path.
+				 * Only for STRICT variants. Placed after done_label so
+				 * non-null rows don't execute it. */
+				if (opcode == EEOP_FUNCEXPR_STRICT
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+					|| opcode == EEOP_FUNCEXPR_STRICT_1
+					|| opcode == EEOP_FUNCEXPR_STRICT_2
+#endif
+				) {
+					Label skip_null = cc.new_label();
+					cc.jmp(skip_null);
+
+					cc.bind(null_arg_label);
+					cc.mov(tmp1, (uint64_t) op->resnull);
+					cc.mov(tmp2.r32(), 1);
+					cc.mov(x86::byte_ptr(tmp1), tmp2.r8());
+
+					cc.bind(skip_null);
+				}
 				break;
 			}
 			case EEOP_BOOL_AND_STEP_FIRST:

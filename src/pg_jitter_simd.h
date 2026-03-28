@@ -20,6 +20,10 @@ extern int32 simd_text_le(int64 a, int64 b, int32 collid);
 extern int32 simd_text_gt(int64 a, int64 b, int32 collid);
 extern int32 simd_text_ge(int64 a, int64 b, int32 collid);
 extern int32 simd_bttextcmp(int64 a, int64 b, int32 collid);
+extern int64 simd_text_larger(int64 a, int64 b, int32 collid);
+extern int64 simd_text_smaller(int64 a, int64 b, int32 collid);
+extern int64 simd_upper(int64 a, int32 collid);
+extern int64 simd_lower(int64 a, int32 collid);
 extern int32 simd_hashtext(int64 a);
 
 /* ================================================================

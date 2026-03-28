@@ -16,6 +16,7 @@
 #include "varatt.h"
 #endif
 
+#include "utils/formatting.h"  /* str_toupper, str_tolower */
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
 
@@ -86,7 +87,16 @@ simd_text_cmp_internal(Datum a, Datum b, Oid collid)
 	int result;
 
 	if (collation_is_c_or_posix(collid)) {
-		result = (int)sz_order(VARDATA_ANY(t1), len1, VARDATA_ANY(t2), len2);
+		/*
+		 * C/POSIX collation: unsigned byte comparison (same as memcmp).
+		 * Cannot use sz_order here — it does SIGNED byte comparison
+		 * which gives wrong results for bytes >= 0x80 (e.g., UTF-8
+		 * multi-byte chars like ä = 0xC3A4 would sort before 'b' = 0x62).
+		 */
+		int cmplen = (len1 < len2) ? len1 : len2;
+		result = memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), cmplen);
+		if (result == 0)
+			result = (len1 > len2) ? 1 : (len1 < len2) ? -1 : 0;
 	} else {
 		result = varstr_cmp(VARDATA_ANY(t1), len1, VARDATA_ANY(t2), len2,
 		                    collid);
@@ -179,6 +189,96 @@ int32
 simd_bttextcmp(int64 a, int64 b, int32 collid)
 {
 	return simd_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid);
+}
+
+int64
+simd_text_larger(int64 a, int64 b, int32 collid)
+{
+	return simd_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) >= 0 ? a : b;
+}
+
+int64
+simd_text_smaller(int64 a, int64 b, int32 collid)
+{
+	return simd_text_cmp_internal((Datum)a, (Datum)b, (Oid)collid) <= 0 ? a : b;
+}
+
+/*
+ * SIMD upper/lower for ASCII text in C/POSIX collation.
+ * For non-ASCII or non-C collation, falls back to PG's str_toupper/tolower.
+ */
+int64
+simd_upper(int64 a, int32 collid)
+{
+	struct varlena *v = (struct varlena *)DatumGetPointer(a);
+	char *data;
+	int len;
+
+	if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))) {
+		text *t = DatumGetTextPP((Datum)a);
+		data = VARDATA_ANY(t);
+		len = VARSIZE_ANY_EXHDR(t);
+	} else {
+		data = VARDATA_ANY(v);
+		len = VARSIZE_ANY_EXHDR(v);
+	}
+
+	/* Non-C collation: use PG's locale-aware str_toupper */
+	if (!pg_jitter_collation_is_c((Oid)collid)) {
+		char *out_str = str_toupper(data, len, (Oid)collid);
+		int rlen = strlen(out_str);
+		text *result = (text *)palloc(VARHDRSZ + rlen);
+		SET_VARSIZE(result, VARHDRSZ + rlen);
+		memcpy(VARDATA(result), out_str, rlen);
+		pfree(out_str);
+		return PointerGetDatum(result);
+	}
+
+	/* C/POSIX: ASCII fast-path, convert a-z → A-Z */
+	text *result = (text *)palloc(VARHDRSZ + len);
+	SET_VARSIZE(result, VARHDRSZ + len);
+	char *out = VARDATA(result);
+	for (int i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)data[i];
+		out[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+	}
+	return PointerGetDatum(result);
+}
+
+int64
+simd_lower(int64 a, int32 collid)
+{
+	struct varlena *v = (struct varlena *)DatumGetPointer(a);
+	char *data;
+	int len;
+
+	if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))) {
+		text *t = DatumGetTextPP((Datum)a);
+		data = VARDATA_ANY(t);
+		len = VARSIZE_ANY_EXHDR(t);
+	} else {
+		data = VARDATA_ANY(v);
+		len = VARSIZE_ANY_EXHDR(v);
+	}
+
+	if (!pg_jitter_collation_is_c((Oid)collid)) {
+		char *out_str = str_tolower(data, len, (Oid)collid);
+		int rlen = strlen(out_str);
+		text *result = (text *)palloc(VARHDRSZ + rlen);
+		SET_VARSIZE(result, VARHDRSZ + rlen);
+		memcpy(VARDATA(result), out_str, rlen);
+		pfree(out_str);
+		return PointerGetDatum(result);
+	}
+
+	text *result = (text *)palloc(VARHDRSZ + len);
+	SET_VARSIZE(result, VARHDRSZ + len);
+	char *out = VARDATA(result);
+	for (int i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)data[i];
+		out[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+	}
+	return PointerGetDatum(result);
 }
 
 int32
