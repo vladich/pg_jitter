@@ -2023,7 +2023,7 @@ int64 jit_extract_timestamp(int64 ts, int32 field_val) {
       case DTK_HOUR:     intresult = time_part / INT64CONST(3600000000); break;
       case DTK_MINUTE:   intresult = (time_part / INT64CONST(60000000)) % 60; break;
       case DTK_MICROSEC: intresult = time_part % INT64CONST(60000000); break;
-      default: __builtin_unreachable();
+      default: pg_unreachable();
     }
     return NumericGetDatum(int64_to_numeric(intresult));
   }
@@ -2391,11 +2391,15 @@ int64 jit_interval_mi(int64 a, int64 b) {
 int64 jit_timestamp_pl_interval(int64 ts, int64 span_ptr) {
   const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
 
-  /* Fast path: no month component — pure arithmetic */
-  if (span->month == 0) {
+  /* Fast path: no month component, finite timestamp — pure arithmetic */
+  if (span->month == 0 && !TIMESTAMP_NOT_FINITE(ts) &&
+      likely(span->time != PG_INT64_MIN && span->time != PG_INT64_MAX)) {
     int64 result = ts;
     result += (int64)span->day * USECS_PER_DAY_CONST;
     result += span->time;
+    if (unlikely(!IS_VALID_TIMESTAMP(result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
     return result;
   }
 
@@ -2406,11 +2410,14 @@ int64 jit_timestamp_pl_interval(int64 ts, int64 span_ptr) {
 int64 jit_timestamp_mi_interval(int64 ts, int64 span_ptr) {
   const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
 
-  /* Fast path: no month component — pure arithmetic */
-  if (span->month == 0) {
+  if (span->month == 0 && !TIMESTAMP_NOT_FINITE(ts) &&
+      likely(span->time != PG_INT64_MIN && span->time != PG_INT64_MAX)) {
     int64 result = ts;
     result -= (int64)span->day * USECS_PER_DAY_CONST;
     result -= span->time;
+    if (unlikely(!IS_VALID_TIMESTAMP(result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
     return result;
   }
 
@@ -2425,10 +2432,18 @@ int64 jit_timestamp_mi_interval(int64 ts, int64 span_ptr) {
  */
 int64 jit_timestamptz_pl_interval(int64 ts, int64 span_ptr) {
   const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
-  if (span->month == 0) {
-    int64 result = ts;
-    result += (int64)span->day * USECS_PER_DAY_CONST;
-    result += span->time;
+  /* Fast path ONLY for pure time intervals (no day/month component).
+   * Day intervals on timestamptz must go through PG's full path because
+   * "add 1 day" means same wall-clock time across DST boundaries,
+   * NOT add 86400 seconds. */
+  if (span->month == 0 && span->day == 0 && !TIMESTAMP_NOT_FINITE(ts)) {
+    int64 result;
+    if (unlikely(pg_add_s64_overflow(ts, span->time, &result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
+    if (unlikely(!IS_VALID_TIMESTAMP(result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
     return result;
   }
   return (int64)DirectFunctionCall2(timestamptz_pl_interval, (Datum)ts,
@@ -2437,10 +2452,14 @@ int64 jit_timestamptz_pl_interval(int64 ts, int64 span_ptr) {
 
 int64 jit_timestamptz_mi_interval(int64 ts, int64 span_ptr) {
   const Interval *span = (const Interval *)DatumGetPointer((Datum)span_ptr);
-  if (span->month == 0) {
-    int64 result = ts;
-    result -= (int64)span->day * USECS_PER_DAY_CONST;
-    result -= span->time;
+  if (span->month == 0 && span->day == 0 && !TIMESTAMP_NOT_FINITE(ts)) {
+    int64 result;
+    if (unlikely(pg_sub_s64_overflow(ts, span->time, &result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
+    if (unlikely(!IS_VALID_TIMESTAMP(result)))
+      ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                      errmsg("timestamp out of range")));
     return result;
   }
   return (int64)DirectFunctionCall2(timestamptz_mi_interval, (Datum)ts,
