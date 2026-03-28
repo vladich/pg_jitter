@@ -621,6 +621,23 @@ pg_jitter_compile_deform(TupleDesc desc,
  *   bit 7:    nullable flag
  */
 
+/*
+ * Alignment helpers for DeformColDesc.
+ *
+ * DeformColDesc.attalign stores alignment as a byte count (1,2,4,8),
+ * but PostgreSQL's att_align_nominal/att_align_pointer macros expect
+ * the char-code form ('c','s','i','d').  Use TYPEALIGN directly for
+ * the nominal case, and replicate att_align_pointer's VARATT_NOT_PAD_BYTE
+ * logic for varlena.
+ */
+#define deform_att_align_nominal(cur_offset, attalign_bytes) \
+	TYPEALIGN(attalign_bytes, cur_offset)
+
+#define deform_att_align_pointer(cur_offset, attalign_bytes, attlen, attptr) \
+	(((attlen) == -1 && VARATT_NOT_PAD_BYTE(attptr)) ? \
+		(uintptr_t)(cur_offset) : \
+		TYPEALIGN(attalign_bytes, cur_offset))
+
 /* ================================================================
  * deform_sparse_dispatch — C helper for wide nullable tables
  *
@@ -683,9 +700,9 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
 
             /* Alignment */
             if (d->attlen == -1)
-                off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                off = deform_att_align_pointer(off, d->attalign, -1, tupdata + off);
             else if (d->attalign > 1)
-                off = att_align_nominal(off, d->attalign);
+                off = deform_att_align_nominal(off, d->attalign);
 
             isnull[attnum] = false;
             values[attnum] = fetch_att(tupdata + off, d->attbyval, d->attlen);
@@ -730,9 +747,9 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
                 {
                     const DeformColDesc *d = &descs[col];
                     if (d->attlen == -1)
-                        off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                        off = deform_att_align_pointer(off, d->attalign, -1, tupdata + off);
                     else if (d->attalign > 1)
-                        off = att_align_nominal(off, d->attalign);
+                        off = deform_att_align_nominal(off, d->attalign);
                     isnull[col] = false;
                     values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
                     off = att_addlength_pointer(off, d->attlen, tupdata + off);
@@ -762,9 +779,9 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
                     {
                         const DeformColDesc *d = &descs[col];
                         if (d->attlen == -1)
-                            off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                            off = deform_att_align_pointer(off, d->attalign, -1, tupdata + off);
                         else if (d->attalign > 1)
-                            off = att_align_nominal(off, d->attalign);
+                            off = deform_att_align_nominal(off, d->attalign);
                         isnull[col] = false;
                         values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
                         off = att_addlength_pointer(off, d->attlen, tupdata + off);
@@ -814,9 +831,9 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
                 const DeformColDesc *d = &descs[col];
 
                 if (d->attlen == -1)
-                    off = att_align_pointer(off, d->attalign, -1, tupdata + off);
+                    off = deform_att_align_pointer(off, d->attalign, -1, tupdata + off);
                 else if (d->attalign > 1)
-                    off = att_align_nominal(off, d->attalign);
+                    off = deform_att_align_nominal(off, d->attalign);
 
                 isnull[col] = false;
                 values[col] = fetch_att(tupdata + off, d->attbyval, d->attlen);
