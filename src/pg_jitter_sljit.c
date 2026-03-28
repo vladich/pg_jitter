@@ -5485,6 +5485,7 @@ static bool sljit_compile_expr(ExprState *state) {
        * fall through to generic V1 which creates the state on first call.
        */
       struct sljit_jump *j_int128_fast_ok = NULL;
+#ifdef PG_INT128_TYPE
       if (!is_byref && fn_addr == int8_avg_accum) {
         /*
          * int8_avg_accum uses Int128AggState (HAVE_INT128).
@@ -5537,6 +5538,7 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_set_label(j_i128_fail, sljit_emit_label(C));
         /* Fall through to generic V1 path */
       }
+#endif /* PG_INT128_TYPE */
 
       /*
        * Fast-path for int2_accum/int4_accum/int8_accum:
