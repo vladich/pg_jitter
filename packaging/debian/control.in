@@ -1,0 +1,21 @@
+Source: postgresql-@@PG_VERSION@@-pg-jitter
+Section: database
+Priority: optional
+Maintainer: Vladimir Churyukin <vladich@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.16),
+               g++,
+               git,
+               postgresql-server-dev-@@PG_VERSION@@
+Standards-Version: 4.6.2
+Homepage: https://github.com/vladich/pg_jitter
+
+Package: postgresql-@@PG_VERSION@@-pg-jitter
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         postgresql-@@PG_VERSION@@
+Description: Lightweight JIT compilation provider for PostgreSQL
+ pg_jitter provides three alternative JIT backends (SLJIT, AsmJIT, MIR)
+ for PostgreSQL, delivering microsecond-level compilation times instead
+ of the milliseconds typical of LLVM-based JIT. Supports expression
+ compilation, tuple deforming, and over 350 inlined built-in functions.
