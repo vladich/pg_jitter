@@ -7601,6 +7601,7 @@ static bool sljit_compile_expr(ExprState *state) {
 #if defined(__x86_64__) || (!defined(__aarch64__))
         crc32_inline_skip:
 #endif
+        ;  /* empty statement after label (C requires statement before declaration) */
 
         /* R0 = 1 (found) or 0 (not found). Branch on result. */
         struct sljit_jump *j_found_rt = sljit_emit_cmp(
