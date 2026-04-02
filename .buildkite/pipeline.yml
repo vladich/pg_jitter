@@ -1,0 +1,207 @@
+env:
+  PG_JITTER_VERSION: "0.3.0"
+  PG_JITTER_RELEASE: "1"
+  PG_VERSIONS: "14 15 16 17 18"
+
+steps:
+  # ============================================================
+  #  RPM Packages
+  # ============================================================
+  - group: ":package: RPM Packages"
+    steps:
+      # --- Rocky 8 ---
+      - label: ":redhat: Rocky 8 x86_64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: el8 }
+        plugins:
+          - docker#v5.11.0:
+              image: rockylinux:8
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.rpm"]
+
+      - label: ":redhat: Rocky 8 aarch64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: el8 }
+        plugins:
+          - docker#v5.11.0:
+              image: rockylinux:8
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.rpm"]
+
+      # --- Rocky 9 ---
+      - label: ":redhat: Rocky 9 x86_64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: el9 }
+        plugins:
+          - docker#v5.11.0:
+              image: rockylinux:9
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.rpm"]
+
+      - label: ":redhat: Rocky 9 aarch64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: el9 }
+        plugins:
+          - docker#v5.11.0:
+              image: rockylinux:9
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.rpm"]
+
+      # --- Fedora 39 ---
+      - label: ":fedora: Fedora 39 x86_64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: fc39 }
+        plugins:
+          - docker#v5.11.0:
+              image: fedora:39
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.rpm"]
+
+      - label: ":fedora: Fedora 39 aarch64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: fc39 }
+        plugins:
+          - docker#v5.11.0:
+              image: fedora:39
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.rpm"]
+
+      # --- Fedora 40 ---
+      - label: ":fedora: Fedora 40 x86_64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: fc40 }
+        plugins:
+          - docker#v5.11.0:
+              image: fedora:40
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.rpm"]
+
+      - label: ":fedora: Fedora 40 aarch64"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: fc40 }
+        plugins:
+          - docker#v5.11.0:
+              image: fedora:40
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.rpm"]
+
+      # --- ppc64le (release only) ---
+      - label: ":redhat: Rocky 9 ppc64le"
+        command: bash .buildkite/scripts/build-rpm.sh
+        env: { DISTRO_TAG: el9 }
+        plugins:
+          - docker#v5.11.0:
+              image: rockylinux:9
+              propagate-environment: true
+        agents: { queue: ppc64le }
+        artifact_paths: ["output/*.rpm"]
+        if: build.tag =~ /^v/
+
+  # ============================================================
+  #  DEB Packages
+  # ============================================================
+  - group: ":package: DEB Packages"
+    steps:
+      # --- Ubuntu 22.04 ---
+      - label: ":ubuntu: Ubuntu 22.04 x86_64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: jammy }
+        plugins:
+          - docker#v5.11.0:
+              image: ubuntu:22.04
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.deb"]
+
+      - label: ":ubuntu: Ubuntu 22.04 aarch64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: jammy }
+        plugins:
+          - docker#v5.11.0:
+              image: ubuntu:22.04
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.deb"]
+
+      # --- Ubuntu 24.04 ---
+      - label: ":ubuntu: Ubuntu 24.04 x86_64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: noble }
+        plugins:
+          - docker#v5.11.0:
+              image: ubuntu:24.04
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.deb"]
+
+      - label: ":ubuntu: Ubuntu 24.04 aarch64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: noble }
+        plugins:
+          - docker#v5.11.0:
+              image: ubuntu:24.04
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.deb"]
+
+      # --- Debian 11 ---
+      - label: ":debian: Debian 11 x86_64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: bullseye }
+        plugins:
+          - docker#v5.11.0:
+              image: debian:11
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.deb"]
+
+      - label: ":debian: Debian 11 aarch64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: bullseye }
+        plugins:
+          - docker#v5.11.0:
+              image: debian:11
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.deb"]
+
+      # --- Debian 12 ---
+      - label: ":debian: Debian 12 x86_64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: bookworm }
+        plugins:
+          - docker#v5.11.0:
+              image: debian:12
+              propagate-environment: true
+        agents: { queue: x86_64 }
+        artifact_paths: ["output/*.deb"]
+
+      - label: ":debian: Debian 12 aarch64"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: bookworm }
+        plugins:
+          - docker#v5.11.0:
+              image: debian:12
+              propagate-environment: true
+        agents: { queue: aarch64 }
+        artifact_paths: ["output/*.deb"]
+
+      # --- ppc64le (release only) ---
+      - label: ":ubuntu: Ubuntu 24.04 ppc64le"
+        command: bash .buildkite/scripts/build-deb.sh
+        env: { DISTRO_CODENAME: noble }
+        plugins:
+          - docker#v5.11.0:
+              image: ubuntu:24.04
+              propagate-environment: true
+        agents: { queue: ppc64le }
+        artifact_paths: ["output/*.deb"]
+        if: build.tag =~ /^v/

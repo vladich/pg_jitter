@@ -1,0 +1,43 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+PG_VERSION = @@PG_VERSION@@
+PG_CONFIG = /usr/lib/postgresql/$(PG_VERSION)/bin/pg_config
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
+	git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
+	git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
+	git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
+	git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
+	git clone --depth 1 https://github.com/simdjson/simdjson.git deps/simdjson
+	cd deps/pcre2 && mkdir -p build && cd build && \
+	  cmake .. -DCMAKE_BUILD_TYPE=Release -DPCRE2_SUPPORT_JIT=ON \
+	    -DPCRE2_SUPPORT_UNICODE=ON -DBUILD_SHARED_LIBS=OFF \
+	    -DPCRE2_STATIC_PIC=ON -DPCRE2_BUILD_TESTS=OFF \
+	    -DPCRE2_BUILD_PCRE2GREP=OFF && \
+	  cmake --build . -j$$(nproc)
+	cmake -B build \
+	  -DPG_CONFIG=$(PG_CONFIG) \
+	  -DSLJIT_DIR=deps/sljit \
+	  -DASMJIT_DIR=deps/asmjit \
+	  -DMIR_DIR=deps/mir \
+	  -DSTRINGZILLA_DIR=deps/stringzilla \
+	  -DPCRE2_DIR=deps/pcre2 \
+	  -DSIMDJSON_DIR=deps/simdjson/singleheader \
+	  -DCMAKE_BUILD_TYPE=Release
+
+override_dh_auto_build:
+	cmake --build build -j$$(nproc)
+
+override_dh_auto_install:
+	DESTDIR=debian/postgresql-$(PG_VERSION)-pg-jitter cmake --install build
+
+override_dh_auto_test:
+	@echo "Skipping tests during package build"
+
+override_dh_shlibdeps:
+	dh_shlibdeps -l/usr/lib/postgresql/$(PG_VERSION)/lib

@@ -1,0 +1,70 @@
+%global pg_version @@PG_VERSION@@
+%global pg_instdir /usr/pgsql-%{pg_version}
+
+Name:           pg_jitter_%{pg_version}
+Version:        @@PKG_VERSION@@
+Release:        1%{?dist}
+Summary:        Lightweight JIT compilation provider for PostgreSQL %{pg_version}
+
+License:        PostgreSQL
+URL:            https://github.com/vladich/pg_jitter
+Source0:        pg_jitter-%{version}.tar.gz
+
+BuildRequires:  cmake >= 3.16
+BuildRequires:  gcc
+BuildRequires:  gcc-c++
+BuildRequires:  git
+BuildRequires:  postgresql%{pg_version}-devel
+Requires:       postgresql%{pg_version}-server
+
+%description
+pg_jitter provides three alternative JIT backends (SLJIT, AsmJIT, MIR) for
+PostgreSQL, delivering microsecond-level compilation times instead of the
+milliseconds typical of LLVM-based JIT. Supports expression compilation,
+tuple deforming, and over 350 inlined built-in functions.
+
+%prep
+%setup -q -n pg_jitter-%{version}
+
+%build
+git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
+git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
+git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
+git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
+git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
+git clone --depth 1 https://github.com/simdjson/simdjson.git deps/simdjson
+
+cd deps/pcre2 && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DPCRE2_SUPPORT_JIT=ON \
+         -DPCRE2_SUPPORT_UNICODE=ON -DBUILD_SHARED_LIBS=OFF \
+         -DPCRE2_STATIC_PIC=ON -DPCRE2_BUILD_TESTS=OFF \
+         -DPCRE2_BUILD_PCRE2GREP=OFF
+cmake --build . -j$(nproc)
+cd ../../..
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
+  BACKENDS="sljit;asmjit;mir"
+else
+  BACKENDS="sljit;mir"
+fi
+
+cmake -B build \
+  -DPG_CONFIG=%{pg_instdir}/bin/pg_config \
+  -DSLJIT_DIR=deps/sljit \
+  -DASMJIT_DIR=deps/asmjit \
+  -DMIR_DIR=deps/mir \
+  -DSTRINGZILLA_DIR=deps/stringzilla \
+  -DPCRE2_DIR=deps/pcre2 \
+  -DSIMDJSON_DIR=deps/simdjson/singleheader \
+  -DCMAKE_BUILD_TYPE=Release \
+  "-DPG_JITTER_BACKENDS=$BACKENDS"
+
+cmake --build build -j$(nproc)
+
+%install
+DESTDIR=%{buildroot} cmake --install build
+
+%files
+%{pg_instdir}/lib/pg_jitter*.so
+%{pg_instdir}/share/pg_jitter/pg_jitter_functions.sql
