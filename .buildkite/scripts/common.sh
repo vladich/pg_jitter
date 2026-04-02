@@ -15,7 +15,7 @@ clone_dependencies() {
   git clone --depth 1 https://github.com/vladich/mir-patched.git   "$DEPS_DIR/mir"
   git clone --depth 1 https://github.com/asmjit/asmjit.git        "$DEPS_DIR/asmjit"
   git clone --depth 1 https://github.com/ashvardanian/StringZilla.git "$DEPS_DIR/stringzilla"
-  git clone --depth 1 https://github.com/PCRE2Project/pcre2.git    "$DEPS_DIR/pcre2"
+  git clone --depth 1 --recurse-submodules https://github.com/PCRE2Project/pcre2.git "$DEPS_DIR/pcre2"
   git clone --depth 1 https://github.com/simdjson/simdjson.git     "$DEPS_DIR/simdjson"
 }
 

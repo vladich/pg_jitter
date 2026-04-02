@@ -5,7 +5,7 @@ env:
 
 steps:
   # ============================================================
-  #  RPM Packages (x86_64 on hosted agents)
+  #  RPM Packages
   # ============================================================
   - group: ":package: RPM Packages"
     steps:
@@ -16,6 +16,7 @@ steps:
           - docker#v5.11.0:
               image: rockylinux:8
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.rpm"]
 
       - label: ":redhat: Rocky 9"
@@ -25,6 +26,7 @@ steps:
           - docker#v5.11.0:
               image: rockylinux:9
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.rpm"]
 
       - label: ":fedora: Fedora 39"
@@ -34,6 +36,7 @@ steps:
           - docker#v5.11.0:
               image: fedora:39
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.rpm"]
 
       - label: ":fedora: Fedora 40"
@@ -43,10 +46,11 @@ steps:
           - docker#v5.11.0:
               image: fedora:40
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.rpm"]
 
   # ============================================================
-  #  DEB Packages (x86_64 on hosted agents)
+  #  DEB Packages
   # ============================================================
   - group: ":package: DEB Packages"
     steps:
@@ -57,6 +61,7 @@ steps:
           - docker#v5.11.0:
               image: ubuntu:22.04
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.deb"]
 
       - label: ":ubuntu: Ubuntu 24.04"
@@ -66,6 +71,7 @@ steps:
           - docker#v5.11.0:
               image: ubuntu:24.04
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.deb"]
 
       - label: ":debian: Debian 11"
@@ -75,6 +81,7 @@ steps:
           - docker#v5.11.0:
               image: debian:11
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.deb"]
 
       - label: ":debian: Debian 12"
@@ -84,4 +91,5 @@ steps:
           - docker#v5.11.0:
               image: debian:12
               propagate-environment: true
+        agents: { queue: x86_64 }
         artifact_paths: ["output/*.deb"]
