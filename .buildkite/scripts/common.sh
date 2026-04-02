@@ -35,16 +35,23 @@ build_pcre2() {
 }
 
 detect_backends() {
-  local ARCH
+  local ARCH CMAKE_VER CMAKE_MAJOR CMAKE_MINOR
   ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64|amd64|aarch64|arm64)
-      echo "sljit;asmjit;mir"
-      ;;
-    *)
-      echo "sljit;mir"
-      ;;
-  esac
+  # AsmJIT requires CMake >= 3.24
+  CMAKE_VER=$(cmake --version 2>/dev/null | head -1 | sed 's/[^0-9.]//g')
+  CMAKE_MAJOR=${CMAKE_VER%%.*}
+  CMAKE_MINOR=$(echo "$CMAKE_VER" | cut -d. -f2)
+  local HAS_ASMJIT=0
+  if [ "$CMAKE_MAJOR" -gt 3 ] 2>/dev/null || { [ "$CMAKE_MAJOR" -eq 3 ] && [ "$CMAKE_MINOR" -ge 24 ]; } 2>/dev/null; then
+    case "$ARCH" in
+      x86_64|amd64|aarch64|arm64) HAS_ASMJIT=1 ;;
+    esac
+  fi
+  if [ "$HAS_ASMJIT" -eq 1 ]; then
+    echo "sljit;asmjit;mir"
+  else
+    echo "sljit;mir"
+  fi
 }
 
 deb_arch() {
