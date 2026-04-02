@@ -25,7 +25,7 @@ apt-get install -y -qq cmake g++ make git curl lsb-release gnupg ruby ruby-dev
 
 # Install fpm
 echo "--- Installing fpm"
-gem install --no-document fpm
+gem install --no-document fpm -v 1.15.1
 
 # --- Setup PGDG repo ---
 echo "--- Setting up PGDG repository"
