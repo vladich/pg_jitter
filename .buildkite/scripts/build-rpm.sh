@@ -44,7 +44,7 @@ fi
 
 # Install fpm
 echo "--- Installing fpm"
-gem install --no-document fpm
+gem install --no-document fpm -v 1.15.1
 
 # --- Setup PGDG repo ---
 echo "--- Setting up PGDG repository"
