@@ -239,6 +239,14 @@ for backend in $BACKENDS; do
     # a known PCRE2 regex crash with direct provider loading.
     # PG14-16: must use direct provider loading (no custom GUC support).
     PG_MAJOR=$("$PG_CONFIG" --version | sed 's/PostgreSQL //' | cut -d. -f1)
+    # Force JIT on all queries
+    "$PSQL" -p "$PGPORT" -d postgres -q -c \
+        "ALTER SYSTEM SET jit_above_cost = 0;" 2>/dev/null
+    "$PSQL" -p "$PGPORT" -d postgres -q -c \
+        "ALTER SYSTEM SET jit_inline_above_cost = 0;" 2>/dev/null
+    "$PSQL" -p "$PGPORT" -d postgres -q -c \
+        "ALTER SYSTEM SET jit_optimize_above_cost = 0;" 2>/dev/null
+
     if [ "$PG_MAJOR" -ge 17 ] 2>/dev/null; then
         EXPECTED_PROVIDER="pg_jitter"
         "$PSQL" -p "$PGPORT" -d postgres -q -c \
