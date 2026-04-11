@@ -157,12 +157,7 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        run: >
-          build.cmd all
-          -DSLJIT_DIR=${{ github.workspace }}\deps\sljit
-          -DASMJIT_DIR=${{ github.workspace }}\deps\asmjit
-          -DMIR_DIR=${{ github.workspace }}\deps\mir
-          -DSTRINGZILLA_DIR=${{ github.workspace }}\deps\stringzilla
+        run: build.cmd all -DSLJIT_DIR=${{ github.workspace }}\deps\sljit -DASMJIT_DIR=${{ github.workspace }}\deps\asmjit -DMIR_DIR=${{ github.workspace }}\deps\mir -DSTRINGZILLA_DIR=${{ github.workspace }}\deps\stringzilla
 
       # ---- Install pg_jitter using install.sh / install.cmd ----
       - name: Install pg_jitter (Unix)

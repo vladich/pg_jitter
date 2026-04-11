@@ -33,7 +33,12 @@ done
 
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 
-if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
+# Resolve pg_config to absolute path
+if [ -x "$PG_CONFIG" ]; then
+    PG_CONFIG="$(cd "$(dirname "$PG_CONFIG")" && pwd)/$(basename "$PG_CONFIG")"
+elif command -v "$PG_CONFIG" > /dev/null 2>&1; then
+    PG_CONFIG="$(command -v "$PG_CONFIG")"
+else
     echo "ERROR: pg_config not found: $PG_CONFIG"
     echo "  Use: ./install.sh --pg-config /path/to/pg_config"
     exit 1

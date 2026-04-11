@@ -66,13 +66,13 @@ goto done_parse
 
 :done_parse
 
-REM ---- Resolve pg_config ----
+REM ---- Resolve pg_config to absolute path ----
 if defined PG_CONFIG_ARG (
     set "PG_CONFIG=%PG_CONFIG_ARG%"
 ) else if not defined PG_CONFIG (
     where pg_config >nul 2>&1
     if !errorlevel! equ 0 (
-        set "PG_CONFIG=pg_config"
+        for /f "delims=" %%p in ('where pg_config') do set "PG_CONFIG=%%p"
     ) else (
         echo ERROR: pg_config not found.
         echo   Use: build.cmd --pg-config C:\path\to\pg_config.exe
@@ -121,7 +121,20 @@ if /i "%_arg%"=="all"    ( set "TARGET=all"    & shift & goto collect_extra )
 :collect_extra
 :extra_loop
 if "%~1"=="" goto done_target
-set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! %~1"
+set "_token=%~1"
+REM cmd.exe treats '=' as an argument delimiter, splitting -DVAR=VALUE into
+REM two tokens (-DVAR and VALUE).  Detect -D tokens and rejoin with the
+REM following token so cmake receives the flag correctly.
+if "!_token:~0,2!"=="-D" (
+    shift
+    if not "%~1"=="" (
+        set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!=%~1"
+    ) else (
+        set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!"
+    )
+) else (
+    set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!"
+)
 shift
 goto extra_loop
 
