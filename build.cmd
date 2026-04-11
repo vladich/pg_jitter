@@ -125,16 +125,16 @@ set "_token=%~1"
 REM cmd.exe treats '=' as an argument delimiter, splitting -DVAR=VALUE into
 REM two tokens (-DVAR and VALUE).  Detect -D tokens and rejoin with the
 REM following token so cmake receives the flag correctly.
-if "!_token:~0,2!"=="-D" (
-    shift
-    if not "%~1"=="" (
-        set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!=%~1"
-    ) else (
-        set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!"
-    )
-) else (
-    set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!"
-)
+REM NOTE: shift inside a parenthesized block does NOT update %1-%9 until the
+REM block exits, so we must use goto to break out before reading the next token.
+if "!_token:~0,2!"=="-D" goto :extra_rejoin_d
+set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!"
+shift
+goto extra_loop
+
+:extra_rejoin_d
+shift
+set "CMAKE_EXTRA_ARGS=!CMAKE_EXTRA_ARGS! !_token!=%~1"
 shift
 goto extra_loop
 
