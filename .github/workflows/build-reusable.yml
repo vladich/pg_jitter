@@ -157,7 +157,7 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        run: build.cmd all -DSLJIT_DIR=${{ github.workspace }}\deps\sljit -DASMJIT_DIR=${{ github.workspace }}\deps\asmjit -DMIR_DIR=${{ github.workspace }}\deps\mir -DSTRINGZILLA_DIR=${{ github.workspace }}\deps\stringzilla
+        run: build.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" all -DSLJIT_DIR=${{ github.workspace }}\deps\sljit -DASMJIT_DIR=${{ github.workspace }}\deps\asmjit -DMIR_DIR=${{ github.workspace }}\deps\mir -DSTRINGZILLA_DIR=${{ github.workspace }}\deps\stringzilla
 
       # ---- Install pg_jitter using install.sh / install.cmd ----
       - name: Install pg_jitter (Unix)
@@ -170,8 +170,8 @@ jobs:
         shell: cmd
         run: |
           REM MIR backend has pre-existing code-gen bugs on Windows — exclude it
-          install.cmd sljit
-          install.cmd asmjit
+          install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" sljit
+          install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" asmjit
 
       # ---- Configure JIT and restart PostgreSQL ----
       - name: Configure and restart PostgreSQL
