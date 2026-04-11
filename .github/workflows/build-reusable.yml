@@ -134,75 +134,56 @@ jobs:
           fetch-depth: 1
 
       # ---- MSVC environment (Windows) ----
-      # Must come before Configure & Build so cl.exe / link.exe are on PATH
+      # Must come before build so cl.exe / link.exe are on PATH
       - name: Setup MSVC environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # ---- Configure & Build ----
-      - name: Configure
+      # ---- Build using build.sh / build.cmd ----
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
         shell: bash
-        env:
-          # Prevent MSYS2 from mangling /D, /I and other MSVC flags into Unix paths
-          MSYS2_ARG_CONV_EXCL: '*'
         run: |
-          # Resolve pg_config: command -v returns MSYS2 paths (e.g. /c/PROGRA~1/...)
-          # which CMake (a native Windows process) cannot execute.
-          # Convert to native Windows path with cygpath -w on Windows.
-          PG_CONFIG="$(command -v pg_config 2>/dev/null || which pg_config 2>/dev/null || true)"
-          if [[ "$RUNNER_OS" == "Windows" && -n "$PG_CONFIG" ]]; then
-            PG_CONFIG="$(cygpath -m "$PG_CONFIG")"
-          fi
-          echo "pg_config resolved to: $PG_CONFIG"
-
-          CMAKE_ARGS="-DPG_JITTER_BACKENDS=sljit;asmjit;mir"
-          CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
-          CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
-          CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
-          CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
-
-          # PCRE2: always built from source
-          if [[ "$RUNNER_OS" != "Windows" ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DPCRE2_DIR=${{ github.workspace }}/deps/pcre2"
-          fi
-
-          # macOS: PG headers need gettext's libintl.h
+          EXTRA_ARGS="-DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
+          EXTRA_ARGS="$EXTRA_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
+          EXTRA_ARGS="$EXTRA_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
+          EXTRA_ARGS="$EXTRA_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
+          EXTRA_ARGS="$EXTRA_ARGS -DPCRE2_DIR=${{ github.workspace }}/deps/pcre2"
           if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
+            EXTRA_ARGS="$EXTRA_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
           fi
+          ./build.sh all $EXTRA_ARGS
 
-          # Windows: use Ninja generator (MSVC toolchain on PATH from msvc-dev-cmd)
-          GENERATOR_ARGS=""
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            GENERATOR_ARGS="-G Ninja"
-          fi
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: >
+          build.cmd all
+          -DSLJIT_DIR=${{ github.workspace }}\deps\sljit
+          -DASMJIT_DIR=${{ github.workspace }}\deps\asmjit
+          -DMIR_DIR=${{ github.workspace }}\deps\mir
+          -DSTRINGZILLA_DIR=${{ github.workspace }}\deps\stringzilla
 
-          cmake -B build $GENERATOR_ARGS -DPG_CONFIG="$PG_CONFIG" -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
+      # ---- Install pg_jitter using install.sh / install.cmd ----
+      - name: Install pg_jitter (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sudo ./install.sh all
 
-      - name: Build
-        run: cmake --build build --parallel --config Release
+      - name: Install pg_jitter (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          REM MIR backend has pre-existing code-gen bugs on Windows — exclude it
+          install.cmd sljit
+          install.cmd asmjit
 
-      # ---- Install pg_jitter & restart with it ----
-      - name: Install pg_jitter and restart PostgreSQL
+      # ---- Configure JIT and restart PostgreSQL ----
+      - name: Configure and restart PostgreSQL
         shell: bash
         run: |
-          PKGLIBDIR="$(pg_config --pkglibdir)"
-          echo "Installing to $PKGLIBDIR"
-
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            # MIR backend has pre-existing code-gen bugs on Windows — exclude it
-            for f in build/Debug/pg_jitter*.dll build/pg_jitter*.dll; do
-              [[ -f "$f" && "$(basename "$f")" != "pg_jitter_mir.dll" ]] && cp "$f" "$PKGLIBDIR/" || true
-            done
-          else
-            sudo cp build/pg_jitter*.so "$PKGLIBDIR/" 2>/dev/null || true
-            sudo cp build/pg_jitter*.dylib "$PKGLIBDIR/" 2>/dev/null || true
-          fi
-          ls "$PKGLIBDIR"/pg_jitter*
-
-          # Restart with pg_jitter meta module (supports runtime backend switching)
-          # Options must come BEFORE the URI — Windows PG 14-16 psql lacks GNU getopt reordering
-          PGDATA=$(psql -t -A -c "SHOW data_directory;" "${{ steps.postgres.outputs.connection-uri }}")
+          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          PGDATA=$(psql -t -A -c "SHOW data_directory;" "$CONNURI")
           echo "PGDATA: $PGDATA"
           pg_ctl -D "$PGDATA" stop -m fast
           echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.conf"
@@ -211,7 +192,7 @@ jobs:
           echo "jit_optimize_above_cost = 0" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" start -l "$PGDATA/logfile" -w
           sleep 1
-          psql -c "SHOW jit_provider;" "${{ steps.postgres.outputs.connection-uri }}"
+          psql -c "SHOW jit_provider;" "$CONNURI"
 
       # ---- Build regression test shared libraries ----
       - name: Build regression test libraries
