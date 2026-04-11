@@ -170,8 +170,8 @@ jobs:
         shell: cmd
         run: |
           REM MIR backend has pre-existing code-gen bugs on Windows — exclude it
-          install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" sljit
-          install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" asmjit
+          call install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" sljit
+          call install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" asmjit
 
       # ---- Configure JIT and restart PostgreSQL ----
       - name: Configure and restart PostgreSQL
