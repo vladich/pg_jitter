@@ -163,7 +163,7 @@ jobs:
       - name: Install pg_jitter (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: sudo ./install.sh all
+        run: sudo -E ./install.sh all
 
       - name: Install pg_jitter (Windows)
         if: runner.os == 'Windows'
