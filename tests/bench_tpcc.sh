@@ -178,8 +178,8 @@ get_exec_times() {
     # Build SQL: settings, warmup runs (discard), timed runs (measure)
     local sql="SET jit = $jit_on;
 SET jit_above_cost = $JIT_ABOVE_COST;
-SET jit_inline_above_cost = 500000;
-SET jit_optimize_above_cost = 500000;
+SET jit_inline_above_cost = $JIT_ABOVE_COST;
+SET jit_optimize_above_cost = $JIT_ABOVE_COST;
 $set_backend
 "
     # Warmup: plain execution (no EXPLAIN)
@@ -214,6 +214,17 @@ ensure_pg_running() {
 CSV="$SCRIPT_DIR/bench_tpcc_$(date +%Y%m%d_%H%M%S).csv"
 echo "query,backend,exec_time_ms" > "$CSV"
 
+# Prewarm all tables and indexes into shared_buffers
+echo -n "Prewarming buffer cache..."
+psql_cmd -q -c "
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+SELECT pg_prewarm(c.oid::regclass, 'buffer')
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i');
+" > /dev/null 2>&1
+echo " done."
+echo ""
+
 echo "Running $NQUERIES queries × ${#BACKENDS[@]} backends (interleaved)..."
 echo ""
 
@@ -223,6 +234,14 @@ for qi in $(seq 0 $((NQUERIES - 1))); do
     label="${LABELS[$qi]}"
     query="${QUERIES[$qi]}"
     printf "  %-18s " "$label"
+
+    # Prewarm buffer cache before each query to eliminate I/O variance
+    psql_cmd -q -c "
+    CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+    SELECT pg_prewarm(c.oid::regclass, 'buffer')
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i');
+    " > /dev/null 2>&1 || true
 
     for backend in "${BACKEND_ARR[@]}"; do
         jit_on="on"

@@ -4733,6 +4733,57 @@ static bool sljit_compile_expr(ExprState *state) {
             }
 
             /*
+             * EXTRACT / DATE_PART compile-time optimization.
+             * Resolves constant unit string at JIT compile time.
+             * Currently ~5% gain on YEAR extraction — needs faster
+             * calendar decomposition for bigger wins.
+             * TODO: implement direct Julian day → year extraction
+             * without full timestamp2tm decomposition.
+             */
+#if 0 /* Disabled: marginal gain, needs faster year extraction */
+            if (!vs_handled && !sljit_shared_code_mode) {
+              PGFunction fn = op->d.func.fn_addr;
+              bool is_extract = (fn == extract_timestamp);
+              bool is_datepart = (fn == timestamp_part);
+
+              if ((is_extract || is_datepart) && fcinfo->nargs == 2) {
+                bool unit_const = true;
+                for (int j = opno - 1; j >= 0; j--) {
+                  if (steps[j].resvalue == &fcinfo->args[0].value) {
+                    unit_const = (steps[j].opcode == EEOP_CONST);
+                    break;
+                  }
+                }
+
+                if (unit_const && !fcinfo->args[0].isnull) {
+                  int field_val = jit_resolve_timestamp_field(
+                      fcinfo->args[0].value);
+
+                  if (field_val >= 0) {
+                    void *helper = is_extract
+                        ? (void *)jit_extract_timestamp
+                        : (void *)jit_datepart_timestamp;
+
+                    sljit_sw ts_off =
+                        (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+                    emit_load_step_field(
+                        C, opno,
+                        offsetof(ExprEvalStep, d.func.fcinfo_data),
+                        SLJIT_R2);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(SLJIT_R2), ts_off);
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0,
+                                   SLJIT_IMM, field_val);
+                    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(W, W, 32), helper);
+                    emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
+                    vs_handled = true;
+                  }
+                }
+              }
+            }
+#endif
+
+            /*
              * Shared-mode PCRE2 path: compile pattern, store pe in
              * flinfo->fn_extra, emit C wrapper call that loads pe
              * from step data at runtime.  Workers rebuild their own
@@ -5294,7 +5345,7 @@ static bool sljit_compile_expr(ExprState *state) {
           (sljit_sw)&fcinfo->args[0].isnull - (sljit_sw)fcinfo;
 
       /* Local jumps that target the end label */
-      struct sljit_jump *j_to_end[2];
+      struct sljit_jump *j_to_end[4];
       int n_to_end = 0;
 
       /*
@@ -5370,6 +5421,195 @@ static bool sljit_compile_expr(ExprState *state) {
        * MemoryContextSwitchTo, fcinfo marshaling, and the
        * indirect function call (~30 instructions saved).
        */
+
+      /*
+       * Fast-path for numeric_avg_accum / numeric_accum:
+       * Try in-place digit accumulation BEFORE the generic path.
+       * On success (returns 1), skip the V1 call entirely.
+       * On failure (returns 0), fall through to generic V1 path.
+       */
+      struct sljit_jump *j_numeric_fast_ok = NULL;
+      if (!is_byref && fn_addr == numeric_avg_accum) {
+        /*
+         * numeric_avg_accum is used by SUM(numeric) and AVG(numeric).
+         * It does NOT compute sumX2, so our fast path (which only
+         * updates sumX) is safe.
+         *
+         * numeric_accum (STDDEV/VARIANCE) also needs sumX2 updated,
+         * so it's NOT eligible for this fast path.
+         *
+         * internal type is pass-by-value (typbyval=true), so
+         * numeric aggregates use BYVAL opcodes.
+         */
+        sljit_sw arg1_val_off =
+            (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+
+        /* R0 = pergroup->transValue (NumericAggState pointer) */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+
+        /* R1 = fcinfo->args[1].value (numeric Datum) */
+        emit_load_step_field(
+            C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                       offsetof(AggStatePerTransData, transfn_fcinfo));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                       arg1_val_off);
+
+        /* Call jit_numeric_agg_trans_fast(state_ptr, datum) -> int32 */
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                   jit_numeric_agg_trans_fast);
+
+        /* If R0 == 0, fast path failed — fall through to generic V1 */
+        struct sljit_jump *j_fast_fail =
+            sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* Fast path succeeded: set transValueIsNull = false, jump to end */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+        j_numeric_fast_ok = sljit_emit_jump(C, SLJIT_JUMP);
+
+        sljit_set_label(j_fast_fail, sljit_emit_label(C));
+        /* Fall through to generic V1 path */
+      }
+
+      /*
+       * Fast-path for int128-based aggregate transitions:
+       * int8_avg_accum (SUM/AVG bigint) and int2/4/8_accum (STDDEV/VARIANCE int).
+       * Same probe pattern: try fast, on success jump to end, on failure
+       * fall through to generic V1 which creates the state on first call.
+       */
+      struct sljit_jump *j_int128_fast_ok = NULL;
+#ifdef PG_INT128_TYPE
+      if (!is_byref && fn_addr == int8_avg_accum) {
+        /*
+         * int8_avg_accum uses Int128AggState (HAVE_INT128).
+         * NOTE: int8_accum/int4_accum/int2_accum use NumericAggState
+         * (not Int128AggState!) because STDDEV/VARIANCE needs exact
+         * precision via numeric arithmetic.
+         */
+        sljit_sw arg1_val_off =
+            (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+        sljit_sw arg1_null_off =
+            (sljit_sw)&fcinfo->args[1].isnull - (sljit_sw)fcinfo;
+
+        /* Non-strict: check arg1 isnull first */
+        emit_load_step_field(
+            C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                       offsetof(AggStatePerTransData, transfn_fcinfo));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_R1, 0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
+                       arg1_null_off);
+        struct sljit_jump *j_arg_null =
+            sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* R0 = state pointer, R1 = newval */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R3),
+                       arg1_val_off);
+
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                   jit_int128_accum_fast);
+
+        /* If R0 == 0, first call — fall through to generic V1 */
+        struct sljit_jump *j_i128_fail =
+            sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* Success path: also handle the null-arg case (just skip to end) */
+        sljit_set_label(j_arg_null, sljit_emit_label(C));
+
+        /* Set transValueIsNull = false, jump to end */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+        j_int128_fast_ok = sljit_emit_jump(C, SLJIT_JUMP);
+
+        sljit_set_label(j_i128_fail, sljit_emit_label(C));
+        /* Fall through to generic V1 path */
+      }
+#endif /* PG_INT128_TYPE */
+
+      /*
+       * Fast-path for int2_accum/int4_accum/int8_accum:
+       * STDDEV/VARIANCE on integers. State is NumericAggState.
+       * Convert int→base-10000 digits inline, add to sumX and sumX2.
+       * Non-strict (handles NULL arg itself).
+       */
+      struct sljit_jump *j_int_accum_fast_ok = NULL;
+      if (false /* TODO: int_accum has precision issue with mixed-weight values */
+          && !is_byref &&
+          (fn_addr == int2_accum || fn_addr == int4_accum ||
+           fn_addr == int8_accum)) {
+        /*
+         * int2/4/8_accum use NumericAggState. Non-strict.
+         * Probe: convert int→digits, add to sumX (and sumX2 if needed).
+         * On failure (state NULL, or carry/rescale needed), fall through to V1.
+         * No null-arg shortcut: if arg is null, helper gets 0 as intval
+         * and the function returns the state unchanged. But int4_accum
+         * also needs to be called for null args because PG's function
+         * handles it. So we should skip entirely for null args — but
+         * to avoid the bug, just always fall through to V1 for null args.
+         */
+        sljit_sw arg1_val_off =
+            (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+        sljit_sw arg1_null_off =
+            (sljit_sw)&fcinfo->args[1].isnull - (sljit_sw)fcinfo;
+
+        /* Check arg1 isnull — if null, skip fast path entirely */
+        emit_load_step_field(
+            C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                       offsetof(AggStatePerTransData, transfn_fcinfo));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_R1, 0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
+                       arg1_null_off);
+        struct sljit_jump *j_ia_null_skip =
+            sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* R0 = state pointer, R1 = int value */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R3),
+                       arg1_val_off);
+        if (fn_addr == int2_accum)
+          sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0, SLJIT_R1, 0);
+        else if (fn_addr == int4_accum)
+          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R1, 0, SLJIT_R1, 0);
+
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
+                   jit_int_numeric_accum_fast);
+
+        /* If R0 == 0, fall through to generic V1 */
+        struct sljit_jump *j_ia_fail =
+            sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+
+        /* Success: set transValueIsNull=false, jump to end */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+        j_int_accum_fast_ok = sljit_emit_jump(C, SLJIT_JUMP);
+
+        /* Null-arg: fall through to generic V1 */
+        sljit_set_label(j_ia_null_skip, sljit_emit_label(C));
+        /* Fast-fail: also fall through */
+        sljit_set_label(j_ia_fail, sljit_emit_label(C));
+      }
+
       if (!is_byref && (fn_addr == int8inc || fn_addr == int8inc_any)) {
         /*
          * Inline int8inc / int8inc_any: transValue += 1.
@@ -5518,6 +5758,408 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_set_label(j_skip, sljit_emit_label(C));
 
         /* transValueIsNull = false */
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == int8smaller || fn_addr == int8larger)) {
+        /*
+         * Inline int8smaller/int8larger: MIN/MAX(int8).
+         * int8 is stored natively in Datum — no sign-extend needed.
+         */
+        bool is_min = (fn_addr == int8smaller);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R2);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         val_off);
+        }
+
+        j_skip = sljit_emit_cmp(
+            C, is_min ? SLJIT_SIG_LESS_EQUAL : SLJIT_SIG_GREATER_EQUAL,
+            SLJIT_R1, 0, SLJIT_R2, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R2, 0);
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == int2smaller || fn_addr == int2larger)) {
+        /*
+         * Inline int2smaller/int2larger: MIN/MAX(int2).
+         * Sign-extend int16 to int64 before comparing.
+         */
+        bool is_min = (fn_addr == int2smaller);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R2);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         val_off);
+        }
+
+        sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R1, 0, SLJIT_R1, 0);
+        sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R2, 0, SLJIT_R2, 0);
+
+        j_skip = sljit_emit_cmp(
+            C, is_min ? SLJIT_SIG_LESS_EQUAL : SLJIT_SIG_GREATER_EQUAL,
+            SLJIT_R1, 0, SLJIT_R2, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R2, 0);
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == float8smaller || fn_addr == float8larger)) {
+        /*
+         * Inline float8smaller/float8larger: MIN/MAX(float8).
+         * float8 is stored in Datum (8 bytes, same size as pointer).
+         * Use SLJIT float compare on FR0/FR1.
+         */
+        bool is_min = (fn_addr == float8smaller);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        /* FR0 = current transValue as float64 */
+        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
+                        SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue));
+        /* FR1 = new input from fcinfo->args[1].value */
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR1, 0,
+                          SLJIT_MEM1(SLJIT_R1), val_off);
+        }
+
+        /*
+         * MIN: skip update if current <= new (FR0 <= FR1)
+         * MAX: skip update if current >= new (FR0 >= FR1)
+         * SLJIT_CMP_F64: F_LESS_EQUAL checks FR0 <= FR1
+         */
+        j_skip = sljit_emit_fcmp(
+            C,
+            is_min ? SLJIT_F_LESS_EQUAL : SLJIT_F_GREATER_EQUAL,
+            SLJIT_FR0, 0, SLJIT_FR1, 0);
+
+        /* Update: store new value */
+        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue),
+                        SLJIT_FR1, 0);
+
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == float4smaller || fn_addr == float4larger)) {
+        /*
+         * Inline float4smaller/float4larger: MIN/MAX(float4).
+         * float4 is stored in Datum via Float4GetDatum (on 64-bit,
+         * the float4 bits occupy the low 32 bits of the Datum).
+         * Load as F32, compare, conditionally store back.
+         */
+        bool is_min = (fn_addr == float4smaller);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR0, 0,
+                        SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR1, 0,
+                          SLJIT_MEM1(SLJIT_R1), val_off);
+        }
+
+        j_skip = sljit_emit_fcmp(
+            C,
+            is_min ? SLJIT_F_LESS_EQUAL : SLJIT_F_GREATER_EQUAL,
+            SLJIT_FR0, 0, SLJIT_FR1, 0);
+
+        sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue),
+                        SLJIT_FR1, 0);
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == date_smaller || fn_addr == date_larger ||
+                  fn_addr == oidsmaller || fn_addr == oidlarger)) {
+        /*
+         * Inline date/oid MIN/MAX: all are int32 stored as
+         * zero-extended Datum. Date uses SIGNED compare,
+         * OID uses UNSIGNED compare.
+         */
+        bool is_min = (fn_addr == date_smaller || fn_addr == oidsmaller);
+        bool is_unsigned = (fn_addr == oidsmaller || fn_addr == oidlarger);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R2);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         val_off);
+        }
+
+        if (!is_unsigned) {
+          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R1, 0, SLJIT_R1, 0);
+          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R2, 0, SLJIT_R2, 0);
+        }
+
+        j_skip = sljit_emit_cmp(
+            C,
+            is_min ? (is_unsigned ? SLJIT_LESS_EQUAL : SLJIT_SIG_LESS_EQUAL)
+                   : (is_unsigned ? SLJIT_GREATER_EQUAL
+                                  : SLJIT_SIG_GREATER_EQUAL),
+            SLJIT_R1, 0, SLJIT_R2, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R2, 0);
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref &&
+                 (fn_addr == timestamp_smaller || fn_addr == timestamp_larger ||
+                  fn_addr == time_smaller || fn_addr == time_larger)) {
+        /*
+         * Inline timestamp/time MIN/MAX.
+         * All are int64 signed compare (microseconds).
+         */
+        bool is_min = (fn_addr == timestamp_smaller ||
+                       fn_addr == time_smaller);
+        struct sljit_jump *j_skip;
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R2);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R2),
+                         val_off);
+        }
+
+        j_skip = sljit_emit_cmp(
+            C, is_min ? SLJIT_SIG_LESS_EQUAL : SLJIT_SIG_GREATER_EQUAL,
+            SLJIT_R1, 0, SLJIT_R2, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R2, 0);
+        sljit_set_label(j_skip, sljit_emit_label(C));
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref && fn_addr == float8pl) {
+        /*
+         * Inline SUM(float8): transValue += newval.
+         * float8pl is strict, so this is always the
+         * non-null path.
+         */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
+                        SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR1, 0,
+                          SLJIT_MEM1(SLJIT_R1), val_off);
+        }
+
+        sljit_emit_fop2(C, SLJIT_ADD_F64, SLJIT_FR0, 0, SLJIT_FR0, 0,
+                        SLJIT_FR1, 0);
+        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue),
+                        SLJIT_FR0, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref && fn_addr == float4pl) {
+        /*
+         * Inline SUM(float4): transValue += newval.
+         * float4 stored in low 32 bits of Datum.
+         */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR0, 0,
+                        SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue));
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR1, 0,
+                          SLJIT_MEM1(SLJIT_R1), val_off);
+        }
+
+        sljit_emit_fop2(C, SLJIT_ADD_F32, SLJIT_FR0, 0, SLJIT_FR0, 0,
+                        SLJIT_FR1, 0);
+        sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_MEM1(SLJIT_R0),
+                        offsetof(AggStatePerGroupData, transValue),
+                        SLJIT_FR0, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+      } else if (!is_byref && fn_addr == int2_sum) {
+        /*
+         * Inline int2_sum: transValue += (int64)arg1.
+         * Same as int4_sum but sign-extend from int16.
+         * int2_sum is NOT strict (handles NULL arg0 itself).
+         */
+        struct sljit_jump *j_not_null;
+
+        {
+          sljit_sw isnull_off =
+              (sljit_sw)&fcinfo->args[1].isnull - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
+                         isnull_off);
+          struct sljit_jump *j_arg_null =
+              sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+          j_to_end[n_to_end++] = j_arg_null;
+        }
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R3);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_R3),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R3),
+                         val_off);
+        }
+        sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R2, 0, SLJIT_R2, 0);
+
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull));
+        j_not_null = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R3, 0, SLJIT_IMM, 0);
+
+        /* First non-null input: transValue = (int64)arg1 */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R2, 0);
+        sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValueIsNull),
+                       SLJIT_IMM, 0);
+        j_to_end[n_to_end++] = sljit_emit_jump(C, SLJIT_JUMP);
+
+        sljit_set_label(j_not_null, sljit_emit_label(C));
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R2, 0);
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue), SLJIT_R1, 0);
+      } else if (is_byref &&
+                 (fn_addr == float8_accum || fn_addr == float4_accum)) {
+        /*
+         * Inline float8_accum / float4_accum: STDDEV/VARIANCE.
+         * Uses Youngs-Cramer algorithm (NOT naive sum-of-squares).
+         * Accumulator is float8[3] at ARR_OVERHEAD_NONULLS(1)=24:
+         *   [0] = N
+         *   [1] = Sx  (sum of values)
+         *   [2] = Sxx (sum of squared deviations from mean)
+         *
+         * Algorithm: N_new = N+1; Sx_new = Sx+val;
+         *   if (N > 0) tmp = val*N_new - Sx_new; Sxx += tmp*tmp/(N_new*N);
+         *
+         * Too complex for pure SLJIT (needs 6+ float regs, overflow check).
+         * Use a C helper function instead.
+         */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
+        /* R0 = array pointer = DatumGetPointer(transValue) */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
+                       offsetof(AggStatePerGroupData, transValue));
+        /* R1 = new input from fcinfo->args[1].value */
+        {
+          sljit_sw val_off =
+              (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
+          emit_load_step_field(
+              C, opno, offsetof(ExprEvalStep, d.agg_trans.pertrans), SLJIT_R1);
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         offsetof(AggStatePerTransData, transfn_fcinfo));
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
+                         val_off);
+        }
+        /* R2 = is_float4 flag */
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM,
+                       fn_addr == float4_accum ? 1 : 0);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3V(W, W, 32),
+                   jit_float8_accum_fast);
+
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
+                       SOFF_AGG_PERGROUP);
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
                        offsetof(AggStatePerGroupData, transValueIsNull),
                        SLJIT_IMM, 0);
@@ -5699,6 +6341,12 @@ static bool sljit_compile_expr(ExprState *state) {
 
         for (int j = 0; j < n_to_end; j++)
           sljit_set_label(j_to_end[j], lbl_end);
+        if (j_numeric_fast_ok)
+          sljit_set_label(j_numeric_fast_ok, lbl_end);
+        if (j_int128_fast_ok)
+          sljit_set_label(j_int128_fast_ok, lbl_end);
+        if (j_int_accum_fast_ok)
+          sljit_set_label(j_int_accum_fast_ok, lbl_end);
       }
       break;
     }
@@ -7601,6 +8249,7 @@ static bool sljit_compile_expr(ExprState *state) {
 #if defined(__x86_64__) || (!defined(__aarch64__))
         crc32_inline_skip:
 #endif
+        ;  /* empty statement after label (C requires statement before declaration) */
 
         /* R0 = 1 (found) or 0 (not found). Branch on result. */
         struct sljit_jump *j_found_rt = sljit_emit_cmp(

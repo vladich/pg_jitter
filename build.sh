@@ -44,8 +44,12 @@ if [ $# -gt 0 ]; then
     CMAKE_EXTRA_ARGS=("$@")
 fi
 
-# Resolve pg_config to absolute path
-if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
+# Resolve pg_config to absolute path (CMake may not inherit shell PATH)
+if [ -x "$PG_CONFIG" ]; then
+    PG_CONFIG="$(cd "$(dirname "$PG_CONFIG")" && pwd)/$(basename "$PG_CONFIG")"
+elif command -v "$PG_CONFIG" > /dev/null 2>&1; then
+    PG_CONFIG="$(command -v "$PG_CONFIG")"
+else
     echo "ERROR: pg_config not found: $PG_CONFIG"
     echo "  Use: ./build.sh --pg-config /path/to/pg_config"
     echo "   or: PG_CONFIG=/path/to/pg_config ./build.sh"
@@ -83,7 +87,7 @@ fi
 
 cmake "$SCRIPT_DIR" "${CMAKE_ARGS[@]}" "${CMAKE_EXTRA_ARGS[@]}"
 
-make -j"$JOBS"
+cmake --build . --parallel "$JOBS"
 
 echo ""
 echo "=== Done ==="

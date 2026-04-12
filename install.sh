@@ -1,7 +1,7 @@
 #!/bin/bash
-# install.sh — Install pg_jitter backends and restart PostgreSQL (macOS / Linux)
+# install.sh — Install pg_jitter backends (macOS / Linux)
 #
-# Usage: ./install.sh [--pg-config PATH] [--pgdata DIR] [sljit|asmjit|mir|all]
+# Usage: ./install.sh [--pg-config PATH] [--pgdata DIR] [--restart] [sljit|asmjit|mir|all]
 #
 # pg_config resolution (first match wins):
 #   1. --pg-config PATH argument
@@ -25,13 +25,20 @@ while [ $# -gt 0 ]; do
         --pgdata)
             [ -z "${2:-}" ] && { echo "ERROR: --pgdata requires a path argument"; exit 1; }
             PGDATA="$2"; shift 2 ;;
+        --restart)
+            DO_RESTART=1; shift ;;
         *) break ;;
     esac
 done
 
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 
-if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
+# Resolve pg_config to absolute path
+if [ -x "$PG_CONFIG" ]; then
+    PG_CONFIG="$(cd "$(dirname "$PG_CONFIG")" && pwd)/$(basename "$PG_CONFIG")"
+elif command -v "$PG_CONFIG" > /dev/null 2>&1; then
+    PG_CONFIG="$(command -v "$PG_CONFIG")"
+else
     echo "ERROR: pg_config not found: $PG_CONFIG"
     echo "  Use: ./install.sh --pg-config /path/to/pg_config"
     exit 1
@@ -40,6 +47,7 @@ fi
 PGBIN="$("$PG_CONFIG" --bindir)"
 PGCTL="$PGBIN/pg_ctl"
 PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
+PG_VERSION=$("$PG_CONFIG" --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
 
 # Resolve data directory
 if [ -n "${PGDATA:-}" ]; then
@@ -48,11 +56,10 @@ else
     PG_DATA="$("$PGBIN/psql" -p "${PGPORT:-5432}" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || true)"
 fi
 
-if [ -z "$PG_DATA" ] || [ ! -d "$PG_DATA" ]; then
-    echo "WARNING: PostgreSQL data directory not found."
+if [ "${DO_RESTART:-}" = "1" ] && { [ -z "$PG_DATA" ] || [ ! -d "$PG_DATA" ]; }; then
+    echo "WARNING: --restart requested but data directory not found."
     echo "  Set PGDATA or use --pgdata DIR, or ensure PostgreSQL is running."
-    echo "  Libraries will be installed but PostgreSQL will NOT be restarted."
-    NO_RESTART=1
+    DO_RESTART=0
 fi
 
 # Detect extension
@@ -76,7 +83,7 @@ echo "  Target: $PKGLIBDIR"
 find_dylib() {
     local b="$1"
     local lib="pg_jitter_$b.$EXT"
-    for dir in "$SCRIPT_DIR/build/$b" "$SCRIPT_DIR/build"; do
+    for dir in "$SCRIPT_DIR/build/pg$PG_VERSION" "$SCRIPT_DIR/build/$b" "$SCRIPT_DIR/build"; do
         if [ -f "$dir/$lib" ]; then
             echo "$dir/$lib"
             return 0
@@ -102,7 +109,7 @@ done
 
 # Also install the meta-provider if available
 META_LIB=""
-for dir in "$SCRIPT_DIR/build/meta" "$SCRIPT_DIR/build"; do
+for dir in "$SCRIPT_DIR/build/pg$PG_VERSION" "$SCRIPT_DIR/build/meta" "$SCRIPT_DIR/build"; do
     if [ -f "$dir/pg_jitter.$EXT" ]; then
         META_LIB="$dir/pg_jitter.$EXT"
         break
@@ -113,12 +120,8 @@ if [ -n "$META_LIB" ]; then
     echo "  pg_jitter.$EXT installed (meta-provider)"
 fi
 
-# Restart PostgreSQL
-if [ "${NO_RESTART:-}" = "1" ]; then
-    echo ""
-    echo "Skipping PostgreSQL restart (data directory unknown)."
-    echo "Restart PostgreSQL manually to load the new libraries."
-else
+# Restart PostgreSQL (only with --restart)
+if [ "${DO_RESTART:-}" = "1" ]; then
     echo ""
     if "$PGCTL" -D "$PG_DATA" status > /dev/null 2>&1; then
         "$PGCTL" -D "$PG_DATA" restart -l /tmp/pg_jitter.log 2>&1
