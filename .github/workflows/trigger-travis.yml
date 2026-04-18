@@ -2,7 +2,7 @@ name: "Trigger Travis CI (ppc64le + s390x)"
 on:
   push:
     branches: [master]
-    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'img/**', 'bench/**']
   workflow_dispatch:
     inputs:
       branch:

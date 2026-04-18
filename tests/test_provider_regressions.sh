@@ -85,7 +85,10 @@ detect_backends() {
 }
 
 if [ "$BACKEND" = "all" ]; then
-    mapfile -t BACKENDS < <(detect_backends)
+    BACKENDS=()
+    while IFS= read -r backend; do
+        BACKENDS+=("$backend")
+    done < <(detect_backends)
 else
     read -r -a BACKENDS <<< "$BACKEND"
 fi

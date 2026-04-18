@@ -2,9 +2,9 @@ name: "PG 17 \xB7 Linux ARM64"
 on:
   push:
     branches: [master]
-    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'img/**', 'bench/**']
   pull_request:
-    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'tests/**', 'img/**', 'bench/**']
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'img/**', 'bench/**']
 jobs:
   build:
     uses: ./.github/workflows/build-reusable.yml
