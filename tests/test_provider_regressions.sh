@@ -108,21 +108,33 @@ backend_settings() {
 
 int4_array_1_to_n() {
     local n="$1"
+    local i sep=""
 
     if [ "$n" -le 0 ]; then
         printf "'{}'::int4[]"
     else
-        printf "'{%s}'::int4[]" "$(seq -s, 1 "$n")"
+        printf "'{"
+        for ((i = 1; i <= n; i++)); do
+            printf "%s%s" "$sep" "$i"
+            sep=","
+        done
+        printf "}'::int4[]"
     fi
 }
 
 int4_array_min_and_1_to_n() {
     local n="$1"
+    local i sep=""
 
     if [ "$n" -le 0 ]; then
         printf "'{-2147483648}'::int4[]"
     else
-        printf "'{-2147483648,%s}'::int4[]" "$(seq -s, 1 "$n")"
+        printf "'{-2147483648"
+        sep=","
+        for ((i = 1; i <= n; i++)); do
+            printf "%s%s" "$sep" "$i"
+        done
+        printf "}'::int4[]"
     fi
 }
 
