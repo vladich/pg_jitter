@@ -238,6 +238,54 @@ FROM vals;"
         echo "PASS: numeric add/sub/mul match PostgreSQL"
     fi
 
+    cmp3_sql="$backend_jit_settings
+CREATE TEMP TABLE pg_jitter_cmp3_bool(a bool, b bool, exp int4);
+INSERT INTO pg_jitter_cmp3_bool VALUES
+  (false, false, 0), (false, true, -1), (true, false, 1), (true, true, 0);
+CREATE TEMP TABLE pg_jitter_cmp3_int8(a int8, b int8, exp int4);
+INSERT INTO pg_jitter_cmp3_int8 VALUES
+  ('-9223372036854775808'::int8, -1::int8, -1),
+  (-1::int8, '-9223372036854775808'::int8, 1),
+  (0::int8, 0::int8, 0),
+  (9223372036854775807::int8, 0::int8, 1),
+  (0::int8, 9223372036854775807::int8, -1);
+CREATE TEMP TABLE pg_jitter_cmp3_cash(a money, b money, exp int4);
+INSERT INTO pg_jitter_cmp3_cash VALUES
+  ((-100)::money, 0::money, -1),
+  (0::money, (-100)::money, 1),
+  (42::money, 42::money, 0);
+WITH checks(name, ok) AS (
+  VALUES
+    ('btboolcmp', (SELECT bool_and(pg_catalog.btboolcmp(a, b) = exp) FROM pg_jitter_cmp3_bool)),
+    ('btint8cmp', (SELECT bool_and(pg_catalog.btint8cmp(a, b) = exp) FROM pg_jitter_cmp3_int8)),
+    ('cash_cmp', (SELECT bool_and(pg_catalog.cash_cmp(a, b) = exp) FROM pg_jitter_cmp3_cash))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+    set +e
+    cmp3_out="$(printf '%s\n' "$cmp3_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    cmp3_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: Tier0 compare coverage crashed or wedged the server"
+        printf '%s\n' "$cmp3_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$cmp3_rc" -ne 0 ]; then
+        echo "FAIL: Tier0 compare coverage raised an unexpected SQL error"
+        printf '%s\n' "$cmp3_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    else
+        cmp3_out="$(printf '%s\n' "$cmp3_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$cmp3_out" != "ok" ]; then
+            echo "FAIL: Tier0 compare checks failed: $cmp3_out"
+            FAIL=$((FAIL + 1))
+        else
+            echo "PASS: Tier0 three-way comparisons match PostgreSQL"
+        fi
+    fi
+
     inlist_sql="$backend_jit_settings
 $simd_inlist_settings
 SET enable_indexscan = off;

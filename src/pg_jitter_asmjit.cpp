@@ -53,9 +53,7 @@ typedef struct
 	int64		sum;
 } JitInt8TransTypeData;
 
-/* MIR precompiled blob support (shared infrastructure) */
-#include "pg_jit_mir_blobs.h"
-}
+	}
 
 /*
  * On Windows, PG's win32_port.h redefines socket functions as macros
@@ -388,11 +386,6 @@ asmjit_compile_expr(ExprState *state)
 		if (min_steps > 0 && state->steps_len < min_steps)
 			return false;
 	}
-
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-	/* Lazy-load MIR precompiled blobs on first compile */
-	mir_load_precompiled_blobs(NULL);
-#endif
 
 	ctx = pg_jitter_get_context(state);
 

@@ -13,7 +13,6 @@ REM Examples:
 REM   build.cmd                                           Build all backends
 REM   build.cmd sljit                                     Build sljit only
 REM   build.cmd --pg-config C:\pg18\bin\pg_config all     Custom PG install
-REM   build.cmd sljit -DPG_JITTER_USE_LLVM=ON            sljit with LLVM blobs
 REM   build.cmd mir -DMIR_DIR=C:\mir                      Custom MIR path
 REM
 REM Prerequisites:

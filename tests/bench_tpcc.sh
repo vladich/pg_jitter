@@ -87,8 +87,13 @@ declare -a LABELS QUERIES
 
 add_q() { LABELS+=("$1"); QUERIES+=("$2"); }
 
-# Pre-generate random parameter sets (one per run + warmup)
-TOTAL_RUNS=$((NWARMUP + NRUNS + 5))
+# Pre-generate enough random parameters for the static query templates.
+# Some templates intentionally use different slots to avoid reusing the same
+# warehouse/district/customer values; the highest slot currently used is 6.
+TOTAL_RUNS=$((NWARMUP + NRUNS))
+if [ "$TOTAL_RUNS" -lt 7 ]; then
+    TOTAL_RUNS=7
+fi
 gen_rand() {
     local lo="$1" hi="$2" range=$(($2 - $1 + 1))
     for i in $(seq 1 "$TOTAL_RUNS"); do

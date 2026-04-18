@@ -26,7 +26,7 @@ It's recommended to set this parameter value to something from ~200 to low thous
 - **sljit** is the most consistent: 5–25% faster than the interpreter across all workloads. This, and also its phenomenal compilation speed, make it the best choice for most scenarios.
 - **AsmJIT** excels on wide-row/deform-heavy queries (up to 32% faster) thanks to specialized tuple deforming
 - **MIR** provides solid gains while being the most portable backend
-- **LLVM** was supposed to be fast at execution time, due to clang optimization advantages, but in fact, in most cases, it's slower than all 3 pg_jitter backends, even not counting compilation performance differences. This is due to zero-cost inlining using compile-time pre-extracted code and manual instruction-level optimization.
+- **LLVM** was supposed to be fast at execution time, due to clang optimization advantages, but in fact, in most cases, it's slower than all 3 pg_jitter backends, even not counting compilation performance differences. pg_jitter instead focuses on fast code generation, direct helper calls, and manual instruction-level optimization for hot expression patterns.
 
 There are some operations that **pg_jitter** optimizes much better than typical expressions:
 
@@ -59,9 +59,8 @@ TPC-C and TPC-H numbers are a bit low, because they are single-pass, while the o
 - **Three independent backends** with different strengths
 - **Runtime backend switching** via `SET pg_jitter.backend = 'sljit'` (no restart)
 - **PostgreSQL 14–18** support from one codebase
-- **Two-tier function optimization** - hot-path PG functions compiled as direct native calls
+- **Tiered function optimization** - hot-path PG functions emitted inline or compiled as direct native calls
 - **No LLVM dependency** - pure C/C++ with small, embeddable libraries
-- **Precompiled function blobs** - optional build-time native code extraction for zero-cost inlining
 - **Supported platforms** - aside from AsmJit (which supports only ARM64/x86_64), other providers can be used on most platforms supported by Postgres. **pg_jitter** builds and passes basic regression testing on Linux/MacOS (ARM64) - all providers, Linux/FreeBSD/Windows (x86_64) - all providers, Linux (PPC64LE) - sljit only, Linux (s390x) - sljit only. It was not yet extensively user-tested outside of ARM64 and x86_64.
 
 ## Stability
@@ -101,10 +100,6 @@ For **MIR** and **sljit**, use the patched versions from [MIR-patched](https://g
 
 # Custom PostgreSQL installation
 ./build.sh --pg-config /opt/pg17/bin/pg_config all
-
-# With precompiled function blobs (optional, pick one)
-./build.sh all -DPG_JITTER_USE_LLVM=ON      # requires clang + llvm-objdump
-./build.sh all -DPG_JITTER_USE_C2MIR=ON     # uses MIR (no extra deps)
 
 # Custom dependency paths
 ./build.sh all -DSLJIT_DIR=/path/to/sljit -DMIR_DIR=/path/to/mir
@@ -191,10 +186,11 @@ pg_jitter implements PostgreSQL's `JitProviderCallbacks` interface. When Postgre
 3. Delegates remaining opcodes to `pg_jitter_fallback_step()` which calls the corresponding `ExecEval*` C functions
 4. Installs the compiled function with a one-time validation wrapper that catches `ALTER COLUMN TYPE` invalidation
 
-### Two-Tier Function Optimization
+### Function Optimization Tiers
 
-- **Tier 1**: Pass-by-value operations (int, float, bool, date, timestamp, OID) compiled as direct native calls with inline overflow checking. No `FunctionCallInfo` overhead.
-- **Tier 2**: Pass-by-reference operations (numeric, text, interval, uuid) called through `DirectFunctionCall` C wrappers. Optionally LLVM-optimized when built with `-DPG_JITTER_USE_LLVM=ON` or c2mir-optimized when built with `-DPG_JITTER_USE_C2MIR=ON`.
+- **Tier 0**: Simple operations emitted directly into provider-generated code. This avoids function-call and `FunctionCallInfo` overhead entirely.
+- **Tier 1**: Direct calls to unwrapped native `jit_*` functions. This bypasses PostgreSQL's fmgr/fcinfo call path.
+- **Tier 2**: Pass-by-reference operations (numeric, interval, uuid, selected text paths) called through wrappers or native helpers. This path has no LLVM or PostgreSQL bitcode dependency.
 
 ### Three JIT Backends
 
@@ -238,20 +234,16 @@ A single codebase supports PostgreSQL 14–18 via compile-time `#if PG_VERSION_N
 - **PG17+**: Generic ResourceOwner API (`ResourceOwnerDesc`)
 - **PG18**: `CompactAttribute`, split `EEOP_DONE`, `CompareType` rename, new opcodes
 
-### Precompiled Function Blobs
+### Function Wrappers
 
-Two optional build-time pipelines extract native code for hot functions and embed them directly into the shared library:
-
-- **LLVM pipeline** (`-DPG_JITTER_USE_LLVM=ON`): clang compiles → `extract_inlines.py` extracts native blobs → embeds in header. Supports deep inlining with PG bitcode.
-- **c2mir pipeline** (`-DPG_JITTER_USE_C2MIR=ON`): c2mir compiles → MIR_gen emits native code → embeds in header. No LLVM toolchain required.
-
-Without either pipeline, all three backends still work — Tier 1 functions use direct calls and Tier 2 uses C wrappers.
+The native precompiled blob pipeline was removed. Small leaf functions are handled by Tier 0 emitters or ordinary Tier 1 direct calls. Pass-by-reference operations that are not safe to reimplement use always-available C wrappers around PostgreSQL built-ins.
 
 ## Testing
 
 ```bash
-# Correctness: 203 JIT-compiled functions (all types, overflow, NULL propagation, 100K-row validation)
-psql -d postgres -f tests/test_precompiled.sql
+# Correctness: provider-specific bugs and direct-function surface
+./tests/test_provider_regressions.sh --backend all
+./tests/test_function_surface.sh --backend all
 
 # Benchmarks
 ./tests/bench_all_backends.sh

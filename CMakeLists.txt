@@ -25,8 +25,6 @@ endif()
 #            -DMIR_DIR=/path/to/mir                               (optional)
 #            -DASMJIT_DIR=/path/to/asmjit                         (optional)
 #            -DPG_JITTER_BACKENDS="sljit;asmjit;mir"              (optional)
-#            -DPG_JITTER_USE_LLVM=ON                              (optional)
-#            -DPG_JITTER_USE_C2MIR=ON                             (optional)
 #            -DPG_JITTER_INSTALL_DIR=/custom/install/path         (optional)
 #
 
@@ -161,7 +159,7 @@ if(PG_JITTER_BUILD_SLJIT)
     endif()
     message(STATUS "sljit directory:    ${SLJIT_DIR}")
 endif()
-if(PG_JITTER_BUILD_MIR OR PG_JITTER_USE_C2MIR)
+if(PG_JITTER_BUILD_MIR)
     if(NOT EXISTS "${MIR_DIR}/mir.c")
         message(FATAL_ERROR "MIR not found at ${MIR_DIR}. Set -DMIR_DIR=/path/to/mir")
     endif()
@@ -221,7 +219,7 @@ if(PG_JITTER_BUILD_SLJIT)
 endif()
 
 # ---------- MIR (static library) ----------
-if(PG_JITTER_BUILD_MIR OR PG_JITTER_USE_C2MIR)
+if(PG_JITTER_BUILD_MIR)
     add_library(mir_lib STATIC ${MIR_DIR}/mir.c ${MIR_DIR}/mir-gen.c)
     target_include_directories(mir_lib PUBLIC ${MIR_DIR})
     target_compile_options(mir_lib PRIVATE -std=gnu11 -w)
@@ -311,11 +309,6 @@ endif()
 
 
 # ==========================================================================
-# Pre-compilation infrastructure (LLVM / c2mir)
-# ==========================================================================
-include(${CMAKE_SOURCE_DIR}/cmake/precompiled.cmake)
-
-# ==========================================================================
 # Helper: configure a backend target with common settings
 # ==========================================================================
 function(pg_jitter_configure_target TARGET_NAME)
@@ -362,7 +355,6 @@ function(pg_jitter_configure_target TARGET_NAME)
             ${PG_INCLUDEDIR_SERVER}/port/win32)
         target_link_libraries(${TARGET_NAME} PRIVATE ${POSTGRES_LIB} ws2_32)
     endif()
-    pg_jitter_add_precompiled(${TARGET_NAME})
     set_target_properties(${TARGET_NAME} PROPERTIES
         PREFIX ""
         SUFFIX "${PG_JITTER_SHARED_SUFFIX}"

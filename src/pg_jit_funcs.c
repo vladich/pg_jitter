@@ -8,8 +8,8 @@
  * TIER 1: Pass-by-value types with trivial bodies (int, float, bool, date,
  *         timestamp, oid). Full native implementation.
  * TIER 2: Pass-by-reference operators (text, numeric, jsonb, uuid, array,
- *         interval, bytea, bpchar, inet). Listed in lookup table with
- *         jit_fn=NULL (deferred to LLVM IR inlining in Part 2).
+ *         interval, bytea, bpchar, inet). Implemented with native helpers
+ *         where practical, otherwise via thin DirectFunctionCall wrappers.
  * TIER 3: Complex mutation functions. Listed as comments only.
  */
 
@@ -2889,36 +2889,33 @@ int32 jit_bttext_pattern_cmp(int64 a, int64 b) {
  * LOOKUP TABLE
  *
  * Maps PG function address → direct-call entry.
- * Tier 2 entries have jit_fn = NULL (deferred to LLVM IR inlining).
- * Tier 3 entries are listed as comments.
  * ================================================================ */
 
 #define T32 JIT_TYPE_32
 #define T64 JIT_TYPE_64
 
-/* Shorthand: E<nargs>(pg_fn, jit_fn, ret_type, arg_types...)
- * The stringified jit_fn name is stored for precompiled blob lookup. */
-#define E0(pg, jf, rt) {(PGFunction)(pg), (void *)(jf), 0, rt, {0}, 0, 0, #jf}
+/* Shorthand: E<nargs>(pg_fn, jit_fn, ret_type, arg_types...) */
+#define E0(pg, jf, rt) {(PGFunction)(pg), (void *)(jf), 0, rt, {0}, 0, 0}
 #define E1(pg, jf, rt, a0)                                                     \
-  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, 0, 0, #jf}
+  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, 0, 0}
 #define E2(pg, jf, rt, a0, a1)                                                 \
-  {(PGFunction)(pg), (void *)(jf), 2, rt, {a0, a1}, 0, 0, #jf}
+  {(PGFunction)(pg), (void *)(jf), 2, rt, {a0, a1}, 0, 0}
 /* EI1: 1-arg entry with inline_op tag for sljit inlining */
 #define EI1(pg, jf, rt, a0, iop)                                               \
-  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, iop, 0, #jf}
+  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, iop, 0}
 /* EI2: 2-arg entry with inline_op tag for sljit inlining */
 #define EI2(pg, jf, rt, a0, a1, iop)                                           \
-  {(PGFunction)(pg), (void *)(jf), 2, rt, {a0, a1}, iop, 0, #jf}
+  {(PGFunction)(pg), (void *)(jf), 2, rt, {a0, a1}, iop, 0}
 /* EC<nargs>: collation-aware entry — passes fcinfo->fncollation as last arg */
 #define EC1(pg, jf, rt, a0)                                                    \
-  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, 0, JIT_FN_FLAG_COLLATION, #jf}
+  {(PGFunction)(pg), (void *)(jf), 1, rt, {a0}, 0, JIT_FN_FLAG_COLLATION}
 #define EC2(pg, jf, rt, a0, a1)                                                \
   {(PGFunction)(pg),      (void *)(jf), 2, rt, {a0, a1}, 0,                    \
-   JIT_FN_FLAG_COLLATION, #jf}
+   JIT_FN_FLAG_COLLATION}
 /* EIC2: 2-arg collation-aware entry with inline_op tag (jit_fn = DEFERRED) */
 #define EIC2(pg, rt, a0, a1, iop)                                              \
   {(PGFunction)(pg), DEFERRED, 2, rt, {a0, a1}, iop,                           \
-   JIT_FN_FLAG_COLLATION, "DEFERRED"}
+   JIT_FN_FLAG_COLLATION}
 
 /* NULL means no native implementation yet — fall through to fcinfo path */
 #define DEFERRED NULL
@@ -3296,11 +3293,11 @@ const JitDirectFn jit_direct_fns[] = {
     /* ---- cross-type timestamptz comparisons (DEFERRED — need TZ conversion) ---- */
 
     /* ---- btree comparison functions ---- */
-    E2(btboolcmp, jit_btboolcmp, T32, T64, T64),
+    EI2(btboolcmp, jit_btboolcmp, T32, T64, T64, JIT_INLINE_BOOL_CMP3),
     E2(btcharcmp, jit_btcharcmp, T32, T32, T32),
     E2(btint2cmp, jit_btint2cmp, T32, T32, T32),
     E2(btint4cmp, jit_btint4cmp, T32, T32, T32),
-    E2(btint8cmp, jit_btint8cmp, T32, T64, T64),
+    EI2(btint8cmp, jit_btint8cmp, T32, T64, T64, JIT_INLINE_INT8_CMP3),
     E2(btint24cmp, jit_btint24cmp, T32, T32, T32),
     E2(btint42cmp, jit_btint42cmp, T32, T32, T32),
     E2(btint28cmp, jit_btint28cmp, T32, T32, T64),
@@ -3331,7 +3328,7 @@ const JitDirectFn jit_direct_fns[] = {
     EI2(cash_le, jit_cash_le, T32, T64, T64, JIT_INLINE_INT8_LE),
     EI2(cash_gt, jit_cash_gt, T32, T64, T64, JIT_INLINE_INT8_GT),
     EI2(cash_ge, jit_cash_ge, T32, T64, T64, JIT_INLINE_INT8_GE),
-    E2(cash_cmp, jit_cash_cmp, T32, T64, T64),
+    EI2(cash_cmp, jit_cash_cmp, T32, T64, T64, JIT_INLINE_INT8_CMP3),
     E2(cash_pl, jit_cash_pl, T64, T64, T64),
     E2(cash_mi, jit_cash_mi, T64, T64, T64),
     E2(cashlarger, jit_cashlarger, T64, T64, T64),
@@ -3386,11 +3383,7 @@ const JitDirectFn jit_direct_fns[] = {
     E2(int8_avg_accum, jit_int8_avg_accum, T64, T64, T64),
 
     /* ================================================================
-     * TIER 2: Pass-by-reference operators — deferred (jit_fn = NULL)
-     *
-     * These are listed for the lookup infrastructure. When Part 2
-     * (LLVM IR codegen) is implemented, native implementations will
-     * be auto-generated for these entries.
+     * TIER 2: Pass-by-reference operators.
      * ================================================================ */
 
     /* ---- interval comparison ---- */
@@ -3444,15 +3437,6 @@ const JitDirectFn jit_direct_fns[] = {
     /* textlen, textoctetlen, text_starts_with moved to implemented section above */
 
 /* ---- numeric comparison + arithmetic ---- */
-#ifdef PG_JITTER_HAVE_TIER2
-    E2(numeric_eq, jit_numeric_eq_precompiled, T32, T64, T64),
-    E2(numeric_ne, jit_numeric_ne_precompiled, T32, T64, T64),
-    E2(numeric_lt, jit_numeric_lt_precompiled, T32, T64, T64),
-    E2(numeric_le, jit_numeric_le_precompiled, T32, T64, T64),
-    E2(numeric_gt, jit_numeric_gt_precompiled, T32, T64, T64),
-    E2(numeric_ge, jit_numeric_ge_precompiled, T32, T64, T64),
-    E2(numeric_cmp, jit_numeric_cmp_precompiled, T32, T64, T64),
-#else
     E2(numeric_eq, jit_numeric_eq, T32, T64, T64),
     E2(numeric_ne, jit_numeric_ne, T32, T64, T64),
     E2(numeric_lt, jit_numeric_lt, T32, T64, T64),
@@ -3460,14 +3444,11 @@ const JitDirectFn jit_direct_fns[] = {
     E2(numeric_gt, jit_numeric_gt, T32, T64, T64),
     E2(numeric_ge, jit_numeric_ge, T32, T64, T64),
     E2(numeric_cmp, jit_numeric_cmp, T32, T64, T64),
-#endif
     E2(numeric_larger, jit_numeric_larger, T64, T64, T64),
     E2(numeric_smaller, jit_numeric_smaller, T64, T64, T64),
-#ifdef PG_JITTER_HAVE_TIER2
-    E1(hash_numeric, jit_hash_numeric_precompiled, T32, T64),
+    E1(hash_numeric, jit_hash_numeric_wrapper, T32, T64),
     E1(numeric_abs, jit_numeric_abs, T64, T64),
     E1(numeric_uminus, jit_numeric_uminus, T64, T64),
-#endif
     /*
      * Use PostgreSQL's Numeric operators for arithmetic. The handwritten
      * short-numeric fast path above is not exact for all weight/dscale
@@ -3478,19 +3459,10 @@ const JitDirectFn jit_direct_fns[] = {
     E2(numeric_mul, jit_numeric_mul_wrapper, T64, T64, T64),
 
 /* ---- uuid comparison ---- */
-#ifdef PG_JITTER_HAVE_TIER2
-    E2(uuid_eq, jit_uuid_eq_precompiled, T32, T64, T64),
-#else
-#endif
-#ifdef PG_JITTER_HAVE_TIER2
-    E2(uuid_lt, jit_uuid_lt_precompiled, T32, T64, T64),
-#else
-#endif
-#ifdef PG_JITTER_HAVE_TIER2
-    E2(uuid_cmp, jit_uuid_cmp_precompiled, T32, T64, T64),
-    E1(uuid_hash, jit_uuid_hash_precompiled, T32, T64),
-#else
-#endif
+    E2(uuid_eq, jit_uuid_eq_wrapper, T32, T64, T64),
+    E2(uuid_lt, jit_uuid_lt_wrapper, T32, T64, T64),
+    E2(uuid_cmp, jit_uuid_cmp_wrapper, T32, T64, T64),
+    E1(uuid_hash, jit_uuid_hash_wrapper, T32, T64),
 
     /* ---- jsonb comparison + operators ---- */
 
@@ -3597,6 +3569,10 @@ const JitDirectFn *jit_find_direct_fn(PGFunction pg_fn) {
 #undef E0
 #undef E1
 #undef E2
+#undef EI1
 #undef EI2
+#undef EC1
+#undef EC2
+#undef EIC2
 #undef DEFERRED
 #undef DEF_CMP

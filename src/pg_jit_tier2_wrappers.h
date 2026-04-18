@@ -1,12 +1,9 @@
 /*
- * pg_jit_tier2_wrappers.h — C wrapper functions for Tier 2 pass-by-ref PG operations
+ * pg_jit_tier2_wrappers.h — C wrapper functions for pass-by-ref PG operations
  *
  * These wrappers call PG built-in functions via DirectFunctionCall, bypassing
- * the need for LLVM bitcode linking. All three JIT backends (sljit, asmjit, mir)
- * can call these directly as regular C functions.
- *
- * When LLVM Tier 2 is available (PG_JITTER_HAVE_TIER2), the LLVM-optimized
- * versions override these for better performance (PG function bodies inlined).
+ * the full fmgr call setup done by expression evaluation. All three JIT
+ * backends call these directly as regular C functions.
  *
  * Args/returns use the same convention as pg_jit_funcs.h:
  *   - Pass-by-ref args passed as int64 (Datum / pointer)

@@ -229,7 +229,7 @@ run_query "Hourly_pattern" \
        ELSE 'evening' END AS shift,
   channel,
   count(*) AS tickets,
-  round(avg(ts - '2024-01-01'::timestamptz), 0) AS avg_offset,
+  round(avg(extract(epoch FROM (ts - '2024-01-01'::timestamptz))), 0) AS avg_offset_seconds,
   round(avg(resolution_mins), 1) AS avg_resolve,
   round(avg(satisfaction::numeric), 2) AS csat
 FROM interactions

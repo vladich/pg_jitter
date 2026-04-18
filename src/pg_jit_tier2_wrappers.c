@@ -1,16 +1,12 @@
 /*
- * pg_jit_tier2_wrappers.c — C wrapper functions for Tier 2 pass-by-ref PG operations
+ * pg_jit_tier2_wrappers.c — C wrapper functions for pass-by-ref PG operations
  *
  * Each wrapper calls the corresponding PG built-in function via
  * DirectFunctionCall, converting between native arg/return types and
  * the V1 fcinfo calling convention.
  *
- * These are compiled directly into each backend's shared library,
- * requiring no external dependencies (no LLVM, no PG bitcode).
- * All three JIT backends call these as regular C functions.
- *
- * Performance note: These have ~10ns overhead vs ~3ns for LLVM-inlined
- * Tier 2 wrappers, but are always available on any platform.
+ * These are compiled directly into each backend's shared library and require
+ * no external compiler toolchain or PostgreSQL bitcode.
  */
 
 #include "postgres.h"
@@ -109,10 +105,9 @@ jit_hash_numeric_wrapper(int64 a)
  * interval comparison (3 functions)
  *
  * Note: interval comparison is already natively implemented in
- * pg_jit_funcs.c as Tier 1 (using INT128). These wrappers are
- * provided for consistency with the LLVM Tier 2 pipeline but
- * should rarely be reached since the lookup table already has
- * native jit_fn pointers for interval_eq/lt/cmp.
+ * pg_jit_funcs.c using INT128. These wrappers are kept for direct-call
+ * fallback use, but should rarely be reached since the lookup table already
+ * has native jit_fn pointers for interval_eq/lt/cmp.
  * ================================================================ */
 
 int32

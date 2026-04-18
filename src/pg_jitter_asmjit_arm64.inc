@@ -1713,8 +1713,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.strb(tmp1.w(), a64::ptr(tmp2));
 					}
 				}
-				else if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD
-					&& dfn->inline_op <= JIT_INLINE_INT8_GE)
+				else if (dfn &&
+					((dfn->inline_op >= JIT_INLINE_INT4_ADD
+					  && dfn->inline_op <= JIT_INLINE_INT8_GE)
+					 || dfn->inline_op == JIT_INLINE_BOOL_CMP3
+					 || dfn->inline_op == JIT_INLINE_INT8_CMP3))
 				{
 					/*
 					 * TIER 0 — INLINE: emit int32/int64 ops as native
@@ -1949,6 +1952,20 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.cmp(a0, a1);
 						cc.cset(tmp1, a64::CondCode::kGE);
 						break;
+					/* ---- three-way comparison ---- */
+					case JIT_INLINE_BOOL_CMP3:
+						cc.cmp(a0, 0);
+						cc.cset(tmp1, a64::CondCode::kNE);
+						cc.cmp(a1, 0);
+						cc.cset(tmp2, a64::CondCode::kNE);
+						cc.sub(tmp1, tmp1, tmp2);
+						break;
+					case JIT_INLINE_INT8_CMP3:
+						cc.cmp(a0, a1);
+						cc.cset(tmp1, a64::CondCode::kGT);
+						cc.cset(tmp2, a64::CondCode::kLT);
+						cc.sub(tmp1, tmp1, tmp2);
+						break;
 					default:
 						Assert(false); /* all inline ops handled above */
 						break;
@@ -1973,27 +1990,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						cc.strb(tmp1.w(), a64::ptr(tmp2));
 					}
 				}
-				else if (dfn && (dfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-						|| (!asmjit_shared_code_mode &&
-							dfn->jit_fn_name &&
-							mir_find_precompiled_fn(dfn->jit_fn_name))
-#endif
-						))
+				else if (dfn && dfn->jit_fn)
 				{
-					/*
-					 * Direct native call — either from dfn->jit_fn or
-					 * MIR-precompiled function pointer.
-					 *
-					 * Skip MIR-precompiled in shared mode: blob addresses
-					 * are in separately mmap'd memory, outside the ±512KB
-					 * dylib relocation range.
-					 */
+					/* Direct native call. */
 					void *call_target = dfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!call_target && !asmjit_shared_code_mode)
-						call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
-#endif
 					/* Load fcinfo once (steps-relative), then load all args from offsets */
 					a64::Gp args[4];
 					a64::Gp fci_base = cc.new_gpx();
@@ -2968,27 +2968,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				/* Not null: call hash function (direct or fcinfo) */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (!asmjit_shared_code_mode &&
-						hdfn->jit_fn_name &&
-						mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-					))
+				if (hdfn && hdfn->jit_fn)
 				{
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-				{
-					void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target && !asmjit_shared_code_mode)
-						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
-				}
+					ASMJIT_MOV_FN(cc, hfn_reg, hdfn->jit_fn);
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -3048,27 +3035,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				/* Not null: call hash function (direct or fcinfo) */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (!asmjit_shared_code_mode &&
-						hdfn->jit_fn_name &&
-						mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-					))
+				if (hdfn && hdfn->jit_fn)
 				{
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-				{
-					void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target && !asmjit_shared_code_mode)
-						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
-				}
+					ASMJIT_MOV_FN(cc, hfn_reg, hdfn->jit_fn);
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -3156,27 +3130,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				/* Not null: call hash function (direct or fcinfo), XOR */
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (!asmjit_shared_code_mode &&
-						hdfn->jit_fn_name &&
-						mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-					))
+				if (hdfn && hdfn->jit_fn)
 				{
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-				{
-					void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target && !asmjit_shared_code_mode)
-						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
-				}
+					ASMJIT_MOV_FN(cc, hfn_reg, hdfn->jit_fn);
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());
@@ -3246,27 +3207,14 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				/* Call hash function (direct or fcinfo), XOR */
 				{
 				const JitDirectFn *hdfn = jit_find_direct_fn(op->d.hashdatum.fn_addr);
-				if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					|| (!asmjit_shared_code_mode &&
-						hdfn->jit_fn_name &&
-						mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-					))
+				if (hdfn && hdfn->jit_fn)
 				{
 					int64_t val_off =
 						(int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
 					a64::Gp hash_arg = cc.new_gpx();
 					cc.ldr(hash_arg, a64::ptr(fci_reg, val_off));
 					a64::Gp hfn_reg = cc.new_gpx();
-				{
-					void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-					if (!hash_target && !asmjit_shared_code_mode)
-						hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-					ASMJIT_MOV_FN(cc, hfn_reg, hash_target);
-				}
+					ASMJIT_MOV_FN(cc, hfn_reg, hdfn->jit_fn);
 					InvokeNode *hinv;
 					cc.invoke(Out(hinv), hfn_reg,
 							  FuncSignature::build<int64_t, int64_t>());

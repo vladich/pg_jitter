@@ -25,10 +25,6 @@ add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
 target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
 target_compile_options(sljit PRIVATE -w)
 
-# ---------- Pre-compilation infrastructure (LLVM / c2mir) ----------
-set(CMAKE_SOURCE_DIR "${ROOT}")
-include(${ROOT}/cmake/precompiled.cmake)
-
 # ---------- pg_jitter_asmjit ----------
 set(COMMON_SRC ${ROOT}/src/pg_jitter_common.c ${ROOT}/src/pg_jit_funcs.c
     ${ROOT}/src/pg_jit_tier2_wrappers.c)
@@ -39,7 +35,6 @@ add_library(pg_jitter_asmjit MODULE ${COMMON_SRC}
 target_include_directories(pg_jitter_asmjit PRIVATE ${PG_INCLUDEDIR_SERVER} ${ROOT}/src
                            ${SLJIT_DIR}/sljit_src)
 target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
-pg_jitter_add_precompiled(pg_jitter_asmjit)
 
 set_target_properties(pg_jitter_asmjit PROPERTIES PREFIX "" SUFFIX "${PG_MODULE_SUFFIX}"
     CXX_VISIBILITY_PRESET default C_VISIBILITY_PRESET default)

@@ -8,7 +8,6 @@
 #   ./build.sh                                          # build all backends
 #   ./build.sh sljit                                    # build sljit only
 #   ./build.sh --pg-config /opt/pg18/bin/pg_config all  # custom PG install
-#   ./build.sh sljit -DPG_JITTER_USE_LLVM=ON            # sljit with LLVM blobs
 #   ./build.sh mir -DMIR_DIR=/opt/mir                   # custom MIR path
 #
 # pg_config resolution (first match wins):

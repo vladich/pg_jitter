@@ -219,13 +219,6 @@ static int mir_patch_sentinels(void *code, Size code_size) {
 }
 
 /*
- * Pre-compiled MIR blob support — shared infrastructure from
- * pg_jit_mir_blobs.h. Provides mir_find_precompiled_fn() and
- * mir_load_precompiled_blobs().
- */
-#include "pg_jit_mir_blobs.h"
-
-/*
  * Per-query MIR state.
  *
  * Each PgJitterContext (= each query) gets its own MIR context.  When the
@@ -296,11 +289,6 @@ static MIR_context_t mir_get_or_create_ctx(PgJitterContext *jctx) {
 
     mir_current_state = st;
     mir_current_jctx = jctx;
-
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-    /* Precompiled blobs use their own mmap'd memory, load once globally */
-    mir_load_precompiled_blobs(NULL);
-#endif
 
     return st->ctx;
   }
@@ -1034,20 +1022,6 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_arg1_types[i] =
             (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-      else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name &&
-               mir_find_precompiled_fn(dfn->jit_fn_name)) {
-        /* Use MIR-precompiled function pointer (skip in shared mode:
-         * blob addresses are in separate mmap, outside relocation range) */
-        char name[32];
-        snprintf(name, sizeof(name), "dfn_%d", i);
-        step_direct_imports[i] = MIR_new_import(ctx, name);
-        step_direct_ret_types[i] = dfn->ret_type;
-        step_direct_arg0_types[i] = dfn->arg_types[0];
-        step_direct_arg1_types[i] =
-            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
-      }
-#endif
       else {
         char name[32];
         snprintf(name, sizeof(name), "fn_%d", i);
@@ -1070,18 +1044,6 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_arg1_types[i] =
             (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-      else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name &&
-               mir_find_precompiled_fn(dfn->jit_fn_name)) {
-        char name[32];
-        snprintf(name, sizeof(name), "dhfn_%d", i);
-        step_direct_imports[i] = MIR_new_import(ctx, name);
-        step_direct_ret_types[i] = dfn->ret_type;
-        step_direct_arg0_types[i] = dfn->arg_types[0];
-        step_direct_arg1_types[i] =
-            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
-      }
-#endif
       else {
         char name[32];
         snprintf(name, sizeof(name), "fn_%d", i);
@@ -2347,8 +2309,11 @@ static bool mir_compile_expr(ExprState *state) {
                              MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp3, 0, 1),
                              MIR_new_int_op(ctx, 0)));
           }
-        } else if (dfn && dfn->inline_op >= JIT_INLINE_INT4_ADD &&
-            dfn->inline_op <= JIT_INLINE_INT8_GE) {
+        } else if (dfn &&
+            ((dfn->inline_op >= JIT_INLINE_INT4_ADD &&
+              dfn->inline_op <= JIT_INLINE_INT8_GE) ||
+             dfn->inline_op == JIT_INLINE_BOOL_CMP3 ||
+             dfn->inline_op == JIT_INLINE_INT8_CMP3)) {
           /*
            * TIER 0 — INLINE: emit the operation as MIR
            * instructions for int32/int64 ops.
@@ -2642,6 +2607,41 @@ static bool mir_compile_expr(ExprState *state) {
                 MIR_new_insn(ctx, MIR_GE, MIR_new_reg_op(ctx, r_ret),
                              MIR_new_reg_op(ctx, a0), MIR_new_reg_op(ctx, a1)));
             break;
+          /* ---- three-way comparison ---- */
+          case JIT_INLINE_BOOL_CMP3: {
+            MIR_reg_t cmp_rhs = mir_new_reg(ctx, f, MIR_T_I64, "cmp3_rhs");
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_NE, MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, a0), MIR_new_int_op(ctx, 0)));
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_NE, MIR_new_reg_op(ctx, cmp_rhs),
+                             MIR_new_reg_op(ctx, a1), MIR_new_int_op(ctx, 0)));
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_SUB, MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, cmp_rhs)));
+            break;
+          }
+          case JIT_INLINE_INT8_CMP3: {
+            MIR_reg_t cmp_rhs = mir_new_reg(ctx, f, MIR_T_I64, "cmp3_rhs");
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_GT, MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, a0), MIR_new_reg_op(ctx, a1)));
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_LT, MIR_new_reg_op(ctx, cmp_rhs),
+                             MIR_new_reg_op(ctx, a0), MIR_new_reg_op(ctx, a1)));
+            MIR_append_insn(
+                ctx, func_item,
+                MIR_new_insn(ctx, MIR_SUB, MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, r_ret),
+                             MIR_new_reg_op(ctx, cmp_rhs)));
+            break;
+          }
           default:
             Assert(false);
             break;
@@ -2664,9 +2664,8 @@ static bool mir_compile_expr(ExprState *state) {
                            MIR_new_int_op(ctx, 0)));
         } else if (dfn && step_direct_imports[opno]) {
           /*
-           * Direct native call — either from dfn->jit_fn or
-           * MIR-precompiled function pointer.  Match arg types
-           * to the actual C signature to avoid ABI mismatch on ARM64.
+           * Direct native call. Match arg types to the actual C signature
+           * to avoid ABI mismatch on ARM64.
            */
           /* Load fcinfo once, then load all args from offsets */
           MIR_reg_t r_args[4];
@@ -9088,13 +9087,6 @@ static bool mir_compile_expr(ExprState *state) {
           snprintf(name, sizeof(name), "dhfn_%d", i);
           if (dfn && dfn->jit_fn)
             MIR_load_external(ctx, name, mir_extern_addr(dfn->jit_fn));
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-          else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name) {
-            void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
-            if (fn)
-              MIR_load_external(ctx, name, fn);
-          }
-#endif
         } else
 #endif /* HAVE_EEOP_HASHDATUM */
           if (opc >= EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL &&
@@ -9132,13 +9124,6 @@ static bool mir_compile_expr(ExprState *state) {
             snprintf(name, sizeof(name), "dfn_%d", i);
             if (dfn && dfn->jit_fn)
               MIR_load_external(ctx, name, mir_extern_addr(dfn->jit_fn));
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-            else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name) {
-              void *fn = mir_find_precompiled_fn(dfn->jit_fn_name);
-              if (fn)
-                MIR_load_external(ctx, name, fn);
-            }
-#endif
           }
       }
     }

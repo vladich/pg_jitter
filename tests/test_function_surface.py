@@ -8,8 +8,9 @@ SQL once with jit=off and once with jit=on for the selected backend, then
 compares a stable digest of the result rows.
 
 The manifest also records which jit_direct_fns entries each case is intended to
-cover.  A coverage check against src/pg_jit_funcs.c makes new direct entries
-visible instead of silently leaving them untested.
+cover.  A coverage check against src/pg_jit_funcs.c fails both when new direct
+entries are added without tests and when existing entries disappear from the
+fast path unexpectedly.
 """
 
 from __future__ import annotations
@@ -813,9 +814,12 @@ def extract_direct_fns(project_dir: Path, pg_version_num: int) -> set[str]:
     return {match.group(1) for match in pattern.finditer(active_body)}
 
 
-def manifest_coverage() -> set[str]:
+def manifest_coverage(psql: Psql) -> set[str]:
     covered: set[str] = set()
     for case in CASES:
+        missing = [req for req in case.requires if not regprocedure_exists(psql, req)]
+        if missing:
+            continue
         covered.update(case.covers)
     return covered
 
@@ -874,7 +878,7 @@ def main() -> int:
 
     project_dir = Path(args.project_dir)
     direct_fns = extract_direct_fns(project_dir, pg_version_num)
-    declared = manifest_coverage()
+    declared = manifest_coverage(psql)
     missing_from_manifest = sorted(direct_fns - declared)
     extra_in_manifest = sorted(declared - direct_fns)
 
@@ -885,11 +889,12 @@ def main() -> int:
             print(f"  {name}")
         failures += 1
     if extra_in_manifest:
-        print("NOTE: manifest names not present in current direct table:")
+        print("FAIL: manifest names not present in current direct table:")
         for name in extra_in_manifest:
             print(f"  {name}")
+        failures += 1
 
-    if missing_from_manifest and not args.no_coverage_check:
+    if (missing_from_manifest or extra_in_manifest) and not args.no_coverage_check:
         return failures
 
     psql.run(SETUP_SQL)

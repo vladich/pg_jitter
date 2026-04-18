@@ -62,15 +62,6 @@ typedef struct {
 
 #include <math.h> /* INFINITY */
 
-/* W^X and I-cache support for code patching (precompiled blobs) */
-#if defined(__APPLE__) && defined(__aarch64__)
-#include <libkern/OSCacheControl.h> /* sys_icache_invalidate */
-#include <pthread.h>
-#endif
-
-/* MIR precompiled blob support (shared infrastructure) */
-#include "pg_jit_mir_blobs.h"
-
 PG_MODULE_MAGIC_EXT(.name = "pg_jitter_sljit", );
 
 /* GUC enum options for pg_jitter.parallel_mode */
@@ -2308,8 +2299,8 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     return true;
   }
 
-  case JIT_INLINE_FLOAT8_GE: {
-    struct sljit_jump *j_nan, *j_done;
+	  case JIT_INLINE_FLOAT8_GE: {
+	    struct sljit_jump *j_nan, *j_done;
 
     sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
     sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR1, SLJIT_R1);
@@ -2325,12 +2316,32 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_fop1(C, SLJIT_CMP_F64 | SLJIT_SET_UNORDERED, SLJIT_FR0, 0,
                     SLJIT_FR0, 0);
     sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_UNORDERED);
-    sljit_set_label(j_done, sljit_emit_label(C));
-    return true;
-  }
+	    sljit_set_label(j_done, sljit_emit_label(C));
+	    return true;
+	  }
 
-  /*
-   * ---- hash_bytes_uint32 inlined (Bob Jenkins final()) ----
+  case JIT_INLINE_BOOL_CMP3:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_IMM, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_NOT_EQUAL);
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R1, 0, SLJIT_IMM, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_NOT_EQUAL);
+    sljit_emit_op2(C, SLJIT_SUB32, SLJIT_R0, 0, SLJIT_R2, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
+    return true;
+
+  case JIT_INLINE_INT8_CMP3:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_SIG_GREATER, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_SIG_GREATER);
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_SIG_LESS, SLJIT_R0, 0, SLJIT_R1,
+                    0);
+    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_SIG_LESS);
+    sljit_emit_op2(C, SLJIT_SUB32, SLJIT_R0, 0, SLJIT_R2, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
+    return true;
+
+	  /*
+	   * ---- hash_bytes_uint32 inlined (Bob Jenkins final()) ----
    *
    * hash_bytes_uint32(k):
    *   a = b = c = 0x9e3779b9 + sizeof(uint32) + 3923095
@@ -2736,254 +2747,6 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
 }
 
-/*
- * Pre-compiled inline blob support.
- *
- * When PG_JITTER_HAVE_PRECOMPILED is defined, we can emit clang-optimized
- * native code instead of hand-written sljit instruction sequences for
- * Tier 1 functions.
- *
- * The approach:
- * 1. Load args into R0, R1 from fcinfo (same as hand-written path)
- * 2. Copy pre-compiled instruction bytes via sljit_emit_op_custom()
- * 3. Patch the `ret` instruction to a forward branch (skip error path)
- * 4. After sljit_generate_code(), fix up BL/CALL relocations
- */
-#if defined(PG_JITTER_HAVE_PRECOMPILED) ||                                     \
-    defined(PG_JITTER_HAVE_MIR_PRECOMPILED)
-#define PG_JITTER_HAVE_INLINE_BLOBS
-#endif
-
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-
-/* Maximum pending relocations across all precompiled blobs in one expression */
-#define MAX_PRECOMPILED_RELOCS 256
-
-/*
- * Pending relocation: tracks a BL/CALL instruction in a precompiled blob
- * that needs post-generation patching. Uses sljit labels for reliable
- * address resolution instead of raw byte offsets.
- */
-typedef struct PendingReloc {
-  struct sljit_label *blob_label; /* label at start of blob in code stream */
-  uint16_t offset_in_blob;        /* byte offset of BL/CALL within blob */
-  uint8_t type;                   /* RELOC_* type */
-  const char *symbol;             /* symbol name to resolve */
-} PendingReloc;
-
-/*
- * Map a symbol name to its runtime address.
- * All 7 BRANCH26 relocation targets across the 197 inlineable blobs:
- *   - 6 error handlers (never return, used by 70 functions)
- *   - hash_bytes_uint32 (used by 6 hash functions)
- */
-static void *resolve_precompiled_symbol(const char *symbol) {
-  /* Error handlers — 6 symbols, 70 functions */
-  if (strcmp(symbol, "jit_error_int4_overflow") == 0)
-    return (void *)jit_error_int4_overflow;
-  if (strcmp(symbol, "jit_error_int8_overflow") == 0)
-    return (void *)jit_error_int8_overflow;
-  if (strcmp(symbol, "jit_error_division_by_zero") == 0)
-    return (void *)jit_error_division_by_zero;
-  if (strcmp(symbol, "jit_error_int2_overflow") == 0)
-    return (void *)jit_error_int2_overflow;
-  if (strcmp(symbol, "jit_error_float_overflow") == 0)
-    return (void *)jit_error_float_overflow;
-  if (strcmp(symbol, "jit_error_float_underflow") == 0)
-    return (void *)jit_error_float_underflow;
-  /* Utility — hash_bytes_uint32 from PG's common/hashfn.h */
-  if (strcmp(symbol, "hash_bytes_uint32") == 0)
-    return (void *)hash_bytes_uint32;
-  /* Unknown symbol — can't resolve, blob won't be used */
-  return NULL;
-}
-
-/*
- * Emit a pre-compiled inline blob into the sljit code stream.
- *
- * Copies the code bytes, patching the `ret` instruction to a forward branch
- * that skips the error-handler tail. BL/CALL relocations are recorded for
- * post-generation fixup using sljit labels for reliable address tracking.
- *
- * Args should already be in R0, R1. Result will be in R0 (per ABI).
- */
-static bool emit_precompiled_inline(struct sljit_compiler *C,
-                                    const PrecompiledInline *pi,
-                                    PendingReloc *relocs, int *nrelocs) {
-  uint8_t buf[512];
-  struct sljit_label *blob_label;
-
-  if (!pi || pi->code_len == 0 || pi->code_len > sizeof(buf))
-    return false;
-
-#if defined(__x86_64__) || defined(_M_X64)
-  /*
-   * x86_64 blobs with cold error tails branch to the byte after the normal
-   * RET. Replacing the 1-byte RET with a 5-byte JMP overwrites that branch
-   * target, so the error path jumps into the JMP displacement. Only emit
-   * leaf blobs whose RET is the final byte; fall through to the normal
-   * sljit/direct-call paths for anything with a tail or relocation.
-   */
-  if (pi->ret_offset != (int)pi->code_len - 1 || pi->n_relocs != 0)
-    return false;
-#endif
-
-  memcpy(buf, pi->code, pi->code_len);
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-  /*
-   * ARM64: Patch ret (0xd65f03c0) → unconditional branch past the
-   * error-handler tail. The error handler starts after ret and includes
-   * frame setup + BL to the error function.
-   *
-   * For jit_int4pl (24 bytes): ret is at offset 8, code_len=24
-   *   remaining = (24 - 8) / 4 = 4 instructions to skip
-   *   B +4 jumps 4*4=16 bytes forward from PC, landing at offset 24
-   *   (just past the blob). Correct.
-   */
-  if (pi->ret_offset >= 0) {
-    uint32_t remaining = (pi->code_len - pi->ret_offset) / 4;
-    uint32_t *ret_instr = (uint32_t *)(buf + pi->ret_offset);
-    /* B (unconditional branch): 0x14000000 | imm26 */
-    *ret_instr = 0x14000000 | (remaining & 0x3FFFFFF);
-  }
-#elif defined(__x86_64__) || defined(_M_X64)
-  /*
-   * x86_64: Patch ret (0xC3) → JMP forward past the error-handler
-   * tail. x86_64 JMP near: 0xE9 + 32-bit displacement.
-   * The displacement is relative to the end of the 5-byte JMP instruction.
-   *
-   * If the 5-byte JMP does not fit within code_len (remaining < 0),
-   * the blob has no error-handler tail — just stop emitting before
-   * the ret and let execution fall through to the next sljit instruction.
-   */
-  {
-    int emit_len = pi->code_len;
-    if (pi->ret_offset >= 0) {
-      int remaining = pi->code_len - pi->ret_offset - 5;
-      if (remaining >= 0) {
-        buf[pi->ret_offset] = 0xE9; /* JMP near */
-        int32_t disp = remaining;
-        memcpy(buf + pi->ret_offset + 1, &disp, 4);
-      } else {
-        /* No room for JMP: truncate at ret, fall through */
-        emit_len = pi->ret_offset;
-      }
-    }
-#else
-  return false;
-#endif
-
-  /*
-   * Place a label right before the blob so we can find its final
-   * address after sljit_generate_code(). This is the key to
-   * reliable relocation: sljit resolves label addresses during
-   * code generation, so we get the exact executable address.
-   */
-  blob_label = sljit_emit_label(C);
-
-  /* Emit the raw instruction bytes */
-#if defined(__aarch64__) || defined(_M_ARM64)
-  for (int off = 0; off < pi->code_len; off += 4) {
-    sljit_emit_op_custom(C, buf + off, 4);
-  }
-#elif defined(__x86_64__) || defined(_M_X64)
-  /*
-   * x86_64: Variable-length instructions. Emit individual bytes.
-   * sljit_emit_op_custom() on x86 accepts 1..16 byte instructions.
-   * We emit up to emit_len bytes (truncated at ret when no JMP fits).
-   */
-  for (int off = 0; off < emit_len; off++) {
-    sljit_emit_op_custom(C, buf + off, 1);
-  }
-  }  /* close emit_len block */
-#endif
-
-  /* Record BL/CALL relocations for post-generation fixup */
-  for (int i = 0; i < pi->n_relocs && *nrelocs < MAX_PRECOMPILED_RELOCS; i++) {
-    relocs[*nrelocs].blob_label = blob_label;
-    relocs[*nrelocs].offset_in_blob = pi->relocs[i].offset;
-    relocs[*nrelocs].type = pi->relocs[i].type;
-    relocs[*nrelocs].symbol = pi->relocs[i].symbol;
-    (*nrelocs)++;
-  }
-
-  return true;
-}
-
-/*
- * After sljit_generate_code(), patch all pending BL/CALL relocations
- * in pre-compiled blobs to point to the actual runtime addresses.
- *
- * Uses sljit label addresses for exact blob positioning. Handles W^X
- * by toggling write protection on macOS ARM64 (MAP_JIT memory).
- */
-static void fixup_precompiled_relocs(void *code, sljit_uw code_size,
-                                     PendingReloc *relocs, int nrelocs) {
-  if (nrelocs == 0)
-    return;
-
-#if defined(__APPLE__) && defined(__aarch64__)
-  /* Toggle JIT memory to writable mode (per-thread on Apple Silicon) */
-  pthread_jit_write_protect_np(0);
-#endif
-
-  for (int i = 0; i < nrelocs; i++) {
-    void *target = resolve_precompiled_symbol(relocs[i].symbol);
-    if (!target)
-      continue;
-
-    /* Get the blob's final address from the sljit label */
-    sljit_uw blob_addr = sljit_get_label_addr(relocs[i].blob_label);
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-    if (relocs[i].type == RELOC_BRANCH26) {
-      uint32_t *instr = (uint32_t *)(blob_addr + relocs[i].offset_in_blob);
-      sljit_sw pc_rel = ((sljit_sw)target - (sljit_sw)instr) >> 2;
-      *instr = (*instr & ~0x3FFFFFF) | ((uint32_t)pc_rel & 0x3FFFFFF);
-    } else if (relocs[i].type == RELOC_MOVZ_MOVK64) {
-      /*
-       * Patch MOVZ+3×MOVK sequence (4 instructions, 16 bytes).
-       * Each instruction has a 16-bit immediate in bits [20:5].
-       */
-      uint32_t *insn = (uint32_t *)(blob_addr + relocs[i].offset_in_blob);
-      uintptr_t addr = (uintptr_t)target;
-      insn[0] =
-          (insn[0] & ~(0xFFFFU << 5)) | (((uint32_t)(addr & 0xFFFF)) << 5);
-      insn[1] = (insn[1] & ~(0xFFFFU << 5)) |
-                (((uint32_t)((addr >> 16) & 0xFFFF)) << 5);
-      insn[2] = (insn[2] & ~(0xFFFFU << 5)) |
-                (((uint32_t)((addr >> 32) & 0xFFFF)) << 5);
-      insn[3] = (insn[3] & ~(0xFFFFU << 5)) |
-                (((uint32_t)((addr >> 48) & 0xFFFF)) << 5);
-    }
-#elif defined(__x86_64__) || defined(_M_X64)
-    if (relocs[i].type == RELOC_PC32) {
-      uint8_t *instr_addr = (uint8_t *)blob_addr + relocs[i].offset_in_blob;
-      /* x86 CALL E8: displacement is from end of 5-byte instruction */
-      int32_t *disp = (int32_t *)(instr_addr + 1);
-      *disp = (int32_t)((sljit_sw)target - (sljit_sw)(instr_addr + 5));
-    } else if (relocs[i].type == RELOC_ABS64) {
-      /* Patch 8-byte absolute address in const pool */
-      uintptr_t addr = (uintptr_t)target;
-      memcpy((uint8_t *)blob_addr + relocs[i].offset_in_blob, &addr, 8);
-    }
-#endif
-  }
-
-#if defined(__APPLE__) && defined(__aarch64__)
-  /* Toggle back to executable mode */
-  pthread_jit_write_protect_np(1);
-  /* Flush instruction cache for the entire code region */
-  sys_icache_invalidate((void *)code, (size_t)code_size);
-#elif defined(__aarch64__)
-  /* Non-Apple ARM64: use GCC builtin */
-  __builtin___clear_cache((char *)code, (char *)code + code_size);
-#endif
-}
-
-#endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-
 static bool sljit_compile_expr(ExprState *state) {
   PgJitterContext *ctx;
   struct sljit_compiler *C;
@@ -3013,12 +2776,6 @@ static bool sljit_compile_expr(ExprState *state) {
     int target;
   } *pending_jumps;
   int npending = 0;
-
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-  /* Pending relocations for pre-compiled inline blobs */
-  PendingReloc precompiled_relocs[MAX_PRECOMPILED_RELOCS];
-  int n_precompiled_relocs = 0;
-#endif
 
   /* Expression identity for shared code in parallel queries */
   int shared_node_id = 0;
@@ -3133,11 +2890,6 @@ static bool sljit_compile_expr(ExprState *state) {
   }
 
   /* JIT is active */
-
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-  /* Lazy-load MIR precompiled blobs on first compile */
-  mir_load_precompiled_blobs(NULL);
-#endif
 
   ctx = pg_jitter_get_context(state);
 
@@ -4361,116 +4113,7 @@ static bool sljit_compile_expr(ExprState *state) {
        */
       {
         const JitDirectFn *dfn = jit_find_direct_fn(op->d.func.fn_addr);
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-        bool used_precompiled = false;
-#endif
-
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-        /*
-         * PRECOMPILED PATH: try to emit optimized native code
-         * for ANY Tier 1 function that has a precompiled blob.
-         * Covers all 192+ functions (int, float, bool, date, ts, oid,
-         * hash, aggregates) — not just the 20 with inline_op tags.
-         *
-         * Skip functions whose blobs have no ret (tail calls to
-         * hash_bytes_uint32) — those 5 hash functions fall through
-         * to the direct-call path.
-         */
-        if (dfn && dfn->jit_fn_name) {
-          const PrecompiledInline *pi;
-#ifdef PG_JITTER_HAVE_PRECOMPILED
-          pi = jit_find_precompiled(dfn->jit_fn_name);
-#elif defined(PG_JITTER_HAVE_MIR_PRECOMPILED)
-          pi = mir_find_precompiled_blob(dfn->jit_fn_name);
-#endif
-
-          /*
-           * Only inline blobs that:
-           * - Have a ret instruction (skip tail-call stubs)
-           * - Are ≤48 bytes (avoid I-cache bloat from large
-           *   float/div blobs; those fall through to direct call)
-           * - On x86_64, are leaf blobs ending at RET. Blobs with cold
-           *   error tails are unsafe because the RET patch overwrites
-           *   the branch target for the tail.
-           */
-          if (pi && pi->ret_offset >= 0 &&
-              pi->code_len <= 48
-#if defined(__x86_64__) || defined(_M_X64)
-              && pi->ret_offset == (int)pi->code_len - 1 &&
-              pi->n_relocs == 0
-              /*
-               * x86_64: sljit R0..R3 != SysV ABI arg regs.
-               * We can map arg0→rdi(R2), arg1→rsi(R1), but
-               * arg2 needs rdx which is sljit's TMP_REG1.
-               * Limit inline blobs to ≤2 args; 3+ use call.
-               */
-              && dfn->nargs <= 2
-#endif
-          ) {
-            /*
-             * Load args from fcinfo→args[].value into ABI
-             * argument registers for the pre-compiled blob.
-             *
-             * ARM64: SLJIT_R0..R3 = x0..x3 = AAPCS64 args.
-             * x86_64: SLJIT_R0=rax, R1=rsi, R2=rdi, R3=rcx
-             *   but SysV ABI is arg0=rdi(R2), arg1=rsi(R1).
-             *   Load in reverse so base_reg (R2=rdi) is
-             *   clobbered last.
-             */
-            if (dfn->nargs > 0) {
-              int base_reg;
-              if (r1_has_fcinfo) {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_R1, 0);
-                base_reg = SLJIT_R2;
-              } else {
-                emit_load_step_field(C, opno,
-                                     offsetof(ExprEvalStep, d.func.fcinfo_data),
-                                     SLJIT_R2);
-                base_reg = SLJIT_R2;
-              }
-#if defined(__x86_64__) || defined(_M_X64)
-              {
-                /*
-                 * SysV x86_64: arg0=rdi(SLJIT_R2),
-                 * arg1=rsi(SLJIT_R1). Load in reverse
-                 * order to avoid clobbering base_reg
-                 * (SLJIT_R2 = rdi) before all args
-                 * are read.
-                 */
-                static const int abi_reg[] = {
-                    SLJIT_R2, /* arg0 → rdi */
-                    SLJIT_R1, /* arg1 → rsi */
-                };
-                for (int i = dfn->nargs - 1; i >= 0; i--) {
-                  sljit_sw val_off =
-                      (sljit_sw)&fcinfo->args[i].value - (sljit_sw)fcinfo;
-                  sljit_emit_op1(C, SLJIT_MOV, abi_reg[i], 0,
-                                 SLJIT_MEM1(base_reg), val_off);
-                }
-              }
-#else
-              for (int i = 0; i < dfn->nargs && i < 4; i++) {
-                sljit_sw val_off =
-                    (sljit_sw)&fcinfo->args[i].value - (sljit_sw)fcinfo;
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0 + i, 0,
-                               SLJIT_MEM1(base_reg), val_off);
-              }
-#endif
-            }
-
-            used_precompiled = emit_precompiled_inline(
-                C, pi, precompiled_relocs, &n_precompiled_relocs);
-
-            if (used_precompiled) {
-              /* Store *op->resvalue = R0, *op->resnull = false */
-              emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
-            }
-          }
-        }
-
-        if (!used_precompiled) {
-#endif /* PG_JITTER_HAVE_INLINE_BLOBS */
-          if (sljit_inline_enabled &&
+        if (sljit_inline_enabled &&
               dfn && (dfn->inline_op == JIT_INLINE_TEXT_EQ ||
                       dfn->inline_op == JIT_INLINE_TEXT_NE)) {
             if (pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
@@ -4508,22 +4151,12 @@ static bool sljit_compile_expr(ExprState *state) {
               /* Inline not supported — fall back to direct call */
               goto sljit_funcexpr_v1_fallback;
             }
-          } else if (dfn && (dfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-                             || (dfn->jit_fn_name &&
-                                 mir_find_precompiled_fn(dfn->jit_fn_name))
-#endif
-                                 )) {
+          } else if (dfn && dfn->jit_fn) {
             /*
              * TIER 1 — DIRECT CALL: native unwrapped function.
-             * Uses dfn->jit_fn or MIR-precompiled function pointer.
              * If strict, R1 already holds fcinfo from null checks.
              */
             void *call_target = dfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-            if (!call_target)
-              call_target = mir_find_precompiled_fn(dfn->jit_fn_name);
-#endif
             {
               /*
                * Load PG args into R0..R(nargs-1), and optionally
@@ -5234,9 +4867,6 @@ static bool sljit_compile_expr(ExprState *state) {
               emit_store_resnull_reg(C, state, opno, op, SLJIT_R0);
             }
           } /* end V1 fallback / pcre2 */
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-        } /* end if (!used_precompiled) */
-#endif
       } /* end direct-call dispatch block */
 
       /* Fix up null-check jumps: emit null_path that sets resnull=true */
@@ -6773,24 +6403,12 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
         emit_inline_funcexpr(C, (JitInlineOp)hdfn->inline_op);
-      } else if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-                          || (hdfn->jit_fn_name &&
-                              mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-                              )) {
+      } else if (hdfn && hdfn->jit_fn) {
         /* Direct hash call: load arg from fcinfo->args[0].value */
         sljit_sw val_off = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
-        {
-          void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-          if (!hash_target)
-            hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-          EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
-        }
+        EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
       } else {
         /* Fallback: fcinfo path (R1 = fcinfo, use as R0 arg) */
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1),
@@ -6850,24 +6468,12 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
         emit_inline_funcexpr(C, (JitInlineOp)hdfn->inline_op);
-      } else if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-                          || (hdfn->jit_fn_name &&
-                              mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-                              )) {
+      } else if (hdfn && hdfn->jit_fn) {
         /* Direct hash call */
         sljit_sw val_off = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
-        {
-          void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-          if (!hash_target)
-            hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-          EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
-        }
+        EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
       } else {
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1),
                        offsetof(FunctionCallInfoBaseData, isnull), SLJIT_IMM,
@@ -6960,24 +6566,12 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
         emit_inline_funcexpr(C, (JitInlineOp)hdfn->inline_op);
-      } else if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-                          || (hdfn->jit_fn_name &&
-                              mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-                              )) {
+      } else if (hdfn && hdfn->jit_fn) {
         /* Direct hash call: reuse R1 for arg load */
         sljit_sw val_off = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
-        {
-          void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-          if (!hash_target)
-            hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-          EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
-        }
+        EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
       } else {
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1),
                        offsetof(FunctionCallInfoBaseData, isnull), SLJIT_IMM,
@@ -7068,24 +6662,12 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
         emit_inline_funcexpr(C, (JitInlineOp)hdfn->inline_op);
-      } else if (hdfn && (hdfn->jit_fn
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-                          || (hdfn->jit_fn_name &&
-                              mir_find_precompiled_fn(hdfn->jit_fn_name))
-#endif
-                              )) {
+      } else if (hdfn && hdfn->jit_fn) {
         /* Direct hash call: reuse R1 for arg load */
         sljit_sw val_off = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1),
                        val_off);
-        {
-          void *hash_target = hdfn->jit_fn;
-#ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
-          if (!hash_target)
-            hash_target = mir_find_precompiled_fn(hdfn->jit_fn_name);
-#endif
-          EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hash_target);
-        }
+        EMIT_ICALL(C, SLJIT_CALL, jit_sljit_call_type(hdfn), hdfn->jit_fn);
       } else {
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R1),
                        offsetof(FunctionCallInfoBaseData, isnull), SLJIT_IMM,
@@ -10047,15 +9629,6 @@ static bool sljit_compile_expr(ExprState *state) {
     INSTR_TIME_SET_CURRENT(emit_end);
     INSTR_TIME_ACCUM_DIFF(ctx->base.instr.emission_counter, emit_end,
                           emit_start);
-
-#ifdef PG_JITTER_HAVE_INLINE_BLOBS
-    /* Patch BL/CALL relocations in pre-compiled blobs.
-     * Uses sljit label addresses for reliable blob positioning,
-     * with W^X toggling on macOS ARM64. */
-    if (n_precompiled_relocs > 0)
-      fixup_precompiled_relocs(code, sljit_get_generated_code_size(C),
-                               precompiled_relocs, n_precompiled_relocs);
-#endif
 
     /*
      * Leader: store compiled code directly in DSM.

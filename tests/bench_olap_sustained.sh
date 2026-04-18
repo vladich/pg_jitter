@@ -94,6 +94,10 @@ cleanup() {
         "$PSQL" -p "$PGPORT" -d postgres -q -c \
             "ALTER SYSTEM SET jit_provider = '$ORIG_PROVIDER';" 2>/dev/null || true
     fi
+    if [ -n "$ORIG_SHARED_BUFFERS" ]; then
+        "$PSQL" -p "$PGPORT" -d postgres -q -c \
+            "ALTER SYSTEM SET shared_buffers = '$ORIG_SHARED_BUFFERS';" 2>/dev/null || true
+    fi
     "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1 || true
     "$PSQL" -p "$PGPORT" -d "$PGDB" -q -c "
         ALTER DATABASE $PGDB RESET jit;
