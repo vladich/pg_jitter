@@ -15,6 +15,9 @@
 
 #include "postgres.h"
 #include "pg_jitter_compat.h"
+
+#include <limits.h>
+
 #include "common/int.h"
 #include "common/int128.h"
 #include "common/hashfn.h"
@@ -75,6 +78,11 @@ pg_noinline void jit_error_float_underflow(void) {
                   errmsg("value out of range: underflow")));
 }
 
+pg_noinline void jit_error_char_overflow(void) {
+  ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                  errmsg("\"char\" out of range")));
+}
+
 /* ================================================================
  * TIER 1: int32 arithmetic (6 + 1 functions)
  * ================================================================ */
@@ -130,6 +138,14 @@ int32 jit_int4inc(int32 a) {
     jit_error_int4_overflow();
   return r;
 }
+
+int32 jit_int4um(int32 a) {
+  if (unlikely(a == PG_INT32_MIN))
+    jit_error_int4_overflow();
+  return -a;
+}
+
+int32 jit_int4up(int32 a) { return a; }
 
 /* ================================================================
  * TIER 1: int64 arithmetic (7 functions)
@@ -192,6 +208,14 @@ int64 jit_int8dec(int64 a) {
   return r;
 }
 
+int64 jit_int8um(int64 a) {
+  if (unlikely(a == PG_INT64_MIN))
+    jit_error_int8_overflow();
+  return -a;
+}
+
+int64 jit_int8up(int64 a) { return a; }
+
 /* ================================================================
  * TIER 1: int16 arithmetic (6 functions)
  * ================================================================ */
@@ -244,6 +268,15 @@ int32 jit_int2abs(int32 a32) {
     jit_error_int2_overflow();
   return (int32)((a < 0) ? -a : a);
 }
+
+int32 jit_int2um(int32 a32) {
+  int16 a = (int16)a32;
+  if (unlikely(a == PG_INT16_MIN))
+    jit_error_int2_overflow();
+  return (int32)(int16)-a;
+}
+
+int32 jit_int2up(int32 a32) { return (int32)(int16)a32; }
 
 /* ================================================================
  * TIER 1: int32 comparison (6 functions)
@@ -503,6 +536,8 @@ int64 jit_float8abs(int64 a) {
 
 int64 jit_float8um(int64 a) { return float8_to_datum(-datum_to_float8(a)); }
 
+int64 jit_float8up(int64 a) { return a; }
+
 /* ================================================================
  * TIER 1: float4 arithmetic (4 + 2 functions)
  * float4 stored in lower 32 bits of Datum. We pass as int64 (Datum).
@@ -550,6 +585,8 @@ int64 jit_float4abs(int64 a) {
 int64 jit_float4um(int64 a) {
   return (int64)Float4GetDatum(-DatumGetFloat4((Datum)a));
 }
+
+int64 jit_float4up(int64 a) { return a; }
 
 /* ================================================================
  * TIER 1: float comparison (12 functions)
@@ -657,6 +694,8 @@ int64 jit_float8smaller(int64 a, int64 b) {
 int64 jit_int48_cast(int32 a)  { return (int64)a; }
 int64 jit_int28_cast(int32 a)  { return (int64)(int16)a; }
 int32 jit_int24_cast(int32 a)  { return (int32)(int16)a; }
+int64 jit_oidtoi8(int32 a) { return (int64)(uint32)a; }
+int32 jit_xid8toxid(int64 a) { return (int32)(uint32)a; }
 
 /* int narrowing (range-checked) */
 int32 jit_int84_cast(int64 a)  {
@@ -690,6 +729,7 @@ int64 jit_dtof(int64 a) {
 int64 jit_i4tod(int32 a) { return float8_to_datum((float8)a); }
 int64 jit_i4tof(int32 a) { return (int64)Float4GetDatum((float4)a); }
 int64 jit_i8tod(int64 a) { return float8_to_datum((float8)a); }
+int64 jit_i8tof(int64 a) { return (int64)Float4GetDatum((float4)a); }
 int64 jit_i2tod(int32 a) { return float8_to_datum((float8)(int16)a); }
 int64 jit_i2tof(int32 a) { return (int64)Float4GetDatum((float4)(int16)a); }
 
@@ -709,6 +749,12 @@ int32 jit_ftoi4(int64 a) {
 int64 jit_dtoi8(int64 a) {
   float8 v = datum_to_float8(a);
   if (unlikely(isnan(v) || !FLOAT8_FITS_IN_INT64(v)))
+    jit_error_int8_overflow();
+  return (int64)rint(v);
+}
+int64 jit_ftoi8(int64 a) {
+  float4 v = DatumGetFloat4((Datum)a);
+  if (unlikely(isnan(v) || !FLOAT4_FITS_IN_INT64(v)))
     jit_error_int8_overflow();
   return (int64)rint(v);
 }
@@ -857,6 +903,105 @@ int64 jit_boolor_statefunc(int64 a, int64 b) {
   return (a != 0 || b != 0) ? 1 : 0;
 }
 
+int32 jit_bool_int4(int64 a) { return (a != 0) ? 1 : 0; }
+
+int32 jit_int4_bool(int32 a) { return (a != 0) ? 1 : 0; }
+
+int32 jit_chartoi4(int32 a) { return (int32)(int8)a; }
+
+int32 jit_i4tochar(int32 a) {
+  if (unlikely(a < SCHAR_MIN || a > SCHAR_MAX))
+    jit_error_char_overflow();
+  return (int32)(int8)a;
+}
+
+/* ================================================================
+ * TIER 1: small by-value system scalar comparisons
+ * ================================================================ */
+
+int32 jit_chareq(int32 a, int32 b) {
+  return ((uint8)a == (uint8)b) ? 1 : 0;
+}
+int32 jit_charne(int32 a, int32 b) {
+  return ((uint8)a != (uint8)b) ? 1 : 0;
+}
+int32 jit_charlt(int32 a, int32 b) {
+  return ((uint8)a < (uint8)b) ? 1 : 0;
+}
+int32 jit_charle(int32 a, int32 b) {
+  return ((uint8)a <= (uint8)b) ? 1 : 0;
+}
+int32 jit_chargt(int32 a, int32 b) {
+  return ((uint8)a > (uint8)b) ? 1 : 0;
+}
+int32 jit_charge(int32 a, int32 b) {
+  return ((uint8)a >= (uint8)b) ? 1 : 0;
+}
+
+int32 jit_xideq(int32 a, int32 b) {
+  return ((uint32)a == (uint32)b) ? 1 : 0;
+}
+int32 jit_xidneq(int32 a, int32 b) {
+  return ((uint32)a != (uint32)b) ? 1 : 0;
+}
+int32 jit_cideq(int32 a, int32 b) {
+  return ((uint32)a == (uint32)b) ? 1 : 0;
+}
+
+int32 jit_xid8eq(int64 a, int64 b) {
+  return ((uint64)a == (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8ne(int64 a, int64 b) {
+  return ((uint64)a != (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8lt(int64 a, int64 b) {
+  return ((uint64)a < (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8le(int64 a, int64 b) {
+  return ((uint64)a <= (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8gt(int64 a, int64 b) {
+  return ((uint64)a > (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8ge(int64 a, int64 b) {
+  return ((uint64)a >= (uint64)b) ? 1 : 0;
+}
+int32 jit_xid8cmp(int64 a, int64 b) {
+  uint64 ua = (uint64)a;
+  uint64 ub = (uint64)b;
+  return (ua > ub) - (ua < ub);
+}
+
+int32 jit_pg_lsn_eq(int64 a, int64 b) {
+  return ((uint64)a == (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_ne(int64 a, int64 b) {
+  return ((uint64)a != (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_lt(int64 a, int64 b) {
+  return ((uint64)a < (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_le(int64 a, int64 b) {
+  return ((uint64)a <= (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_gt(int64 a, int64 b) {
+  return ((uint64)a > (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_ge(int64 a, int64 b) {
+  return ((uint64)a >= (uint64)b) ? 1 : 0;
+}
+int32 jit_pg_lsn_cmp(int64 a, int64 b) {
+  uint64 ua = (uint64)a;
+  uint64 ub = (uint64)b;
+  return (ua > ub) - (ua < ub);
+}
+int64 jit_pg_lsn_larger(int64 a, int64 b) {
+  return ((uint64)a > (uint64)b) ? a : b;
+}
+int64 jit_pg_lsn_smaller(int64 a, int64 b) {
+  return ((uint64)a < (uint64)b) ? a : b;
+}
+
 /* ================================================================
  * TIER 1: timestamp/timestamptz comparison (14 functions)
  * Timestamp = int64 microseconds since 2000-01-01.
@@ -885,6 +1030,7 @@ int32 jit_timestamp_cmp(int64 a, int64 b) {
 /* timestamp min/max */
 int64 jit_timestamp_larger(int64 a, int64 b) { return (a >= b) ? a : b; }
 int64 jit_timestamp_smaller(int64 a, int64 b) { return (a <= b) ? a : b; }
+int32 jit_timestamp_finite(int64 ts) { return TIMESTAMP_NOT_FINITE(ts) ? 0 : 1; }
 #define jit_timestamptz_larger jit_timestamp_larger
 #define jit_timestamptz_smaller jit_timestamp_smaller
 
@@ -927,6 +1073,8 @@ int32 jit_date_mi(int32 a, int32 b) {
     jit_error_int4_overflow();
   return r;
 }
+
+int32 jit_date_finite(int32 date) { return DATE_NOT_FINITE(date) ? 0 : 1; }
 
 /* ================================================================
  * TIER 1: OID comparison (8 functions)
@@ -971,6 +1119,17 @@ int32 jit_hashbool(int64 a) {
 }
 
 int32 jit_hashdate(int32 a) { return (int32)hash_bytes_uint32((uint32)a); }
+
+int64 jit_hashint8extended(int64 val, int64 seed);
+
+int32 jit_time_hash(int64 a) { return (int32)jit_hashint8(a); }
+int64 jit_time_hash_extended(int64 a, int64 seed) {
+  return jit_hashint8extended(a, seed);
+}
+int32 jit_pg_lsn_hash(int64 a) { return (int32)jit_hashint8(a); }
+int64 jit_pg_lsn_hash_extended(int64 a, int64 seed) {
+  return jit_hashint8extended(a, seed);
+}
 
 /* timestamp_hash and timestamptz_hash just call hashint8 */
 #define jit_timestamp_hash jit_hashint8
@@ -2164,6 +2323,8 @@ int32 jit_time_le(int64 a, int64 b) { return a <= b; }
 int32 jit_time_gt(int64 a, int64 b) { return a > b; }
 int32 jit_time_ge(int64 a, int64 b) { return a >= b; }
 int32 jit_time_cmp(int64 a, int64 b) { return (a < b) ? -1 : (a > b) ? 1 : 0; }
+int64 jit_time_larger(int64 a, int64 b) { return (a > b) ? a : b; }
+int64 jit_time_smaller(int64 a, int64 b) { return (a < b) ? a : b; }
 
 /* ================================================================
  * TIER 1: Extended hash functions
@@ -2288,9 +2449,20 @@ int64 jit_float4_from_int2(int32 v) {
 /* ================================================================
  * TIER 3: Btree comparison functions (return -1, 0, 1)
  * ================================================================ */
+int32 jit_btboolcmp(int64 a, int64 b) { return (a != 0) - (b != 0); }
+int32 jit_btcharcmp(int32 a, int32 b) { return (int32)(uint8)a - (int32)(uint8)b; }
+int32 jit_btint2cmp(int32 a, int32 b) { return (int32)(int16)a - (int32)(int16)b; }
 int32 jit_btint4cmp(int32 a, int32 b) { return (a > b) - (a < b); }
 int32 jit_btint8cmp(int64 a, int64 b) { return (a > b) - (a < b); }
+int32 jit_btint24cmp(int32 a, int32 b) {
+  int32 la = (int32)(int16)a;
+  return (la > b) - (la < b);
+}
 int32 jit_btint42cmp(int32 a, int32 b) { int64 la = (int64)a, lb = (int64)(int16)b; return (la > lb) - (la < lb); }
+int32 jit_btint28cmp(int32 a, int64 b) {
+  int64 la = (int64)(int16)a;
+  return (la > b) - (la < b);
+}
 int32 jit_btint48cmp(int32 a, int64 b) { int64 la = (int64)a; return (la > b) - (la < b); }
 int32 jit_btint82cmp(int64 a, int32 b) { int64 lb = (int64)(int16)b; return (a > lb) - (a < lb); }
 int32 jit_btint84cmp(int64 a, int32 b) { int64 lb = (int64)b; return (a > lb) - (a < lb); }
@@ -2312,7 +2484,28 @@ int32 jit_btfloat84cmp(int64 a, int64 b) {
   double db = (double)fb;
   return (da > db) ? 1 : (da < db) ? -1 : 0;
 }
+int32 jit_btoidcmp(int32 a, int32 b) {
+  uint32 ua = (uint32)a;
+  uint32 ub = (uint32)b;
+  return (ua > ub) - (ua < ub);
+}
 int32 jit_date_cmp(int32 a, int32 b) { return (a > b) - (a < b); }
+
+int64 jit_int4range_subdiff(int32 a, int32 b) {
+  return float8_to_datum((float8)a - (float8)b);
+}
+int64 jit_int8range_subdiff(int64 a, int64 b) {
+  return float8_to_datum((float8)a - (float8)b);
+}
+int64 jit_daterange_subdiff(int32 a, int32 b) {
+  return float8_to_datum((float8)a - (float8)b);
+}
+int64 jit_tsrange_subdiff(int64 a, int64 b) {
+  return float8_to_datum(((float8)a - (float8)b) / (float8)USECS_PER_SEC);
+}
+int64 jit_tstzrange_subdiff(int64 a, int64 b) {
+  return float8_to_datum(((float8)a - (float8)b) / (float8)USECS_PER_SEC);
+}
 
 /* ================================================================
  * TIER 5: Text operations
@@ -2740,6 +2933,8 @@ const JitDirectFn jit_direct_fns[] = {
     EI2(int4mod, jit_int4mod, T32, T32, T32, JIT_INLINE_INT4_MOD),
     E1(int4abs, jit_int4abs, T32, T32),
     E1(int4inc, jit_int4inc, T32, T32),
+    E1(int4um, jit_int4um, T32, T32),
+    E1(int4up, jit_int4up, T32, T32),
 
     /* ---- int8 arithmetic ---- */
     EI2(int8pl, jit_int8pl, T64, T64, T64, JIT_INLINE_INT8_ADD),
@@ -2750,6 +2945,8 @@ const JitDirectFn jit_direct_fns[] = {
     E1(int8abs, jit_int8abs, T64, T64),
     E1(int8inc, jit_int8inc, T64, T64),
     E1(int8dec, jit_int8dec, T64, T64),
+    E1(int8um, jit_int8um, T64, T64),
+    E1(int8up, jit_int8up, T64, T64),
 
     /* ---- int2 arithmetic ---- */
     E2(int2pl, jit_int2pl, T32, T32, T32),
@@ -2758,6 +2955,8 @@ const JitDirectFn jit_direct_fns[] = {
     E2(int2div, jit_int2div, T32, T32, T32),
     E2(int2mod, jit_int2mod, T32, T32, T32),
     E1(int2abs, jit_int2abs, T32, T32),
+    E1(int2um, jit_int2um, T32, T32),
+    E1(int2up, jit_int2up, T32, T32),
 
     /* ---- int4 comparison ---- */
     EI2(int4eq, jit_int4eq, T32, T32, T32, JIT_INLINE_INT4_EQ),
@@ -2892,6 +3091,7 @@ const JitDirectFn jit_direct_fns[] = {
     EI2(float8div, jit_float8div, T64, T64, T64, JIT_INLINE_FLOAT8_DIV),
     E1(float8abs, jit_float8abs, T64, T64),
     E1(float8um, jit_float8um, T64, T64),
+    E1(float8up, jit_float8up, T64, T64),
 
     /* ---- float4 arithmetic ---- */
     E2(float4pl, jit_float4pl, T64, T64, T64),
@@ -2900,6 +3100,7 @@ const JitDirectFn jit_direct_fns[] = {
     E2(float4div, jit_float4div, T64, T64, T64),
     E1(float4abs, jit_float4abs, T64, T64),
     E1(float4um, jit_float4um, T64, T64),
+    E1(float4up, jit_float4up, T64, T64),
 
     /* ---- float comparison ---- */
     E2(float4eq, jit_float4eq, T32, T64, T64),
@@ -2959,11 +3160,19 @@ const JitDirectFn jit_direct_fns[] = {
     E1(i4tof, jit_i4tof, T64, T32),
     E1(ftoi4, jit_ftoi4, T32, T64),
     EI1(i8tod, jit_i8tod, T64, T64, JIT_INLINE_INT8_TO_FLOAT8),
+    E1(i8tof, jit_i8tof, T64, T64),
     E1(dtoi8, jit_dtoi8, T64, T64),
+    E1(ftoi8, jit_ftoi8, T64, T64),
     E1(i2tod, jit_i2tod, T64, T32),
     E1(dtoi2, jit_dtoi2, T32, T64),
     E1(i2tof, jit_i2tof, T64, T32),
     E1(ftoi2, jit_ftoi2, T32, T64),
+    E1(bool_int4, jit_bool_int4, T32, T64),
+    E1(int4_bool, jit_int4_bool, T32, T32),
+    E1(chartoi4, jit_chartoi4, T32, T32),
+    E1(i4tochar, jit_i4tochar, T32, T32),
+    E1(oidtoi8, jit_oidtoi8, T64, T32),
+    E1(xid8toxid, jit_xid8toxid, T32, T64),
 
     /* Extended hash functions moved to implemented section below */
 
@@ -2976,6 +3185,35 @@ const JitDirectFn jit_direct_fns[] = {
     E2(boolge, jit_boolge, T32, T64, T64),
     E2(booland_statefunc, jit_booland_statefunc, T64, T64, T64),
     E2(boolor_statefunc, jit_boolor_statefunc, T64, T64, T64),
+
+    /* ---- small by-value system scalar comparisons ---- */
+    EI2(chareq, jit_chareq, T32, T32, T32, JIT_INLINE_UINT8_EQ),
+    EI2(charne, jit_charne, T32, T32, T32, JIT_INLINE_UINT8_NE),
+    EI2(charlt, jit_charlt, T32, T32, T32, JIT_INLINE_UINT8_LT),
+    EI2(charle, jit_charle, T32, T32, T32, JIT_INLINE_UINT8_LE),
+    EI2(chargt, jit_chargt, T32, T32, T32, JIT_INLINE_UINT8_GT),
+    EI2(charge, jit_charge, T32, T32, T32, JIT_INLINE_UINT8_GE),
+    EI2(xideq, jit_xideq, T32, T32, T32, JIT_INLINE_UINT32_EQ),
+    EI2(xidneq, jit_xidneq, T32, T32, T32, JIT_INLINE_UINT32_NE),
+    EI2(cideq, jit_cideq, T32, T32, T32, JIT_INLINE_UINT32_EQ),
+    EI2(xid8eq, jit_xid8eq, T32, T64, T64, JIT_INLINE_UINT64_EQ),
+    EI2(xid8ne, jit_xid8ne, T32, T64, T64, JIT_INLINE_UINT64_NE),
+    EI2(xid8lt, jit_xid8lt, T32, T64, T64, JIT_INLINE_UINT64_LT),
+    EI2(xid8le, jit_xid8le, T32, T64, T64, JIT_INLINE_UINT64_LE),
+    EI2(xid8gt, jit_xid8gt, T32, T64, T64, JIT_INLINE_UINT64_GT),
+    EI2(xid8ge, jit_xid8ge, T32, T64, T64, JIT_INLINE_UINT64_GE),
+    E2(xid8cmp, jit_xid8cmp, T32, T64, T64),
+    EI2(pg_lsn_eq, jit_pg_lsn_eq, T32, T64, T64, JIT_INLINE_UINT64_EQ),
+    EI2(pg_lsn_ne, jit_pg_lsn_ne, T32, T64, T64, JIT_INLINE_UINT64_NE),
+    EI2(pg_lsn_lt, jit_pg_lsn_lt, T32, T64, T64, JIT_INLINE_UINT64_LT),
+    EI2(pg_lsn_le, jit_pg_lsn_le, T32, T64, T64, JIT_INLINE_UINT64_LE),
+    EI2(pg_lsn_gt, jit_pg_lsn_gt, T32, T64, T64, JIT_INLINE_UINT64_GT),
+    EI2(pg_lsn_ge, jit_pg_lsn_ge, T32, T64, T64, JIT_INLINE_UINT64_GE),
+    E2(pg_lsn_cmp, jit_pg_lsn_cmp, T32, T64, T64),
+    E2(pg_lsn_larger, jit_pg_lsn_larger, T64, T64, T64),
+    E2(pg_lsn_smaller, jit_pg_lsn_smaller, T64, T64, T64),
+    E1(pg_lsn_hash, jit_pg_lsn_hash, T32, T64),
+    E2(pg_lsn_hash_extended, jit_pg_lsn_hash_extended, T64, T64, T64),
 
     /* ---- timestamp comparison (same repr as int8) ---- */
     EI2(timestamp_eq, jit_timestamp_eq, T32, T64, T64, JIT_INLINE_INT8_EQ),
@@ -2995,6 +3233,7 @@ const JitDirectFn jit_direct_fns[] = {
     /* ---- timestamp min/max ---- */
     E2(timestamp_larger, jit_timestamp_larger, T64, T64, T64),
     E2(timestamp_smaller, jit_timestamp_smaller, T64, T64, T64),
+    E1(timestamp_finite, jit_timestamp_finite, T32, T64),
 
     /* ---- timestamp/tz hash ---- */
     EI1(timestamp_hash, jit_timestamp_hash, T64, T64, JIT_INLINE_HASHINT8),
@@ -3021,6 +3260,7 @@ const JitDirectFn jit_direct_fns[] = {
     E2(date_pli, jit_date_pli, T32, T32, T32),
     E2(date_mii, jit_date_mii, T32, T32, T32),
     E2(date_mi, jit_date_mi, T32, T32, T32),
+    E1(date_finite, jit_date_finite, T32, T32),
 
     /* ---- cross-type: date vs timestamp ---- */
     E2(date_eq_timestamp, jit_date_eq_timestamp, T32, T32, T64),
@@ -3048,13 +3288,22 @@ const JitDirectFn jit_direct_fns[] = {
     EI2(time_gt, jit_time_gt, T32, T64, T64, JIT_INLINE_INT8_GT),
     EI2(time_ge, jit_time_ge, T32, T64, T64, JIT_INLINE_INT8_GE),
     E2(time_cmp, jit_time_cmp, T32, T64, T64),
+    E2(time_larger, jit_time_larger, T64, T64, T64),
+    E2(time_smaller, jit_time_smaller, T64, T64, T64),
+    E1(time_hash, jit_time_hash, T32, T64),
+    E2(time_hash_extended, jit_time_hash_extended, T64, T64, T64),
 
     /* ---- cross-type timestamptz comparisons (DEFERRED — need TZ conversion) ---- */
 
     /* ---- btree comparison functions ---- */
+    E2(btboolcmp, jit_btboolcmp, T32, T64, T64),
+    E2(btcharcmp, jit_btcharcmp, T32, T32, T32),
+    E2(btint2cmp, jit_btint2cmp, T32, T32, T32),
     E2(btint4cmp, jit_btint4cmp, T32, T32, T32),
     E2(btint8cmp, jit_btint8cmp, T32, T64, T64),
+    E2(btint24cmp, jit_btint24cmp, T32, T32, T32),
     E2(btint42cmp, jit_btint42cmp, T32, T32, T32),
+    E2(btint28cmp, jit_btint28cmp, T32, T32, T64),
     E2(btint48cmp, jit_btint48cmp, T32, T32, T64),
     E2(btint82cmp, jit_btint82cmp, T32, T64, T32),
     E2(btint84cmp, jit_btint84cmp, T32, T64, T32),
@@ -3062,7 +3311,13 @@ const JitDirectFn jit_direct_fns[] = {
     E2(btfloat8cmp, jit_btfloat8cmp, T32, T64, T64),
     E2(btfloat48cmp, jit_btfloat48cmp, T32, T64, T64),
     E2(btfloat84cmp, jit_btfloat84cmp, T32, T64, T64),
+    E2(btoidcmp, jit_btoidcmp, T32, T32, T32),
     E2(date_cmp, jit_date_cmp, T32, T32, T32),
+    E2(int4range_subdiff, jit_int4range_subdiff, T64, T32, T32),
+    E2(int8range_subdiff, jit_int8range_subdiff, T64, T64, T64),
+    E2(daterange_subdiff, jit_daterange_subdiff, T64, T32, T32),
+    E2(tsrange_subdiff, jit_tsrange_subdiff, T64, T64, T64),
+    E2(tstzrange_subdiff, jit_tstzrange_subdiff, T64, T64, T64),
 
     /* Type casts are handled via EI1 entries with JIT_INLINE_* ops above.
      * Additional cast functions (int8/float8/float4 by name) share names
@@ -3092,12 +3347,12 @@ const JitDirectFn jit_direct_fns[] = {
      * detection before re-enabling. */
 
     /* ---- OID comparison ---- */
-    E2(oideq, jit_oideq, T32, T32, T32),
-    E2(oidne, jit_oidne, T32, T32, T32),
-    E2(oidlt, jit_oidlt, T32, T32, T32),
-    E2(oidle, jit_oidle, T32, T32, T32),
-    E2(oidgt, jit_oidgt, T32, T32, T32),
-    E2(oidge, jit_oidge, T32, T32, T32),
+    EI2(oideq, jit_oideq, T32, T32, T32, JIT_INLINE_UINT32_EQ),
+    EI2(oidne, jit_oidne, T32, T32, T32, JIT_INLINE_UINT32_NE),
+    EI2(oidlt, jit_oidlt, T32, T32, T32, JIT_INLINE_UINT32_LT),
+    EI2(oidle, jit_oidle, T32, T32, T32, JIT_INLINE_UINT32_LE),
+    EI2(oidgt, jit_oidgt, T32, T32, T32, JIT_INLINE_UINT32_GT),
+    EI2(oidge, jit_oidge, T32, T32, T32, JIT_INLINE_UINT32_GE),
     E2(oidlarger, jit_oidlarger, T32, T32, T32),
     E2(oidsmaller, jit_oidsmaller, T32, T32, T32),
 
@@ -3212,12 +3467,15 @@ const JitDirectFn jit_direct_fns[] = {
     E1(hash_numeric, jit_hash_numeric_precompiled, T32, T64),
     E1(numeric_abs, jit_numeric_abs, T64, T64),
     E1(numeric_uminus, jit_numeric_uminus, T64, T64),
-    E2(numeric_add, jit_numeric_add, T64, T64, T64),
-    E2(numeric_sub, jit_numeric_sub, T64, T64, T64),
-    E2(numeric_mul, jit_numeric_mul, T64, T64, T64),
-#else
-    /* numeric_add/sub/mul now have native implementations above */
 #endif
+    /*
+     * Use PostgreSQL's Numeric operators for arithmetic. The handwritten
+     * short-numeric fast path above is not exact for all weight/dscale
+     * combinations, so keeping it in the direct-call table corrupts results.
+     */
+    E2(numeric_add, jit_numeric_add_wrapper, T64, T64, T64),
+    E2(numeric_sub, jit_numeric_sub_wrapper, T64, T64, T64),
+    E2(numeric_mul, jit_numeric_mul_wrapper, T64, T64, T64),
 
 /* ---- uuid comparison ---- */
 #ifdef PG_JITTER_HAVE_TIER2

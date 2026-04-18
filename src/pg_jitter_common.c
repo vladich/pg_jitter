@@ -28,9 +28,20 @@
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
 #endif
 #include "access/detoast.h"    /* DatumGetTextPP */
+#include "access/htup_details.h"
 #include "utils/resowner.h"
 
 #include <stdlib.h> /* for atoi */
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || \
+    defined(_M_IX86)
+#define PG_JITTER_X86 1
+#ifdef _MSC_VER
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
+#endif
 
 #ifdef __linux__
 #include <unistd.h> /* for sysconf */
@@ -48,6 +59,12 @@ int pg_jitter_shared_code_max_kb = 4096; /* 4 MB default */
 /* GUC: pg_jitter.deform_cache — cache compiled deform functions across queries */
 bool pg_jitter_deform_cache = true;
 
+/* GUC: pg_jitter.deform_avx512 — use AVX-512 for supported deform batches */
+bool pg_jitter_deform_avx512 = true;
+
+/* GUC: pg_jitter.deform_avx512_min_cols — minimum int4 batch width */
+int pg_jitter_deform_avx512_min_cols = DEFORM_AVX512_MIN_COLS_DEFAULT;
+
 /* GUC: pg_jitter.min_expr_steps — skip JIT for expressions with fewer steps */
 int pg_jitter_min_expr_steps = 4;
 
@@ -56,6 +73,9 @@ int pg_jitter_in_hash_strategy = IN_HASH_CRC32;
 
 /* GUC: pg_jitter.in_bsearch_max — max IN list size for inline bsearch tree */
 int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
+
+/* GUC: pg_jitter.in_simd_max — max IN list size for SIMD linear scan */
+int pg_jitter_in_simd_max = IN_SIMD_MAX_DEFAULT;
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
@@ -67,6 +87,204 @@ int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
 static JitDsmSlotTable *jit_dsm_slots = NULL;
 static bool shmem_init_attempted = false;
 static bool shmem_init_failed = false;
+
+#ifdef PG_JITTER_X86
+static bool
+pg_jitter_cpuid(uint32 leaf, uint32 subleaf, uint32 *eax, uint32 *ebx,
+                uint32 *ecx, uint32 *edx)
+{
+#ifdef _MSC_VER
+  int regs[4];
+  int max_leaf[4];
+  int base = (leaf & 0x80000000U) ? 0x80000000 : 0;
+
+  __cpuid(max_leaf, base);
+  if ((uint32) max_leaf[0] < leaf)
+    return false;
+
+  __cpuidex(regs, (int) leaf, (int) subleaf);
+  *eax = (uint32) regs[0];
+  *ebx = (uint32) regs[1];
+  *ecx = (uint32) regs[2];
+  *edx = (uint32) regs[3];
+  return true;
+#elif defined(__GNUC__) || defined(__clang__)
+  if (__get_cpuid_max(leaf & 0x80000000U, NULL) < leaf)
+    return false;
+
+  __cpuid_count(leaf, subleaf, *eax, *ebx, *ecx, *edx);
+  return true;
+#else
+  return false;
+#endif
+}
+
+static uint64
+pg_jitter_xgetbv(uint32 index)
+{
+#ifdef _MSC_VER
+  return (uint64) _xgetbv(index);
+#elif defined(__GNUC__) || defined(__clang__)
+  uint32 eax;
+  uint32 edx;
+
+  __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(index));
+  return ((uint64) edx << 32) | eax;
+#else
+  return 0;
+#endif
+}
+#endif
+
+bool
+pg_jitter_cpu_has_sse42(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  cached = pg_jitter_cpuid(1, 0, &eax, &ebx, &ecx, &edx) &&
+           ((ecx & (1U << 20)) != 0);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+static bool
+pg_jitter_cpu_has_avx_os_state(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+  uint64 xcr0;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  if (!pg_jitter_cpuid(1, 0, &eax, &ebx, &ecx, &edx) ||
+      (ecx & (1U << 26)) == 0 ||  /* XSAVE */
+      (ecx & (1U << 27)) == 0 ||  /* OSXSAVE */
+      (ecx & (1U << 28)) == 0)    /* AVX */
+  {
+    cached = 0;
+    return false;
+  }
+
+  xcr0 = pg_jitter_xgetbv(0);
+  cached = ((xcr0 & 0x6) == 0x6); /* XMM + YMM state enabled */
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+bool
+pg_jitter_cpu_has_avx2(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  cached = pg_jitter_cpu_has_avx_os_state() &&
+           pg_jitter_cpuid(7, 0, &eax, &ebx, &ecx, &edx) &&
+           ((ebx & (1U << 5)) != 0);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+static bool
+pg_jitter_cpu_has_avx512_os_state(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+  uint64 xcr0;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  if (!pg_jitter_cpuid(1, 0, &eax, &ebx, &ecx, &edx) ||
+      (ecx & (1U << 26)) == 0 ||  /* XSAVE */
+      (ecx & (1U << 27)) == 0 ||  /* OSXSAVE */
+      (ecx & (1U << 28)) == 0)    /* AVX */
+  {
+    cached = 0;
+    return false;
+  }
+
+  xcr0 = pg_jitter_xgetbv(0);
+  cached = ((xcr0 & 0xE6) == 0xE6);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+bool
+pg_jitter_cpu_has_avx512f(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  cached = pg_jitter_cpu_has_avx512_os_state() &&
+           pg_jitter_cpuid(7, 0, &eax, &ebx, &ecx, &edx) &&
+           ((ebx & (1U << 16)) != 0);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+bool
+pg_jitter_cpu_has_avx512bw(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  cached = pg_jitter_cpu_has_avx512f() &&
+           pg_jitter_cpuid(7, 0, &eax, &ebx, &ecx, &edx) &&
+           ((ebx & (1U << 30)) != 0);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
+
+bool
+pg_jitter_cpu_has_avx512vl(void)
+{
+#ifdef PG_JITTER_X86
+  static int cached = -1;
+  uint32 eax, ebx, ecx, edx;
+
+  if (cached >= 0)
+    return cached != 0;
+
+  cached = pg_jitter_cpu_has_avx512f() &&
+           pg_jitter_cpuid(7, 0, &eax, &ebx, &ecx, &edx) &&
+           ((ebx & (1U << 31)) != 0);
+  return cached != 0;
+#else
+  return false;
+#endif
+}
 
 /*
  * Lazy init: try to allocate from PG's spare shmem pool.
@@ -175,6 +393,31 @@ int pg_jitter_get_min_expr_steps(void) {
     return atoi(val);
 
   return pg_jitter_min_expr_steps;
+}
+
+/*
+ * Read pg_jitter.deform_avx512 from the GUC system.
+ */
+bool pg_jitter_get_deform_avx512(void) {
+  const char *val = GetConfigOption("pg_jitter.deform_avx512", true, false);
+
+  if (val == NULL)
+    return pg_jitter_deform_avx512;
+
+  return strcmp(val, "on") == 0 || strcmp(val, "true") == 0 ||
+         strcmp(val, "1") == 0;
+}
+
+/*
+ * Read pg_jitter.deform_avx512_min_cols from the GUC system.
+ */
+int pg_jitter_get_deform_avx512_min_cols(void) {
+  const char *val = GetConfigOption("pg_jitter.deform_avx512_min_cols", true, false);
+
+  if (val != NULL)
+    return atoi(val);
+
+  return pg_jitter_deform_avx512_min_cols;
 }
 
 /*
@@ -2159,95 +2402,16 @@ int pg_jitter_deform_threshold(void) {
 }
 
 /*
- * pg_jitter_wide_deform_limit — hard cap on JIT deform column count.
+ * pg_jitter_wide_deform_limit — safety cap on JIT deform column count.
  *
- * Above this limit, JIT deform (both unrolled and loop-based) is
- * slower than the interpreter's slot_getsomeattrs_int().  The
- * crossover depends on per-tuple iteration cost, which scales with
- * the number of columns and is bounded by data-cache capacity.
- *
- * The dispatch-table general loop uses a 1-byte dispatch array
- * (vs 8-byte descriptors) and specialized handlers with all
- * properties as compile-time immediates.  Benchmarks at 1000 cols:
- *   Wide1000_last: JIT 112ms vs interpreter 109ms (3% slower)
- *   Wide1000_grpby: JIT 116ms vs interpreter 111ms (4% slower)
- *
- * The crossover is around 700-800 columns.  We set the limit at
- * ~680 to safely cover 300-col tables with margin.
- *
- * Architecture-specific limits:
- *
- *   ARM64 (Apple M1–M3)     — 64 KB L1D → 682.
- *   ARM64 (Apple M4+)       — 128 KB L1D → 1365.
- *   ARM64 (Graviton 2/3)    — 64 KB L1D → 682.
- *   x86-64 (Skylake, Zen 3) — 32 KB L1D → 682.
- *   x86-64 (Ice Lake+, Zen 4+) — 48 KB L1D → 1024.
+ * PostgreSQL itself caps heap tables at MaxHeapAttributeNumber (1600) and
+ * tuple descriptors at MaxTupleAttributeNumber (1664).  Keep every valid
+ * tuple shape eligible for the compact loop/sparse deform paths; the old
+ * cache-derived performance cap incorrectly disabled profitable 1000-column
+ * sparse deform.
  */
 int pg_jitter_wide_deform_limit(void) {
-  static int limit = 0;
-
-  if (limit > 0)
-    return limit;
-
-  {
-    long l1d_size = 0;
-
-#ifdef __linux__
-    l1d_size = sysconf(_SC_LEVEL1_DCACHE_SIZE);
-#elif defined(__APPLE__)
-    {
-      size_t len = sizeof(l1d_size);
-      sysctlbyname("hw.l1dcachesize", &l1d_size, &len, NULL, 0);
-    }
-#elif defined(_WIN32)
-    {
-      SYSTEM_LOGICAL_PROCESSOR_INFORMATION *buf = NULL;
-      DWORD sz = 0;
-      GetLogicalProcessorInformation(NULL, &sz);
-      buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc(sz);
-      if (buf && GetLogicalProcessorInformation(buf, &sz)) {
-        DWORD n = sz / sizeof(*buf);
-        for (DWORD i = 0; i < n; i++) {
-          if (buf[i].Relationship == RelationCache &&
-              buf[i].Cache.Level == 1 &&
-              buf[i].Cache.Type == CacheData) {
-            l1d_size = buf[i].Cache.Size;
-            break;
-          }
-        }
-      }
-      free(buf);
-    }
-#endif
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-    /*
-     * ARM64: efficient fixed-width instructions, generous caches.
-     * Apple M1-M3: 64 KB → 682,  M4+: 128 KB → 1365.
-     * Graviton: 64 KB → 682.
-     */
-    if (l1d_size <= 0)
-      l1d_size = 65536;           /* assume 64 KB if detection fails */
-    limit = l1d_size / 96;
-#elif defined(__x86_64__) || defined(_M_X64)
-    /*
-     * x86-64: variable-length encoding, more register pressure.
-     * Skylake/Zen3: 32 KB → 682,  Ice Lake/Zen4+: 48 KB → 1024.
-     */
-    if (l1d_size <= 0)
-      l1d_size = 32768;           /* assume 32 KB if detection fails */
-    limit = l1d_size / 48;
-#else
-    if (l1d_size <= 0)
-      l1d_size = 32768;
-    limit = l1d_size / 96;
-#endif
-
-    if (limit < 100)
-      limit = 100;                /* never go below 100 columns */
-
-    return limit;
-  }
+  return MaxTupleAttributeNumber;
 }
 
 /*

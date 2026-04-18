@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(pg_jitter C CXX)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (default: Release)" FORCE)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 # PG17+ headers use C99 designated initializers in inline functions
 # (e.g. storage/fd.h). MSVC requires C++20 for designated initializer support.
@@ -128,7 +133,13 @@ set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir-patched" CACHE PATH
     "Path to MIR source directory")
 set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
-set(STRINGZILLA_DIR "${CMAKE_SOURCE_DIR}/../stringzilla" CACHE PATH
+
+set(_pg_jitter_default_stringzilla_dir "${CMAKE_SOURCE_DIR}/../stringzilla")
+if(NOT EXISTS "${_pg_jitter_default_stringzilla_dir}/include/stringzilla/stringzilla.h"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/../StringZilla/include/stringzilla/stringzilla.h")
+    set(_pg_jitter_default_stringzilla_dir "${CMAKE_SOURCE_DIR}/../StringZilla")
+endif()
+set(STRINGZILLA_DIR "${_pg_jitter_default_stringzilla_dir}" CACHE PATH
     "Path to StringZilla source directory (header-only)")
 set(PCRE2_DIR "${CMAKE_SOURCE_DIR}/../pcre2" CACHE PATH
     "Path to PCRE2 source directory")
@@ -154,6 +165,26 @@ if(PG_JITTER_BUILD_ASMJIT)
     endif()
     message(STATUS "AsmJIT directory:   ${ASMJIT_DIR}")
 endif()
+
+if(NOT EXISTS "${STRINGZILLA_DIR}/include/stringzilla/stringzilla.h")
+    set(_pg_jitter_stringzilla_candidates
+        "${CMAKE_SOURCE_DIR}/../StringZilla"
+        "${CMAKE_SOURCE_DIR}/../stringzilla")
+    foreach(_candidate IN LISTS _pg_jitter_stringzilla_candidates)
+        if(EXISTS "${_candidate}/include/stringzilla/stringzilla.h")
+            set(STRINGZILLA_DIR "${_candidate}" CACHE PATH
+                "Path to StringZilla source directory (header-only)" FORCE)
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NOT EXISTS "${STRINGZILLA_DIR}/include/stringzilla/stringzilla.h")
+    message(FATAL_ERROR
+        "StringZilla not found at ${STRINGZILLA_DIR}. "
+        "Set -DSTRINGZILLA_DIR=/path/to/StringZilla")
+endif()
+message(STATUS "StringZilla:        ${STRINGZILLA_DIR}")
 
 # ==========================================================================
 # Platform detection

@@ -266,16 +266,39 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 #define IN_HASH_PG       0  /* PG's built-in Jenkins hash probe */
 #define IN_HASH_CRC32    1  /* CRC32C open-addressing */
 
-/* Default threshold: ≤ this → inline bsearch tree, > this → CRC32 hash */
+/*
+ * Default threshold: ≤ this → inline bsearch tree, > this → CRC32 hash.
+ *
+ * The hashed scalar-array SIMD linear scan is opt-in only.  PostgreSQL starts
+ * using HASHED_SCALARARRAYOP for lists large enough that a linear scan loses on
+ * common miss-heavy workloads.
+ */
 #define IN_BSEARCH_MAX_DEFAULT 4096
+#define IN_SIMD_MAX_DEFAULT 0
+#define DEFORM_AVX512_MIN_COLS_DEFAULT 1200
 
 /* GUC variables shared across backends (defined in pg_jitter_common.c) */
 extern int pg_jitter_parallel_mode;
 extern int pg_jitter_shared_code_max_kb;
 extern bool pg_jitter_deform_cache;
+extern bool pg_jitter_deform_avx512;
+extern int pg_jitter_deform_avx512_min_cols;
 extern int pg_jitter_min_expr_steps;
 extern int pg_jitter_in_hash_strategy;
 extern int pg_jitter_in_bsearch_max;
+extern int pg_jitter_in_simd_max;
+
+/*
+ * x86 CPU feature checks with OS XSAVE/XCR0 validation.
+ *
+ * These helpers intentionally report whether the current process may execute
+ * the instruction class, not just whether the physical CPU advertises it.
+ */
+extern bool pg_jitter_cpu_has_sse42(void);
+extern bool pg_jitter_cpu_has_avx2(void);
+extern bool pg_jitter_cpu_has_avx512f(void);
+extern bool pg_jitter_cpu_has_avx512bw(void);
+extern bool pg_jitter_cpu_has_avx512vl(void);
 
 /*
  * Read the current parallel mode from the GUC system.
@@ -288,6 +311,8 @@ extern int pg_jitter_in_bsearch_max;
  */
 extern int pg_jitter_get_parallel_mode(void);
 extern int pg_jitter_get_min_expr_steps(void);
+extern bool pg_jitter_get_deform_avx512(void);
+extern int pg_jitter_get_deform_avx512_min_cols(void);
 
 /*
  * Loop-based deform for wide tables.
@@ -302,12 +327,8 @@ extern int pg_jitter_get_min_expr_steps(void);
 #define DEFORM_BYTES_PER_COL  140
 
 /*
- * Hard cap on JIT deform column count.  Above this, JIT deform (both
- * unrolled and loop-based) is slower than the interpreter due to
- * compilation overhead and data-cache pressure.  Fall back to
- * slot_getsomeattrs_int() for tables wider than this.
- *
- * Derived from L1D cache size at runtime via pg_jitter_wide_deform_limit().
+ * Safety cap on JIT deform column count.  Returns MaxTupleAttributeNumber,
+ * PostgreSQL's tuple descriptor limit.
  */
 extern int pg_jitter_wide_deform_limit(void);
 

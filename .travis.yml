@@ -207,6 +207,27 @@ script:
     ls "$DLPATH"/*.so 2>/dev/null || true
     cd "$TRAVIS_BUILD_DIR"
 
+    # ---- Find pg_regress before any baseline/JIT runs ----
+    PG_REGRESS=""
+    for candidate in \
+      "$($PG_CONFIG --pkglibdir)/pgxs/src/test/regress/pg_regress" \
+      "$($PG_CONFIG --bindir)/../lib/pgxs/src/test/regress/pg_regress" \
+      "$($PG_CONFIG --bindir)/pg_regress" \
+      "/usr/lib/postgresql/${PG_MAJOR}/lib/pgxs/src/test/regress/pg_regress" \
+    ; do
+      if [ -f "$candidate" ]; then
+        PG_REGRESS="$candidate"
+        break
+      fi
+    done
+
+    if [ -z "$PG_REGRESS" ]; then
+      echo "ERROR: pg_regress not found"
+      exit 1
+    fi
+    REGRESS_SCHEDULE="parallel_schedule"
+    echo "Using pg_regress: $PG_REGRESS"
+
     # ---- s390x: Baseline run (no JIT) to identify platform-specific failures ----
     BASELINE_OUTDIR=""
     if [ "$ARCH" = "s390x" ]; then
@@ -314,12 +335,10 @@ script:
             EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', r.nspname);
         END LOOP;
     END $$;
-    DO $$ DECLARE r RECORD; BEGIN
-        FOR r IN SELECT spcname FROM pg_tablespace
-                 WHERE spcname NOT IN ('pg_default','pg_global') LOOP
-            EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
-        END LOOP;
-    END $$;
+    SELECT format('DROP TABLESPACE IF EXISTS %I;', spcname)
+    FROM pg_tablespace
+    WHERE spcname NOT IN ('pg_default','pg_global')
+    \gexec
     DO $$ DECLARE r RECORD; BEGIN
         FOR r IN SELECT rolname FROM pg_roles
                  WHERE rolname LIKE 'regress_%'
@@ -374,6 +393,30 @@ script:
       sleep 1
 
       echo "Active backend: $backend"
+
+      BACKEND_CHECK_LOG="${TRAVIS_BUILD_DIR}/regress-output-$backend/backend_check.log"
+      mkdir -p "$(dirname "$BACKEND_CHECK_LOG")"
+      set +e
+      BACKEND_CHECK_OUTPUT=$(psql -X -v ON_ERROR_STOP=1 -h localhost -p $PGPORT -d postgres -c "
+        SHOW jit_provider;
+        SHOW pg_jitter.backend;
+        SET jit = on;
+        SET jit_above_cost = 0;
+        SET jit_inline_above_cost = 0;
+        SET jit_optimize_above_cost = 0;
+        SELECT SUM(i) FROM generate_series(1,1000) AS g(i) WHERE i > 10;
+      " 2>&1)
+      BACKEND_CHECK_RC=$?
+      set -e
+      printf '%s\n' "$BACKEND_CHECK_OUTPUT" > "$BACKEND_CHECK_LOG"
+      if [ $BACKEND_CHECK_RC -ne 0 ] ||
+         printf '%s\n' "$BACKEND_CHECK_OUTPUT" | grep -q 'invalid value for parameter "pg_jitter.backend"'; then
+        echo "  => $backend: FAILED backend activation"
+        cat "$BACKEND_CHECK_LOG"
+        RESULTS="$RESULTS  $backend: FAILED backend activation\n"
+        FAILED=$((FAILED + 1))
+        continue
+      fi
 
       # Save log position
       LOG_OFFSET=0

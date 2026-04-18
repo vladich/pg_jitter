@@ -327,6 +327,12 @@ SECTION_NAMES=()
 add_section() { SECTIONS+=("${#LABELS[@]}:$1"); SECTION_NAMES+=("$1"); }
 add_query() { LABELS+=("$1"); QUERIES+=("$2"); }
 
+IN_LIST_128="$(seq -s, 1 128)"
+IN_LIST_4096="$(seq -s, 1 4096)"
+IN_LIST_4097="$(seq -s, 1 4097)"
+IN_LIST_5000="$(seq -s, 1 5000)"
+IN_LIST_5000_NULL="NULL,$IN_LIST_5000"
+
 # --- Basic Aggregation ---
 add_section "Basic Aggregation"
 add_query "SUM_int"             "SELECT SUM(val1) FROM bench_data"
@@ -430,7 +436,12 @@ add_query "Regex_alternation"   "SELECT COUNT(*) FROM text_data WHERE hash_text 
 
 # --- IN list / Sort ---
 add_section "IN list / Sort"
-add_query "IN_list_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
+add_query "IN_expr_20"          "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
+add_query "IN_expr_128"         "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN ($IN_LIST_128)"
+add_query "IN_expr_4096"        "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN ($IN_LIST_4096)"
+add_query "IN_expr_4097"        "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN ($IN_LIST_4097)"
+add_query "IN_expr_5000_null"   "SELECT COUNT(*) FROM bench_data WHERE val1 + 0 IN ($IN_LIST_5000_NULL)"
+add_query "IN_index_20"         "SELECT COUNT(*) FROM bench_data WHERE grp IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
 add_query "IN_list_small"       "SELECT COUNT(*) FROM join_left WHERE key1 + 0 IN (1,2,3,4,5,6,7,8,9,10)"
 add_query "IN_text_5"           "SELECT COUNT(*) FROM text_data WHERE grp_text IN ('prefix_1','prefix_10','prefix_20','prefix_50','prefix_99')"
 add_query "IN_text_20"          "SELECT COUNT(*) FROM text_data WHERE grp_text IN ('prefix_1','prefix_5','prefix_10','prefix_15','prefix_20','prefix_25','prefix_30','prefix_35','prefix_40','prefix_45','prefix_50','prefix_55','prefix_60','prefix_65','prefix_70','prefix_75','prefix_80','prefix_85','prefix_90','prefix_99')"

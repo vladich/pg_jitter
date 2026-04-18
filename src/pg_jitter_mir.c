@@ -319,6 +319,29 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
   cb->reset_after_error = mir_reset_after_error;
   cb->release_context = pg_jitter_release_context;
   cb->compile_expr = mir_compile_expr;
+
+  if (!GetConfigOption("pg_jitter.deform_avx512", true, false)) {
+    DefineCustomBoolVariable(
+        "pg_jitter.deform_avx512",
+        "Use AVX-512F for supported tuple deform batches when the CPU and OS "
+        "allow executing AVX-512 instructions.",
+        NULL, &pg_jitter_deform_avx512,
+        true,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
+
+  if (!GetConfigOption("pg_jitter.deform_avx512_min_cols", true, false)) {
+    DefineCustomIntVariable(
+        "pg_jitter.deform_avx512_min_cols",
+        "Minimum uniform int4 deform batch width required before using "
+        "AVX-512. 0 allows AVX-512 for every eligible batch.",
+        NULL, &pg_jitter_deform_avx512_min_cols,
+        DEFORM_AVX512_MIN_COLS_DEFAULT,
+        0, MaxTupleAttributeNumber,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
 }
 
 /*
@@ -745,48 +768,57 @@ static bool mir_compile_expr(ExprState *state) {
                                        MIR_T_I64, "val", MIR_T_P, "desc");
   }
 
-  /* Protos for direct native calls: [nargs-1][ret_type][arg0_type]
-   * where ret_type/arg0_type index 0 = I32, 1 = I64 (matches JIT_TYPE_*) */
-  MIR_item_t proto_direct[2][2][2];
+  /* Protos for direct native calls.
+   * Type indexes 0 = I32, 1 = I64 (matches JIT_TYPE_*).  The 2-arg
+   * prototype must key on both argument types; mixed signatures such as
+   * date_cmp_timestamp(int32,int64) otherwise truncate the second argument. */
+  MIR_item_t proto_direct[2][2][2][2]; /* [nargs-1][ret][arg0][arg1] */
   {
     MIR_type_t rt32 = MIR_T_I32, rt64 = MIR_T_I64;
+    MIR_type_t mir_types[2] = {MIR_T_I32, MIR_T_I64};
     /* 1-arg protos */
-    proto_direct[0][0][0] =
+    proto_direct[0][0][0][0] =
         MIR_new_proto(ctx, "p_d1_32_32", 1, &rt32, 1, MIR_T_I32, "a0");
-    proto_direct[0][0][1] =
+    proto_direct[0][0][1][0] =
         MIR_new_proto(ctx, "p_d1_32_64", 1, &rt32, 1, MIR_T_I64, "a0");
-    proto_direct[0][1][0] =
+    proto_direct[0][1][0][0] =
         MIR_new_proto(ctx, "p_d1_64_32", 1, &rt64, 1, MIR_T_I32, "a0");
-    proto_direct[0][1][1] =
+    proto_direct[0][1][1][0] =
         MIR_new_proto(ctx, "p_d1_64_64", 1, &rt64, 1, MIR_T_I64, "a0");
-    /* 2-arg protos (arg0 == arg1 type for all non-deferred entries) */
-    proto_direct[1][0][0] = MIR_new_proto(ctx, "p_d2_32_32", 1, &rt32, 2,
-                                          MIR_T_I32, "a0", MIR_T_I32, "a1");
-    proto_direct[1][0][1] = MIR_new_proto(ctx, "p_d2_32_64", 1, &rt32, 2,
-                                          MIR_T_I64, "a0", MIR_T_I64, "a1");
-    proto_direct[1][1][0] = MIR_new_proto(ctx, "p_d2_64_32", 1, &rt64, 2,
-                                          MIR_T_I32, "a0", MIR_T_I32, "a1");
-    proto_direct[1][1][1] = MIR_new_proto(ctx, "p_d2_64_64", 1, &rt64, 2,
-                                          MIR_T_I64, "a0", MIR_T_I64, "a1");
+    /* 2-arg protos */
+    for (int rt = 0; rt < 2; rt++) {
+      for (int a0 = 0; a0 < 2; a0++) {
+        for (int a1 = 0; a1 < 2; a1++) {
+          char name[32];
+          MIR_type_t ret_type = (rt == JIT_TYPE_32) ? rt32 : rt64;
+          snprintf(name, sizeof(name), "p_d2_%d_%d_%d", rt, a0, a1);
+          proto_direct[1][rt][a0][a1] =
+              MIR_new_proto(ctx, name, 1, &ret_type, 2,
+                            mir_types[a0], "a0", mir_types[a1], "a1");
+        }
+      }
+    }
   }
 
   /* 2-arg + collation protos: (arg0, arg1, I32 collid) -> ret
    * Used for collation-aware direct-call functions (texteq, text_lt, etc.) */
-  MIR_item_t proto_direct_coll[2][2]; /* [ret_type][arg0_type] */
+  MIR_item_t proto_direct_coll[2][2][2]; /* [ret][arg0][arg1] */
   {
     MIR_type_t rt32 = MIR_T_I32, rt64 = MIR_T_I64;
-    proto_direct_coll[0][0] = MIR_new_proto(ctx, "p_dc_32_32", 1, &rt32, 3,
-                                            MIR_T_I32, "a0", MIR_T_I32, "a1",
-                                            MIR_T_I32, "c");
-    proto_direct_coll[0][1] = MIR_new_proto(ctx, "p_dc_32_64", 1, &rt32, 3,
-                                            MIR_T_I64, "a0", MIR_T_I64, "a1",
-                                            MIR_T_I32, "c");
-    proto_direct_coll[1][0] = MIR_new_proto(ctx, "p_dc_64_32", 1, &rt64, 3,
-                                            MIR_T_I32, "a0", MIR_T_I32, "a1",
-                                            MIR_T_I32, "c");
-    proto_direct_coll[1][1] = MIR_new_proto(ctx, "p_dc_64_64", 1, &rt64, 3,
-                                            MIR_T_I64, "a0", MIR_T_I64, "a1",
-                                            MIR_T_I32, "c");
+    MIR_type_t mir_types[2] = {MIR_T_I32, MIR_T_I64};
+    for (int rt = 0; rt < 2; rt++) {
+      for (int a0 = 0; a0 < 2; a0++) {
+        for (int a1 = 0; a1 < 2; a1++) {
+          char name[32];
+          MIR_type_t ret_type = (rt == JIT_TYPE_32) ? rt32 : rt64;
+          snprintf(name, sizeof(name), "p_dc_%d_%d_%d", rt, a0, a1);
+          proto_direct_coll[rt][a0][a1] =
+              MIR_new_proto(ctx, name, 1, &ret_type, 3,
+                            mir_types[a0], "a0", mir_types[a1], "a1",
+                            MIR_T_I32, "c");
+        }
+      }
+    }
   }
 
   /* Proto for agg_trans helpers: (ExprState*, ExprEvalStep*) -> void */
@@ -980,6 +1012,7 @@ static bool mir_compile_expr(ExprState *state) {
   MIR_item_t *step_direct_imports = palloc0(sizeof(MIR_item_t) * steps_len);
   uint8 *step_direct_ret_types = palloc0(steps_len * sizeof(uint8));
   uint8 *step_direct_arg0_types = palloc0(steps_len * sizeof(uint8));
+  uint8 *step_direct_arg1_types = palloc0(steps_len * sizeof(uint8));
   MIR_item_t *ioc_in_imports = palloc0(sizeof(MIR_item_t) * steps_len);
   for (int i = 0; i < steps_len; i++) {
     ExprEvalStep *op = &steps[i];
@@ -998,6 +1031,8 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_imports[i] = MIR_new_import(ctx, name);
         step_direct_ret_types[i] = dfn->ret_type;
         step_direct_arg0_types[i] = dfn->arg_types[0];
+        step_direct_arg1_types[i] =
+            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
       else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name &&
@@ -1009,6 +1044,8 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_imports[i] = MIR_new_import(ctx, name);
         step_direct_ret_types[i] = dfn->ret_type;
         step_direct_arg0_types[i] = dfn->arg_types[0];
+        step_direct_arg1_types[i] =
+            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
 #endif
       else {
@@ -1030,6 +1067,8 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_imports[i] = MIR_new_import(ctx, name);
         step_direct_ret_types[i] = dfn->ret_type;
         step_direct_arg0_types[i] = dfn->arg_types[0];
+        step_direct_arg1_types[i] =
+            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
 #ifdef PG_JITTER_HAVE_MIR_PRECOMPILED
       else if (!mir_shared_code_mode && dfn && dfn->jit_fn_name &&
@@ -1039,6 +1078,8 @@ static bool mir_compile_expr(ExprState *state) {
         step_direct_imports[i] = MIR_new_import(ctx, name);
         step_direct_ret_types[i] = dfn->ret_type;
         step_direct_arg0_types[i] = dfn->arg_types[0];
+        step_direct_arg1_types[i] =
+            (dfn->nargs > 1) ? dfn->arg_types[1] : JIT_TYPE_32;
       }
 #endif
       else {
@@ -2664,7 +2705,8 @@ static bool mir_compile_expr(ExprState *state) {
                                              r_fci, 0, 1)));
             MIR_item_t d_proto =
                 proto_direct_coll[step_direct_ret_types[opno]]
-                                 [step_direct_arg0_types[opno]];
+                                 [step_direct_arg0_types[opno]]
+                                 [step_direct_arg1_types[opno]];
             MIR_append_insn(ctx, func_item,
                             MIR_new_call_insn(
                                 ctx, 6, MIR_new_ref_op(ctx, d_proto),
@@ -2677,7 +2719,8 @@ static bool mir_compile_expr(ExprState *state) {
             int nargs_idx = (dfn->nargs >= 2) ? 1 : 0;
             MIR_item_t d_proto =
                 proto_direct[nargs_idx][step_direct_ret_types[opno]]
-                            [step_direct_arg0_types[opno]];
+                            [step_direct_arg0_types[opno]]
+                            [step_direct_arg1_types[opno]];
             if (dfn->nargs == 1) {
               MIR_append_insn(ctx, func_item,
                               MIR_new_call_insn(
@@ -3653,7 +3696,8 @@ static bool mir_compile_expr(ExprState *state) {
             MIR_new_call_insn(
                 ctx, 4,
                 MIR_new_ref_op(ctx, proto_direct[0][step_direct_ret_types[opno]]
-                                                [step_direct_arg0_types[opno]]),
+                                                [step_direct_arg0_types[opno]]
+                                                [step_direct_arg1_types[opno]]),
                 MIR_new_ref_op(ctx, step_direct_imports[opno]),
                 MIR_new_reg_op(ctx, r_ret), MIR_new_reg_op(ctx, r_harg)));
       } else {
@@ -3763,7 +3807,8 @@ static bool mir_compile_expr(ExprState *state) {
             MIR_new_call_insn(
                 ctx, 4,
                 MIR_new_ref_op(ctx, proto_direct[0][step_direct_ret_types[opno]]
-                                                [step_direct_arg0_types[opno]]),
+                                                [step_direct_arg0_types[opno]]
+                                                [step_direct_arg1_types[opno]]),
                 MIR_new_ref_op(ctx, step_direct_imports[opno]),
                 MIR_new_reg_op(ctx, r_ret), MIR_new_reg_op(ctx, r_harg)));
       } else {
@@ -3911,7 +3956,8 @@ static bool mir_compile_expr(ExprState *state) {
             MIR_new_call_insn(
                 ctx, 4,
                 MIR_new_ref_op(ctx, proto_direct[0][step_direct_ret_types[opno]]
-                                                [step_direct_arg0_types[opno]]),
+                                                [step_direct_arg0_types[opno]]
+                                                [step_direct_arg1_types[opno]]),
                 MIR_new_ref_op(ctx, step_direct_imports[opno]),
                 MIR_new_reg_op(ctx, r_ret), MIR_new_reg_op(ctx, r_harg)));
       } else {
@@ -4043,7 +4089,8 @@ static bool mir_compile_expr(ExprState *state) {
             MIR_new_call_insn(
                 ctx, 4,
                 MIR_new_ref_op(ctx, proto_direct[0][step_direct_ret_types[opno]]
-                                                [step_direct_arg0_types[opno]]),
+                                                [step_direct_arg0_types[opno]]
+                                                [step_direct_arg1_types[opno]]),
                 MIR_new_ref_op(ctx, step_direct_imports[opno]),
                 MIR_new_reg_op(ctx, r_ret), MIR_new_reg_op(ctx, r_harg)));
       } else {

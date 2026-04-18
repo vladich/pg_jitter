@@ -47,6 +47,9 @@
 #include <smmintrin.h>
 #define PG_JITTER_HAVE_SSE41 1
 #endif
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+#endif
 #endif /* _MSC_VER */
 #endif
 
@@ -779,9 +782,6 @@ done:
 #include "pg_crc32c_compat.h"
 #endif
 
-/* Empty slot sentinel — INT32_MIN is extremely unlikely as a real value */
-#define CRC32_HASH_EMPTY INT32_MIN
-
 static inline uint32
 crc32_hash_int4(int32 val)
 {
@@ -792,11 +792,12 @@ crc32_hash_int4(int32 val)
 #elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
 	return _mm_crc32_u32(0xFFFFFFFF, (uint32)val);
 #else
-	/* Fallback: use PG's CRC32C */
+	/* Fallback: use PG's CRC32C combiner, but keep the raw pre-FIN value.
+	 * The JIT emits raw CRC32 instructions for this hash table, so build
+	 * and probe must use the same convention on every platform. */
 	pg_crc32c crc;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &val, sizeof(val));
-	FIN_CRC32C(crc);
 	return (uint32)crc;
 #endif
 }
@@ -809,22 +810,20 @@ crc32_hash_build_int4(const int32 *vals, int nvals, bool has_nulls)
 	while (table_size < nvals * 2)
 		table_size <<= 1;
 
-	Size alloc = offsetof(Crc32HashTable, table) + table_size * sizeof(int32);
-	Crc32HashTable *ht = MemoryContextAlloc(TopMemoryContext, alloc);
+	Size alloc = offsetof(Crc32HashTable, table) +
+		table_size * sizeof(Crc32HashSlot);
+	Crc32HashTable *ht = MemoryContextAllocZero(TopMemoryContext, alloc);
 	ht->mask = table_size - 1;
 	ht->nitems = nvals;
 	ht->has_nulls = has_nulls;
 
-	/* Fill with empty sentinel */
-	for (int i = 0; i < table_size; i++)
-		ht->table[i] = CRC32_HASH_EMPTY;
-
 	/* Insert values with linear probing */
 	for (int i = 0; i < nvals; i++) {
 		uint32 h = crc32_hash_int4(vals[i]) & ht->mask;
-		while (ht->table[h] != CRC32_HASH_EMPTY)
+		while (ht->table[h].occupied)
 			h = (h + 1) & ht->mask;
-		ht->table[h] = vals[i];
+		ht->table[h].value = vals[i];
+		ht->table[h].occupied = true;
 	}
 
 	return ht;
@@ -837,10 +836,9 @@ crc32_hash_probe_int4(int32 val, int64 table_ptr)
 	uint32 h = crc32_hash_int4(val) & ht->mask;
 
 	for (;;) {
-		int32 slot = ht->table[h];
-		if (slot == CRC32_HASH_EMPTY)
+		if (!ht->table[h].occupied)
 			return 0;  /* not found */
-		if (slot == val)
+		if (ht->table[h].value == val)
 			return 1;  /* found */
 		h = (h + 1) & ht->mask;
 	}
@@ -948,28 +946,28 @@ simd_int8_array_eq(int64 val, const int64 *data, int nitems)
 bool
 simd_nullbitmap_all_notnull(const uint8 *bits, int ncols)
 {
-	int nbytes = (ncols + 7) / 8;
+	int full_bytes = ncols >> 3;
+	int trailing = ncols & 7;
 
 #ifdef PG_JITTER_HAVE_NEON
 	int i = 0;
-	for (; i + 16 <= nbytes; i += 16) {
+	for (; i + 16 <= full_bytes; i += 16) {
 		uint8x16_t v = vld1q_u8(bits + i);
 		if (vminvq_u8(v) != 0xFF)
 			return false;
 	}
-	for (; i < nbytes; i++)
+	for (; i < full_bytes; i++)
 		if (bits[i] != 0xFF)
 			return false;
 #else
-	for (int i = 0; i < nbytes; i++)
+	for (int i = 0; i < full_bytes; i++)
 		if (bits[i] != 0xFF)
 			return false;
 #endif
-	/* Mask out trailing bits in the last byte */
-	int trailing = ncols % 8;
+
 	if (trailing != 0) {
 		uint8 mask = (1 << trailing) - 1;
-		if ((bits[nbytes - 1] & mask) != mask)
+		if ((bits[full_bytes] & mask) != mask)
 			return false;
 	}
 	return true;

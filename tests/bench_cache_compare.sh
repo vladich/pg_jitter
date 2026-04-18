@@ -164,7 +164,10 @@ run_one_bench "Bool_AND_OR" \
 run_one_bench "Arith_complex" \
     "SELECT SUM(val * val + key1 * 3 - key2) FROM join_left"
 
-run_one_bench "IN_list_20" \
+run_one_bench "IN_expr_20" \
+    "SELECT COUNT(*) FROM join_left WHERE val + 0 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
+
+run_one_bench "IN_index_20" \
     "SELECT COUNT(*) FROM join_left WHERE key1 IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)"
 
 # ---- Subqueries ----

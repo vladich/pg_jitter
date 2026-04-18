@@ -23,6 +23,7 @@
 #include "fmgr.h"
 #include "jit/jit.h"
 #include "miscadmin.h"
+#include "access/htup_details.h"
 #include "nodes/execnodes.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
@@ -43,6 +44,8 @@
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
 #endif
+
+#define META_DEFORM_AVX512_MIN_COLS_DEFAULT 1200
 
 /*
  * PG 14 doesn't mark pkglib_path with PGDLLIMPORT, so it can't be linked
@@ -242,6 +245,8 @@ static int pg_jitter_backend = PG_JITTER_BACKEND_SLJIT;
 static int meta_parallel_mode = 1;		/* PARALLEL_JIT_PER_WORKER */
 static int meta_shared_code_max_kb = 4096;	/* 4 MB */
 static bool meta_deform_cache = true;
+static bool meta_deform_avx512 = true;
+static int meta_deform_avx512_min_cols = META_DEFORM_AVX512_MIN_COLS_DEFAULT;
 static int meta_min_expr_steps = 4;
 static bool meta_adaptive = true;
 static int meta_adaptive_samples = 64;
@@ -1627,6 +1632,30 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 							 PGC_USERSET,
 							 GUC_ALLOW_IN_PARALLEL,
 							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_jitter.deform_avx512",
+							 "Use AVX-512F for supported tuple deform batches "
+							 "when the CPU and OS allow executing AVX-512 "
+							 "instructions.",
+							 NULL,
+							 &meta_deform_avx512,
+							 true,
+							 PGC_USERSET,
+							 GUC_ALLOW_IN_PARALLEL,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_jitter.deform_avx512_min_cols",
+		"Minimum uniform int4 deform batch width required before using "
+		"AVX-512. 0 allows AVX-512 for every eligible batch.",
+		NULL,
+		&meta_deform_avx512_min_cols,
+		META_DEFORM_AVX512_MIN_COLS_DEFAULT,
+		0,
+		MaxTupleAttributeNumber,
+		PGC_USERSET,
+		GUC_ALLOW_IN_PARALLEL,
+		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"pg_jitter.min_expr_steps",

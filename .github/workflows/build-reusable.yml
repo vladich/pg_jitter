@@ -265,9 +265,16 @@ jobs:
         shell: bash
         run: |
           CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          PG_MAJOR="${{ inputs.postgres-version }}"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             # MIR backend has pre-existing code-gen bugs on Windows — skip it
-            BACKENDS="sljit asmjit auto"
+            if [[ "$PG_MAJOR" -lt 17 ]]; then
+              BACKENDS="sljit asmjit"
+            else
+              BACKENDS="sljit asmjit auto"
+            fi
+          elif [[ "$PG_MAJOR" -lt 17 ]]; then
+            BACKENDS="sljit asmjit mir"
           else
             BACKENDS="sljit asmjit mir auto"
           fi
@@ -279,7 +286,6 @@ jobs:
 
           # Find pg_regress (with or without .exe suffix)
           PG_REGRESS=""
-          PG_MAJOR="${{ inputs.postgres-version }}"
           for candidate in \
             "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress" \
             "$(pg_config --pkglibdir)/pgxs/src/test/regress/pg_regress.exe" \
@@ -336,12 +342,10 @@ jobs:
                   EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', r.nspname);
               END LOOP;
           END $$;
-          DO $$ DECLARE r RECORD; BEGIN
-              FOR r IN SELECT spcname FROM pg_tablespace
-                       WHERE spcname NOT IN ('pg_default','pg_global') LOOP
-                  EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
-              END LOOP;
-          END $$;
+          SELECT format('DROP TABLESPACE IF EXISTS %I;', spcname)
+          FROM pg_tablespace
+          WHERE spcname NOT IN ('pg_default','pg_global')
+          \gexec
           DO $$ DECLARE r RECORD; BEGIN
               FOR r IN SELECT rolname FROM pg_roles
                        WHERE rolname LIKE 'regress_%'
@@ -391,16 +395,49 @@ jobs:
 
             cleanup_database || true
 
-            # Switch backend by writing to config and reloading.
-            # ALTER SYSTEM SET rejects unknown GUCs, but the config file accepts them.
-            # Remove ALL pg_jitter.* settings from auto.conf so each run starts clean.
-            grep -v '^pg_jitter\.' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
+            # Switch backend by writing to config and restarting.
+            # PG14-PG16 use direct providers; PG17+ uses the meta provider
+            # plus pg_jitter.backend, where "auto" is supported.
+            grep -Ev '^(jit_provider|pg_jitter\.)' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
             mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf"
-            echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
+            if [ "$PG_MAJOR" -ge 17 ]; then
+              echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.auto.conf"
+              echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
+            else
+              echo "jit_provider = 'pg_jitter_$backend'" >> "$PGDATA/postgresql.auto.conf"
+            fi
             pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
             sleep 1
 
             echo "Active backend: $backend"
+
+            BACKEND_CHECK_LOG="${{ github.workspace }}/regress-output-$backend/backend_check.log"
+            mkdir -p "$(dirname "$BACKEND_CHECK_LOG")"
+            BACKEND_SHOW_SQL=""
+            if [ "$PG_MAJOR" -ge 17 ]; then
+              BACKEND_SHOW_SQL="SHOW pg_jitter.backend;"
+            fi
+            set +e
+            BACKEND_CHECK_OUTPUT=$(psql -X -v ON_ERROR_STOP=1 -c "
+              SHOW jit_provider;
+              $BACKEND_SHOW_SQL
+              SET jit = on;
+              SET jit_above_cost = 0;
+              SET jit_inline_above_cost = 0;
+              SET jit_optimize_above_cost = 0;
+              SELECT SUM(i) FROM generate_series(1,1000) AS g(i) WHERE i > 10;
+            " "$CONNURI" 2>&1)
+            BACKEND_CHECK_RC=$?
+            set -e
+            printf '%s\n' "$BACKEND_CHECK_OUTPUT" > "$BACKEND_CHECK_LOG"
+            if [ $BACKEND_CHECK_RC -ne 0 ] ||
+               printf '%s\n' "$BACKEND_CHECK_OUTPUT" | grep -q 'invalid value for parameter "pg_jitter.backend"'; then
+              echo "  => $backend: FAILED backend activation"
+              cat "$BACKEND_CHECK_LOG"
+              RESULTS="$RESULTS  $backend: FAILED backend activation\n"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
 
             # Save log position before tests so we can dump only new lines on failure
             LOG_OFFSET=0
@@ -492,6 +529,64 @@ jobs:
 
             echo ""
           done
+
+          if [ $FAILED -eq 0 ] && [ "$RUNNER_OS" != "Windows" ]; then
+            echo "============================================"
+            echo "  pg_jitter targeted regression tests"
+            echo "============================================"
+
+            PG_CONFIG_PATH="$(command -v pg_config)"
+            TARGETED_FAILED=0
+
+            for backend in $BACKENDS; do
+              grep -Ev '^(jit_provider|pg_jitter\.)' "$PGDATA/postgresql.auto.conf" > "$PGDATA/postgresql.auto.conf.tmp" || true
+              mv "$PGDATA/postgresql.auto.conf.tmp" "$PGDATA/postgresql.auto.conf"
+              if [ "$PG_MAJOR" -ge 17 ]; then
+                echo "jit_provider = 'pg_jitter'" >> "$PGDATA/postgresql.auto.conf"
+                echo "pg_jitter.backend = '$backend'" >> "$PGDATA/postgresql.auto.conf"
+              else
+                echo "jit_provider = 'pg_jitter_$backend'" >> "$PGDATA/postgresql.auto.conf"
+              fi
+              pg_ctl -D "$PGDATA" restart -l "$PGDATA/logfile" -w || true
+              sleep 1
+
+              set +e
+              ./tests/test_provider_regressions.sh \
+                --pg-config "$PG_CONFIG_PATH" \
+                --host localhost \
+                --port "$PGPORT" \
+                --db postgres \
+                --backend "$backend"
+              PROVIDER_RC=$?
+
+              ./tests/test_function_surface.sh \
+                --pg-config "$PG_CONFIG_PATH" \
+                --host localhost \
+                --port "$PGPORT" \
+                --db postgres \
+                --backend "$backend"
+              SURFACE_RC=$?
+              set -e
+
+              if [ $PROVIDER_RC -ne 0 ]; then
+                RESULTS="$RESULTS  $backend targeted provider regressions: FAILED\n"
+                TARGETED_FAILED=$((TARGETED_FAILED + 1))
+              else
+                RESULTS="$RESULTS  $backend targeted provider regressions: PASSED\n"
+              fi
+
+              if [ $SURFACE_RC -ne 0 ]; then
+                RESULTS="$RESULTS  $backend function surface regressions: FAILED\n"
+                TARGETED_FAILED=$((TARGETED_FAILED + 1))
+              else
+                RESULTS="$RESULTS  $backend function surface regressions: PASSED\n"
+              fi
+            done
+
+            if [ $TARGETED_FAILED -ne 0 ]; then
+              FAILED=$((FAILED + TARGETED_FAILED))
+            fi
+          fi
 
           echo "============================================"
           echo "  SUMMARY"

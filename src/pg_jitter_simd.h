@@ -77,11 +77,22 @@ extern int32 simd_int8_array_eq(int64 val, const int64 *data, int nitems);
  * At runtime: crc32(val) & mask → linear probe.
  * ~3 cycles per lookup vs PG's ~30 cycles (Jenkins + chained buckets).
  * ================================================================ */
+typedef struct Crc32HashSlot {
+	int32 value;
+	bool  occupied;
+	uint8 pad[3];
+} Crc32HashSlot;
+
+#define CRC32_HASH_SLOT_SHIFT 3
+#define CRC32_HASH_SLOT_SIZE  (1 << CRC32_HASH_SLOT_SHIFT)
+StaticAssertDecl(sizeof(Crc32HashSlot) == CRC32_HASH_SLOT_SIZE,
+                 "Crc32HashSlot must stay 8 bytes for inline JIT probes");
+
 typedef struct Crc32HashTable {
 	int32    mask;         /* table_size - 1 (power of 2) */
 	int32    nitems;       /* number of values stored */
 	bool     has_nulls;    /* array contained NULLs */
-	int32    table[];      /* open-addressing slots, INT32_MIN = empty */
+	Crc32HashSlot table[]; /* open-addressing slots */
 } Crc32HashTable;
 
 /* Build hash table from sorted int32 values (called at JIT compile time) */

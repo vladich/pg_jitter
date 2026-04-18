@@ -12,6 +12,7 @@
 #include "executor/nodeAgg.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
+#include "nodes/plannodes.h"
 #include "utils/expandeddatum.h"
 #include "utils/palloc.h"
 
@@ -114,6 +115,37 @@ static int sljit_sreg_steps = 0;
 static int sljit_sreg_slot_vals[5];
 static int sljit_sreg_slot_nulls[5];
 
+#if defined(__x86_64__) || defined(_M_X64)
+static bool
+emit_x86_crc32c_u32_reg(struct sljit_compiler *C, sljit_s32 dst,
+                        sljit_s32 src)
+{
+  sljit_s32 dst_idx = sljit_get_register_index(SLJIT_GP_REGISTER, dst);
+  sljit_s32 src_idx = sljit_get_register_index(SLJIT_GP_REGISTER, src);
+  sljit_u8 inst[6];
+  sljit_u32 n = 0;
+  sljit_u8 rex = 0x40;
+
+  if (dst_idx < 0 || src_idx < 0)
+    return false;
+
+  inst[n++] = 0xF2; /* mandatory CRC32 prefix */
+  if (dst_idx >= 8)
+    rex |= 0x04; /* REX.R */
+  if (src_idx >= 8)
+    rex |= 0x01; /* REX.B */
+  if (rex != 0x40)
+    inst[n++] = rex;
+
+  inst[n++] = 0x0F;
+  inst[n++] = 0x38;
+  inst[n++] = 0xF1; /* crc32 r32, r/m32 */
+  inst[n++] = (sljit_u8)(0xC0 | ((dst_idx & 7) << 3) | (src_idx & 7));
+
+  return sljit_emit_op_custom(C, inst, n) == SLJIT_SUCCESS;
+}
+#endif
+
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
 static void sljit_code_free(void *data);
@@ -164,6 +196,29 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
                              NULL, NULL, NULL);
   }
 
+  if (!GetConfigOption("pg_jitter.deform_avx512", true, false)) {
+    DefineCustomBoolVariable(
+        "pg_jitter.deform_avx512",
+        "Use AVX-512F for supported tuple deform batches when the CPU and OS "
+        "allow executing AVX-512 instructions.",
+        NULL, &pg_jitter_deform_avx512,
+        true,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
+
+  if (!GetConfigOption("pg_jitter.deform_avx512_min_cols", true, false)) {
+    DefineCustomIntVariable(
+        "pg_jitter.deform_avx512_min_cols",
+        "Minimum uniform int4 deform batch width required before using "
+        "AVX-512. 0 allows AVX-512 for every eligible batch.",
+        NULL, &pg_jitter_deform_avx512_min_cols,
+        DEFORM_AVX512_MIN_COLS_DEFAULT,
+        0, MaxTupleAttributeNumber,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
+
   if (!GetConfigOption("pg_jitter.min_expr_steps", true, false)) {
     DefineCustomIntVariable(
         "pg_jitter.min_expr_steps",
@@ -203,6 +258,28 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
         PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
         NULL, NULL, NULL);
   }
+
+  if (!GetConfigOption("pg_jitter.in_simd_max", true, false)) {
+    DefineCustomIntVariable(
+        "pg_jitter.in_simd_max",
+        "Max int4 HASHED_SCALARARRAYOP constants for generated SIMD "
+        "linear scan. 0 disables this opt-in path.",
+        NULL, &pg_jitter_in_simd_max,
+        IN_SIMD_MAX_DEFAULT,
+        0, 64,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || \
+    defined(_M_IX86)
+  elog(DEBUG1,
+       "pg_jitter: x86 SIMD usable features sse4.2=%d avx2=%d "
+       "avx512f=%d avx512bw=%d avx512vl=%d",
+       pg_jitter_cpu_has_sse42(), pg_jitter_cpu_has_avx2(),
+       pg_jitter_cpu_has_avx512f(), pg_jitter_cpu_has_avx512bw(),
+       pg_jitter_cpu_has_avx512vl());
+#endif
 }
 
 /*
@@ -458,6 +535,100 @@ static bool expr_has_fast_path(ExprState *state) {
   return false;
 }
 
+static bool sljit_plan_is_tiny_scan(Plan *plan) {
+  if (!plan)
+    return false;
+
+  switch (nodeTag(plan)) {
+  case T_IndexScan:
+  case T_IndexOnlyScan:
+  case T_BitmapHeapScan:
+  case T_TidScan:
+  case T_TidRangeScan:
+    break;
+  default:
+    return false;
+  }
+
+  return plan->plan_rows <= 128 && plan->total_cost <= 1000;
+}
+
+static bool sljit_should_skip_tiny_scan_expr(ExprState *state) {
+  PlanState *parent = state->parent;
+  Plan *plan;
+  bool tiny_scan_parent;
+  bool tiny_agg_parent;
+  bool has_agg = false;
+  bool has_qual = false;
+
+  if (!parent || !parent->plan)
+    return false;
+
+  plan = parent->plan;
+  tiny_scan_parent = sljit_plan_is_tiny_scan(plan);
+  tiny_agg_parent =
+      nodeTag(plan) == T_Agg && sljit_plan_is_tiny_scan(outerPlan(plan));
+
+  /*
+   * These plans normally do too little expression work to amortize native code
+   * generation. Use only fields already present in the Plan node; no catalog
+   * probes or index metadata checks.
+   */
+  if (!tiny_scan_parent && !tiny_agg_parent)
+    return false;
+
+  for (int i = 0; i < state->steps_len; i++) {
+    ExprEvalStep *step = &state->steps[i];
+    ExprEvalOp opc = ExecEvalStepOp(state, step);
+
+    switch (opc) {
+    case EEOP_QUAL:
+      has_qual = true;
+      break;
+
+    case EEOP_INNER_FETCHSOME:
+    case EEOP_OUTER_FETCHSOME:
+    case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
+    case EEOP_OLD_FETCHSOME:
+    case EEOP_NEW_FETCHSOME:
+#endif
+      break;
+
+    case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+    case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+    case EEOP_AGG_PLAIN_TRANS_BYREF:
+      if (!tiny_agg_parent)
+        return false;
+      has_agg = true;
+      break;
+
+#ifdef HAVE_EEOP_HASHDATUM
+    case EEOP_HASHDATUM_SET_INITVAL:
+    case EEOP_HASHDATUM_FIRST:
+    case EEOP_HASHDATUM_FIRST_STRICT:
+    case EEOP_HASHDATUM_NEXT32:
+    case EEOP_HASHDATUM_NEXT32_STRICT:
+#endif
+    case EEOP_HASHED_SCALARARRAYOP:
+    case EEOP_SCALARARRAYOP:
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+    case EEOP_IS_JSON:
+#endif
+    case EEOP_IOCOERCE:
+      return false;
+
+    default:
+      break;
+    }
+  }
+
+  return tiny_agg_parent ? has_agg : has_qual;
+}
+
 /*
  * Deform compilation functions (pg_jitter_compile_deform,
  * pg_jitter_compile_deform_loop, pg_jitter_compiled_deform_dispatch) are in
@@ -478,6 +649,17 @@ static void *sljit_compile_deform_loop(TupleDesc desc,
                                        const TupleTableSlotOps *ops,
                                        int natts) {
   return pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
+}
+
+static bool sljit_deform_has_nullable(TupleDesc desc, int natts) {
+  for (int attnum = 0; attnum < natts; attnum++) {
+    CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+
+    if (!JITTER_ATT_IS_NOTNULL(att))
+      return true;
+  }
+
+  return false;
 }
 
 /*
@@ -519,7 +701,8 @@ static void *find_or_compile_deform(PgJitterContext *ctx,
     void *code;
 
     INSTR_TIME_SET_CURRENT(deform_start);
-    if (natts > pg_jitter_deform_threshold())
+    if (natts > pg_jitter_deform_threshold() ||
+        (natts >= 64 && sljit_deform_has_nullable(desc, natts)))
       code = sljit_compile_deform_loop(desc, ops, natts);
     else
       code = sljit_compile_deform(desc, ops, natts);
@@ -617,6 +800,7 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
   int attnum;
   int known_alignment = 0;
   bool attguaranteedalign = true;
+  bool all_notnull = true;
   int guaranteed_column_number = -1;
   sljit_sw tuple_off;
   sljit_sw slot_off;
@@ -638,6 +822,25 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
     return false;
 
   if (natts > pg_jitter_wide_deform_limit())
+    return false;
+
+  /* --- Pre-scan: find nullability and guaranteed_column_number --- */
+  for (attnum = 0; attnum < natts; attnum++) {
+    CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+
+    if (!JITTER_ATT_IS_NOTNULL(att))
+      all_notnull = false;
+
+    if (JITTER_ATT_IS_NOTNULL(att) && !att->atthasmissing && !att->attisdropped)
+      guaranteed_column_number = attnum;
+  }
+
+  /*
+   * Wide nullable tables tend to be sparse and branch-heavy.  The inline
+   * unrolled path bloats the expression body and loses I-cache locality; the
+   * compiled loop/sparse-dispatch path handles bitmap bytes in bulk.
+   */
+  if (!all_notnull && natts >= 64)
     return false;
 
   /* Wide tables: skip inline deform, fall through to compiled loop deform */
@@ -663,14 +866,6 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
   } else {
     tuple_off = offsetof(MinimalTupleTableSlot, tuple);
     slot_off = offsetof(MinimalTupleTableSlot, off);
-  }
-
-  /* --- Pre-scan: find guaranteed_column_number --- */
-  for (attnum = 0; attnum < natts; attnum++) {
-    CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
-
-    if (JITTER_ATT_IS_NOTNULL(att) && !att->atthasmissing && !att->attisdropped)
-      guaranteed_column_number = attnum;
   }
 
   /* Allocate forward-jump tracking arrays */
@@ -1619,6 +1814,120 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_SIG_GREATER_EQUAL);
     return true;
 
+  /* ---- unsigned by-value comparisons ---- */
+  case JIT_INLINE_UINT8_EQ:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT8_NE:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_NOT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT8_LT:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_R0, 0, SLJIT_R1,
+                    0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS);
+    return true;
+
+  case JIT_INLINE_UINT8_LE:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_LESS_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT8_GT:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_GREATER, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER);
+    return true;
+
+  case JIT_INLINE_UINT8_GE:
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0, SLJIT_R0, 0);
+    sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0, SLJIT_R1, 0);
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_GREATER_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT32_EQ:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT32_NE:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_NOT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT32_LT:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_R0, 0, SLJIT_R1,
+                    0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS);
+    return true;
+
+  case JIT_INLINE_UINT32_LE:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_LESS_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT32_GT:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_GREATER, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER);
+    return true;
+
+  case JIT_INLINE_UINT32_GE:
+    sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_GREATER_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT64_EQ:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT64_NE:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_NOT_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT64_LT:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_LESS, SLJIT_R0, 0, SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS);
+    return true;
+
+  case JIT_INLINE_UINT64_LE:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_LESS_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_LESS_EQUAL);
+    return true;
+
+  case JIT_INLINE_UINT64_GT:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_GREATER, SLJIT_R0, 0, SLJIT_R1,
+                    0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER);
+    return true;
+
+  case JIT_INLINE_UINT64_GE:
+    sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_GREATER_EQUAL, SLJIT_R0, 0,
+                    SLJIT_R1, 0);
+    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_GREATER_EQUAL);
+    return true;
+
   /* ---- float64 arithmetic (overflow-checked) ---- */
   /*
    * float8 values are stored as Datum (int64 bit-pattern).
@@ -2507,6 +2816,18 @@ static bool emit_precompiled_inline(struct sljit_compiler *C,
   if (!pi || pi->code_len == 0 || pi->code_len > sizeof(buf))
     return false;
 
+#if defined(__x86_64__) || defined(_M_X64)
+  /*
+   * x86_64 blobs with cold error tails branch to the byte after the normal
+   * RET. Replacing the 1-byte RET with a 5-byte JMP overwrites that branch
+   * target, so the error path jumps into the JMP displacement. Only emit
+   * leaf blobs whose RET is the final byte; fall through to the normal
+   * sljit/direct-call paths for anything with a tail or relocation.
+   */
+  if (pi->ret_offset != (int)pi->code_len - 1 || pi->n_relocs != 0)
+    return false;
+#endif
+
   memcpy(buf, pi->code, pi->code_len);
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -2719,6 +3040,9 @@ static bool sljit_compile_expr(ExprState *state) {
   if (expr_has_fast_path(state))
     return false;
 
+  if (sljit_should_skip_tiny_scan_expr(state))
+    return false;
+
   /* Skip JIT for expressions below the minimum step threshold */
   {
     int min_steps = pg_jitter_get_min_expr_steps();
@@ -2834,9 +3158,12 @@ static bool sljit_compile_expr(ExprState *state) {
 
     elog(DEBUG1,
          "pg_jitter: compile_expr node=%d expr=%d is_worker=%d "
-         "shared_mode=%d share_init=%d",
+         "shared_mode=%d share_init=%d plan_tag=%d rows=%.0f cost=%.2f "
+         "steps=%d",
          shared_node_id, shared_expr_idx, IsParallelWorker(),
-         sljit_shared_code_mode, ctx->share_state.initialized);
+         sljit_shared_code_mode, ctx->share_state.initialized,
+         (int) nodeTag(state->parent->plan), state->parent->plan->plan_rows,
+         state->parent->plan->total_cost, state->steps_len);
 
     /* Leader: create DSM on first compile */
     if (sljit_shared_code_mode && !IsParallelWorker() &&
@@ -4062,10 +4389,15 @@ static bool sljit_compile_expr(ExprState *state) {
            * - Have a ret instruction (skip tail-call stubs)
            * - Are ≤48 bytes (avoid I-cache bloat from large
            *   float/div blobs; those fall through to direct call)
+           * - On x86_64, are leaf blobs ending at RET. Blobs with cold
+           *   error tails are unsafe because the RET patch overwrites
+           *   the branch target for the tail.
            */
           if (pi && pi->ret_offset >= 0 &&
               pi->code_len <= 48
 #if defined(__x86_64__) || defined(_M_X64)
+              && pi->ret_offset == (int)pi->code_len - 1 &&
+              pi->n_relocs == 0
               /*
                * x86_64: sljit R0..R3 != SysV ABI arg regs.
                * We can map arg0→rdi(R2), arg1→rsi(R1), but
@@ -7777,21 +8109,39 @@ static bool sljit_compile_expr(ExprState *state) {
         }
       }
 
-      if (sorted_vals && nvals > 0 && nvals <= 32 &&
+      int simd_reg_size = SLJIT_SIMD_REG_128;
+      int simd_lanes = 4;
+      int simd_hw_max_nvals = 32;
+      int simd_max_nvals = pg_jitter_in_simd_max;
+
+#ifdef SLJIT_HAS_AVX2
+      if (pg_jitter_cpu_has_avx2() &&
+          sljit_has_cpu_feature(SLJIT_HAS_AVX2)) {
+        simd_reg_size = SLJIT_SIMD_REG_256;
+        simd_lanes = 8;
+        simd_hw_max_nvals = 64;
+      }
+#endif
+
+      if (simd_max_nvals > simd_hw_max_nvals)
+        simd_max_nvals = simd_hw_max_nvals;
+
+      if (sorted_vals && nvals > 0 && nvals <= simd_max_nvals &&
           eq_dfn && eq_dfn->jit_fn &&
           (fcinfo->args[0].value == 0 || sizeof(int32) == 4) && /* int4 check */
           (op->d.hashedscalararrayop.finfo->fn_addr == int4eq) &&
           sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
         /*
-         * ---- SIMD int32 linear scan (up to 32 elements) ----
+         * ---- SIMD int32 linear scan (opt-in, up to 32/64 elements) ----
          *
-         * For small int4 constant arrays, SIMD 4-wide XOR+check
-         * beats binary search: no branch mispredictions, 1-8
-         * iterations for 4-32 elements. Processes 4 values per
-         * NEON/SSE iteration.
+         * PostgreSQL emits HASHED_SCALARARRAYOP only after the list is large
+         * enough that a linear scan often loses. Keep this path available for
+         * targeted experiments/cases, but leave it disabled by default.
          */
         struct sljit_jump *j_scalar_null_simd;
         struct sljit_label *lbl_done_simd;
+        int padded_nvals = (nvals + simd_lanes - 1) & ~(simd_lanes - 1);
+        int simd_type = simd_reg_size | SLJIT_SIMD_ELEM_32;
 
         sljit_sw off_arg0_value_simd =
             (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -7800,15 +8150,30 @@ static bool sljit_compile_expr(ExprState *state) {
 
         /* Build aligned int32 array in TopMemoryContext */
         int32 *simd_vals = MemoryContextAllocZero(TopMemoryContext,
-                                                    ((nvals + 3) & ~3) * sizeof(int32));
+                                                  padded_nvals * sizeof(int32));
         for (int k = 0; k < nvals; k++)
           simd_vals[k] = DatumGetInt32(sorted_vals[k]);
-        /* Pad with a sentinel value that won't match. Use a value
-         * NOT in the array. Since sorted_vals is sorted, pick
-         * sorted_vals[0] ^ 0x80000000 (flip sign bit — guaranteed
-         * different from sorted_vals[0]). */
-        int32 pad_val = simd_vals[0] ^ (int32)0x80000000;
-        for (int k = nvals; k < ((nvals + 3) & ~3); k++)
+
+        /* Pad with a value absent from the array. */
+        uint32 pad_bits = ((uint32)simd_vals[0]) ^ (uint32)0x80000000U;
+        int32 pad_val;
+        for (;;) {
+          bool found = false;
+          int32 candidate = (int32)pad_bits;
+
+          for (int k = 0; k < nvals; k++) {
+            if (simd_vals[k] == candidate) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            pad_val = candidate;
+            break;
+          }
+          pad_bits += (uint32)0x9E3779B9U;
+        }
+        for (int k = nvals; k < padded_nvals; k++)
           simd_vals[k] = pad_val;
 
         /* Check scalar not NULL */
@@ -7825,14 +8190,13 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
                        SLJIT_MEM1(SLJIT_R0), off_arg0_value_simd);
 
-        /* VR0 = broadcast scalar to 4 int32 lanes */
-        sljit_emit_simd_replicate(C,
-            SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-            SLJIT_VR0, SLJIT_R0, 0);
+        /* VR0 = broadcast scalar to SIMD int32 lanes */
+        sljit_emit_simd_replicate(C, simd_type, SLJIT_VR0, SLJIT_R0, 0);
 
-        /* SIMD loop: check 4 elements per iteration */
-        int nchunks = ((nvals + 3) & ~3) / 4;
-        struct sljit_jump **found_jumps = palloc(nchunks * sizeof(struct sljit_jump *));
+        /* SIMD loop: check 4 or 8 elements per iteration */
+        int nchunks = padded_nvals / simd_lanes;
+        struct sljit_jump **found_jumps =
+            palloc(nchunks * sizeof(struct sljit_jump *));
         int n_found = 0;
 
         /* R2 = constant array base pointer */
@@ -7840,20 +8204,18 @@ static bool sljit_compile_expr(ExprState *state) {
                        SLJIT_IMM, (sljit_sw)simd_vals);
 
         for (int chunk = 0; chunk < nchunks; chunk++) {
-          /* VR1 = load 4x int32 from constant array */
-          sljit_emit_simd_mov(C,
-              SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-              SLJIT_VR1, SLJIT_MEM1(SLJIT_R2), chunk * 16);
+          /* VR1 = load SIMD-width int32 chunk from constant array */
+          sljit_emit_simd_mov(C, SLJIT_SIMD_LOAD | simd_type,
+                              SLJIT_VR1, SLJIT_MEM1(SLJIT_R2),
+                              chunk * simd_lanes * (int)sizeof(int32));
 
           /* VR2 = CMPEQ: matching lanes become all-1s, others all-0s */
-          sljit_emit_simd_op2(C,
-              SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32 | SLJIT_SIMD_OP2_CMPEQ,
-              SLJIT_VR2, SLJIT_VR0, SLJIT_VR1, 0);
+          sljit_emit_simd_op2(C, simd_type | SLJIT_SIMD_OP2_CMPEQ,
+                              SLJIT_VR2, SLJIT_VR0, SLJIT_VR1, 0);
 
           /* Extract sign bits: bit i set if lane i matched */
-          sljit_emit_simd_sign(C,
-              SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-              SLJIT_VR2, SLJIT_R1, 0);
+          sljit_emit_simd_sign(C, SLJIT_SIMD_STORE | simd_type,
+                               SLJIT_VR2, SLJIT_R1, 0);
 
           /* Any bit set → found match */
           found_jumps[n_found++] =
@@ -8127,19 +8489,17 @@ static bool sljit_compile_expr(ExprState *state) {
         /* sorted_vals is only set for typbyval int4/int8 types.
          * Skip in shared mode: ht_table pointer is process-local. */
         /*
-         * ---- Inline CRC32 hash probe (> 512 elements) ----
+         * ---- Inline CRC32 hash probe (above in_bsearch_max) ----
          *
          * Build CRC32 open-addressing hash table at compile time.
-         * Emit probe directly in SLJIT — no function call.
+         * AArch64 and SSE4.2-capable x86_64 emit the probe inline; other
+         * platforms call the C helper.
          *
          * Register usage:
          *   R0 = scalar value (preserved)
          *   R1 = hash index / CRC temp
          *   R2 = slot address
          *   R3 = loaded slot value
-         *
-         * Compile-time constants embedded as immediates:
-         *   mask, table base pointer, EMPTY sentinel
          */
         int32 *int4_vals = MemoryContextAlloc(TopMemoryContext,
                                                nvals * sizeof(int32));
@@ -8148,7 +8508,8 @@ static bool sljit_compile_expr(ExprState *state) {
         pfree(sorted_vals);
 
         Crc32HashTable *ht = crc32_hash_build_int4(int4_vals, nvals,
-                                                     array_has_nulls);
+                                                   array_has_nulls);
+        pfree(int4_vals);
         sljit_sw ht_table = (sljit_sw)ht->table;
         sljit_s32 ht_mask = ht->mask;
 
@@ -8172,7 +8533,7 @@ static bool sljit_compile_expr(ExprState *state) {
         /* Load scalar value into R0 */
         sljit_sw off_arg0_value_rt =
             (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
-        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+        sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
                        SLJIT_MEM1(SLJIT_R0), off_arg0_value_rt);
 
         /* CRC32 hash: R1 = crc32c(0xFFFFFFFF, R0) & mask */
@@ -8185,14 +8546,18 @@ static bool sljit_compile_expr(ExprState *state) {
           sljit_u8 crc_inst[4] = {0x21, 0x58, 0xC0, 0x1A};
           sljit_emit_op_custom(C, crc_inst, 4);
         }
-#elif defined(__x86_64__)
-        /* Emit CRC32 EDX, EAX: F2 0F 38 F1 D0 */
-        /* TODO: x86 uses different register mapping */
-        /* Fall back to function call on x86 for now */
-        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, W),
-                   crc32_hash_probe_int4);
-        goto crc32_inline_skip;
+#elif defined(__x86_64__) || defined(_M_X64)
+        if (!pg_jitter_cpu_has_sse42() ||
+            !emit_x86_crc32c_u32_reg(C, SLJIT_R1, SLJIT_R0)) {
+          sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                         SLJIT_IMM, (sljit_sw)ht);
+          EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, W),
+                     crc32_hash_probe_int4);
+          goto crc32_inline_skip;
+        }
 #else
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                       SLJIT_IMM, (sljit_sw)ht);
         EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, W),
                    crc32_hash_probe_int4);
         goto crc32_inline_skip;
@@ -8202,9 +8567,9 @@ static bool sljit_compile_expr(ExprState *state) {
         sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0,
                        SLJIT_R1, 0, SLJIT_IMM, ht_mask);
 
-        /* R2 = &table[hash] = table_base + R1 * 4 */
+        /* R2 = &table[hash] = table_base + R1 * sizeof(table[0]) */
         sljit_emit_op2(C, SLJIT_SHL32, SLJIT_R2, 0,
-                       SLJIT_R1, 0, SLJIT_IMM, 2);
+                       SLJIT_R1, 0, SLJIT_IMM, CRC32_HASH_SLOT_SHIFT);
         sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
                        SLJIT_R2, 0, SLJIT_IMM, ht_table);
 
@@ -8212,14 +8577,18 @@ static bool sljit_compile_expr(ExprState *state) {
         {
           struct sljit_label *lbl_probe = sljit_emit_label(C);
 
-          /* R3 = table[index] */
-          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R3, 0,
-                         SLJIT_MEM1(SLJIT_R2), 0);
-
-          /* if slot == EMPTY → not found */
+          /* if slot is unoccupied → not found */
+          sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0,
+                         SLJIT_MEM1(SLJIT_R2),
+                         offsetof(Crc32HashSlot, occupied));
           struct sljit_jump *j_not_found_rt = sljit_emit_cmp(
               C, SLJIT_EQUAL, SLJIT_R3, 0,
-              SLJIT_IMM, (sljit_sw)INT32_MIN);
+              SLJIT_IMM, 0);
+
+          /* R3 = table[index].value */
+          sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R3, 0,
+                         SLJIT_MEM1(SLJIT_R2),
+                         offsetof(Crc32HashSlot, value));
 
           /* if slot == val → found */
           struct sljit_jump *j_found_inline = sljit_emit_cmp(
@@ -8231,7 +8600,7 @@ static bool sljit_compile_expr(ExprState *state) {
           sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0,
                          SLJIT_R1, 0, SLJIT_IMM, ht_mask);
           sljit_emit_op2(C, SLJIT_SHL32, SLJIT_R2, 0,
-                         SLJIT_R1, 0, SLJIT_IMM, 2);
+                         SLJIT_R1, 0, SLJIT_IMM, CRC32_HASH_SLOT_SHIFT);
           sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
                          SLJIT_R2, 0, SLJIT_IMM, ht_table);
           sljit_set_label(sljit_emit_jump(C, SLJIT_JUMP), lbl_probe);

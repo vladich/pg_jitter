@@ -171,6 +171,36 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			NULL, NULL, NULL);
 	}
 
+	if (!GetConfigOption("pg_jitter.deform_avx512", true, false))
+	{
+		DefineCustomBoolVariable(
+			"pg_jitter.deform_avx512",
+			"Use AVX-512F for supported tuple deform batches when the CPU and OS "
+			"allow executing AVX-512 instructions.",
+			NULL,
+			&pg_jitter_deform_avx512,
+			true,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter.deform_avx512_min_cols", true, false))
+	{
+		DefineCustomIntVariable(
+			"pg_jitter.deform_avx512_min_cols",
+			"Minimum uniform int4 deform batch width required before using "
+			"AVX-512. 0 allows AVX-512 for every eligible batch.",
+			NULL,
+			&pg_jitter_deform_avx512_min_cols,
+			DEFORM_AVX512_MIN_COLS_DEFAULT,
+			0,
+			MaxTupleAttributeNumber,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
 	if (!GetConfigOption("pg_jitter.min_expr_steps", true, false))
 	{
 		DefineCustomIntVariable(

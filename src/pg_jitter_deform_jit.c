@@ -615,6 +615,292 @@ pg_jitter_compile_deform(TupleDesc desc,
 #define DHANDLER_COUNT    7
 #define DHANDLER_NULLABLE_BIT 0x80	/* bit 7: column is nullable */
 
+#if defined(__x86_64__) || defined(_M_X64)
+static bool
+emit_x86_avx512_modrm_base(sljit_u8 *inst, sljit_u32 *n,
+						   sljit_s32 base_idx)
+{
+	sljit_u8	base_low;
+
+	if (base_idx < 0 || base_idx > 15)
+		return false;
+
+	base_low = (sljit_u8) (base_idx & 7);
+
+	if (base_low == 4)
+	{
+		/* rsp/r12 base requires a SIB byte; index=4 means no index. */
+		inst[(*n)++] = 0x04;
+		inst[(*n)++] = (sljit_u8) (0x20 | base_low);
+		return true;
+	}
+
+	if (base_low == 5)
+	{
+		/* rbp/r13 with mod=00 is RIP-relative; use disp8=0. */
+		inst[(*n)++] = (sljit_u8) (0x40 | base_low);
+		inst[(*n)++] = 0x00;
+		return true;
+	}
+
+	inst[(*n)++] = base_low;
+	return true;
+}
+
+static bool
+emit_x86_avx512_base_is_encodable(sljit_s32 base_reg)
+{
+	sljit_s32	base_idx;
+
+	base_idx = sljit_get_register_index(SLJIT_GP_REGISTER, base_reg);
+	return base_idx >= 0 && base_idx <= 15;
+}
+
+static bool
+emit_x86_avx512_vpmovsxdq_zmm0_m256(struct sljit_compiler *C,
+									sljit_s32 base_reg)
+{
+	sljit_u8	inst[8];
+	sljit_u32	n = 0;
+	sljit_s32	base_idx;
+
+	base_idx = sljit_get_register_index(SLJIT_GP_REGISTER, base_reg);
+	if (base_idx < 0 || base_idx > 15)
+		return false;
+
+	inst[n++] = 0x62;
+	inst[n++] = (base_idx & 8) ? 0xd2 : 0xf2;
+	inst[n++] = 0x7d;
+	inst[n++] = 0x48;
+	inst[n++] = 0x25;
+	if (!emit_x86_avx512_modrm_base(inst, &n, base_idx))
+		return false;
+
+	return sljit_emit_op_custom(C, inst, n) == SLJIT_SUCCESS;
+}
+
+static bool
+emit_x86_avx512_vmovdqu64_m512_zmm0(struct sljit_compiler *C,
+									sljit_s32 base_reg)
+{
+	sljit_u8	inst[8];
+	sljit_u32	n = 0;
+	sljit_s32	base_idx;
+
+	base_idx = sljit_get_register_index(SLJIT_GP_REGISTER, base_reg);
+	if (base_idx < 0 || base_idx > 15)
+		return false;
+
+	inst[n++] = 0x62;
+	inst[n++] = (base_idx & 8) ? 0xd1 : 0xf1;
+	inst[n++] = 0xfe;
+	inst[n++] = 0x48;
+	inst[n++] = 0x7f;
+	if (!emit_x86_avx512_modrm_base(inst, &n, base_idx))
+		return false;
+
+	return sljit_emit_op_custom(C, inst, n) == SLJIT_SUCCESS;
+}
+#endif
+
+static void
+emit_int4_to_datum_scalar_tail(struct sljit_compiler *C)
+{
+	struct sljit_jump *j_no_tail;
+	struct sljit_label *l_tail_top;
+
+	j_no_tail = sljit_emit_cmp(C, SLJIT_EQUAL,
+							   SLJIT_R3, 0, SLJIT_IMM, 0);
+	l_tail_top = sljit_emit_label(C);
+
+	sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R2, 0,
+				   SLJIT_MEM1(SLJIT_R0), 0);
+	sljit_emit_op1(C, SLJIT_MOV,
+				   SLJIT_MEM1(SLJIT_R1), 0,
+				   SLJIT_R2, 0);
+	sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+				   SLJIT_R0, 0, SLJIT_IMM, 4);
+	sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+				   SLJIT_R1, 0, SLJIT_IMM, 8);
+	sljit_emit_op2(C, SLJIT_SUB, SLJIT_R3, 0,
+				   SLJIT_R3, 0, SLJIT_IMM, 1);
+	sljit_set_label(
+		sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R3, 0, SLJIT_IMM, 0),
+		l_tail_top);
+	sljit_set_label(j_no_tail, sljit_emit_label(C));
+}
+
+/*
+ * Emit int4 tuple-data extraction into Datum slots.
+ *
+ * Inputs:
+ *   R0 = int4 tuple data pointer
+ *   R1 = Datum output pointer
+ *   R2 = number of int4 columns to extract
+ *
+ * Clobbers R0-R3 and VR0/VR1.  The vector loop intentionally handles only
+ * full 4-wide or 8-wide chunks; the scalar tail preserves correctness for
+ * schemas whose int4 run length is not a multiple of the vector width.
+ */
+static void
+emit_int4_to_datum_batch(struct sljit_compiler *C, int max_int4_count)
+{
+	bool	use_avx2 = false;
+	bool	use_avx512 = false;
+	int		avx512_min_cols = DEFORM_AVX512_MIN_COLS_DEFAULT;
+	struct sljit_jump *j_avx512_done = NULL;
+	struct sljit_jump *j_avx512_small = NULL;
+
+#ifdef SLJIT_HAS_AVX2
+	use_avx2 = pg_jitter_cpu_has_avx2() &&
+		sljit_has_cpu_feature(SLJIT_HAS_AVX2);
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+	avx512_min_cols = pg_jitter_get_deform_avx512_min_cols();
+	use_avx512 = sizeof(Datum) == 8 &&
+		pg_jitter_get_deform_avx512() &&
+		max_int4_count >= avx512_min_cols &&
+		pg_jitter_cpu_has_avx512f() &&
+		emit_x86_avx512_base_is_encodable(SLJIT_R0) &&
+		emit_x86_avx512_base_is_encodable(SLJIT_R1);
+#endif
+
+	if (use_avx512)
+	{
+		struct sljit_jump *j_no_vec;
+		struct sljit_label *l_vec_top;
+
+		if (avx512_min_cols > 0)
+			j_avx512_small = sljit_emit_cmp(C, SLJIT_SIG_LESS,
+											SLJIT_R2, 0,
+											SLJIT_IMM, avx512_min_cols);
+
+		/* R3 = vectorized count, rounded down to a multiple of eight. */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R2, 0, SLJIT_IMM, ~((sljit_sw) 7));
+		j_no_vec = sljit_emit_cmp(C, SLJIT_EQUAL,
+								  SLJIT_R3, 0, SLJIT_IMM, 0);
+
+		/* R3 = vector end pointer in the Datum output array. */
+		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+					   SLJIT_R3, 0, SLJIT_IMM, 3);
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+					   SLJIT_R1, 0, SLJIT_R3, 0);
+
+		l_vec_top = sljit_emit_label(C);
+
+#if defined(__x86_64__) || defined(_M_X64)
+		(void) emit_x86_avx512_vpmovsxdq_zmm0_m256(C, SLJIT_R0);
+		(void) emit_x86_avx512_vmovdqu64_m512_zmm0(C, SLJIT_R1);
+#endif
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+					   SLJIT_R0, 0, SLJIT_IMM, 32);
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+					   SLJIT_R1, 0, SLJIT_IMM, 64);
+		sljit_set_label(
+			sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
+			l_vec_top);
+
+		sljit_set_label(j_no_vec, sljit_emit_label(C));
+
+		/* Scalar tail for count % 8 columns. */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R2, 0, SLJIT_IMM, 7);
+		emit_int4_to_datum_scalar_tail(C);
+		j_avx512_done = sljit_emit_jump(C, SLJIT_JUMP);
+	}
+
+	if (j_avx512_small)
+		sljit_set_label(j_avx512_small, sljit_emit_label(C));
+
+	if (sljit_has_cpu_feature(SLJIT_HAS_SIMD))
+	{
+		struct sljit_jump *j_no_vec;
+		struct sljit_label *l_vec_top;
+
+		/* R3 = vectorized count, rounded down to a multiple of four. */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R2, 0, SLJIT_IMM, ~((sljit_sw) 3));
+		j_no_vec = sljit_emit_cmp(C, SLJIT_EQUAL,
+								  SLJIT_R3, 0, SLJIT_IMM, 0);
+
+		/* R3 = vector end pointer in the Datum output array. */
+		sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
+					   SLJIT_R3, 0, SLJIT_IMM, 3);
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
+					   SLJIT_R1, 0, SLJIT_R3, 0);
+
+		l_vec_top = sljit_emit_label(C);
+
+		if (use_avx2)
+		{
+			/*
+			 * AVX2: sign-extend 4x int32 directly from memory into
+			 * 4x int64 and store one 256-bit Datum vector.
+			 */
+			sljit_emit_simd_extend(C,
+				SLJIT_SIMD_REG_256 | SLJIT_SIMD_ELEM_32 |
+				SLJIT_SIMD_EXTEND_64 |
+				SLJIT_SIMD_EXTEND_SIGNED,
+				SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
+			sljit_emit_simd_mov(C,
+				SLJIT_SIMD_STORE | SLJIT_SIMD_REG_256 | SLJIT_SIMD_ELEM_64,
+				SLJIT_VR0, SLJIT_MEM1(SLJIT_R1), 0);
+		}
+		else
+		{
+			/* Portable 128-bit SIMD: load 4x int32, extend/store 2+2. */
+			sljit_emit_simd_mov(C,
+				SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
+				SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
+			sljit_emit_simd_extend(C,
+				SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32 |
+				SLJIT_SIMD_EXTEND_64 |
+				SLJIT_SIMD_EXTEND_SIGNED,
+				SLJIT_VR1, SLJIT_VR0, 0);
+			sljit_emit_simd_mov(C,
+				SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+				SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
+			sljit_emit_simd_lane_replicate(C,
+				SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+				SLJIT_VR0, SLJIT_VR0, 1);
+			sljit_emit_simd_extend(C,
+				SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32 |
+				SLJIT_SIMD_EXTEND_64 |
+				SLJIT_SIMD_EXTEND_SIGNED,
+				SLJIT_VR1, SLJIT_VR0, 0);
+			sljit_emit_simd_mov(C,
+				SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
+				SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
+		}
+
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+					   SLJIT_R0, 0, SLJIT_IMM, 16);
+		sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+					   SLJIT_R1, 0, SLJIT_IMM, 32);
+		sljit_set_label(
+			sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
+			l_vec_top);
+
+		sljit_set_label(j_no_vec, sljit_emit_label(C));
+
+		/* Scalar tail for count % 4 columns. */
+		sljit_emit_op2(C, SLJIT_AND, SLJIT_R3, 0,
+					   SLJIT_R2, 0, SLJIT_IMM, 3);
+		emit_int4_to_datum_scalar_tail(C);
+		if (j_avx512_done)
+			sljit_set_label(j_avx512_done, sljit_emit_label(C));
+		return;
+	}
+
+	sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
+					 SLJIT_IMM,
+					 (sljit_sw) simd_extract_int32_values);
+	if (j_avx512_done)
+		sljit_set_label(j_avx512_done, sljit_emit_label(C));
+}
+
 /*
  * Dispatch byte layout (local dispatch loop):
  *   bits 0-6: handler index (0-6)
@@ -1055,25 +1341,12 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 	/* ============================================================
 	 * SPARSE DISPATCH: wide nullable tables (C helper)
 	 *
-	 * For tables with 64-500 nullable columns in local mode,
+	 * For tables with 64+ nullable columns in local mode,
 	 * delegate to a C helper that processes the null bitmap
 	 * byte-by-byte with NEON bulk-zero + CTZ bit scanning.
-	 *
-	 * For >500 columns, return NULL to let the dispatch function
-	 * fall back to PG's slot_getsomeattrs_int() — at that width,
-	 * deform is memory-bandwidth limited and the interpreter's
-	 * hand-tuned code matches our C helper.
 	 * ============================================================ */
-	if (!all_notnull && !gen_buf && natts > 500)
-	{
-		/* Too wide: interpreter beats any JIT path */
-		sljit_free_compiler(C);
-		if (!target_descs)
-			pfree(descriptors);
-		return NULL;
-	}
-
-	if (!all_notnull && !gen_buf && natts >= 64)
+	if (!all_notnull && !gen_buf && natts >= 64 &&
+		!(all_fixed_byval && uniform_attlen && first_attlen > 0))
 	{
 		int is_minimal_val = (ops == &TTSOpsMinimalTuple) ? 1 : 0;
 
@@ -1146,85 +1419,14 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_fast_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-			if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
-				/*
-				 * Inline SLJIT SIMD: load 4x int32, sign-extend to
-				 * 2x int64, store as Datums. Eliminates C function
-				 * call overhead (~100 cycles per invocation).
-				 */
-				/* R0 = tupdata + offset, R1 = values + attnum*8 */
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_S3, 0, SLJIT_S4, 0);
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-							   SLJIT_S5, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_S1, 0, SLJIT_R1, 0);
-				/* R2 = count */
-				/* R3 = end pointer (values + (attnum+count)*8) */
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
-							   SLJIT_R2, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-							   SLJIT_R1, 0, SLJIT_R3, 0);
-
-				/* SIMD loop: 4 int32 per iteration */
-				struct sljit_label *l_simd_top;
-				struct sljit_jump *j_simd_done;
-
-				j_simd_done = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
-											  SLJIT_R1, 0, SLJIT_R3, 0);
-				l_simd_top = sljit_emit_label(C);
-
-				/* VR0 = load 4x int32 from tupdata */
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-					SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
-
-				/* VR1 = sign-extend lower 2x int32 → 2x int64 */
-				sljit_emit_simd_extend(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-					SLJIT_VR1, SLJIT_VR0, 0);
-
-				/* Store lower 2 Datums */
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
-
-				/* For upper 2: extract upper half and extend.
-				 * simd_extend with offset gets upper elements. */
-				/* Move upper 64 bits to lower: lane_replicate lane 1 */
-				sljit_emit_simd_lane_replicate(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR0, SLJIT_VR0, 1);
-				/* Now VR0 has upper 2 int32s in the lower 64 bits */
-				sljit_emit_simd_extend(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-					SLJIT_VR1, SLJIT_VR0, 0);
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
-
-				/* Advance: R0 += 16 (4 int32), R1 += 32 (4 Datums) */
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_R0, 0, SLJIT_IMM, 16);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_R1, 0, SLJIT_IMM, 32);
-
-				sljit_set_label(
-					sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
-					l_simd_top);
-				sljit_set_label(j_simd_done, sljit_emit_label(C));
-			} else {
-				/* Fallback: call C function */
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_S3, 0, SLJIT_S4, 0);
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-							   SLJIT_S5, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_S1, 0, SLJIT_R1, 0);
-				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-								 SLJIT_IMM,
-								 (sljit_sw) simd_extract_int32_values);
-			}
+			/* R0 = tupdata + offset, R1 = values + attnum*8, R2 = count */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
+			emit_int4_to_datum_batch(C, natts);
 
 			/* Update S4 (offset): S4 += count * 4 */
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -1361,63 +1563,14 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			j_semi_done = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
 										 SLJIT_R2, 0, SLJIT_IMM, 0);
 
-			if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
-				/* Inline SIMD: same as all_notnull path */
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_S3, 0, SLJIT_S4, 0);
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-							   SLJIT_S5, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_S1, 0, SLJIT_R1, 0);
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
-							   SLJIT_R2, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-							   SLJIT_R1, 0, SLJIT_R3, 0);
-
-				struct sljit_label *l_st;
-				struct sljit_jump *j_sd;
-				j_sd = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
-									   SLJIT_R1, 0, SLJIT_R3, 0);
-				l_st = sljit_emit_label(C);
-
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-					SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
-				sljit_emit_simd_extend(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-					SLJIT_VR1, SLJIT_VR0, 0);
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
-				sljit_emit_simd_lane_replicate(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR0, SLJIT_VR0, 1);
-				sljit_emit_simd_extend(C,
-					SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-					SLJIT_VR1, SLJIT_VR0, 0);
-				sljit_emit_simd_mov(C,
-					SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-					SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
-
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_R0, 0, SLJIT_IMM, 16);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_R1, 0, SLJIT_IMM, 32);
-				sljit_set_label(
-					sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
-					l_st);
-				sljit_set_label(j_sd, sljit_emit_label(C));
-			} else {
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-							   SLJIT_S3, 0, SLJIT_S4, 0);
-				sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
-							   SLJIT_S5, 0, SLJIT_IMM, 3);
-				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-							   SLJIT_S1, 0, SLJIT_R1, 0);
-				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-								 SLJIT_IMM,
-								 (sljit_sw) simd_extract_int32_values);
-			}
+			/* R0 = tupdata + offset, R1 = values + attnum*8, R2 = count */
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+						   SLJIT_S3, 0, SLJIT_S4, 0);
+			sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0,
+						   SLJIT_S5, 0, SLJIT_IMM, 3);
+			sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+						   SLJIT_S1, 0, SLJIT_R1, 0);
+			emit_int4_to_datum_batch(C, natts);
 
 			sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
 						   SLJIT_MEM1(SLJIT_SP), DLOFF_MAXATT);
@@ -1476,6 +1629,22 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 			/* GENERAL LOOP entry point when hasnulls is set */
 			sljit_set_label(j_has_nulls_general, sljit_emit_label(C));
 
+			if (!gen_buf && natts >= 64)
+			{
+				int is_minimal_val = (ops == &TTSOpsMinimalTuple) ? 1 : 0;
+
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, natts);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+							   SLJIT_IMM, (sljit_sw) descriptors);
+				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+							   SLJIT_IMM, is_minimal_val);
+				sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4V(P, 32, P, 32),
+								 SLJIT_IMM, (sljit_sw) deform_sparse_dispatch);
+				sljit_emit_return_void(C);
+			}
+			else
+			{
 			/* General loop for the hasnulls case */
 			{
 				struct sljit_label *l_gn_top;
@@ -1562,6 +1731,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 					sljit_set_label(j_gn_done, l_gn_epilogue);
 					sljit_set_label(j_gn_avail, l_gn_epilogue);
 				}
+			}
 			}
 
 			sljit_set_label(j_skip_general, sljit_emit_label(C));
@@ -2342,47 +2512,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 							   SLJIT_S5, 0, SLJIT_IMM, 3);
 				sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
 							   SLJIT_S1, 0, SLJIT_R1, 0);
-				if (sljit_has_cpu_feature(SLJIT_HAS_SIMD)) {
-					sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
-								   SLJIT_R2, 0, SLJIT_IMM, 3);
-					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R3, 0,
-								   SLJIT_R1, 0, SLJIT_R3, 0);
-					struct sljit_label *l_bt;
-					struct sljit_jump *j_bd;
-					j_bd = sljit_emit_cmp(C, SLJIT_GREATER_EQUAL,
-										   SLJIT_R1, 0, SLJIT_R3, 0);
-					l_bt = sljit_emit_label(C);
-					sljit_emit_simd_mov(C,
-						SLJIT_SIMD_LOAD | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_32,
-						SLJIT_VR0, SLJIT_MEM1(SLJIT_R0), 0);
-					sljit_emit_simd_extend(C,
-						SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-						SLJIT_VR1, SLJIT_VR0, 0);
-					sljit_emit_simd_mov(C,
-						SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-						SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 0);
-					sljit_emit_simd_lane_replicate(C,
-						SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-						SLJIT_VR0, SLJIT_VR0, 1);
-					sljit_emit_simd_extend(C,
-						SLJIT_SIMD_REG_128 | SLJIT_SIMD_EXTEND_32 | SLJIT_SIMD_EXTEND_SIGNED,
-						SLJIT_VR1, SLJIT_VR0, 0);
-					sljit_emit_simd_mov(C,
-						SLJIT_SIMD_STORE | SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_64,
-						SLJIT_VR1, SLJIT_MEM1(SLJIT_R1), 16);
-					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
-								   SLJIT_R0, 0, SLJIT_IMM, 16);
-					sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-								   SLJIT_R1, 0, SLJIT_IMM, 32);
-					sljit_set_label(
-						sljit_emit_cmp(C, SLJIT_LESS, SLJIT_R1, 0, SLJIT_R3, 0),
-						l_bt);
-					sljit_set_label(j_bd, sljit_emit_label(C));
-				} else {
-					sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32),
-									 SLJIT_IMM,
-									 (sljit_sw) simd_extract_int32_values);
-				}
+				emit_int4_to_datum_batch(C, 255); /* batch_count is uint8 */
 
 				/* Reload count for offset/attnum advance */
 				sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -2820,6 +2950,20 @@ deform_attrs_hash(TupleDesc desc, int natts)
 	return (uint32) crc;
 }
 
+static bool
+deform_desc_has_nullable(TupleDesc desc, int natts)
+{
+	for (int i = 0; i < natts; i++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(desc, i);
+
+		if (!JITTER_ATT_IS_NOTNULL(att))
+			return true;
+	}
+
+	return false;
+}
+
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
 static int n_deform_dispatch = 0;
 
@@ -2961,8 +3105,9 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 		}
 	}
 
-	/* Compile: loop for wide tables, unrolled for narrow */
-	if (natts > pg_jitter_deform_threshold())
+	/* Compile: sparse-loop path also wins for medium-width nullable tables. */
+	if (natts > pg_jitter_deform_threshold() ||
+		(natts >= 64 && deform_desc_has_nullable(desc, natts)))
 		fn = pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
 	else
 		fn = pg_jitter_compile_deform(desc, ops, natts);

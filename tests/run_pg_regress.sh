@@ -1,42 +1,85 @@
-#!/bin/bash
-# run_pg_regress.sh — Run PostgreSQL regression tests for each JIT backend
+#!/usr/bin/env bash
+# run_pg_regress.sh - Run PostgreSQL pg_regress for pg_jitter backends.
 #
-# Runs the standard pg_regress installcheck suite once per backend,
-# switching jit_provider via ALTER SYSTEM + restart between runs.
-# Restores the original jit_provider when done.
+# Typical local use with an existing server:
+#   ./tests/run_pg_regress.sh \
+#     --pg-config ~/postgres_install/v17/bin/pg_config \
+#     --pg-src ~/postgres_versions/v17 \
+#     --port 5433 \
+#     --backends "sljit asmjit mir auto"
 #
-# Usage:
-#   ./tests/run_pg_regress.sh [options]
-#
-# Options:
-#   --pg-config PATH     Path to pg_config (default: $PG_CONFIG or pg_config)
-#   --port PORT          PostgreSQL port (default: $PGPORT or 5433)
-#   --pg-src DIR         PostgreSQL source tree (default: $PG_SRC or auto-detect)
-#   --backends LIST      Space-separated backend list (default: "sljit asmjit mir")
-set -e
+# Safer isolated use: initialize a fresh temporary cluster per backend.
+#   ./tests/run_pg_regress.sh \
+#     --pg-config ~/postgres_install/v17/bin/pg_config \
+#     --pg-src ~/postgres_versions/v17 \
+#     --port 5433 \
+#     --fresh-cluster
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 PG_CONFIG="${PG_CONFIG:-pg_config}"
 PGPORT="${PGPORT:-5433}"
+PGHOST="${PGHOST:-/tmp}"
 PG_SRC="${PG_SRC:-}"
-BACKENDS="sljit asmjit mir auto"
+BACKENDS="${BACKENDS:-}"
+FRESH_CLUSTER=0
+KEEP_CLUSTER=0
+PGDATA_OVERRIDE="${PGDATA:-}"
+OUTPUT_DIR=""
+MAX_CONCURRENT_TESTS=20
+MAX_CONNECTIONS=1
+SCHEDULE="parallel_schedule"
 
-# Parse args
+usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+Options:
+  --pg-config PATH       Path to pg_config (default: PG_CONFIG or pg_config)
+  --pg-src DIR           PostgreSQL source tree with src/test/regress
+  --port PORT            PostgreSQL port (default: PGPORT or 5433)
+  --host HOST            pg_regress/psql host (default: PGHOST or /tmp)
+  --backends LIST        Space-separated backend list
+                         (default: direct backends, plus auto on PG17+)
+  --fresh-cluster        Reinitialize a temporary cluster for each backend
+  --datadir DIR          Data directory for --fresh-cluster
+                         (default: /tmp/pg_jitter_regress_pgMAJOR_PORT)
+  --keep-cluster         Do not stop/remove the fresh cluster on exit
+  --output-dir DIR       Directory for per-backend pg_regress artifacts
+  --schedule FILE        Schedule filename/path (default: parallel_schedule)
+  --max-concurrent-tests N
+  --max-connections N
+  -h, --help             Show this help
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pg-config) PG_CONFIG="$2"; shift 2;;
-        --port)      PGPORT="$2";    shift 2;;
-        --pg-src)    PG_SRC="$2";    shift 2;;
-        --backends)  BACKENDS="$2";  shift 2;;
-        *) echo "Unknown option: $1"; exit 1;;
+        --pg-config) PG_CONFIG="$2"; shift 2 ;;
+        --pg-src) PG_SRC="$2"; shift 2 ;;
+        --port) PGPORT="$2"; shift 2 ;;
+        --host) PGHOST="$2"; shift 2 ;;
+        --backends) BACKENDS="$2"; shift 2 ;;
+        --fresh-cluster) FRESH_CLUSTER=1; shift ;;
+        --datadir) PGDATA_OVERRIDE="$2"; shift 2 ;;
+        --keep-cluster) KEEP_CLUSTER=1; shift ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --schedule) SCHEDULE="$2"; shift 2 ;;
+        --max-concurrent-tests) MAX_CONCURRENT_TESTS="$2"; shift 2 ;;
+        --max-connections) MAX_CONNECTIONS="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
-# Resolve pg_config
-if ! command -v "$PG_CONFIG" > /dev/null 2>&1 && [ ! -x "$PG_CONFIG" ]; then
-    echo "ERROR: pg_config not found: $PG_CONFIG"
-    echo "  Use: --pg-config /path/to/pg_config  or  export PG_CONFIG=..."
+if [ -x "$PG_CONFIG" ]; then
+    PG_CONFIG="$(cd "$(dirname "$PG_CONFIG")" && pwd)/$(basename "$PG_CONFIG")"
+elif command -v "$PG_CONFIG" >/dev/null 2>&1; then
+    PG_CONFIG="$(command -v "$PG_CONFIG")"
+else
+    echo "ERROR: pg_config not found: $PG_CONFIG" >&2
     exit 1
 fi
 
@@ -44,23 +87,55 @@ PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
 PSQL="$PGBIN/psql"
 PGCTL="$PGBIN/pg_ctl"
-PGDATA="$("$PSQL" -p "$PGPORT" -d postgres -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
+INITDB="$PGBIN/initdb"
+PG_MAJOR="$("$PG_CONFIG" --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')"
 
-if [ -z "$PGDATA" ] || [ ! -d "$PGDATA" ]; then
-    echo "ERROR: Cannot determine PGDATA. Is PostgreSQL running on port $PGPORT?"
-    exit 1
+if [ -z "$BACKENDS" ]; then
+    case "$(uname -m)" in
+        x86_64|amd64|AMD64|aarch64|arm64)
+            BACKENDS="sljit asmjit mir"
+            ;;
+        *)
+            BACKENDS="sljit mir"
+            ;;
+    esac
+    if [ "$PG_MAJOR" -ge 17 ]; then
+        BACKENDS="$BACKENDS auto"
+    fi
 fi
 
-# Auto-detect PostgreSQL source tree
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="/tmp/pg_jitter_regress_results_pg${PG_MAJOR}_${PGPORT}_$(date +%Y%m%d_%H%M%S)"
+fi
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+SUMMARY_FILE="$OUTPUT_DIR/summary.txt"
+: > "$SUMMARY_FILE"
+
+psql_postgres() {
+    "$PSQL" -h "$PGHOST" -p "$PGPORT" -d postgres -X "$@"
+}
+
+pg_ready() {
+    "$PGBIN/pg_isready" -h "$PGHOST" -p "$PGPORT" -q >/dev/null 2>&1
+}
+
+log_summary() {
+    printf '%s\n' "$*" | tee -a "$SUMMARY_FILE"
+}
+
+# Auto-detect PostgreSQL source tree.
 if [ -z "$PG_SRC" ]; then
-    # Walk up from pg_config bindir to find src/test/regress
     PG_INSTALL_PREFIX="$("$PG_CONFIG" --prefix 2>/dev/null || echo "")"
     for candidate in \
+        "$HOME/postgres_versions/v${PG_MAJOR}" \
+        "$HOME/postgres_versions/${PG_MAJOR}" \
+        "$REPO_DIR/../postgres_versions/v${PG_MAJOR}" \
         "$REPO_DIR/../postgres-jit" \
         "$REPO_DIR/../postgresql" \
         "$REPO_DIR/../postgres" \
-        "$PG_INSTALL_PREFIX" \
-    ; do
+        "$PG_INSTALL_PREFIX"
+    do
         if [ -n "$candidate" ] && [ -f "$candidate/src/test/regress/pg_regress" ]; then
             PG_SRC="$candidate"
             break
@@ -68,100 +143,208 @@ if [ -z "$PG_SRC" ]; then
     done
 fi
 
-if [ -z "$PG_SRC" ] || [ ! -f "$PG_SRC/src/test/regress/pg_regress" ]; then
-    echo "ERROR: PostgreSQL source tree not found."
-    echo "  Use: --pg-src /path/to/postgres  or  export PG_SRC=..."
+if [ -z "$PG_SRC" ] || [ ! -d "$PG_SRC/src/test/regress" ]; then
+    echo "ERROR: PostgreSQL source tree not found." >&2
+    echo "Use --pg-src /path/to/postgres or export PG_SRC." >&2
     exit 1
 fi
 
-# Use a per-port working copy of the regress directory so parallel
-# runs across PG versions don't stomp on each other's results.
 REGRESS_DIR_ORIG="$PG_SRC/src/test/regress"
-REGRESS_DIR="/tmp/pg_jitter_regress_work_${PGPORT}"
-if [ ! -d "$REGRESS_DIR" ] || [ "$REGRESS_DIR_ORIG/pg_regress" -nt "$REGRESS_DIR/pg_regress" ]; then
-    rm -rf "$REGRESS_DIR"
-    cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
+REGRESS_DIR="/tmp/pg_jitter_regress_work_pg${PG_MAJOR}_${PGPORT}"
+
+refresh_regress_workdir() {
+    local needs_copy=0
+
+    if [ ! -d "$REGRESS_DIR" ]; then
+        needs_copy=1
+    elif [ "$REGRESS_DIR_ORIG/pg_regress" -nt "$REGRESS_DIR/pg_regress" ]; then
+        needs_copy=1
+    elif [ "$REGRESS_DIR_ORIG/parallel_schedule" -nt "$REGRESS_DIR/parallel_schedule" ]; then
+        needs_copy=1
+    fi
+
+    if [ "$needs_copy" -eq 1 ]; then
+        rm -rf "$REGRESS_DIR"
+        cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
+    fi
+
     mkdir -p "$REGRESS_DIR/testtablespace"
+}
+
+find_pg_regress() {
+    local pgxs candidate
+
+    pgxs="$("$PG_CONFIG" --pgxs 2>/dev/null || true)"
+    for candidate in \
+        "${pgxs:+$(printf '%s' "$pgxs" | sed 's|/pgxs/.*|/pgxs/src/test/regress/pg_regress|')}" \
+        "$REGRESS_DIR_ORIG/pg_regress" \
+        "$PGBIN/pg_regress" \
+        "$PGBIN/../lib/pgxs/src/test/regress/pg_regress" \
+        "$PKGLIBDIR/pgxs/src/test/regress/pg_regress"
+    do
+        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+refresh_regress_workdir
+PG_REGRESS="$(find_pg_regress)" || {
+    echo "ERROR: pg_regress not found." >&2
+    exit 1
+}
+
+schedule_path() {
+    if [[ "$SCHEDULE" = /* ]]; then
+        printf '%s\n' "$SCHEDULE"
+    else
+        printf '%s/%s\n' "$REGRESS_DIR" "$SCHEDULE"
+    fi
+}
+
+SCHEDULE_PATH="$(schedule_path)"
+if [ ! -f "$SCHEDULE_PATH" ]; then
+    echo "ERROR: regression schedule not found: $SCHEDULE_PATH" >&2
+    exit 1
 fi
 
-# Verify all backend dylibs exist
-for backend in $BACKENDS; do
-    # "auto" uses the meta provider (pg_jitter.dylib), not a separate dylib
-    if [ "$backend" = "auto" ]; then
-        if [ ! -f "$PKGLIBDIR/pg_jitter.dylib" ] && \
-           [ ! -f "$PKGLIBDIR/pg_jitter.so" ]; then
-            echo "ERROR: pg_jitter (meta provider) not found in $PKGLIBDIR"
+verify_backend_libraries() {
+    local backend
+
+    for backend in $BACKENDS; do
+        if [ "$backend" = "auto" ]; then
+            if [ ! -f "$PKGLIBDIR/pg_jitter.dylib" ] &&
+               [ ! -f "$PKGLIBDIR/pg_jitter.so" ] &&
+               [ ! -f "$PKGLIBDIR/pg_jitter.dll" ]; then
+                echo "ERROR: pg_jitter meta provider not found in $PKGLIBDIR" >&2
+                exit 1
+            fi
+            continue
+        fi
+
+        if [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.dylib" ] &&
+           [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.so" ] &&
+           [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.dll" ]; then
+            echo "ERROR: pg_jitter_${backend} not found in $PKGLIBDIR" >&2
+            echo "Run: ./install.sh --pg-config $PG_CONFIG all" >&2
             exit 1
         fi
-        continue
-    fi
-    if [ ! -f "$PKGLIBDIR/pg_jitter_$backend.dylib" ] && \
-       [ ! -f "$PKGLIBDIR/pg_jitter_$backend.so" ]; then
-        echo "ERROR: pg_jitter_$backend not found in $PKGLIBDIR"
-        echo "  Run: ./install all"
+    done
+}
+
+verify_backend_libraries
+
+if [ "$FRESH_CLUSTER" -eq 1 ]; then
+    PGDATA_TEST="${PGDATA_OVERRIDE:-/tmp/pg_jitter_regress_pg${PG_MAJOR}_${PGPORT}}"
+    if [[ "$PGDATA_TEST" != /tmp/pg_jitter_regress_* ]]; then
+        echo "ERROR: --fresh-cluster refuses to manage non-temporary datadir: $PGDATA_TEST" >&2
+        echo "Use a /tmp/pg_jitter_regress_* path with --datadir." >&2
         exit 1
     fi
-done
+else
+    PGDATA_TEST="$(psql_postgres -t -A -c "SHOW data_directory;" 2>/dev/null || true)"
+    if [ -z "$PGDATA_TEST" ] || [ ! -d "$PGDATA_TEST" ]; then
+        echo "ERROR: Cannot determine PGDATA. Is PostgreSQL running on $PGHOST:$PGPORT?" >&2
+        echo "Use --fresh-cluster to let this script initialize a temporary cluster." >&2
+        exit 1
+    fi
+fi
 
-# Save original provider
-ORIG_PROVIDER="$("$PSQL" -p "$PGPORT" -d postgres -t -A -c "SHOW jit_provider;" 2>/dev/null)"
+ORIG_PROVIDER=""
+ORIG_JIT_ABOVE=""
+ORIG_JIT_INLINE=""
+ORIG_JIT_OPTIMIZE=""
+if [ "$FRESH_CLUSTER" -eq 0 ]; then
+    ORIG_PROVIDER="$(psql_postgres -t -A -c "SHOW jit_provider;" 2>/dev/null || true)"
+    ORIG_JIT_ABOVE="$(psql_postgres -t -A -c "SHOW jit_above_cost;" 2>/dev/null || true)"
+    ORIG_JIT_INLINE="$(psql_postgres -t -A -c "SHOW jit_inline_above_cost;" 2>/dev/null || true)"
+    ORIG_JIT_OPTIMIZE="$(psql_postgres -t -A -c "SHOW jit_optimize_above_cost;" 2>/dev/null || true)"
+fi
+
+stop_fresh_cluster() {
+    if [ "$FRESH_CLUSTER" -eq 1 ] && [ "$KEEP_CLUSTER" -eq 0 ] && [ -n "${PGDATA_TEST:-}" ]; then
+        "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
+    fi
+}
+
+restore_existing_cluster() {
+    if [ "$FRESH_CLUSTER" -eq 0 ] && [ -n "$ORIG_PROVIDER" ]; then
+        if ! pg_ready; then
+            "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
+            "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+        fi
+
+        psql_postgres -q -c "ALTER SYSTEM SET jit_provider = '$ORIG_PROVIDER';" >/dev/null 2>&1 || true
+        [ -n "$ORIG_JIT_ABOVE" ] &&
+            psql_postgres -q -c "ALTER SYSTEM SET jit_above_cost = '$ORIG_JIT_ABOVE';" >/dev/null 2>&1 || true
+        [ -n "$ORIG_JIT_INLINE" ] &&
+            psql_postgres -q -c "ALTER SYSTEM SET jit_inline_above_cost = '$ORIG_JIT_INLINE';" >/dev/null 2>&1 || true
+        [ -n "$ORIG_JIT_OPTIMIZE" ] &&
+            psql_postgres -q -c "ALTER SYSTEM SET jit_optimize_above_cost = '$ORIG_JIT_OPTIMIZE';" >/dev/null 2>&1 || true
+        psql_postgres -q -c "ALTER SYSTEM RESET pg_jitter.backend;" >/dev/null 2>&1 || true
+        "$PGCTL" -D "$PGDATA_TEST" restart -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup_on_exit() {
+    restore_existing_cluster
+    stop_fresh_cluster
+}
+trap cleanup_on_exit EXIT
+
+start_fresh_cluster() {
+    local backend="$1"
+    local log_file="$OUTPUT_DIR/postgresql_${backend}.log"
+
+    "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
+    rm -rf "$PGDATA_TEST"
+
+    "$INITDB" -D "$PGDATA_TEST" --no-locale -E UTF8 -A trust --no-instructions \
+        > "$OUTPUT_DIR/initdb_${backend}.log" 2>&1
+
+    {
+        echo "port = $PGPORT"
+        echo "listen_addresses = 'localhost'"
+        if [[ "$PGHOST" = /* ]]; then
+            mkdir -p "$PGHOST"
+            echo "unix_socket_directories = '$PGHOST'"
+        fi
+        echo "max_connections = 100"
+        echo "shared_buffers = '128MB'"
+        echo "log_min_messages = warning"
+    } >> "$PGDATA_TEST/postgresql.conf"
+
+    "$PGCTL" -D "$PGDATA_TEST" -l "$log_file" start -w >/dev/null
+}
 
 ensure_pg_running() {
-    if ! "$PGBIN/pg_isready" -p "$PGPORT" -q 2>/dev/null; then
-        if [ -n "$PGDATA" ]; then
-            "$PGCTL" -D "$PGDATA" stop -m immediate 2>/dev/null || true
-            sleep 1
-            "$PGCTL" -D "$PGDATA" start -l "$PGDATA/logfile" -w 2>/dev/null || true
-            sleep 1
-        else
-            echo "ERROR: Cannot restart — PGDATA unknown" >&2
-            exit 1
-        fi
+    if ! pg_ready; then
+        "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
+        "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+        sleep 1
     fi
 }
 
-restore_provider() {
-    if [ -n "$ORIG_PROVIDER" ]; then
-        ensure_pg_running
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM SET jit_provider = '$ORIG_PROVIDER';" 2>/dev/null
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM RESET pg_jitter.backend;" 2>/dev/null
-        "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
-    fi
+drop_regression_database() {
+    psql_postgres -q -c "DROP DATABASE IF EXISTS regression WITH (FORCE);" >/dev/null 2>&1 || true
 }
-trap restore_provider EXIT
 
-echo "=== PostgreSQL Regression Tests — pg_jitter backends ==="
-echo ""
-echo "  Port:       $PGPORT"
-echo "  PGDATA:     $PGDATA"
-echo "  PG source:  $PG_SRC"
-echo "  pkglibdir:  $PKGLIBDIR"
-echo "  Backends:   $BACKENDS"
-echo ""
-
-# ================================================================
-# Pre-test cleanup function: remove leftover state from previous runs
-# ================================================================
 cleanup_database() {
-    echo "Cleaning up leftover database state..."
-    "$PSQL" -p "$PGPORT" -d postgres -q -X <<'CLEANUP_SQL'
--- Drop leftover event triggers
+    psql_postgres -q -v ON_ERROR_STOP=0 <<'CLEANUP_SQL' >/dev/null || true
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT evtname FROM pg_event_trigger LOOP
         EXECUTE format('DROP EVENT TRIGGER IF EXISTS %I CASCADE', r.evtname);
     END LOOP;
 END $$;
 
--- Drop leftover publications
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT pubname FROM pg_publication LOOP
         EXECUTE format('DROP PUBLICATION IF EXISTS %I CASCADE', r.pubname);
     END LOOP;
 END $$;
 
--- Drop leftover subscriptions
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT subname FROM pg_subscription LOOP
         BEGIN
@@ -173,14 +356,12 @@ DO $$ DECLARE r RECORD; BEGIN
     END LOOP;
 END $$;
 
--- Drop leftover foreign servers
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT srvname FROM pg_foreign_server LOOP
         EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', r.srvname);
     END LOOP;
 END $$;
 
--- Drop leftover schemas (except system ones)
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT nspname FROM pg_namespace
              WHERE nspname NOT IN ('pg_catalog','information_schema','public')
@@ -190,15 +371,11 @@ DO $$ DECLARE r RECORD; BEGIN
     END LOOP;
 END $$;
 
--- Drop leftover tablespaces
-DO $$ DECLARE r RECORD; BEGIN
-    FOR r IN SELECT spcname FROM pg_tablespace
-             WHERE spcname NOT IN ('pg_default','pg_global') LOOP
-        EXECUTE format('DROP TABLESPACE IF EXISTS %I', r.spcname);
-    END LOOP;
-END $$;
+SELECT format('DROP TABLESPACE IF EXISTS %I;', spcname)
+FROM pg_tablespace
+WHERE spcname NOT IN ('pg_default','pg_global')
+\gexec
 
--- Drop leftover roles (regress_* roles from previous test runs)
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT rolname FROM pg_roles
              WHERE rolname LIKE 'regress_%'
@@ -212,11 +389,163 @@ DO $$ DECLARE r RECORD; BEGIN
     END LOOP;
 END $$;
 CLEANUP_SQL
-    echo "Cleanup complete."
 }
 
-"$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
-cleanup_database
+set_backend() {
+    local backend="$1"
+    local expected_provider
+
+    psql_postgres -q -c "ALTER SYSTEM SET jit_above_cost = 0;" >/dev/null
+    psql_postgres -q -c "ALTER SYSTEM SET jit_inline_above_cost = 0;" >/dev/null
+    psql_postgres -q -c "ALTER SYSTEM SET jit_optimize_above_cost = 0;" >/dev/null
+
+    if [ "$PG_MAJOR" -ge 17 ]; then
+        expected_provider="pg_jitter"
+        psql_postgres -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" >/dev/null
+        psql_postgres -q -c "ALTER SYSTEM SET pg_jitter.backend = '$backend';" >/dev/null
+    elif [ "$backend" = "auto" ]; then
+        expected_provider="pg_jitter"
+        psql_postgres -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" >/dev/null
+    else
+        expected_provider="pg_jitter_$backend"
+        psql_postgres -q -c "ALTER SYSTEM SET jit_provider = '$expected_provider';" >/dev/null
+    fi
+
+    "$PGCTL" -D "$PGDATA_TEST" restart -l "$OUTPUT_DIR/postgresql_${backend}.log" -w >/dev/null 2>&1
+    sleep 1
+
+    local active_provider
+    active_provider="$(psql_postgres -t -A -c "SHOW jit_provider;" 2>/dev/null || true)"
+    if [ "$active_provider" != "$expected_provider" ]; then
+        echo "expected jit_provider=$expected_provider, got $active_provider"
+        return 1
+    fi
+
+    if [ "$expected_provider" = "pg_jitter" ] &&
+       { [ "$PG_MAJOR" -ge 17 ] || [ "$backend" != "auto" ]; }; then
+        local backend_output active_backend
+        backend_output="$(psql_postgres -t -A -c "SHOW pg_jitter.backend;" 2>&1 || true)"
+        active_backend="$(printf '%s\n' "$backend_output" | tail -1)"
+        if [ "$active_backend" != "$backend" ]; then
+            printf 'expected pg_jitter.backend=%s, got output:\n%s\n' "$backend" "$backend_output"
+            return 1
+        fi
+    fi
+
+    # SHOW pg_jitter.backend can still succeed when PostgreSQL accepted an
+    # unknown custom GUC into postgresql.auto.conf before loading pg_jitter.
+    # Execute a cheap forced-JIT query and reject startup-time GUC warnings
+    # before running the full suite.
+    local smoke_output
+    smoke_output="$(psql_postgres -q -t -A -v ON_ERROR_STOP=1 -c "
+SET jit = on;
+SET jit_above_cost = 0;
+SET jit_inline_above_cost = 0;
+SET jit_optimize_above_cost = 0;
+SELECT SUM(i) FROM generate_series(1,1000) AS g(i) WHERE i > 10;
+$(if [ "$expected_provider" = "pg_jitter" ]; then printf 'SHOW pg_jitter.backend;'; fi)
+" 2>&1)" || {
+        printf 'forced-JIT smoke query failed:\n%s\n' "$smoke_output"
+        return 1
+    }
+
+    if printf '%s\n' "$smoke_output" |
+       grep -q 'invalid value for parameter "pg_jitter.backend"'; then
+        printf 'forced-JIT smoke query reported invalid backend:\n%s\n' "$smoke_output"
+        return 1
+    fi
+
+    if [ "$expected_provider" = "pg_jitter" ]; then
+        local active_backend
+        active_backend="$(printf '%s\n' "$smoke_output" | tail -1)"
+        if [ "$active_backend" != "$backend" ]; then
+            printf 'expected pg_jitter.backend=%s after forced-JIT load, got output:\n%s\n' \
+                "$backend" "$smoke_output"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+run_backend() {
+    local backend="$1"
+    local outdir="$OUTPUT_DIR/$backend"
+    local logfile="$outdir/pg_regress.log"
+    local rc fail_line
+
+    mkdir -p "$outdir/testtablespace"
+    log_summary "===== run: $backend ====="
+
+    if [ "$FRESH_CLUSTER" -eq 1 ]; then
+        start_fresh_cluster "$backend"
+    else
+        ensure_pg_running
+    fi
+
+    drop_regression_database
+    cleanup_database
+
+    if ! set_backend "$backend" > "$outdir/backend_check.log" 2>&1; then
+        log_summary "backend=$backend rc=1"
+        log_summary "backend activation failed; see $outdir/backend_check.log"
+        log_summary ""
+        [ "$FRESH_CLUSTER" -eq 1 ] && stop_fresh_cluster
+        return 1
+    fi
+
+    set +e
+    (
+        cd "$REGRESS_DIR"
+        PGPORT="$PGPORT" "$PG_REGRESS" \
+            --inputdir="$REGRESS_DIR" \
+            --outputdir="$outdir" \
+            --bindir="$PGBIN" \
+            --dlpath="$REGRESS_DIR" \
+            --max-concurrent-tests="$MAX_CONCURRENT_TESTS" \
+            --max-connections="$MAX_CONNECTIONS" \
+            --schedule="$SCHEDULE_PATH" \
+            --host="$PGHOST" \
+            --port="$PGPORT" \
+            --dbname=regression \
+            2>&1
+    ) | tee "$logfile" | tail -3
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    cp -f "$logfile" "$REGRESS_DIR/regression_${backend}.log" 2>/dev/null || true
+    cp -f "$outdir/regression.diffs" "$REGRESS_DIR/regression_${backend}.diffs" 2>/dev/null || true
+    cp -f "$outdir/regression.out" "$REGRESS_DIR/regression_${backend}.out" 2>/dev/null || true
+
+    log_summary "backend=$backend rc=$rc"
+    if [ "$rc" -eq 0 ]; then
+        log_summary "All tests passed."
+    else
+        fail_line="$(grep -E '# [0-9]+ of [0-9]+ tests failed|[0-9]+ of [0-9]+ tests failed' "$logfile" | tail -1 || true)"
+        if [ -n "$fail_line" ]; then
+            log_summary "$fail_line"
+        else
+            log_summary "pg_regress failed; see $logfile"
+        fi
+    fi
+    log_summary "artifacts=$outdir"
+    log_summary ""
+
+    [ "$FRESH_CLUSTER" -eq 1 ] && stop_fresh_cluster
+    return "$rc"
+}
+
+echo "=== PostgreSQL Regression Tests - pg_jitter backends ==="
+echo "  PG version:  $("$PG_CONFIG" --version)"
+echo "  Port:        $PGPORT"
+echo "  Host:        $PGHOST"
+echo "  PGDATA:      $PGDATA_TEST"
+echo "  PG source:   $PG_SRC"
+echo "  pg_regress:  $PG_REGRESS"
+echo "  pkglibdir:   $PKGLIBDIR"
+echo "  Backends:    $BACKENDS"
+echo "  Output dir:  $OUTPUT_DIR"
+echo "  Fresh mode:  $FRESH_CLUSTER"
 echo ""
 
 PASSED=0
@@ -228,94 +557,26 @@ for backend in $BACKENDS; do
     echo "  $backend"
     echo "============================================"
 
-    # Clean up leftover state between backends
-    ensure_pg_running
-    # Drop the regression database to ensure a clean slate
-    "$PSQL" -p "$PGPORT" -d postgres -q -c "DROP DATABASE IF EXISTS regression;" 2>/dev/null || true
-    cleanup_database
-
-    # PG17+ supports custom GUCs via ALTER SYSTEM, so we use the
-    # meta module (pg_jitter) + pg_jitter.backend GUC. This avoids
-    # a known PCRE2 regex crash with direct provider loading.
-    # PG14-16: must use direct provider loading (no custom GUC support).
-    PG_MAJOR=$("$PG_CONFIG" --version | sed 's/PostgreSQL //' | cut -d. -f1)
-    # Force JIT on all queries
-    "$PSQL" -p "$PGPORT" -d postgres -q -c \
-        "ALTER SYSTEM SET jit_above_cost = 0;" 2>/dev/null
-    "$PSQL" -p "$PGPORT" -d postgres -q -c \
-        "ALTER SYSTEM SET jit_inline_above_cost = 0;" 2>/dev/null
-    "$PSQL" -p "$PGPORT" -d postgres -q -c \
-        "ALTER SYSTEM SET jit_optimize_above_cost = 0;" 2>/dev/null
-
-    if [ "$PG_MAJOR" -ge 17 ] 2>/dev/null; then
-        EXPECTED_PROVIDER="pg_jitter"
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM SET pg_jitter.backend = '$backend';" 2>/dev/null
-    elif [ "$backend" = "auto" ]; then
-        EXPECTED_PROVIDER="pg_jitter"
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
-    else
-        EXPECTED_PROVIDER="pg_jitter_$backend"
-        "$PSQL" -p "$PGPORT" -d postgres -q -c \
-            "ALTER SYSTEM SET jit_provider = 'pg_jitter_$backend';" 2>/dev/null
-    fi
-    "$PGCTL" -D "$PGDATA" restart -l "$PGDATA/logfile" -w >/dev/null 2>&1
-    sleep 1
-
-    # Verify provider is active
-    ACTIVE="$("$PSQL" -p "$PGPORT" -d postgres -t -A -c "SHOW jit_provider;" 2>/dev/null)"
-    if [ "$ACTIVE" != "$EXPECTED_PROVIDER" ]; then
-        echo "  WARNING: expected $EXPECTED_PROVIDER, got $ACTIVE"
-    fi
-
-    # Run installcheck, capture output
-    LOGFILE="$REGRESS_DIR/regression_${backend}.log"
-    set +e
-    PG_REGRESS="$("$PG_CONFIG" --pgxs | sed 's|/pgxs/.*|/pgxs/src/test/regress/pg_regress|')"
-    (cd "$REGRESS_DIR" && PGPORT="$PGPORT" "$PG_REGRESS" --inputdir=. --bindir="$PGBIN" \
-        --dlpath=. --max-concurrent-tests=20 \
-        --schedule=./parallel_schedule --max-connections=1 \
-        --port="$PGPORT" --host=/tmp 2>&1) | tee "$LOGFILE" | tail -3
-    RC=${PIPESTATUS[0]}
-    set -e
-
-    if [ $RC -eq 0 ]; then
+    if run_backend "$backend"; then
         echo "  => $backend: PASSED"
-        RESULTS="$RESULTS  $backend: PASSED (all tests)\n"
+        RESULTS="${RESULTS}  ${backend}: PASSED\n"
         PASSED=$((PASSED + 1))
     else
-        # Extract failure count from log
-        FAIL_LINE=$(grep -E '# [0-9]+ of [0-9]+ tests failed' "$LOGFILE" | tail -1)
-        if [ -n "$FAIL_LINE" ]; then
-            echo "  => $backend: FAILED — $FAIL_LINE"
-            RESULTS="$RESULTS  $backend: FAILED — $FAIL_LINE\n"
-        else
-            echo "  => $backend: FAILED (exit code $RC)"
-            RESULTS="$RESULTS  $backend: FAILED (exit code $RC)\n"
-        fi
+        echo "  => $backend: FAILED"
+        RESULTS="${RESULTS}  ${backend}: FAILED\n"
         FAILED=$((FAILED + 1))
-
-        # Copy diffs for inspection
-        DIFFS="$REGRESS_DIR/regression.diffs"
-        if [ -f "$DIFFS" ]; then
-            cp "$DIFFS" "$REGRESS_DIR/regression_${backend}.diffs"
-            echo "     Diffs saved: $REGRESS_DIR/regression_${backend}.diffs"
-        fi
     fi
-
     echo ""
 done
 
-# Summary
 echo "============================================"
 echo "  SUMMARY"
 echo "============================================"
-printf "$RESULTS"
+printf '%b' "$RESULTS"
 echo ""
-echo "  $PASSED passed, $FAILED failed out of $(echo $BACKENDS | wc -w | tr -d ' ') backends"
+echo "  $PASSED passed, $FAILED failed out of $(echo "$BACKENDS" | wc -w | tr -d ' ') backends"
+echo "  Artifacts: $OUTPUT_DIR"
+echo "  Summary:   $SUMMARY_FILE"
 echo "============================================"
 
-exit $FAILED
+exit "$FAILED"
