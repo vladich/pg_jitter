@@ -85,6 +85,11 @@ fi
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+PG_LIBDIR="$("$PG_CONFIG" --libdir)"
+PKGLIB_CANDIDATES=("$PKGLIBDIR")
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PKGLIBDIR" ]; then
+    PKGLIB_CANDIDATES+=("$PG_LIBDIR/postgresql")
+fi
 PSQL="$PGBIN/psql"
 PGCTL="$PGBIN/pg_ctl"
 INITDB="$PGBIN/initdb"
@@ -213,21 +218,31 @@ fi
 verify_backend_libraries() {
     local backend
 
+    provider_lib_exists() {
+        local name="$1"
+        local dir
+
+        for dir in "${PKGLIB_CANDIDATES[@]}"; do
+            if [ -f "$dir/$name.dylib" ] ||
+               [ -f "$dir/$name.so" ] ||
+               [ -f "$dir/$name.dll" ]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
     for backend in $BACKENDS; do
         if [ "$backend" = "auto" ]; then
-            if [ ! -f "$PKGLIBDIR/pg_jitter.dylib" ] &&
-               [ ! -f "$PKGLIBDIR/pg_jitter.so" ] &&
-               [ ! -f "$PKGLIBDIR/pg_jitter.dll" ]; then
-                echo "ERROR: pg_jitter meta provider not found in $PKGLIBDIR" >&2
+            if ! provider_lib_exists "pg_jitter"; then
+                echo "ERROR: pg_jitter meta provider not found in ${PKGLIB_CANDIDATES[*]}" >&2
                 exit 1
             fi
             continue
         fi
 
-        if [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.dylib" ] &&
-           [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.so" ] &&
-           [ ! -f "$PKGLIBDIR/pg_jitter_${backend}.dll" ]; then
-            echo "ERROR: pg_jitter_${backend} not found in $PKGLIBDIR" >&2
+        if ! provider_lib_exists "pg_jitter_${backend}"; then
+            echo "ERROR: pg_jitter_${backend} not found in ${PKGLIB_CANDIDATES[*]}" >&2
             echo "Run: ./install.sh --pg-config $PG_CONFIG all" >&2
             exit 1
         fi
@@ -542,7 +557,7 @@ echo "  Host:        $PGHOST"
 echo "  PGDATA:      $PGDATA_TEST"
 echo "  PG source:   $PG_SRC"
 echo "  pg_regress:  $PG_REGRESS"
-echo "  pkglibdir:   $PKGLIBDIR"
+echo "  pkglibdirs:  ${PKGLIB_CANDIDATES[*]}"
 echo "  Backends:    $BACKENDS"
 echo "  Output dir:  $OUTPUT_DIR"
 echo "  Fresh mode:  $FRESH_CLUSTER"

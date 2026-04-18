@@ -52,6 +52,11 @@ done
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+PG_LIBDIR="$("$PG_CONFIG" --libdir)"
+PKGLIB_CANDIDATES=("$PKGLIBDIR")
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PKGLIBDIR" ]; then
+    PKGLIB_CANDIDATES+=("$PG_LIBDIR/postgresql")
+fi
 PGCTL="$PGBIN/pg_ctl"
 PG_VERSION="$("$PG_CONFIG" --version)"
 PGDATA="$("$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
@@ -66,6 +71,43 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 psql_cmd() {
     "$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -X "$@"
+}
+
+provider_lib_exists() {
+    local name="$1"
+    local suffix="$2"
+    local dir
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/$name$suffix" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+provider_lib_exists_any_suffix() {
+    local name="$1"
+    local dir
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/$name.so" ] || [ -f "$dir/$name.dylib" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_dlsuffix() {
+    local dir
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/pg_jitter_sljit.dylib" ] || [ -f "$dir/pg_jitter.dylib" ]; then
+            echo ".dylib"
+            return
+        fi
+    done
+    echo ".so"
 }
 
 ensure_pg_running() {
@@ -121,18 +163,14 @@ fi
 # ================================================================
 
 # Detect DLSUFFIX
-if [ -f "$PKGLIBDIR/pg_jitter_sljit.dylib" ]; then
-    DLSUFFIX=".dylib"
-else
-    DLSUFFIX=".so"
-fi
+DLSUFFIX="$(detect_dlsuffix)"
 
 # Check if meta-provider is installed and ensure it's active
 JIT_PROVIDER=$(psql_cmd -t -A -c "SHOW jit_provider;" 2>/dev/null || echo "")
 META_MODE=0
 
 # If pg_jitter meta module is available, ensure it's the active provider
-if [ -f "$PKGLIBDIR/pg_jitter${DLSUFFIX}" ]; then
+if provider_lib_exists "pg_jitter" "$DLSUFFIX"; then
     if [ "$JIT_PROVIDER" != "pg_jitter" ]; then
         echo "Switching jit_provider to pg_jitter (was: $JIT_PROVIDER)..."
         psql_cmd -q -c "ALTER SYSTEM SET jit_provider = 'pg_jitter';" 2>/dev/null
@@ -153,13 +191,13 @@ ALL_BACKENDS=("interp")
 ALL_NAMES=("interp")
 
 # Check for llvmjit (may use .so or .dylib depending on PG version)
-if [ -f "$PKGLIBDIR/llvmjit${DLSUFFIX}" ] || [ -f "$PKGLIBDIR/llvmjit.so" ] || [ -f "$PKGLIBDIR/llvmjit.dylib" ]; then
+if provider_lib_exists "llvmjit" "$DLSUFFIX" || provider_lib_exists_any_suffix "llvmjit"; then
     ALL_BACKENDS+=("llvmjit")
     ALL_NAMES+=("llvmjit")
 fi
 
 for b in sljit asmjit mir; do
-    if [ -f "$PKGLIBDIR/pg_jitter_${b}${DLSUFFIX}" ]; then
+    if provider_lib_exists "pg_jitter_${b}" "$DLSUFFIX"; then
         ALL_BACKENDS+=("$b")
         ALL_NAMES+=("$b")
     fi

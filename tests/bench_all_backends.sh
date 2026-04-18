@@ -30,6 +30,11 @@ done
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+PG_LIBDIR="$("$PG_CONFIG" --libdir)"
+PKGLIB_CANDIDATES=("$PKGLIBDIR")
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PKGLIBDIR" ]; then
+    PKGLIB_CANDIDATES+=("$PG_LIBDIR/postgresql")
+fi
 PGDATA="$("$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -t -A -c "SHOW data_directory;" 2>/dev/null || echo "")"
 PGCTL="$PGBIN/pg_ctl"
 OUTFILE="$SCRIPT_DIR/bench_results_$(date +%Y%m%d_%H%M%S).txt"
@@ -39,6 +44,31 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 psql_cmd() {
     "$PGBIN/psql" -p "$PGPORT" -d "$PGDB" -X "$@"
+}
+
+provider_lib_exists() {
+    local name="$1"
+    local suffix="$2"
+    local dir
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/$name$suffix" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_dlsuffix() {
+    local dir
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/pg_jitter_sljit.dylib" ] || [ -f "$dir/pg_jitter.dylib" ]; then
+            echo ".dylib"
+            return
+        fi
+    done
+    echo ".so"
 }
 
 ensure_pg_running() {
@@ -122,18 +152,14 @@ if [ "$JIT_PROVIDER" = "pg_jitter" ]; then
 fi
 
 # Determine DLSUFFIX
-if [ -f "$PKGLIBDIR/pg_jitter_sljit.dylib" ]; then
-    DLSUFFIX=".dylib"
-else
-    DLSUFFIX=".so"
-fi
+DLSUFFIX="$(detect_dlsuffix)"
 
 # Build backend list
 ALL_BACKENDS=("interp")
 ALL_NAMES=("interp")
 
 for b in sljit asmjit mir; do
-    if [ -f "$PKGLIBDIR/pg_jitter_${b}${DLSUFFIX}" ]; then
+    if provider_lib_exists "pg_jitter_${b}" "$DLSUFFIX"; then
         ALL_BACKENDS+=("$b")
         ALL_NAMES+=("$b")
     fi

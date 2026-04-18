@@ -47,7 +47,12 @@ fi
 PGBIN="$("$PG_CONFIG" --bindir)"
 PGCTL="$PGBIN/pg_ctl"
 PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
+PG_LIBDIR=$("$PG_CONFIG" --libdir)
 PG_VERSION=$("$PG_CONFIG" --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
+INSTALL_DIRS=("$PKGLIBDIR")
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PKGLIBDIR" ]; then
+    INSTALL_DIRS+=("$PG_LIBDIR/postgresql")
+fi
 
 # Resolve data directory
 if [ -n "${PGDATA:-}" ]; then
@@ -77,7 +82,7 @@ case "$TARGET" in
 esac
 
 echo "=== pg_jitter install ($TARGET) ==="
-echo "  Target: $PKGLIBDIR"
+echo "  Targets: ${INSTALL_DIRS[*]}"
 
 # Find and copy dylibs (support both flat and per-backend build layouts)
 find_dylib() {
@@ -103,7 +108,9 @@ done
 
 for b in "${BACKENDS[@]}"; do
     src=$(find_dylib "$b")
-    cp "$src" "$PKGLIBDIR/"
+    for dir in "${INSTALL_DIRS[@]}"; do
+        cp "$src" "$dir/"
+    done
     echo "  pg_jitter_$b.$EXT installed"
 done
 
@@ -116,7 +123,9 @@ for dir in "$SCRIPT_DIR/build/pg$PG_VERSION" "$SCRIPT_DIR/build/meta" "$SCRIPT_D
     fi
 done
 if [ -n "$META_LIB" ]; then
-    cp "$META_LIB" "$PKGLIBDIR/"
+    for dir in "${INSTALL_DIRS[@]}"; do
+        cp "$META_LIB" "$dir/"
+    done
     echo "  pg_jitter.$EXT installed (meta-provider)"
 fi
 

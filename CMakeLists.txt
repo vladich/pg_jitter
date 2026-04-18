@@ -126,6 +126,14 @@ set(PG_JITTER_INSTALL_DIR "${PG_PKGLIBDIR}" CACHE PATH
     "Installation directory for pg_jitter shared libraries")
 message(STATUS "Install directory:  ${PG_JITTER_INSTALL_DIR}")
 
+set(PG_JITTER_EXTRA_INSTALL_DIRS "")
+set(_pg_jitter_lib_postgresql "${PG_LIBDIR}/postgresql")
+if(IS_DIRECTORY "${_pg_jitter_lib_postgresql}"
+   AND NOT "${_pg_jitter_lib_postgresql}" STREQUAL "${PG_JITTER_INSTALL_DIR}")
+    list(APPEND PG_JITTER_EXTRA_INSTALL_DIRS "${_pg_jitter_lib_postgresql}")
+    message(STATUS "Extra install dir:  ${_pg_jitter_lib_postgresql}")
+endif()
+
 # ---------- Dependency directories ----------
 set(SLJIT_DIR "${CMAKE_SOURCE_DIR}/../sljit" CACHE PATH
     "Path to sljit source directory")
@@ -438,6 +446,9 @@ foreach(_tgt ${PG_JITTER_TARGETS})
     # Use install(FILES) on the built target to avoid cmake MODULE install issues.
     # $<TARGET_FILE:...> resolves to the full path of the built shared library.
     install(FILES $<TARGET_FILE:${_tgt}> DESTINATION ${PG_JITTER_INSTALL_DIR})
+    foreach(_extra_dir ${PG_JITTER_EXTRA_INSTALL_DIRS})
+        install(FILES $<TARGET_FILE:${_tgt}> DESTINATION ${_extra_dir})
+    endforeach()
 endforeach()
 
 # Install SQL function definitions

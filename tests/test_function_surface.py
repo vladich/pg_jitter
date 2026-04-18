@@ -665,6 +665,11 @@ class Psql:
         self.db = db
         self.bindir = self._pg_config("--bindir")
         self.pkglibdir = self._pg_config("--pkglibdir")
+        self.libdir = self._pg_config("--libdir")
+        self.pkglib_candidates = [Path(self.pkglibdir)]
+        lib_postgresql = Path(self.libdir) / "postgresql"
+        if lib_postgresql.is_dir() and lib_postgresql != Path(self.pkglibdir):
+            self.pkglib_candidates.append(lib_postgresql)
         self.psql = str(Path(self.bindir) / "psql")
 
     def _pg_config(self, arg: str) -> str:
@@ -690,7 +695,7 @@ class Psql:
         return proc.stdout.strip()
 
 
-def detect_backends(pkglibdir: str, pg_version_num: int) -> list[str]:
+def detect_backends(pkglibdirs: list[Path], pg_version_num: int) -> list[str]:
     if sys.platform == "darwin":
         ext = "dylib"
     elif os.name == "nt":
@@ -700,12 +705,15 @@ def detect_backends(pkglibdir: str, pg_version_num: int) -> list[str]:
 
     found: list[str] = []
     for backend in ("sljit", "asmjit", "mir"):
-        if Path(pkglibdir, f"pg_jitter_{backend}.{ext}").exists():
+        if any(Path(pkglibdir, f"pg_jitter_{backend}.{ext}").exists()
+               for pkglibdir in pkglibdirs):
             found.append(backend)
-    if pg_version_num >= 170000 and Path(pkglibdir, f"pg_jitter.{ext}").exists():
+    if pg_version_num >= 170000 and any(Path(pkglibdir, f"pg_jitter.{ext}").exists()
+                                        for pkglibdir in pkglibdirs):
         found.append("auto")
     if not found:
-        raise RuntimeError(f"no pg_jitter provider libraries found in {pkglibdir}")
+        paths = ", ".join(str(path) for path in pkglibdirs)
+        raise RuntimeError(f"no pg_jitter provider libraries found in {paths}")
     return found
 
 
@@ -860,7 +868,7 @@ def main() -> int:
     pg_version_num = int(psql.run("SHOW server_version_num;"))
 
     if args.backend == "all":
-        backends = detect_backends(psql.pkglibdir, pg_version_num)
+        backends = detect_backends(psql.pkglib_candidates, pg_version_num)
     else:
         backends = args.backend.split()
 

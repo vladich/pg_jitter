@@ -41,6 +41,11 @@ done
 
 PGBIN="$("$PG_CONFIG" --bindir)"
 PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+PG_LIBDIR="$("$PG_CONFIG" --libdir)"
+PKGLIB_CANDIDATES=("$PKGLIBDIR")
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PKGLIBDIR" ]; then
+    PKGLIB_CANDIDATES+=("$PG_LIBDIR/postgresql")
+fi
 PSQL="$PGBIN/psql"
 PG_ISREADY="$PGBIN/pg_isready"
 
@@ -63,13 +68,16 @@ detect_backends() {
     esac
 
     for b in sljit asmjit mir; do
-        if [ -f "$PKGLIBDIR/pg_jitter_${b}.${ext}" ]; then
-            found+=("$b")
-        fi
+        for dir in "${PKGLIB_CANDIDATES[@]}"; do
+            if [ -f "$dir/pg_jitter_${b}.${ext}" ]; then
+                found+=("$b")
+                break
+            fi
+        done
     done
 
     if [ ${#found[@]} -eq 0 ]; then
-        echo "ERROR: no pg_jitter backend libraries found in $PKGLIBDIR" >&2
+        echo "ERROR: no pg_jitter backend libraries found in ${PKGLIB_CANDIDATES[*]}" >&2
         exit 1
     fi
 
