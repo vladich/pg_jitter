@@ -281,7 +281,9 @@ jobs:
           REGRESS_DIR="${{ github.workspace }}/postgres-src/src/test/regress"
           PGPORT=$(psql -t -A -c "SHOW port;" "$CONNURI")
 
-          # pg_regress spawns psql over TCP — needs password from env
+          # pg_regress and targeted pg_jitter tests spawn psql over TCP.
+          # Be explicit: libpq otherwise defaults to the runner OS user.
+          export PGUSER="postgres"
           export PGPASSWORD="postgres"
 
           # Find pg_regress (with or without .exe suffix)
