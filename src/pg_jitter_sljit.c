@@ -87,6 +87,61 @@ static bool sljit_shared_code_mode = false;
  */
 static bool sljit_inline_enabled = false;
 
+#ifdef WORDS_BIGENDIAN
+#define JIT_VARATT_1B_MASK 0x80
+#define JIT_VARATT_1B_E_HEADER 0x80
+#else
+#define JIT_VARATT_1B_MASK 0x01
+#define JIT_VARATT_1B_E_HEADER 0x01
+#endif
+
+static void
+emit_varatt_1b_exhdr_len(struct sljit_compiler *C, sljit_s32 reg)
+{
+#ifdef WORDS_BIGENDIAN
+  sljit_emit_op2(C, SLJIT_AND, reg, 0, reg, 0, SLJIT_IMM, 0x7f);
+#else
+  sljit_emit_op2(C, SLJIT_LSHR, reg, 0, reg, 0, SLJIT_IMM, 1);
+#endif
+  sljit_emit_op2(C, SLJIT_SUB, reg, 0, reg, 0, SLJIT_IMM, 1);
+}
+
+static inline void
+emit_load_datum_u32(struct sljit_compiler *C, sljit_s32 dst,
+                    sljit_s32 src, sljit_sw srcw)
+{
+#ifdef WORDS_BIGENDIAN
+  sljit_emit_op1(C, SLJIT_MOV, dst, 0, src, srcw);
+  sljit_emit_op1(C, SLJIT_MOV_U32, dst, 0, dst, 0);
+#else
+  sljit_emit_op1(C, SLJIT_MOV_U32, dst, 0, src, srcw);
+#endif
+}
+
+static inline void
+emit_load_datum_s32(struct sljit_compiler *C, sljit_s32 dst,
+                    sljit_s32 src, sljit_sw srcw)
+{
+#ifdef WORDS_BIGENDIAN
+  sljit_emit_op1(C, SLJIT_MOV, dst, 0, src, srcw);
+  sljit_emit_op1(C, SLJIT_MOV_S32, dst, 0, dst, 0);
+#else
+  sljit_emit_op1(C, SLJIT_MOV_S32, dst, 0, src, srcw);
+#endif
+}
+
+static inline void
+emit_load_datum_32(struct sljit_compiler *C, sljit_s32 dst,
+                   sljit_s32 src, sljit_sw srcw)
+{
+#ifdef WORDS_BIGENDIAN
+  sljit_emit_op1(C, SLJIT_MOV, dst, 0, src, srcw);
+  sljit_emit_op1(C, SLJIT_MOV32, dst, 0, dst, 0);
+#else
+  sljit_emit_op1(C, SLJIT_MOV32, dst, 0, src, srcw);
+#endif
+}
+
 /*
  * Per-compilation cached register for state->steps base pointer.
  * When non-zero, emit_load_step_field() uses this register directly
@@ -2615,20 +2670,23 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_R0), 0);
   sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R3, 0, SLJIT_MEM1(SLJIT_R1), 0);
 
-  /* 3. Check both headers are short varlena: (hdr & 1) && hdr != 1 */
-  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z, SLJIT_R2, 0, SLJIT_IMM, 1);
-  j_slow1 = sljit_emit_jump(C, SLJIT_ZERO);      /* hdr_a even → slow */
-  j_slow2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 1);
-  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z, SLJIT_R3, 0, SLJIT_IMM, 1);
-  j_slow3 = sljit_emit_jump(C, SLJIT_ZERO);      /* hdr_b even → slow */
-  j_slow4 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R3, 0, SLJIT_IMM, 1);
+  /* 3. Check both headers are short varlena, excluding external headers. */
+  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
+                  SLJIT_R2, 0, SLJIT_IMM, JIT_VARATT_1B_MASK);
+  j_slow1 = sljit_emit_jump(C, SLJIT_ZERO);
+  j_slow2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0,
+                           SLJIT_IMM, JIT_VARATT_1B_E_HEADER);
+  sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
+                  SLJIT_R3, 0, SLJIT_IMM, JIT_VARATT_1B_MASK);
+  j_slow3 = sljit_emit_jump(C, SLJIT_ZERO);
+  j_slow4 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R3, 0,
+                           SLJIT_IMM, JIT_VARATT_1B_E_HEADER);
 
   /* 4. Headers equal → same length? */
   j_len_ne = sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R2, 0, SLJIT_R3, 0);
 
-  /* 5. data_len = (hdr_a >> 1) - 1 → R2 */
-  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_IMM, 1);
-  sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_IMM, 1);
+  /* 5. data_len = VARSIZE_1B_EXHDR(hdr_a) → R2 */
+  emit_varatt_1b_exhdr_len(C, SLJIT_R2);
 
   /* 6. data_len == 0 → both empty → result_eq */
   j_empty = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 0);
@@ -2638,11 +2696,8 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
 
   /*
    * 8. Inline word comparison (data_len 1-7, zero function calls).
-   *    Load 8 bytes from each datum, shift left to clear trailing
-   *    garbage, compare the meaningful prefix.
-   *    On little-endian, byte 0 (header) is in the LSB.  Shifting
-   *    left by (7 - data_len) * 8 bits pushes meaningful bytes to
-   *    the MSB and zeros out the garbage in the LSB.
+   *    Load 8 bytes from each datum and shift away trailing garbage
+   *    according to the host byte order.
    */
   sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0, SLJIT_IMM, 7,
                  SLJIT_R2, 0);                            /* 7 - data_len */
@@ -2652,10 +2707,17 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
                  SLJIT_MEM1(SLJIT_R0), 0);               /* word_a */
   sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
                  SLJIT_MEM1(SLJIT_R1), 0);               /* word_b */
+#ifdef WORDS_BIGENDIAN
+  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R3, 0,
+                 SLJIT_R3, 0, SLJIT_R2, 0);              /* word_a >>= shift */
+  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
+                 SLJIT_R0, 0, SLJIT_R2, 0);              /* word_b >>= shift */
+#else
   sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
                  SLJIT_R3, 0, SLJIT_R2, 0);              /* word_a <<= shift */
   sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
                  SLJIT_R0, 0, SLJIT_R2, 0);              /* word_b <<= shift */
+#endif
   j_small_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
                                SLJIT_R3, 0, SLJIT_R0, 0);
   j_to_ne = sljit_emit_jump(C, SLJIT_JUMP);              /* not equal */
@@ -2665,10 +2727,15 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   {
     struct sljit_jump *j_simd_ne = NULL, *j_memcmp_eq2;
     int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
-    bool has_simd_cmpeq = sljit_has_cpu_feature(SLJIT_HAS_SIMD) &&
+    bool has_simd_cmpeq =
+#ifdef WORDS_BIGENDIAN
+        false;
+#else
+        sljit_has_cpu_feature(SLJIT_HAS_SIMD) &&
         (sljit_emit_simd_op2(C,
             simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
             SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
+#endif
 
     /* If SIMD available: data_len > 16 → memcmp. Otherwise all > 7 → memcmp. */
     struct sljit_jump *j_memcmp_path = sljit_emit_cmp(C, SLJIT_GREATER,
@@ -4264,7 +4331,7 @@ static bool sljit_compile_expr(ExprState *state) {
                      *
                      * 1. Load datum ptr → R0
                      * 2. Load 1-byte varlena header, check short form
-                     * 3. data_len = (hdr >> 1) - 1
+                     * 3. data_len = VARSIZE_1B_EXHDR(hdr)
                      * 4. data_len >= pattern_len? (else → no match)
                      * 5. Load 8 bytes from data+1, mask to pattern_len
                      * 6. Compare against pattern immediate
@@ -4293,20 +4360,19 @@ static bool sljit_compile_expr(ExprState *state) {
                       sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
                                      SLJIT_MEM1(SLJIT_R0), 0);
 
-                      /* Check short varlena: (hdr & 1) && hdr != 1 */
+                      /* Check short varlena, excluding external headers. */
                       sljit_emit_op2u(C, SLJIT_AND | SLJIT_SET_Z,
-                                      SLJIT_R1, 0, SLJIT_IMM, 1);
+                                      SLJIT_R1, 0, SLJIT_IMM,
+                                      JIT_VARATT_1B_MASK);
                       struct sljit_jump *j_slow1 =
                           sljit_emit_jump(C, SLJIT_ZERO);
                       struct sljit_jump *j_slow2 =
                           sljit_emit_cmp(C, SLJIT_EQUAL,
-                                         SLJIT_R1, 0, SLJIT_IMM, 1);
+                                         SLJIT_R1, 0, SLJIT_IMM,
+                                         JIT_VARATT_1B_E_HEADER);
 
-                      /* data_len = (hdr >> 1) - 1 → R1 */
-                      sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0,
-                                     SLJIT_R1, 0, SLJIT_IMM, 1);
-                      sljit_emit_op2(C, SLJIT_SUB, SLJIT_R1, 0,
-                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+                      /* data_len = VARSIZE_1B_EXHDR(hdr) → R1 */
+                      emit_varatt_1b_exhdr_len(C, SLJIT_R1);
 
                       /* data_len >= pattern_len? */
                       struct sljit_jump *j_too_short =
@@ -4315,9 +4381,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
                       /*
                        * Load 8 bytes from data start (ptr+1, skip header).
-                       * On little-endian, byte 0 is in the LSB.
                        * We need to compare bytes 0..pattern_len-1.
-                       * Mask: keep only the lower pattern_len*8 bits.
                        */
                       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
                                      SLJIT_MEM1(SLJIT_R0), 1);
@@ -4327,11 +4391,16 @@ static bool sljit_compile_expr(ExprState *state) {
                       memcpy(&pat_imm, literal, literal_len);
 
                       if (literal_len < 8) {
+#ifdef WORDS_BIGENDIAN
+                        uint64_t mask = ~UINT64CONST(0) << ((8 - literal_len) * 8);
+#else
                         /* Mask: (1 << (literal_len*8)) - 1 */
-                        uint64_t mask = ((uint64_t)1 << (literal_len * 8)) - 1;
+                        uint64_t mask = (UINT64CONST(1) << (literal_len * 8)) - 1;
+#endif
                         sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
                                        SLJIT_R1, 0,
                                        SLJIT_IMM, (sljit_sw)mask);
+                        pat_imm &= mask;
                       }
                       /* else literal_len == 8: compare full 8 bytes, no mask */
 
@@ -4468,7 +4537,7 @@ static bool sljit_compile_expr(ExprState *state) {
                    *
                    * Fast path (1-byte varlena header, covers text ≤126 bytes):
                    *   data = datum_ptr + 1
-                   *   len  = (first_byte >> 1) - 1
+                   *   len  = VARSIZE_1B_EXHDR(first_byte)
                    *   call pcre2_jit_func(&jit_args)
                    *
                    * Slow path (4-byte header, toast): call C wrapper.
@@ -4508,22 +4577,24 @@ static bool sljit_compile_expr(ExprState *state) {
                       sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R1, 0,
                                      SLJIT_MEM1(SLJIT_R0), 0);
 
-                      /* Check VARATT_IS_1B: bit 0 set → 1-byte header */
+                      /* Check VARATT_IS_1B, excluding external headers. */
                       sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0,
-                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+                                     SLJIT_R1, 0, SLJIT_IMM,
+                                     JIT_VARATT_1B_MASK);
                       j_to_slow = sljit_emit_cmp(C, SLJIT_EQUAL,
                                                   SLJIT_R2, 0, SLJIT_IMM, 0);
+                      struct sljit_jump *j_external =
+                          sljit_emit_cmp(C, SLJIT_EQUAL,
+                                         SLJIT_R1, 0, SLJIT_IMM,
+                                         JIT_VARATT_1B_E_HEADER);
 
                       /* === FAST PATH: 1-byte header === */
                       /* R2 = data pointer = datum + 1 */
                       sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
                                      SLJIT_R0, 0, SLJIT_IMM, 1);
 
-                      /* R1 = length = (first_byte >> 1) - 1 */
-                      sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0,
-                                     SLJIT_R1, 0, SLJIT_IMM, 1);
-                      sljit_emit_op2(C, SLJIT_SUB, SLJIT_R1, 0,
-                                     SLJIT_R1, 0, SLJIT_IMM, 1);
+                      /* R1 = VARSIZE_1B_EXHDR(first_byte) */
+                      emit_varatt_1b_exhdr_len(C, SLJIT_R1);
 
                       /* Store str, begin, end, startchar_ptr into jit_args */
                       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -4559,6 +4630,7 @@ static bool sljit_compile_expr(ExprState *state) {
                       /* === SLOW PATH: 4B header or toast === */
                       l_slow = sljit_emit_label(C);
                       sljit_set_label(j_to_slow, l_slow);
+                      sljit_set_label(j_external, l_slow);
 
                       /*
                        * Reload datum from step data. Cannot use R1
@@ -6541,8 +6613,8 @@ static bool sljit_compile_expr(ExprState *state) {
       } else {
         emit_load_step_field(
             C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
-        sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(NullableDatum, value));
+        emit_load_datum_u32(C, SLJIT_R0, SLJIT_MEM1(SLJIT_R0),
+                            offsetof(NullableDatum, value));
         sljit_emit_op2(C, SLJIT_ROTL32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TEMP, SLJIT_R0,
                        0);
@@ -6648,8 +6720,8 @@ static bool sljit_compile_expr(ExprState *state) {
         /* Load from memory, rotate, spill to stack */
         emit_load_step_field(
             C, opno, offsetof(ExprEvalStep, d.hashdatum.iresult), SLJIT_R0);
-        sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R0),
-                       offsetof(NullableDatum, value));
+        emit_load_datum_u32(C, SLJIT_R0, SLJIT_MEM1(SLJIT_R0),
+                            offsetof(NullableDatum, value));
         sljit_emit_op2(C, SLJIT_ROTL32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), SOFF_TEMP, SLJIT_R0,
                        0);
@@ -7021,7 +7093,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
       /* R0 = (int32) *op->resvalue */
       emit_load_resvalue_addr(C, state, opno, op, SLJIT_R1);
-      sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R1), 0);
+      emit_load_datum_s32(C, SLJIT_R0, SLJIT_MEM1(SLJIT_R1), 0);
 
       /* Compare R0 against 0 → set result bool */
       {
@@ -7769,8 +7841,8 @@ static bool sljit_compile_expr(ExprState *state) {
             sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 0);
 
         /* Load scalar int32 value into R0 */
-        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
-                       SLJIT_MEM1(SLJIT_R0), off_arg0_value_simd);
+        emit_load_datum_32(C, SLJIT_R0, SLJIT_MEM1(SLJIT_R0),
+                           off_arg0_value_simd);
 
         /* VR0 = broadcast scalar to SIMD int32 lanes */
         sljit_emit_simd_replicate(C, simd_type, SLJIT_VR0, SLJIT_R0, 0);
@@ -8115,8 +8187,8 @@ static bool sljit_compile_expr(ExprState *state) {
         /* Load scalar value into R0 */
         sljit_sw off_arg0_value_rt =
             (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
-        sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
-                       SLJIT_MEM1(SLJIT_R0), off_arg0_value_rt);
+        emit_load_datum_s32(C, SLJIT_R0, SLJIT_MEM1(SLJIT_R0),
+                            off_arg0_value_rt);
 
         /* CRC32 hash: R1 = crc32c(0xFFFFFFFF, R0) & mask */
         sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0,
@@ -9220,9 +9292,16 @@ static bool sljit_compile_expr(ExprState *state) {
         /* Actual array size = header + raw data (no alignment padding needed
          * for by-value types stored contiguously). palloc will round up. */
         int total_size = dataoff + data_size;
+        uint32 varsize_header;
 
         struct sljit_jump *j_null_jumps[64];
         int n_null_jumps = 0;
+
+#ifdef WORDS_BIGENDIAN
+        varsize_header = (uint32) total_size;
+#else
+        varsize_header = ((uint32) total_size) << 2;
+#endif
 
         /* First check for any nulls in elemnulls[] array */
         emit_load_step_field(
@@ -9254,7 +9333,7 @@ static bool sljit_compile_expr(ExprState *state) {
          */
         /* SET_VARSIZE: store total_size in first 4 bytes */
         sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(SLJIT_R1), 0, SLJIT_IMM,
-                       (total_size << 2));
+                       varsize_header);
         /* ndim = 1 */
         sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(SLJIT_R1),
                        offsetof(ArrayType, ndim), SLJIT_IMM, 1);

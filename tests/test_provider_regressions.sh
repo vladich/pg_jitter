@@ -301,6 +301,71 @@ FROM checks;"
         fi
     fi
 
+    endian_sql="$backend_jit_settings
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_endian_text(v text);
+INSERT INTO pg_jitter_endian_text VALUES
+  ('enable_hashjoin'), ('enable_mergejoin'), ('enable_seqscan'),
+  ('jit'), ('disable_cost');
+CREATE TEMP TABLE pg_jitter_endian_vals(v int4);
+INSERT INTO pg_jitter_endian_vals SELECT g::int4 FROM generate_series(1, 32) AS g;
+WITH checks(name, ok) AS (
+  VALUES
+    ('short_text_eq',
+     (SELECT count(*) = 1 FROM pg_jitter_endian_text
+      WHERE v = 'enable_hashjoin')),
+    ('short_text_ne',
+     (SELECT count(*) = 4 FROM pg_jitter_endian_text
+      WHERE v <> 'enable_hashjoin')),
+    ('prefix_like',
+     (SELECT count(*) = 3 FROM pg_jitter_endian_text
+      WHERE v LIKE 'enable%')),
+    ('prefix_not_like',
+     (SELECT count(*) = 2 FROM pg_jitter_endian_text
+      WHERE v NOT LIKE 'enable%')),
+    ('regex_prefix',
+     (SELECT count(*) = 3 FROM pg_jitter_endian_text
+      WHERE v ~ '^enable')),
+    ('arrayexpr_int4',
+     (SELECT bool_and(array_to_string(ARRAY[v, v + 1, v + 2]::int4[], ',') =
+                      concat_ws(',', v, v + 1, v + 2))
+      FROM pg_jitter_endian_vals)),
+    ('arrayexpr_int2',
+     (SELECT bool_and(array_to_string(ARRAY[v::int2, (v + 1)::int2]::int2[], ',') =
+                      concat_ws(',', v::int2, (v + 1)::int2))
+      FROM pg_jitter_endian_vals)),
+    ('arrayexpr_bool',
+     (SELECT bool_and(array_to_string(ARRAY[(v % 2 = 0), (v % 3 = 0)]::bool[], ',') =
+                      concat_ws(',', (v % 2 = 0), (v % 3 = 0)))
+      FROM pg_jitter_endian_vals))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+    set +e
+    endian_out="$(printf '%s\n' "$endian_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    endian_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: endian-sensitive text/array coverage crashed or wedged the server"
+        printf '%s\n' "$endian_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$endian_rc" -ne 0 ]; then
+        echo "FAIL: endian-sensitive text/array coverage raised an unexpected SQL error"
+        printf '%s\n' "$endian_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    else
+        endian_out="$(printf '%s\n' "$endian_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$endian_out" != "ok" ]; then
+            echo "FAIL: endian-sensitive text/array checks failed: $endian_out"
+            FAIL=$((FAIL + 1))
+        else
+            echo "PASS: endian-sensitive text/array checks match PostgreSQL"
+        fi
+    fi
+
     inlist_sql="$backend_jit_settings
 $simd_inlist_settings
 SET enable_indexscan = off;

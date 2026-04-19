@@ -751,6 +751,17 @@ emit_int4_to_datum_batch(struct sljit_compiler *C, int max_int4_count)
 	struct sljit_jump *j_avx512_done = NULL;
 	struct sljit_jump *j_avx512_small = NULL;
 
+#ifdef WORDS_BIGENDIAN
+	/*
+	 * Keep the batched int4 run JITed on big-endian targets, but avoid
+	 * generic SIMD lane packing.  Datum slots must contain the sign-extended
+	 * int32 value in the native Datum representation.
+	 */
+	sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_R2, 0);
+	emit_int4_to_datum_scalar_tail(C);
+	return;
+#endif
+
 #ifdef SLJIT_HAS_AVX2
 	use_avx2 = pg_jitter_cpu_has_avx2() &&
 		sljit_has_cpu_feature(SLJIT_HAS_AVX2);
