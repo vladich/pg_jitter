@@ -134,7 +134,6 @@ install:
 
   # Build pg_jitter (asmjit available on x86_64/amd64/arm64 only)
   - |
-    set -euo pipefail
     . "$HOME/.travis_env"
     ARCH=$(uname -m)
     CMAKE_ARGS="-DPG_CONFIG=${PG_CONFIG}"
