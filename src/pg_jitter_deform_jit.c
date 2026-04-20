@@ -42,10 +42,41 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <libkern/OSCacheControl.h>
+#endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #endif
+
+/*
+ * Return the exact executable-buffer byte count requested by SLJIT.
+ *
+ * Must be called after sljit_generate_code(): at that point SLJIT has
+ * applied backend-specific jump shrinking, literal-pool sizing, and any
+ * call-context padding to compiler->size / executable_size.
+ */
+static Size
+sljit_generated_buffer_size(struct sljit_compiler *C)
+{
+#if defined(SLJIT_CONFIG_X86) && SLJIT_CONFIG_X86
+	return (Size) C->size;
+#elif defined(SLJIT_CONFIG_ARM_THUMB2) && SLJIT_CONFIG_ARM_THUMB2
+	return (Size) (C->size * sizeof(uint16));
+#elif defined(SLJIT_CONFIG_RISCV) && SLJIT_CONFIG_RISCV
+	return (Size) (C->size * sizeof(uint16));
+#elif defined(SLJIT_CONFIG_S390X) && SLJIT_CONFIG_S390X
+	return (Size) sljit_get_generated_code_size(C);
+#elif (defined(SLJIT_CONFIG_ARM) && SLJIT_CONFIG_ARM) || \
+	(defined(SLJIT_CONFIG_PPC) && SLJIT_CONFIG_PPC) || \
+	(defined(SLJIT_CONFIG_MIPS) && SLJIT_CONFIG_MIPS) || \
+	(defined(SLJIT_CONFIG_LOONGARCH) && SLJIT_CONFIG_LOONGARCH)
+	return (Size) (C->size * sizeof(uint32));
+#else
+	return (Size) sljit_get_generated_code_size(C);
+#endif
+}
 
 /* ================================================================
  * sljit_compile_deform — unrolled per-column deform
@@ -1157,6 +1188,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 							  int natts,
 							  DeformColDesc *target_descs,
 							  Size *code_size_out,
+							  Size *code_buffer_size_out,
 							  struct sljit_generate_code_buffer *gen_buf)
 {
 	struct sljit_compiler *C;
@@ -2893,6 +2925,8 @@ deform_code_gen:
 
 	if (code && code_size_out)
 		*code_size_out = sljit_get_generated_code_size(C);
+	if (code && code_buffer_size_out)
+		*code_buffer_size_out = sljit_generated_buffer_size(C);
 
 	/* Patch dispatch jump table with actual handler addresses */
 	if (code && dispatch_jump_table)
@@ -3162,7 +3196,8 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	/* Compile: sparse-loop path also wins for medium-width nullable tables. */
 	if (natts > pg_jitter_deform_threshold() ||
 		(natts >= 64 && deform_desc_has_nullable(desc, natts)))
-		fn = pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
+		fn = pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL,
+										   NULL);
 	else
 		fn = pg_jitter_compile_deform(desc, ops, natts);
 
@@ -3263,6 +3298,22 @@ shared_deform_free(void *addr, Size size)
 #endif
 }
 
+static void
+shared_deform_flush_icache(void *addr, Size size)
+{
+	if (!addr || size == 0)
+		return;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+	sys_icache_invalidate(addr, size);
+#elif defined(__GNUC__) || defined(__clang__)
+	__builtin___clear_cache((char *) addr, (char *) addr + size);
+#else
+	(void) addr;
+	(void) size;
+#endif
+}
+
 
 /* ================================================================
  * pg_jitter_compile_shared_deform — leader-side shared deform setup
@@ -3283,12 +3334,20 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 {
 	Size		code_area_size;
 	Size		desc_offset;
+	Size		desc_size;
+	Size		page_used_size;
+	Size		stored_size;
 	Size		total_size;
 	long		page_size;
 	void	   *page_addr;
 	void	   *compiled;
+	void	   *probe_code;
 	Size		code_size = 0;
+	Size		expected_code_size = 0;
+	Size		code_buffer_size = 0;
+	Size		second_code_buffer_size = 0;
 	DeformColDesc *descs;
+	DeformColDesc *probe_descs;
 	char	   *dsm_dest;
 	uint32		attrs_hash;
 	uint32		ops_kind;
@@ -3306,22 +3365,51 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	if (page_size <= 0)
 		page_size = 4096;
 
+	desc_size = sizeof(DeformColDesc) * (Size) natts;
+
 	/*
-	 * Layout: [code (up to code_area_size)] [descriptors (8 bytes × natts)]
-	 *
-	 * Loop-based deform is ~530-800 bytes.  We reserve 2048 bytes.
+	 * First pass: ask SLJIT for the exact executable-buffer size required
+	 * by this deform loop.  The generated code is discarded; only the size
+	 * is used to lay out the shared page.  The second pass must require the
+	 * same size before we publish anything to DSM.
 	 */
-	code_area_size = 2048;
+	probe_descs = (DeformColDesc *) palloc(desc_size);
+	probe_code = pg_jitter_compile_deform_loop(desc, ops, natts,
+											   probe_descs, &expected_code_size,
+											   &code_buffer_size, NULL);
+	pfree(probe_descs);
+
+	if (!probe_code || expected_code_size == 0 || code_buffer_size == 0 ||
+		expected_code_size > code_buffer_size)
+	{
+		if (probe_code)
+			sljit_free_code(probe_code, NULL);
+		elog(DEBUG1, "pg_jitter: shared deform sizing failed "
+			 "(code=%zu buffer=%zu)",
+			 expected_code_size, code_buffer_size);
+		return false;
+	}
+
+	sljit_free_code(probe_code, NULL);
+
+	/*
+	 * Layout: [exact SLJIT executable buffer] [descriptors].
+	 * The mmap length is still rounded to pages because mmap/mprotect
+	 * require page granularity, but there is no fixed code reservation.
+	 */
+	code_area_size = code_buffer_size;
 	desc_offset = MAXALIGN(code_area_size);
-	total_size = desc_offset + sizeof(DeformColDesc) * natts;
+	page_used_size = desc_offset + desc_size;
+	stored_size = expected_code_size + desc_size;
+	total_size = page_used_size;
 	total_size = (total_size + page_size - 1) & ~(page_size - 1);
 
-	/* Check DSM has room for the page bytes at the end */
-	if (sjc->used + total_size > sjc->capacity)
+	/* Check DSM has room for the compact exact bytes at the end */
+	if (sjc->used + stored_size > sjc->capacity)
 	{
 		elog(DEBUG1, "pg_jitter: shared deform skipped, DSM too small "
 			 "(%zu used + %zu needed > %zu capacity)",
-			 sjc->used, total_size, sjc->capacity);
+			 sjc->used, stored_size, sjc->capacity);
 		return false;
 	}
 
@@ -3395,13 +3483,21 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 		buf.executable_offset = 0;
 
 		compiled = pg_jitter_compile_deform_loop(desc, ops, natts,
-												 descs, &code_size, &buf);
+												 descs, &code_size,
+												 &second_code_buffer_size,
+												 &buf);
 	}
 
-	if (!compiled)
+	if (!compiled || code_size == 0 ||
+		code_size != expected_code_size ||
+		second_code_buffer_size != code_buffer_size ||
+		code_size > code_area_size)
 	{
 		shared_deform_free(page_addr, total_size);
-		elog(DEBUG1, "pg_jitter: shared deform compilation failed");
+		elog(DEBUG1, "pg_jitter: shared deform compilation failed "
+			 "(code=%zu expected_code=%zu buffer=%zu expected_buffer=%zu)",
+			 code_size, expected_code_size,
+			 second_code_buffer_size, code_buffer_size);
 		return false;
 	}
 
@@ -3412,10 +3508,12 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 		elog(DEBUG1, "pg_jitter: shared deform mprotect failed: %m");
 		return false;
 	}
+	shared_deform_flush_icache(page_addr, code_size);
 
 	/* Store metadata in DSM header */
 	sjc->deform_addr = (uint64)(uintptr_t) page_addr;
 	sjc->deform_page_size = total_size;
+	sjc->deform_used_size = stored_size;
 	sjc->deform_code_size = code_size;
 	sjc->deform_desc_offset = desc_offset;
 	sjc->deform_natts = natts;
@@ -3424,9 +3522,10 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	sjc->deform_tdtypeid = desc->tdtypeid;
 	sjc->deform_tdtypmod = desc->tdtypmod;
 
-	/* Copy page bytes to end of DSM (page is PROT_READ so this works) */
-	dsm_dest = (char *) sjc + sjc->capacity - total_size;
-	memcpy(dsm_dest, page_addr, total_size);
+	/* Copy exact initialized bytes to DSM: generated code, then descriptors. */
+	dsm_dest = (char *) sjc + sjc->capacity - stored_size;
+	memcpy(dsm_dest, page_addr, code_size);
+	memcpy(dsm_dest + code_size, descs, desc_size);
 
 	/* Set local fast-path */
 	shared_deform_fn = page_addr;
@@ -3441,9 +3540,9 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	shared_deform_page_size = total_size;
 
 	elog(DEBUG1, "pg_jitter: compiled shared deform at %p, "
-		 "%zu code + %d×%zu desc = %zu bytes (%zu pages)",
+		 "%zu code (%zu buffer) + %d×%zu desc = %zu DSM / %zu mmap bytes (%zu pages)",
 		 page_addr, code_size,
-		 natts, sizeof(DeformColDesc), total_size,
+		 code_buffer_size, natts, sizeof(DeformColDesc), stored_size, total_size,
 		 total_size / page_size);
 
 	return true;
@@ -3463,8 +3562,20 @@ pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc)
 	void   *target_addr;
 	void   *page;
 	char   *dsm_src;
+	Size	desc_size;
 
 	if (!sjc || sjc->deform_addr == 0)
+		return false;
+
+	if (sjc->deform_natts <= 0 || sjc->deform_code_size == 0 ||
+		sjc->deform_used_size == 0 ||
+		sjc->deform_desc_offset < sjc->deform_code_size ||
+		sjc->deform_desc_offset > sjc->deform_page_size)
+		return false;
+
+	desc_size = sizeof(DeformColDesc) * (Size) sjc->deform_natts;
+	if (sjc->deform_used_size != sjc->deform_code_size + desc_size ||
+		desc_size > sjc->deform_page_size - sjc->deform_desc_offset)
 		return false;
 
 	/* Already attached? */
@@ -3482,9 +3593,11 @@ pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc)
 		return false;
 	}
 
-	/* Copy page bytes from DSM */
-	dsm_src = (char *) sjc + sjc->capacity - sjc->deform_page_size;
-	memcpy(page, dsm_src, sjc->deform_page_size);
+	/* Copy compact exact bytes from DSM into their runtime page offsets. */
+	dsm_src = (char *) sjc + sjc->capacity - sjc->deform_used_size;
+	memcpy(page, dsm_src, sjc->deform_code_size);
+	memcpy((char *) page + sjc->deform_desc_offset,
+		   dsm_src + sjc->deform_code_size, desc_size);
 
 	/* Make executable */
 	if (mprotect(page, sjc->deform_page_size, PROT_READ | PROT_EXEC) != 0)
@@ -3493,6 +3606,7 @@ pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc)
 		elog(DEBUG1, "pg_jitter: worker shared deform mprotect failed: %m");
 		return false;
 	}
+	shared_deform_flush_icache(page, sjc->deform_code_size);
 
 	shared_deform_fn = page;
 	shared_deform_natts = sjc->deform_natts;

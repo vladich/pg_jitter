@@ -696,7 +696,8 @@ static void *sljit_compile_deform(TupleDesc desc, const TupleTableSlotOps *ops,
 static void *sljit_compile_deform_loop(TupleDesc desc,
                                        const TupleTableSlotOps *ops,
                                        int natts) {
-  return pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL);
+  return pg_jitter_compile_deform_loop(desc, ops, natts, NULL, NULL, NULL,
+                                       NULL);
 }
 
 static bool sljit_deform_has_nullable(TupleDesc desc, int natts) {

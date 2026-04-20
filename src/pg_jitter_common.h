@@ -45,6 +45,7 @@ typedef struct SharedJitCompiledCode
 	/* Shared deform for parallel I-cache sharing */
 	uint64		deform_addr;		/* leader's mmap VA (0 = not set) */
 	Size		deform_page_size;	/* page-aligned allocation size */
+	Size		deform_used_size;	/* exact DSM bytes: code bytes + descs */
 	Size		deform_code_size;	/* code bytes only */
 	Size		deform_desc_offset;	/* descriptor offset within page */
 	int			deform_natts;		/* columns */
@@ -52,7 +53,7 @@ typedef struct SharedJitCompiledCode
 	uint32		deform_ops_kind;		/* stable TupleTableSlotOps kind */
 	Oid			deform_tdtypeid;	/* descriptor type OID */
 	int32		deform_tdtypmod;	/* descriptor typmod */
-	/* deform page bytes stored at end of DSM, offset = capacity - deform_page_size */
+	/* compact [code][descs] bytes stored at capacity - deform_used_size */
 
 	/* SharedJitCodeEntry entries follow */
 } SharedJitCompiledCode;
@@ -367,6 +368,7 @@ extern void *pg_jitter_compile_deform_loop(TupleDesc desc,
 										   int natts,
 										   DeformColDesc *target_descs,
 										   Size *code_size_out,
+										   Size *code_buffer_size_out,
 										   struct sljit_generate_code_buffer *gen_buf);
 extern void pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot,
 											   int natts);
