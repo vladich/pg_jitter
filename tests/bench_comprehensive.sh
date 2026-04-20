@@ -553,18 +553,17 @@ add_query "Bool_20cond"        "SELECT COUNT(*) FROM join_left WHERE (val > 100 
 add_query "Agg_complex_10"    "SELECT grp, COUNT(*), SUM(val1*val1), AVG(val2+val3), MIN(val1-val2+val3), MAX(val4*2-val5), SUM(CASE WHEN val1>5000 THEN val2 ELSE val3 END), AVG(ABS(val1-val2)), SUM(val1%100+val2%100), COUNT(NULLIF(val3,0)) FROM bench_data GROUP BY grp"
 
 # --- Extreme LIKE/Regex on Long Strings ---
-# TEMPORARILY DISABLED: all text_long queries crash on PG18 (pre-existing PCRE2 bug)
 # These test PCRE2 JIT advantage on 400-600 char strings (200K rows).
 # PG's regex engine must scan each position; PCRE2 JIT compiles to native code.
-#add_section "Long String LIKE/Regex"
-#add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
-#add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
-#add_query "Long_NOT_ILIKE"     "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
-#add_query "Long_Regex_alt"     "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
-#add_query "Long_Regex_8alt"    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
-#add_query "Long_Regex_icase"   "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
-#add_query "Long_Regex_class"   "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
-#add_query "Long_combined"      "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
+add_section "Long String LIKE/Regex"
+add_query "Long_LIKE_int"      "SELECT COUNT(*) FROM text_long WHERE long_text LIKE '%abcdef%'"
+add_query "Long_ILIKE_int"     "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%'"
+add_query "Long_NOT_ILIKE"     "SELECT COUNT(*) FROM text_long WHERE long_text NOT ILIKE '%ZZZZZZ%'"
+add_query "Long_Regex_alt"     "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234)'"
+add_query "Long_Regex_8alt"    "SELECT COUNT(*) FROM text_long WHERE long_text ~ '(abcd|efgh|1234|5678|abcf|def0|1abc|f012)'"
+add_query "Long_Regex_icase"   "SELECT COUNT(*) FROM text_long WHERE long_text ~* '(ABCD|EFAB|1234)'"
+add_query "Long_Regex_class"   "SELECT COUNT(*) FROM text_long WHERE long_text ~ '[a-f]{8,}'"
+add_query "Long_combined"      "SELECT COUNT(*) FROM text_long WHERE long_text ILIKE '%ABCDEF%' OR long_text ~ '(1234|5678|9abc)'"
 
 # --- CASE Binary Search ---
 # These test O(log N) binary search optimization for large CASE expressions.

@@ -15,6 +15,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/nodes.h"
 #include "storage/shmem.h"
 #include "utils/expandeddatum.h"
 #include "utils/fmgrprotos.h"
@@ -1784,8 +1785,337 @@ void pg_jitter_install_expr(ExprState *state, ExprStateEvalFunc compiled_func) {
  * Uses a simple spinlock (pg_atomic_uint32) to protect concurrent writes,
  * though in practice only the leader stores code.
  */
+static uint64
+pg_jitter_fnv1a_bytes(uint64 hash, const void *data, Size len)
+{
+  const unsigned char *bytes = (const unsigned char *)data;
+  Size i;
+
+  for (i = 0; i < len; i++) {
+    hash ^= (uint64)bytes[i];
+    hash *= UINT64CONST(1099511628211);
+  }
+
+  return hash;
+}
+
+static uint64
+pg_jitter_fnv1a_u64(uint64 hash, uint64 value)
+{
+  return pg_jitter_fnv1a_bytes(hash, &value, sizeof(value));
+}
+
+static bool
+pg_jitter_node_can_dump(const void *node)
+{
+  NodeTag tag;
+
+  if (!node)
+    return false;
+
+  tag = nodeTag(node);
+
+  /*
+   * ExprState->expr is "debugging only" and can point at executor state
+   * objects.  Older PG versions warn when nodeToString() sees those, which
+   * breaks regression output.  Real expression/parse/plan nodes sit before
+   * T_ExprState in all supported versions; executor states do not.
+   */
+  return tag >= T_Alias && tag < T_ExprState;
+}
+
+/*
+ * Fingerprint an ExprState for shared-code lookup.
+ *
+ * The primary input is PostgreSQL's own nodeToString() serialization of the
+ * original expression tree.  That keeps this guard version-tolerant and avoids
+ * mirroring every ExprEvalStep payload here.  The opcode stream is also mixed
+ * in so that expression init-time rewrites or missing original nodes still get
+ * a useful safety key.
+ */
+uint64
+pg_jitter_expr_fingerprint(ExprState *state)
+{
+  uint64 hash = UINT64CONST(14695981039346656037);
+  int i;
+
+  hash = pg_jitter_fnv1a_u64(hash, (uint64)PG_VERSION_NUM);
+  hash = pg_jitter_fnv1a_u64(hash, (uint64)sizeof(Datum));
+  hash = pg_jitter_fnv1a_u64(hash, (uint64)state->flags);
+  hash = pg_jitter_fnv1a_u64(hash, (uint64)state->steps_len);
+
+  if (state->parent && state->parent->plan)
+    hash = pg_jitter_fnv1a_u64(hash, (uint64)nodeTag(state->parent->plan));
+
+  if (pg_jitter_node_can_dump(state->expr)) {
+    char *expr_string = nodeToString((const void *)state->expr);
+
+    if (expr_string) {
+      hash = pg_jitter_fnv1a_u64(hash, UINT64CONST(0x4558505254524545));
+      hash = pg_jitter_fnv1a_bytes(hash, expr_string, strlen(expr_string));
+      pfree(expr_string);
+    }
+  }
+
+  for (i = 0; i < state->steps_len; i++) {
+    ExprEvalStep *op = &state->steps[i];
+    ExprEvalOp opcode = ExecEvalStepOp(state, op);
+
+    hash = pg_jitter_fnv1a_u64(hash, (uint64)i);
+    hash = pg_jitter_fnv1a_u64(hash, (uint64)opcode);
+
+    switch (opcode) {
+      case EEOP_INNER_FETCHSOME:
+      case EEOP_OUTER_FETCHSOME:
+      case EEOP_SCAN_FETCHSOME:
+#ifdef HAVE_EEOP_OLD_NEW
+      case EEOP_OLD_FETCHSOME:
+      case EEOP_NEW_FETCHSOME:
+#endif
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.fetch.last_var);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.fetch.fixed);
+        break;
+
+      case EEOP_INNER_VAR:
+      case EEOP_OUTER_VAR:
+      case EEOP_SCAN_VAR:
+      case EEOP_INNER_SYSVAR:
+      case EEOP_OUTER_SYSVAR:
+      case EEOP_SCAN_SYSVAR:
+#ifdef HAVE_EEOP_OLD_NEW
+      case EEOP_OLD_VAR:
+      case EEOP_NEW_VAR:
+      case EEOP_OLD_SYSVAR:
+      case EEOP_NEW_SYSVAR:
+#endif
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.var.attnum);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.var.vartype);
+#ifdef HAVE_EEOP_OLD_NEW
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.var.varreturningtype);
+#endif
+        break;
+
+      case EEOP_ASSIGN_INNER_VAR:
+      case EEOP_ASSIGN_OUTER_VAR:
+      case EEOP_ASSIGN_SCAN_VAR:
+#ifdef HAVE_EEOP_OLD_NEW
+      case EEOP_ASSIGN_OLD_VAR:
+      case EEOP_ASSIGN_NEW_VAR:
+#endif
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.assign_var.resultnum);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.assign_var.attnum);
+        break;
+
+      case EEOP_ASSIGN_TMP:
+      case EEOP_ASSIGN_TMP_MAKE_RO:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.assign_tmp.resultnum);
+        break;
+
+      case EEOP_CONST:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.isnull);
+        if (!op->d.constval.isnull)
+          hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.value);
+        break;
+
+      case EEOP_FUNCEXPR:
+      case EEOP_FUNCEXPR_STRICT:
+      case EEOP_FUNCEXPR_FUSAGE:
+      case EEOP_FUNCEXPR_STRICT_FUSAGE:
+      case EEOP_NULLIF:
+      case EEOP_DISTINCT:
+      case EEOP_NOT_DISTINCT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+      case EEOP_FUNCEXPR_STRICT_1:
+      case EEOP_FUNCEXPR_STRICT_2:
+#endif
+        if (op->d.func.finfo)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.func.finfo->fn_oid);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.func.nargs);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.func.make_ro);
+        break;
+
+      case EEOP_BOOL_AND_STEP_FIRST:
+      case EEOP_BOOL_AND_STEP:
+      case EEOP_BOOL_AND_STEP_LAST:
+      case EEOP_BOOL_OR_STEP_FIRST:
+      case EEOP_BOOL_OR_STEP:
+      case EEOP_BOOL_OR_STEP_LAST:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.boolexpr.jumpdone);
+        break;
+
+      case EEOP_QUAL:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.qualexpr.jumpdone);
+        break;
+
+      case EEOP_JUMP:
+      case EEOP_JUMP_IF_NULL:
+      case EEOP_JUMP_IF_NOT_NULL:
+      case EEOP_JUMP_IF_NOT_TRUE:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.jump.jumpdone);
+        break;
+
+      case EEOP_PARAM_EXEC:
+      case EEOP_PARAM_EXTERN:
+#ifdef HAVE_EEOP_PARAM_SET
+      case EEOP_PARAM_SET:
+#endif
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.param.paramid);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.param.paramtype);
+        break;
+
+      case EEOP_PARAM_CALLBACK:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.cparam.paramid);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.cparam.paramtype);
+        break;
+
+      case EEOP_IOCOERCE:
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+      case EEOP_IOCOERCE_SAFE:
+#endif
+        if (op->d.iocoerce.finfo_out)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.iocoerce.finfo_out->fn_oid);
+        if (op->d.iocoerce.finfo_in)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.iocoerce.finfo_in->fn_oid);
+        break;
+
+      case EEOP_NEXTVALUEEXPR:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.nextvalueexpr.seqid);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.nextvalueexpr.seqtypid);
+        break;
+
+      case EEOP_ARRAYEXPR:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.arrayexpr.nelems);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.arrayexpr.elemtype);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.arrayexpr.elemlength);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.arrayexpr.elembyval);
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)(unsigned char)op->d.arrayexpr.elemalign);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.arrayexpr.multidims);
+        break;
+
+      case EEOP_ROWCOMPARE_STEP:
+        if (op->d.rowcompare_step.finfo)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.rowcompare_step.finfo->fn_oid);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.rowcompare_step.jumpnull);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.rowcompare_step.jumpdone);
+        break;
+
+      case EEOP_ROWCOMPARE_FINAL:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.rowcompare_final.cmptype);
+        break;
+
+      case EEOP_MINMAX:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.minmax.nelems);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.minmax.op);
+        if (op->d.minmax.finfo)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.minmax.finfo->fn_oid);
+        break;
+
+      case EEOP_FIELDSELECT:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.fieldselect.fieldnum);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.fieldselect.resulttype);
+        break;
+
+      case EEOP_FIELDSTORE_DEFORM:
+      case EEOP_FIELDSTORE_FORM:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.fieldstore.ncolumns);
+        break;
+
+      case EEOP_DOMAIN_NOTNULL:
+      case EEOP_DOMAIN_CHECK:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.domaincheck.resulttype);
+        break;
+
+      case EEOP_CONVERT_ROWTYPE:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.convert_rowtype.inputtype);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.convert_rowtype.outputtype);
+        break;
+
+      case EEOP_SCALARARRAYOP:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.scalararrayop.element_type);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.scalararrayop.useOr);
+        if (op->d.scalararrayop.finfo)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.scalararrayop.finfo->fn_oid);
+        break;
+
+      case EEOP_HASHED_SCALARARRAYOP:
+        if (op->d.hashedscalararrayop.finfo)
+          hash = pg_jitter_fnv1a_u64(hash,
+                                     (uint64)op->d.hashedscalararrayop.finfo->fn_oid);
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.hashedscalararrayop.has_nulls);
+#if PG_VERSION_NUM >= 180000
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.hashedscalararrayop.inclause);
+#endif
+        break;
+
+      case EEOP_AGGREF:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.aggref.aggno);
+        break;
+
+      case EEOP_AGG_STRICT_DESERIALIZE:
+      case EEOP_AGG_DESERIALIZE:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.agg_deserialize.jumpnull);
+        break;
+
+      case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+#ifdef HAVE_EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1
+      case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
+#endif
+      case EEOP_AGG_STRICT_INPUT_CHECK_NULLS:
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.agg_strict_input_check.nargs);
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.agg_strict_input_check.jumpnull);
+        break;
+
+      case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK:
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.agg_plain_pergroup_nullcheck.setoff);
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.agg_plain_pergroup_nullcheck.jumpnull);
+        break;
+
+      case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+      case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+      case EEOP_AGG_PLAIN_TRANS_BYREF:
+      case EEOP_AGG_ORDERED_TRANS_DATUM:
+      case EEOP_AGG_ORDERED_TRANS_TUPLE:
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.agg_trans.setno);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.agg_trans.transno);
+        hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.agg_trans.setoff);
+        break;
+
+#ifdef HAVE_EEOP_AGG_PRESORTED_DISTINCT
+      case EEOP_AGG_PRESORTED_DISTINCT_SINGLE:
+      case EEOP_AGG_PRESORTED_DISTINCT_MULTI:
+        hash = pg_jitter_fnv1a_u64(hash,
+                                   (uint64)op->d.agg_presorted_distinctcheck.jumpdistinct);
+        break;
+#endif
+
+      default:
+        break;
+    }
+  }
+
+  return hash ? hash : UINT64CONST(1);
+}
+
 bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
                                  int node_id, int expr_idx,
+                                 uint64 expr_fingerprint,
                                  uint64 dylib_ref_addr) {
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
   SharedJitCodeEntry *entry;
@@ -1808,6 +2138,7 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
   entry = (SharedJitCodeEntry *)((char *)sjc + sjc->used);
   entry->plan_node_id = node_id;
   entry->expr_index = expr_idx;
+  entry->expr_fingerprint = expr_fingerprint;
   entry->code_size = code_size;
   entry->dylib_ref_addr = dylib_ref_addr;
   memcpy(entry->code_bytes, code, code_size);
@@ -1828,6 +2159,7 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
  * Returns true if found, with code_bytes and code_size set.
  */
 bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
+                                uint64 expr_fingerprint,
                                 const void **code_bytes, Size *code_size,
                                 uint64 *dylib_ref_addr) {
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
@@ -1839,13 +2171,22 @@ bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
   for (i = 0; i < sjc->num_entries; i++) {
     SharedJitCodeEntry *entry = (SharedJitCodeEntry *)((char *)sjc + offset);
 
-    if (entry->plan_node_id == node_id && entry->expr_index == expr_idx) {
+    if (entry->plan_node_id == node_id && entry->expr_index == expr_idx &&
+        entry->expr_fingerprint == expr_fingerprint) {
       *code_bytes = entry->code_bytes;
       *code_size = entry->code_size;
       if (dylib_ref_addr)
         *dylib_ref_addr = entry->dylib_ref_addr;
       return true;
     }
+
+    if (entry->plan_node_id == node_id && entry->expr_index == expr_idx)
+      elog(DEBUG1,
+           "pg_jitter: shared code fingerprint mismatch "
+           "node=%d expr=%d leader=%llx worker=%llx",
+           node_id, expr_idx,
+           (unsigned long long)entry->expr_fingerprint,
+           (unsigned long long)expr_fingerprint);
 
     offset +=
         MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + entry->code_size);

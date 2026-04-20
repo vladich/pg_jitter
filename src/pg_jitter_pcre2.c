@@ -27,68 +27,8 @@
 #include "pg_crc32c_compat.h"
 #endif
 
-/* ================================================================
- * Mirror of PCRE2 internal structures for direct JIT function calls.
- *
- * Copied from PCRE2 10.48-DEV:
- *   sljit_stack        — sljit_src/sljitLir.h
- *   jit_arguments      — pcre2_jit_compile.c:179
- *   executable_functions — pcre2_jit_compile.c:199
- *   pcre2_real_code    — pcre2_intmodedep.h:660
- *
- * These MUST match the PCRE2 version we build against.
- * ================================================================ */
-
-/* sljit_stack: 4 pointers controlling the backtracking stack */
-typedef struct pj_sljit_stack {
-	uint8_t *min_start;
-	uint8_t *start;
-	uint8_t *end;
-	uint8_t *top;
-} pj_sljit_stack;
-
-/*
- * jit_arguments: the struct passed to PCRE2's JIT-compiled function.
- * Fields before 'str' are constant per-pattern; str/begin/end change per row.
- */
-typedef struct pj_jit_args {
-	pj_sljit_stack *stack;           /* backtracking stack */
-	const uint8_t  *str;             /* current position (= begin + start_offset) */
-	const uint8_t  *begin;           /* subject start */
-	const uint8_t  *end;             /* subject end */
-	void           *match_data;      /* pcre2_match_data* for ovector writes */
-	const uint8_t  *startchar_ptr;   /* output: start of matched text */
-	uint8_t        *mark_ptr;        /* output: (*MARK) name */
-	void           *callout;         /* callout function pointer */
-	void           *callout_data;    /* callout user data */
-	size_t          offset_limit;    /* use-offset-limit value */
-	uint32_t        limit_match;     /* match limit */
-	uint32_t        oveccount;       /* number of ovector slots (pairs × 2) */
-	uint32_t        options;         /* match options */
-} pj_jit_args;
-
-/* JIT function signature: int func(jit_arguments *args) */
-typedef int (*pj_jit_func_t)(pj_jit_args *);
-
-/*
- * Offset of executable_jit in pcre2_real_code:
- *   pcre2_memctl memctl   = { malloc(8), free(8), data(8) } = 24 bytes
- *   const uint8_t *tables = 8 bytes
- *   void *executable_jit  → at offset 32
- */
-#define PJ_EXECUTABLE_JIT_OFFSET  32
-
-/* PCRE2 default match limit (from pcre2_internal.h) */
-#define PJ_MATCH_LIMIT  10000000
-
 /* Pre-allocated stack size for JIT backtracking (matches PCRE2's MACHINE_STACK_SIZE) */
 #define PJ_STACK_SIZE   32768
-
-/* Pre-allocated state for direct JIT calls (one per cache entry) */
-typedef struct Pcre2DirectState {
-	pj_jit_args       args;
-	pcre2_jit_stack   *jit_stack;   /* PCRE2 API-allocated stack */
-} Pcre2DirectState;
 
 /* ================================================================
  * Pattern cache
@@ -280,8 +220,11 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 		return NULL;
 	}
 
-	/* Create reusable match_data (only need 1 ovector pair for yes/no) */
-	match_data = pcre2_match_data_create(1, NULL);
+	/*
+	 * Create reusable match_data with the pattern's capture capacity.  This uses
+	 * PCRE2's public API instead of reading executable_jit->top_bracket.
+	 */
+	match_data = pcre2_match_data_create_from_pattern(code, NULL);
 	if (!match_data)
 	{
 		pcre2_code_free(code);
@@ -309,13 +252,14 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 			}
 		}
 		/* Free old entry */
-		if (pcre2_cache[slot_idx].entry.jit_direct) {
-			Pcre2DirectState *old_ds =
-				(Pcre2DirectState *)pcre2_cache[slot_idx].entry.jit_direct;
-			if (old_ds->jit_stack)
-				pcre2_jit_stack_free(old_ds->jit_stack);
-			pfree(old_ds);
-		}
+#ifdef PCRE2_JIT_FAST_API
+		if (pcre2_cache[slot_idx].entry.jit_fast)
+			pcre2_jit_fast_context_free(pcre2_cache[slot_idx].entry.jit_fast);
+#endif
+		if (pcre2_cache[slot_idx].entry.match_context)
+			pcre2_match_context_free(pcre2_cache[slot_idx].entry.match_context);
+		if (pcre2_cache[slot_idx].entry.jit_stack)
+			pcre2_jit_stack_free(pcre2_cache[slot_idx].entry.jit_stack);
 		if (pcre2_cache[slot_idx].entry.code)
 			pcre2_code_free(pcre2_cache[slot_idx].entry.code);
 		if (pcre2_cache[slot_idx].entry.match_data)
@@ -337,100 +281,42 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 	slot->entry.flags = pcre2_flags;
 	slot->entry.code = code;
 	slot->entry.match_data = match_data;
-	slot->entry.jit_func = NULL;
-	slot->entry.jit_direct = NULL;
+	slot->entry.match_context = NULL;
+	slot->entry.jit_stack = pcre2_jit_stack_create(PJ_STACK_SIZE,
+	                                               PJ_STACK_SIZE * 4, NULL);
+#ifdef PCRE2_JIT_FAST_API
+	slot->entry.jit_fast = NULL;
+#endif
 
-	/*
-	 * Extract JIT function pointer for direct calls.
-	 *
-	 * pcre2_real_code.executable_jit points to an executable_functions
-	 * struct whose first field is executable_funcs[3] — an array of
-	 * function pointers for full/partial-soft/partial-hard matching.
-	 * Index 0 = PCRE2_JIT_COMPLETE (full matching), which is what we use.
-	 */
+	if (slot->entry.jit_stack)
 	{
-		void **ejit_ptr = (void **)((char *)code + PJ_EXECUTABLE_JIT_OFFSET);
-		void *ejit = *ejit_ptr;
-
-		if (ejit)
+#ifdef PCRE2_JIT_FAST_API
+		slot->entry.jit_fast =
+			pcre2_jit_fast_context_create(code, PCRE2_JIT_COMPLETE,
+			                              match_data, slot->entry.jit_stack);
+		if (!slot->entry.jit_fast)
 		{
-			void **funcs = (void **)ejit;
-			pj_jit_func_t jit_fn = (pj_jit_func_t)funcs[0];
-
-			if (jit_fn)
+			slot->entry.match_context = pcre2_match_context_create(NULL);
+			if (slot->entry.match_context)
+				pcre2_jit_stack_assign(slot->entry.match_context, NULL,
+				                       slot->entry.jit_stack);
+			else
 			{
-				Pcre2DirectState *ds = MemoryContextAllocZero(
-					TopMemoryContext, sizeof(Pcre2DirectState));
-
-				/*
-				 * Use PCRE2 API to create a proper JIT stack.
-				 * pcre2_jit_stack wraps an sljit_stack with correct
-				 * alignment and memory management.
-				 *
-				 * pcre2_real_jit_stack layout:
-				 *   pcre2_memctl memctl;    // 24 bytes
-				 *   struct sljit_stack *stack; // at offset 24
-				 *
-				 * But we can just use the internal pointer directly.
-				 */
-				ds->jit_stack = pcre2_jit_stack_create(
-					PJ_STACK_SIZE, PJ_STACK_SIZE * 4, NULL);
-
-				/* Extract sljit_stack from pcre2_jit_stack */
-				/* pcre2_real_jit_stack: memctl(24) then stack pointer */
-				pj_sljit_stack *stack_ptr =
-					*(pj_sljit_stack **)((char *)ds->jit_stack + 24);
-
-				/* Pre-fill constant jit_arguments fields */
-				ds->args.stack = stack_ptr;
-				ds->args.match_data = match_data;
-				ds->args.mark_ptr = NULL;
-				ds->args.callout = NULL;
-				ds->args.callout_data = NULL;
-				ds->args.offset_limit = (size_t)-1; /* PCRE2_UNSET */
-				ds->args.options = 0;
-
-				/* Match limit: min(MATCH_LIMIT, pattern's limit) */
-				{
-					uint32_t pat_limit;
-					ds->args.limit_match = PJ_MATCH_LIMIT;
-					if (pcre2_pattern_info(code, PCRE2_INFO_MATCHLIMIT,
-					                       &pat_limit) == 0 &&
-					    pat_limit < (uint32_t)PJ_MATCH_LIMIT)
-						ds->args.limit_match = pat_limit;
-				}
-
-				/*
-				 * oveccount: must match match_data capacity AND the pattern's
-				 * top_bracket.  PCRE2 JIT returns PCRE2_ERROR_JIT_STACKLIMIT
-				 * or similar errors if oveccount is insufficient.
-				 *
-				 * executable_functions layout (pcre2_jit_compile.c:199):
-				 *   void *executable_funcs[3]       = 24 bytes
-				 *   void *read_only_data_heads[3]   = 24 bytes
-				 *   sljit_uw executable_sizes[3]     = 24 bytes
-				 *   sljit_u32 top_bracket            = at offset 72
-				 *
-				 * top_bracket = re->top_bracket + 1 (includes group 0).
-				 * We need match_data with at least top_bracket pairs.
-				 */
-				{
-					uint32_t top_bracket = *(uint32_t *)((char *)ejit + 72);
-
-					/* Reallocate match_data if needed */
-					if (top_bracket > 1) {
-						pcre2_match_data_free(match_data);
-						match_data = pcre2_match_data_create(top_bracket, NULL);
-						slot->entry.match_data = match_data;
-					}
-					ds->args.match_data = match_data;
-					ds->args.oveccount = top_bracket << 1;
-				}
-
-				slot->entry.jit_func = (void *)jit_fn;
-				slot->entry.jit_direct = ds;
+				pcre2_jit_stack_free(slot->entry.jit_stack);
+				slot->entry.jit_stack = NULL;
 			}
 		}
+#else
+		slot->entry.match_context = pcre2_match_context_create(NULL);
+		if (slot->entry.match_context)
+			pcre2_jit_stack_assign(slot->entry.match_context, NULL,
+			                       slot->entry.jit_stack);
+		else
+		{
+			pcre2_jit_stack_free(slot->entry.jit_stack);
+			slot->entry.jit_stack = NULL;
+		}
+#endif
 	}
 
 	slot->lru_counter = ++pcre2_lru_clock;
@@ -451,7 +337,7 @@ pg_jitter_pcre2_match(Pcre2CacheEntry *entry, const char *data, int len)
 	                     0,        /* start_offset */
 	                     0,        /* options */
 	                     entry->match_data,
-	                     NULL);    /* match_context */
+	                     entry->match_context);
 
 	/*
 	 * rc > 0: match found (number of ovector pairs filled)
@@ -462,13 +348,34 @@ pg_jitter_pcre2_match(Pcre2CacheEntry *entry, const char *data, int len)
 	return (rc >= 0);
 }
 
+int32
+pg_jitter_pcre2_match_raw(int64 entry_ptr, int64 data_ptr, int32 len)
+{
+	Pcre2CacheEntry *entry = (Pcre2CacheEntry *)entry_ptr;
+	const uint8_t *data = (const uint8_t *)(uintptr_t)data_ptr;
+	int rc;
+
+#ifdef PCRE2_JIT_FAST_API
+	if (entry->jit_fast)
+		rc = pcre2_jit_fast_match(entry->jit_fast, (PCRE2_SPTR)data,
+		                          len, 0, 0);
+	else
+#endif
+		rc = pcre2_jit_match(entry->code,
+		                     (PCRE2_SPTR)data, len,
+		                     0, 0,
+		                     entry->match_data,
+		                     entry->match_context);
+
+	return (rc >= 0) ? 1 : 0;
+}
+
 /* ================================================================
  * JIT-callable wrapper: text Datum + Pcre2CacheEntry* → int32
  *
- * When jit_func is available, calls the PCRE2 JIT function directly
- * with a pre-allocated jit_arguments struct and stack, bypassing
- * the pcre2_jit_match() wrapper overhead (~35ns/call savings).
- * Falls back to pcre2_jit_match() if direct state is unavailable.
+ * With the bundled patched PCRE2, uses an opaque fast-JIT context that keeps
+ * PCRE2's private argument state inside PCRE2.  System PCRE2 builds use the
+ * public pcre2_jit_match() API with an assigned reusable JIT stack.
  * ================================================================ */
 int32
 pg_jitter_pcre2_match_text(int64 datum, int64 entry_ptr)
@@ -478,39 +385,13 @@ pg_jitter_pcre2_match_text(int64 datum, int64 entry_ptr)
 	text *t = DatumGetTextPP(d);
 	int len = VARSIZE_ANY_EXHDR(t);
 	const uint8_t *data = (const uint8_t *)VARDATA_ANY(t);
-	int rc;
-
-	if (entry->jit_func)
-	{
-		/*
-		 * Direct JIT call — update only the per-row fields
-		 * (str, begin, end, startchar_ptr) and invoke the
-		 * JIT function with our pre-allocated arguments.
-		 */
-		Pcre2DirectState *ds = (Pcre2DirectState *)entry->jit_direct;
-		pj_jit_func_t func = (pj_jit_func_t)entry->jit_func;
-
-		ds->args.str = data;
-		ds->args.begin = data;
-		ds->args.end = data + len;
-		ds->args.startchar_ptr = data;
-
-		rc = func(&ds->args);
-	}
-	else
-	{
-		/* Fallback: standard pcre2_jit_match path */
-		rc = pcre2_jit_match(entry->code,
-		                     (PCRE2_SPTR)data, len,
-		                     0, 0,
-		                     entry->match_data,
-		                     NULL);
-	}
+	int32 result = pg_jitter_pcre2_match_raw(entry_ptr, (int64)(uintptr_t)data,
+	                                         len);
 
 	if ((Pointer)t != DatumGetPointer(d))
 		pfree(t);
 
-	return (rc >= 0) ? 1 : 0;
+	return result;
 }
 
 #endif /* PG_JITTER_HAVE_PCRE2 */

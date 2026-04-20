@@ -310,6 +310,9 @@ INSERT INTO pg_jitter_endian_text VALUES
   ('jit'), ('disable_cost');
 CREATE TEMP TABLE pg_jitter_endian_vals(v int4);
 INSERT INTO pg_jitter_endian_vals SELECT g::int4 FROM generate_series(1, 32) AS g;
+CREATE TEMP TABLE pg_jitter_endian_float4_agg(v float4);
+INSERT INTO pg_jitter_endian_float4_agg VALUES
+  (7.8::float4), (99.097::float4), (0.09561::float4), (324.78::float4);
 WITH checks(name, ok) AS (
   VALUES
     ('short_text_eq',
@@ -338,7 +341,13 @@ WITH checks(name, ok) AS (
     ('arrayexpr_bool',
      (SELECT bool_and(array_to_string(ARRAY[(v % 2 = 0), (v % 3 = 0)]::bool[], ',') =
                       concat_ws(',', (v % 2 = 0), (v % 3 = 0)))
-      FROM pg_jitter_endian_vals))
+      FROM pg_jitter_endian_vals)),
+    ('float4_sum',
+     (SELECT sum(v)::numeric(12,3) = 431.773::numeric(12,3)
+      FROM pg_jitter_endian_float4_agg)),
+    ('float4_max',
+     (SELECT max(v)::numeric(12,2) = 324.78::numeric(12,2)
+      FROM pg_jitter_endian_float4_agg))
 )
 SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
 FROM checks;"
@@ -349,20 +358,73 @@ FROM checks;"
     set -e
 
     if ! server_ready; then
-        echo "FAIL: endian-sensitive text/array coverage crashed or wedged the server"
+        echo "FAIL: endian-sensitive text/array/float4 coverage crashed or wedged the server"
         printf '%s\n' "$endian_out" | sed -n '1,80p'
         FAIL=$((FAIL + 1))
     elif [ "$endian_rc" -ne 0 ]; then
-        echo "FAIL: endian-sensitive text/array coverage raised an unexpected SQL error"
+        echo "FAIL: endian-sensitive text/array/float4 coverage raised an unexpected SQL error"
         printf '%s\n' "$endian_out" | sed -n '1,120p'
         FAIL=$((FAIL + 1))
     else
         endian_out="$(printf '%s\n' "$endian_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
         if [ "$endian_out" != "ok" ]; then
-            echo "FAIL: endian-sensitive text/array checks failed: $endian_out"
+            echo "FAIL: endian-sensitive text/array/float4 checks failed: $endian_out"
             FAIL=$((FAIL + 1))
         else
-            echo "PASS: endian-sensitive text/array checks match PostgreSQL"
+            echo "PASS: endian-sensitive text/array/float4 checks match PostgreSQL"
+        fi
+    fi
+
+    pcre2_sql="$backend_jit_settings
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_pcre2_text(v text);
+INSERT INTO pg_jitter_pcre2_text VALUES
+  ('Alpha123omega'),
+  (repeat('x', 260) || 'alpha123omega' || repeat('y', 260)),
+  (repeat('z', 260) || 'ALPHA456OMEGA' || repeat('q', 260)),
+  (repeat('n', 300) || 'no_match');
+WITH checks(name, ok) AS (
+  VALUES
+    ('short_ilike',
+     (SELECT count(*) = 1 FROM pg_jitter_pcre2_text
+      WHERE v ILIKE 'alpha123%')),
+    ('long_like_underscore',
+     (SELECT count(*) = 1 FROM pg_jitter_pcre2_text
+      WHERE v LIKE '%alpha_23omega%')),
+    ('long_regex_captures',
+     (SELECT count(*) = 1 FROM pg_jitter_pcre2_text
+      WHERE v ~ '(alpha)([0-9]+)(omega)')),
+    ('long_regex_icase_captures',
+     (SELECT count(*) = 3 FROM pg_jitter_pcre2_text
+      WHERE v ~* '(alpha)([0-9]+)(omega)')),
+    ('long_not_regex_icase',
+     (SELECT count(*) = 1 FROM pg_jitter_pcre2_text
+      WHERE v !~* '(alpha)([0-9]+)(omega)'))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+    set +e
+    pcre2_out="$(printf '%s\n' "$pcre2_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    pcre2_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: PCRE2 LIKE/regex coverage crashed or wedged the server"
+        printf '%s\n' "$pcre2_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$pcre2_rc" -ne 0 ]; then
+        echo "FAIL: PCRE2 LIKE/regex coverage raised an unexpected SQL error"
+        printf '%s\n' "$pcre2_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    else
+        pcre2_out="$(printf '%s\n' "$pcre2_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$pcre2_out" != "ok" ]; then
+            echo "FAIL: PCRE2 LIKE/regex checks failed: $pcre2_out"
+            FAIL=$((FAIL + 1))
+        else
+            echo "PASS: PCRE2 LIKE/regex checks match PostgreSQL"
         fi
     fi
 
@@ -576,6 +638,108 @@ FROM checks;"
 	            FAIL=$((FAIL + 1))
 	        else
 	            echo "PASS: wide int4 deform SIMD tails match PostgreSQL"
+	        fi
+	    fi
+
+	    if [ "$backend" = "sljit" ]; then
+	        parallel_shared_sql="$backend_jit_settings
+	SET enable_indexscan = off;
+	SET enable_bitmapscan = off;
+	SET pg_jitter.parallel_mode = 'shared';
+	SET max_parallel_workers_per_gather = 4;
+	SET parallel_leader_participation = off;
+	SET parallel_setup_cost = 0;
+	SET parallel_tuple_cost = 0;
+	SET min_parallel_table_scan_size = 0;
+	SET min_parallel_index_scan_size = 0;
+	DROP TABLE IF EXISTS pg_jitter_pshape_a;
+	DROP TABLE IF EXISTS pg_jitter_pshape_b;
+	DO \$\$
+	DECLARE
+	  n int := 130;
+	  rows int := 40000;
+	  cols_a text;
+	  cols_b text;
+	BEGIN
+	  SELECT string_agg(
+	           format('CASE WHEN g %% 7 = 0 THEN NULL ELSE %s END AS c%s',
+	                  CASE WHEN i % 3 = 0 THEN 'g::int4'
+	                       WHEN i % 3 = 1 THEN '(''txt_'' || g)::text'
+	                       ELSE '(g::float8 / 3.0)' END,
+	                  lpad(i::text, 3, '0')),
+	           ', ' ORDER BY i)
+	  INTO cols_a
+	  FROM generate_series(1, n) AS s(i);
+
+	  SELECT string_agg(
+	           format('CASE WHEN g %% 11 = 0 THEN NULL ELSE (g + %s)::int4 END AS c%s',
+	                  i, lpad(i::text, 3, '0')),
+	           ', ' ORDER BY i)
+	  INTO cols_b
+	  FROM generate_series(1, n) AS s(i);
+
+	  EXECUTE format('CREATE TABLE pg_jitter_pshape_a AS SELECT g AS id, g %% 10 AS grp, %s FROM generate_series(1, %s) AS g',
+	                 cols_a, rows);
+	  EXECUTE format('CREATE TABLE pg_jitter_pshape_b AS SELECT g AS id, g %% 10 AS grp, %s FROM generate_series(1, %s) AS g',
+	                 cols_b, rows);
+	END
+	\$\$;
+	ALTER TABLE pg_jitter_pshape_a SET (parallel_workers = 4);
+	ALTER TABLE pg_jitter_pshape_b SET (parallel_workers = 4);
+	ANALYZE pg_jitter_pshape_a;
+	ANALYZE pg_jitter_pshape_b;
+	CREATE OR REPLACE FUNCTION pg_temp.pg_jitter_parallel_compare(query text)
+	RETURNS text LANGUAGE plpgsql AS \$\$
+	DECLARE
+	  serial_result text;
+	  parallel_result text;
+	BEGIN
+	  EXECUTE 'SET max_parallel_workers_per_gather = 0';
+	  EXECUTE 'SELECT (' || query || ')::text' INTO serial_result;
+	  EXECUTE 'SET max_parallel_workers_per_gather = 4';
+	  EXECUTE 'SELECT (' || query || ')::text' INTO parallel_result;
+
+	  IF serial_result IS DISTINCT FROM parallel_result THEN
+	    RETURN format('serial=%s parallel=%s', serial_result, parallel_result);
+	  END IF;
+
+	  RETURN 'ok';
+	END
+	\$\$;
+	SELECT pg_temp.pg_jitter_parallel_compare(
+	  \$q\$SELECT sum(total) FROM (
+	         SELECT COALESCE(sum(c128::numeric), 0)::bigint AS total
+	         FROM pg_jitter_pshape_a
+	         WHERE c128 IS NOT NULL
+	         UNION ALL
+	         SELECT COALESCE(sum(c128::numeric), 0)::bigint AS total
+	         FROM pg_jitter_pshape_b
+	         WHERE c128 IS NOT NULL
+	       ) s\$q\$);
+	DROP TABLE pg_jitter_pshape_a;
+	DROP TABLE pg_jitter_pshape_b;"
+
+	        set +e
+	        parallel_shared_out="$(printf '%s\n' "$parallel_shared_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+	        parallel_shared_rc=$?
+	        set -e
+
+	        if ! server_ready; then
+	            echo "FAIL: parallel shared wide-shape coverage crashed or wedged the server"
+	            printf '%s\n' "$parallel_shared_out" | sed -n '1,80p'
+	            FAIL=$((FAIL + 1))
+	        elif [ "$parallel_shared_rc" -ne 0 ]; then
+	            echo "FAIL: parallel shared wide-shape coverage raised an unexpected SQL error"
+	            printf '%s\n' "$parallel_shared_out" | sed -n '1,120p'
+	            FAIL=$((FAIL + 1))
+	        else
+	            parallel_shared_out="$(printf '%s\n' "$parallel_shared_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+	            if [ "$parallel_shared_out" != "ok" ]; then
+	                echo "FAIL: parallel shared wide-shape checks failed: $parallel_shared_out"
+	                FAIL=$((FAIL + 1))
+	            else
+	                echo "PASS: parallel shared wide-shape guard matches PostgreSQL"
+	            fi
 	        fi
 	    fi
 	done

@@ -2799,15 +2799,20 @@ int32 jit_textne(int64 a, int64 b, int32 collid) {
  * Caller already checked pointer inequality (a != b).
  */
 int32 jit_text_datum_eq(int64 a, int64 b) {
-  uint8 ha = *(uint8 *)a, hb = *(uint8 *)b;
+  const void *pa = (const void *)(uintptr_t)a;
+  const void *pb = (const void *)(uintptr_t)b;
 
-  /* Fast path: both short 1-byte header */
-  if ((ha & 1) && ha > 1 && (hb & 1) && hb > 1) {
-    uint32 len;
-    if (ha != hb)
+  /* Fast path: both inline 1-byte-header datums, using PostgreSQL macros. */
+  if (VARATT_IS_1B(pa) && !VARATT_IS_1B_E(pa) &&
+      VARATT_IS_1B(pb) && !VARATT_IS_1B_E(pb)) {
+    Size sizea = VARSIZE_1B(pa);
+    Size sizeb = VARSIZE_1B(pb);
+    Size len;
+
+    if (sizea != sizeb)
       return 0; /* different lengths */
-    len = (ha >> 1) - 1;
-    return len == 0 || memcmp((char *)a + 1, (char *)b + 1, len) == 0;
+    len = sizea - VARHDRSZ_SHORT;
+    return len == 0 || memcmp(VARDATA_1B(pa), VARDATA_1B(pb), len) == 0;
   }
 
   /* Slow path: 4-byte header, toasted, or compressed.

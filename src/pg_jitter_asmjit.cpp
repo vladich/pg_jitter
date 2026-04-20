@@ -369,6 +369,7 @@ asmjit_compile_expr(ExprState *state)
 	instr_time		starttime, endtime;
 	int				shared_node_id = 0;
 	int				shared_expr_idx = 0;
+	uint64			shared_expr_fingerprint = 0;
 
 	if (!state->parent)
 		return false;
@@ -399,6 +400,7 @@ asmjit_compile_expr(ExprState *state)
 	{
 		pg_jitter_get_expr_identity(ctx, state,
 									&shared_node_id, &shared_expr_idx);
+		shared_expr_fingerprint = pg_jitter_expr_fingerprint(state);
 
 		/*
 		 * Shared code mode is only supported on ARM64 where the generated
@@ -442,6 +444,7 @@ asmjit_compile_expr(ExprState *state)
 		if (ctx->share_state.sjc &&
 			pg_jitter_find_shared_code(ctx->share_state.sjc,
 									   shared_node_id, shared_expr_idx,
+									   shared_expr_fingerprint,
 									   &code_bytes, &code_size,
 									   &leader_dylib_ref))
 		{
@@ -542,6 +545,7 @@ asmjit_compile_expr(ExprState *state)
 		pg_jitter_store_shared_code(ctx->share_state.sjc,
 									ac->func, gen_code_size,
 									shared_node_id, shared_expr_idx,
+									shared_expr_fingerprint,
 									(uint64)(uintptr_t) pg_jitter_fallback_step);
 	}
 

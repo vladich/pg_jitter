@@ -2978,6 +2978,23 @@ deform_desc_has_nullable(TupleDesc desc, int natts)
 static DeformDispatchEntry deform_dispatch_cache[DEFORM_DISPATCH_CACHE_SIZE];
 static int n_deform_dispatch = 0;
 
+#define SHARED_DEFORM_OPS_INVALID	0
+#define SHARED_DEFORM_OPS_HEAP		1
+#define SHARED_DEFORM_OPS_BUFFER_HEAP	2
+#define SHARED_DEFORM_OPS_MINIMAL	3
+
+static uint32
+shared_deform_slot_ops_kind(const TupleTableSlotOps *ops)
+{
+	if (ops == &TTSOpsHeapTuple)
+		return SHARED_DEFORM_OPS_HEAP;
+	if (ops == &TTSOpsBufferHeapTuple)
+		return SHARED_DEFORM_OPS_BUFFER_HEAP;
+	if (ops == &TTSOpsMinimalTuple)
+		return SHARED_DEFORM_OPS_MINIMAL;
+	return SHARED_DEFORM_OPS_INVALID;
+}
+
 /*
  * Multi-entry fast-path cache for deform dispatch.  Avoids recomputing the
  * O(natts) CRC32C hash on every row.
@@ -3013,6 +3030,12 @@ static int n_dispatch_fast = 0;
  * ================================================================ */
 static void *shared_deform_fn = NULL;
 static int   shared_deform_natts = 0;
+static uint32 shared_deform_attrs_hash = 0;
+static uint32 shared_deform_ops_kind = SHARED_DEFORM_OPS_INVALID;
+static Oid   shared_deform_tdtypeid = InvalidOid;
+static int32 shared_deform_tdtypmod = -1;
+static TupleDesc shared_deform_valid_desc = NULL;
+static const TupleTableSlotOps *shared_deform_valid_ops = NULL;
 static void *shared_deform_page = NULL;		/* for munmap on cleanup */
 static Size  shared_deform_page_size = 0;
 
@@ -3054,8 +3077,28 @@ pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot, int natts)
 	/* Shared deform fast path: same VA across all parallel workers */
 	if (shared_deform_fn && natts == shared_deform_natts)
 	{
-		((void (*)(TupleTableSlot *)) shared_deform_fn)(slot);
-		return;
+		if (shared_deform_valid_desc == desc &&
+			shared_deform_valid_ops == ops &&
+			desc->tdtypeid == shared_deform_tdtypeid &&
+			desc->tdtypmod == shared_deform_tdtypmod)
+		{
+			((void (*)(TupleTableSlot *)) shared_deform_fn)(slot);
+			return;
+		}
+
+		if (shared_deform_slot_ops_kind(ops) == shared_deform_ops_kind &&
+			desc->tdtypeid == shared_deform_tdtypeid &&
+			desc->tdtypmod == shared_deform_tdtypmod)
+		{
+			ahash = deform_attrs_hash(desc, natts);
+			if (ahash == shared_deform_attrs_hash)
+			{
+				shared_deform_valid_desc = desc;
+				shared_deform_valid_ops = ops;
+				((void (*)(TupleTableSlot *)) shared_deform_fn)(slot);
+				return;
+			}
+		}
 	}
 
 	if (pg_jitter_deform_cache)
@@ -3247,9 +3290,17 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	Size		code_size = 0;
 	DeformColDesc *descs;
 	char	   *dsm_dest;
+	uint32		attrs_hash;
+	uint32		ops_kind;
 
 	if (!sjc || sjc->deform_addr != 0)
 		return false;		/* already set */
+
+	ops_kind = shared_deform_slot_ops_kind(ops);
+	if (ops_kind == SHARED_DEFORM_OPS_INVALID)
+		return false;
+
+	attrs_hash = deform_attrs_hash(desc, natts);
 
 	page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0)
@@ -3368,6 +3419,10 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	sjc->deform_code_size = code_size;
 	sjc->deform_desc_offset = desc_offset;
 	sjc->deform_natts = natts;
+	sjc->deform_attrs_hash = attrs_hash;
+	sjc->deform_ops_kind = ops_kind;
+	sjc->deform_tdtypeid = desc->tdtypeid;
+	sjc->deform_tdtypmod = desc->tdtypmod;
 
 	/* Copy page bytes to end of DSM (page is PROT_READ so this works) */
 	dsm_dest = (char *) sjc + sjc->capacity - total_size;
@@ -3376,6 +3431,12 @@ pg_jitter_compile_shared_deform(SharedJitCompiledCode *sjc,
 	/* Set local fast-path */
 	shared_deform_fn = page_addr;
 	shared_deform_natts = natts;
+	shared_deform_attrs_hash = attrs_hash;
+	shared_deform_ops_kind = ops_kind;
+	shared_deform_tdtypeid = desc->tdtypeid;
+	shared_deform_tdtypmod = desc->tdtypmod;
+	shared_deform_valid_desc = desc;
+	shared_deform_valid_ops = ops;
 	shared_deform_page = page_addr;
 	shared_deform_page_size = total_size;
 
@@ -3435,6 +3496,12 @@ pg_jitter_attach_shared_deform(SharedJitCompiledCode *sjc)
 
 	shared_deform_fn = page;
 	shared_deform_natts = sjc->deform_natts;
+	shared_deform_attrs_hash = sjc->deform_attrs_hash;
+	shared_deform_ops_kind = sjc->deform_ops_kind;
+	shared_deform_tdtypeid = sjc->deform_tdtypeid;
+	shared_deform_tdtypmod = sjc->deform_tdtypmod;
+	shared_deform_valid_desc = NULL;
+	shared_deform_valid_ops = NULL;
 	shared_deform_page = page;
 	shared_deform_page_size = sjc->deform_page_size;
 
@@ -3463,4 +3530,10 @@ pg_jitter_reset_shared_deform(void)
 	}
 	shared_deform_fn = NULL;
 	shared_deform_natts = 0;
+	shared_deform_attrs_hash = 0;
+	shared_deform_ops_kind = SHARED_DEFORM_OPS_INVALID;
+	shared_deform_tdtypeid = InvalidOid;
+	shared_deform_tdtypmod = -1;
+	shared_deform_valid_desc = NULL;
+	shared_deform_valid_ops = NULL;
 }

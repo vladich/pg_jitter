@@ -27,18 +27,17 @@ typedef struct Pcre2CacheEntry {
 	char              *pattern;      /* regex string (palloc'd) */
 	uint32             flags;        /* PCRE2 compile flags */
 	pcre2_code        *code;         /* compiled + JIT-compiled code */
-	pcre2_match_data  *match_data;   /* reusable match_data (oveccount=1) */
+	pcre2_match_data  *match_data;   /* reusable match_data */
+	pcre2_match_context *match_context; /* fallback public JIT stack context */
+	pcre2_jit_stack   *jit_stack;    /* reusable public PCRE2 JIT stack */
 
 	/*
-	 * Direct JIT call state — bypasses pcre2_jit_match() overhead.
-	 * At runtime, only str/begin/end are updated per row; everything
-	 * else is pre-filled at compile time.  Saves ~35ns/row by avoiding:
-	 * - pcre2_jit_match argument setup (14 fields)
-	 * - 32KB stack allocation in jit_machine_stack_exec
-	 * - result writeback to match_data
+	 * Opaque PCRE2 fast-JIT state.  Available with the bundled patched PCRE2
+	 * API; system PCRE2 builds use match_context + jit_stack above.
 	 */
-	void              *jit_func;     /* PCRE2 JIT function pointer, or NULL */
-	void              *jit_direct;   /* pre-allocated Pcre2DirectState */
+#ifdef PCRE2_JIT_FAST_API
+	pcre2_jit_fast_context *jit_fast;
+#endif
 } Pcre2CacheEntry;
 
 /*
@@ -60,6 +59,13 @@ extern Pcre2CacheEntry *pg_jitter_pcre2_compile(const char *pattern, int patlen,
  */
 extern bool pg_jitter_pcre2_match(Pcre2CacheEntry *entry,
                                    const char *data, int len);
+
+/*
+ * JIT-callable wrapper for already-detoasted text data.
+ * Signature: int32(int64 entry_ptr, int64 data_ptr, int32 len).
+ */
+extern int32 pg_jitter_pcre2_match_raw(int64 entry_ptr, int64 data_ptr,
+                                       int32 len);
 
 /*
  * JIT-callable wrapper: takes text Datum and Pcre2CacheEntry pointer,

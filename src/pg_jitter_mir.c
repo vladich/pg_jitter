@@ -579,6 +579,7 @@ static bool mir_compile_expr(ExprState *state) {
   MIR_type_t res_type;
   int shared_node_id = 0;
   int shared_expr_idx = 0;
+  uint64 shared_expr_fingerprint = 0;
 
   if (!state->parent)
     return false;
@@ -610,6 +611,7 @@ static bool mir_compile_expr(ExprState *state) {
    */
   if (state->parent->state->es_jit_flags & PGJIT_EXPR) {
     pg_jitter_get_expr_identity(jctx, state, &shared_node_id, &shared_expr_idx);
+    shared_expr_fingerprint = pg_jitter_expr_fingerprint(state);
 
     mir_shared_code_mode =
         (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED) &&
@@ -651,7 +653,8 @@ static bool mir_compile_expr(ExprState *state) {
 
     if (jctx->share_state.sjc &&
         pg_jitter_find_shared_code(jctx->share_state.sjc, shared_node_id,
-                                   shared_expr_idx, &code_bytes, &code_size,
+                                   shared_expr_idx, shared_expr_fingerprint,
+                                   &code_bytes, &code_size,
                                    &leader_dylib_ref)) {
       void *handle;
       void *code_ptr;
@@ -9169,6 +9172,7 @@ static bool mir_compile_expr(ExprState *state) {
     if (mir_shared_code_mode && mir_n_sentinels > 0) {
       void *mcode = f->machine_code;
       Size mcode_size = f->machine_code_len;
+      bool patch_ok = true;
       int npatched;
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -9184,11 +9188,23 @@ static bool mir_compile_expr(ExprState *state) {
         Size page_len = ((uintptr_t)mcode + mcode_size) - page_start;
 
         page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
-        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_WRITE) != 0)
+        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_WRITE) != 0) {
           elog(WARNING,
                "pg_jitter[mir]: mprotect(RW) for sentinel patching failed: %m");
+          patch_ok = false;
+        }
       }
 #endif
+
+      if (!patch_ok) {
+        MIR_unload_module(ctx, m);
+        pfree(step_labels);
+        pfree(step_fn_imports);
+        pfree(step_direct_imports);
+        pfree(ioc_in_imports);
+        mir_shared_code_mode = false;
+        return false;
+      }
 
       npatched = mir_patch_sentinels(mcode, mcode_size);
 
@@ -9209,9 +9225,11 @@ static bool mir_compile_expr(ExprState *state) {
         Size page_len = ((uintptr_t)mcode + mcode_size) - page_start;
 
         page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
-        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC) != 0)
+        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC) != 0) {
           elog(WARNING,
                "pg_jitter[mir]: mprotect(RX) for sentinel patching failed: %m");
+          patch_ok = false;
+        }
       }
 #else
       /* x86_64: coherent I/D caches, no flush needed */
@@ -9221,11 +9239,23 @@ static bool mir_compile_expr(ExprState *state) {
         Size page_len = ((uintptr_t)mcode + mcode_size) - page_start;
 
         page_len = (page_len + pgsz - 1) & ~(pgsz - 1);
-        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC) != 0)
+        if (mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC) != 0) {
           elog(WARNING,
                "pg_jitter[mir]: mprotect(RX) for sentinel patching failed: %m");
+          patch_ok = false;
+        }
       }
 #endif
+
+      if (!patch_ok) {
+        MIR_unload_module(ctx, m);
+        pfree(step_labels);
+        pfree(step_fn_imports);
+        pfree(step_direct_imports);
+        pfree(ioc_in_imports);
+        mir_shared_code_mode = false;
+        return false;
+      }
     }
 
 #ifdef _WIN64
@@ -9275,6 +9305,7 @@ static bool mir_compile_expr(ExprState *state) {
 
       pg_jitter_store_shared_code(jctx->share_state.sjc, mcode, mcode_size,
                                   shared_node_id, shared_expr_idx,
+                                  shared_expr_fingerprint,
                                   (uint64)(uintptr_t)pg_jitter_fallback_step);
     }
   }

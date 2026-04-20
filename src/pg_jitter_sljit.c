@@ -90,9 +90,11 @@ static bool sljit_inline_enabled = false;
 #ifdef WORDS_BIGENDIAN
 #define JIT_VARATT_1B_MASK 0x80
 #define JIT_VARATT_1B_E_HEADER 0x80
+#define JIT_DATUM_FLOAT4_MEM_OFFSET ((sljit_sw)(sizeof(Datum) - sizeof(float4)))
 #else
 #define JIT_VARATT_1B_MASK 0x01
 #define JIT_VARATT_1B_E_HEADER 0x01
+#define JIT_DATUM_FLOAT4_MEM_OFFSET ((sljit_sw)0)
 #endif
 
 static void
@@ -300,7 +302,7 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
         NULL, &pg_jitter_in_bsearch_max,
         IN_BSEARCH_MAX_DEFAULT,
         0,    /* minimum: 0 = disable */
-        8192, /* maximum: beyond this SLJIT code buffer overflows */
+        IN_BSEARCH_MAX_DEFAULT, /* fixed work arrays are sized to this */
         PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
         NULL, NULL, NULL);
   }
@@ -2847,6 +2849,7 @@ static bool sljit_compile_expr(ExprState *state) {
   /* Expression identity for shared code in parallel queries */
   int shared_node_id = 0;
   int shared_expr_idx = 0;
+  uint64 shared_expr_fingerprint = 0;
 
   /* For COMPARE mode: saved DSM code for post-compilation comparison */
 
@@ -2970,6 +2973,7 @@ static bool sljit_compile_expr(ExprState *state) {
     sljit_inline_enabled =
         (state->parent->state->es_jit_flags & PGJIT_INLINE) != 0;
     pg_jitter_get_expr_identity(ctx, state, &shared_node_id, &shared_expr_idx);
+    shared_expr_fingerprint = pg_jitter_expr_fingerprint(state);
 
     sljit_shared_code_mode =
         (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED) &&
@@ -3011,7 +3015,8 @@ static bool sljit_compile_expr(ExprState *state) {
      * Set to 99 to share all (normal behavior). */
     if (ctx->share_state.sjc &&
         pg_jitter_find_shared_code(ctx->share_state.sjc, shared_node_id,
-                                   shared_expr_idx, &code_bytes, &code_size,
+                                   shared_expr_idx, shared_expr_fingerprint,
+                                   &code_bytes, &code_size,
                                    &leader_dylib_ref)) {
       void *handle;
       void *code_ptr;
@@ -4529,34 +4534,23 @@ static bool sljit_compile_expr(ExprState *state) {
                   }
 
 #ifdef PG_JITTER_HAVE_PCRE2
-                  /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex.
-                   *
-                   * When direct JIT state is available, inline the varlena
-                   * header extraction in SLJIT and call the PCRE2 JIT
-                   * function directly — zero C wrapper overhead.
-                   *
-                   * Fast path (1-byte varlena header, covers text ≤126 bytes):
-                   *   data = datum_ptr + 1
-                   *   len  = VARSIZE_1B_EXHDR(first_byte)
-                   *   call pcre2_jit_func(&jit_args)
-                   *
-                   * Slow path (4-byte header, toast): call C wrapper.
-                   */
-                  if (!vs_handled && !use_v1) {
+	                  /* Tier 3: PCRE2 JIT for complex LIKE/ILIKE/regex.
+	                   * Inline short-header extraction, then call pg_jitter's
+	                   * raw public-API wrapper.  The PCRE2 private JIT state
+	                   * stays behind PCRE2's opaque fast-context API. */
+	                  if (!vs_handled && !use_v1) {
                     bool is_like = is_like_fn || is_ilike_fn;
                     bool case_insens = is_ilike_fn || is_iregex_fn;
                     Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
                         pat_str, pat_len, is_like, case_insens);
 
-                    if (pe && pe->jit_func && pe->jit_direct) {
-                      /* Inline fast path: extract text + call JIT directly.
-                       * pe->jit_direct points to Pcre2DirectState whose
-                       * first field is pj_jit_args (at offset 0). */
-                      void *jit_args_ptr = pe->jit_direct;
-                      struct sljit_label *l_slow;
-                      struct sljit_label *l_done;
-                      struct sljit_jump *j_to_slow;
-                      struct sljit_jump *j_to_done;
+	                    if (pe) {
+	                      /* Inline fast path: extract short text and call raw
+	                       * matcher, avoiding DatumGetTextPP for common values. */
+	                      struct sljit_label *l_slow;
+	                      struct sljit_label *l_done;
+	                      struct sljit_jump *j_to_slow;
+	                      struct sljit_jump *j_to_done;
 
                       /* R0 = text datum pointer */
                       sljit_sw off0 =
@@ -4593,37 +4587,22 @@ static bool sljit_compile_expr(ExprState *state) {
                       sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0,
                                      SLJIT_R0, 0, SLJIT_IMM, 1);
 
-                      /* R1 = VARSIZE_1B_EXHDR(first_byte) */
-                      emit_varatt_1b_exhdr_len(C, SLJIT_R1);
+	                      /* R1 = VARSIZE_1B_EXHDR(first_byte) */
+	                      emit_varatt_1b_exhdr_len(C, SLJIT_R1);
 
-                      /* Store str, begin, end, startchar_ptr into jit_args */
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                                     SLJIT_IMM, (sljit_sw)jit_args_ptr);
-                      /* args.str = data (offset 8) */
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 8,
-                                     SLJIT_R2, 0);
-                      /* args.begin = data (offset 16) */
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 16,
-                                     SLJIT_R2, 0);
-                      /* args.end = data + len (offset 24) */
-                      sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
-                                     SLJIT_R2, 0, SLJIT_R1, 0);
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 24,
-                                     SLJIT_R1, 0);
-                      /* args.startchar_ptr = data (offset 40) */
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0), 40,
-                                     SLJIT_R2, 0);
+	                      /* Call raw matcher: int32(entry, data, len) */
+	                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+	                                     SLJIT_R1, 0);
+	                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+	                                     SLJIT_R2, 0);
+	                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+	                                     SLJIT_R3, 0);
+	                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+	                                     SLJIT_IMM, (sljit_sw)pe);
+	                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, W, 32),
+	                                 pg_jitter_pcre2_match_raw);
 
-                      /* Call PCRE2 JIT function: int func(jit_args *) */
-                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS1(W, P),
-                                 pe->jit_func);
-
-                      /* Convert: R0 = (result >= 0) ? 1 : 0 */
-                      /* PCRE2 JIT returns >= 0 for match, < 0 for no match */
-                      sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_SIG_LESS,
-                                      SLJIT_R0, 0, SLJIT_IMM, 0);
-                      sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0,
-                                          SLJIT_SIG_GREATER_EQUAL);
+	                      /* Raw matcher returns 1 for match, 0 for no match. */
 
                       j_to_done = sljit_emit_jump(C, SLJIT_JUMP);
 
@@ -4660,34 +4639,7 @@ static bool sljit_compile_expr(ExprState *state) {
 
                       emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
                       vs_handled = true;
-                    }
-                    else if (pe) {
-                      /* No direct JIT state — use C wrapper */
-                      sljit_sw off0 =
-                          (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
-                      if (r1_has_fcinfo)
-                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                                       SLJIT_MEM1(SLJIT_R1), off0);
-                      else {
-                        emit_load_step_field(
-                            C, opno,
-                            offsetof(ExprEvalStep, d.func.fcinfo_data),
-                            SLJIT_R2);
-                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                                       SLJIT_MEM1(SLJIT_R2), off0);
-                      }
-                      sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                                     SLJIT_IMM, (sljit_sw)pe);
-                      EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, W),
-                                 pg_jitter_pcre2_match_text);
-
-                      if (vs_negate)
-                        sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0,
-                                       SLJIT_R0, 0, SLJIT_IMM, 1);
-
-                      emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
-                      vs_handled = true;
-                    }
+	                    }
                   }
 #endif /* PG_JITTER_HAVE_PCRE2 */
                 }
@@ -5920,9 +5872,8 @@ static bool sljit_compile_expr(ExprState *state) {
                  (fn_addr == float4smaller || fn_addr == float4larger)) {
         /*
          * Inline float4smaller/float4larger: MIN/MAX(float4).
-         * float4 is stored in Datum via Float4GetDatum (on 64-bit,
-         * the float4 bits occupy the low 32 bits of the Datum).
-         * Load as F32, compare, conditionally store back.
+         * float4 is stored in a Datum via Float4GetDatum.  In memory, the
+         * low-order 32 Datum bits are at offset +4 on big-endian 64-bit hosts.
          */
         bool is_min = (fn_addr == float4smaller);
         struct sljit_jump *j_skip;
@@ -5931,7 +5882,8 @@ static bool sljit_compile_expr(ExprState *state) {
                        SOFF_AGG_PERGROUP);
         sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR0, 0,
                         SLJIT_MEM1(SLJIT_R0),
-                        offsetof(AggStatePerGroupData, transValue));
+                        offsetof(AggStatePerGroupData, transValue) +
+                            JIT_DATUM_FLOAT4_MEM_OFFSET);
         {
           sljit_sw val_off =
               (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
@@ -5940,7 +5892,8 @@ static bool sljit_compile_expr(ExprState *state) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
                          offsetof(AggStatePerTransData, transfn_fcinfo));
           sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR1, 0,
-                          SLJIT_MEM1(SLJIT_R1), val_off);
+                          SLJIT_MEM1(SLJIT_R1),
+                          val_off + JIT_DATUM_FLOAT4_MEM_OFFSET);
         }
 
         j_skip = sljit_emit_fcmp(
@@ -5949,7 +5902,8 @@ static bool sljit_compile_expr(ExprState *state) {
             SLJIT_FR0, 0, SLJIT_FR1, 0);
 
         sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_MEM1(SLJIT_R0),
-                        offsetof(AggStatePerGroupData, transValue),
+                        offsetof(AggStatePerGroupData, transValue) +
+                            JIT_DATUM_FLOAT4_MEM_OFFSET,
                         SLJIT_FR1, 0);
         sljit_set_label(j_skip, sljit_emit_label(C));
 
@@ -6073,13 +6027,14 @@ static bool sljit_compile_expr(ExprState *state) {
       } else if (!is_byref && fn_addr == float4pl) {
         /*
          * Inline SUM(float4): transValue += newval.
-         * float4 stored in low 32 bits of Datum.
+         * float4 is stored in the low-order 32 Datum bits.
          */
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_SP),
                        SOFF_AGG_PERGROUP);
         sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR0, 0,
                         SLJIT_MEM1(SLJIT_R0),
-                        offsetof(AggStatePerGroupData, transValue));
+                        offsetof(AggStatePerGroupData, transValue) +
+                            JIT_DATUM_FLOAT4_MEM_OFFSET);
         {
           sljit_sw val_off =
               (sljit_sw)&fcinfo->args[1].value - (sljit_sw)fcinfo;
@@ -6088,13 +6043,15 @@ static bool sljit_compile_expr(ExprState *state) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R1),
                          offsetof(AggStatePerTransData, transfn_fcinfo));
           sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_FR1, 0,
-                          SLJIT_MEM1(SLJIT_R1), val_off);
+                          SLJIT_MEM1(SLJIT_R1),
+                          val_off + JIT_DATUM_FLOAT4_MEM_OFFSET);
         }
 
         sljit_emit_fop2(C, SLJIT_ADD_F32, SLJIT_FR0, 0, SLJIT_FR0, 0,
                         SLJIT_FR1, 0);
         sljit_emit_fop1(C, SLJIT_MOV_F32, SLJIT_MEM1(SLJIT_R0),
-                        offsetof(AggStatePerGroupData, transValue),
+                        offsetof(AggStatePerGroupData, transValue) +
+                            JIT_DATUM_FLOAT4_MEM_OFFSET,
                         SLJIT_FR0, 0);
 
         sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_MEM1(SLJIT_R0),
@@ -9726,20 +9683,9 @@ static bool sljit_compile_expr(ExprState *state) {
            shared_node_id, shared_expr_idx, gen_code_size, code,
            (void *)pg_jitter_fallback_step, (void *)pg_jitter_agg_byref_finish);
 
-      /* DEBUG: dump leader code to file */
-      {
-        char fname[128];
-        snprintf(fname, sizeof(fname), "/tmp/jit_leader_n%d_e%d.bin",
-                 shared_node_id, shared_expr_idx);
-        FILE *fp = fopen(fname, "wb");
-        if (fp) {
-          fwrite(code, 1, gen_code_size, fp);
-          fclose(fp);
-        }
-      }
-
       pg_jitter_store_shared_code(ctx->share_state.sjc, code, gen_code_size,
                                   shared_node_id, shared_expr_idx,
+                                  shared_expr_fingerprint,
                                   (uint64)(uintptr_t)pg_jitter_fallback_step);
     }
 

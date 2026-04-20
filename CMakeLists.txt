@@ -29,9 +29,11 @@ endif()
 #
 
 # ---------- Backend selection ----------
-# AsmJIT only supports arm64 and x86_64
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64")
+# AsmJIT only supports arm64 and x86_64/amd64
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64|amd64")
     set(_default_backends "sljit;asmjit;mir")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
+    set(_default_backends "sljit")
 else()
     set(_default_backends "sljit;mir")
 endif()
@@ -47,9 +49,9 @@ else()
 endif()
 list(FIND PG_JITTER_BACKENDS "asmjit" _idx)
 if(_idx GREATER_EQUAL 0)
-    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64|amd64")
         message(FATAL_ERROR
-            "AsmJIT requires arm64 or x86_64 (detected: ${CMAKE_SYSTEM_PROCESSOR})")
+            "AsmJIT requires arm64 or x86_64/amd64 (detected: ${CMAKE_SYSTEM_PROCESSOR})")
     endif()
     set(PG_JITTER_BUILD_ASMJIT ON)
 else()

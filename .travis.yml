@@ -74,9 +74,16 @@ before_install:
 install:
   # Clone dependencies
   - git clone --depth 1 https://github.com/vladich/sljit.git deps/sljit
-  - git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
   - git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
-  - git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
+  - |
+    ARCH=$(uname -m)
+    if [ "$ARCH" != "s390x" ]; then
+      git clone --depth 1 https://github.com/vladich/mir-patched.git deps/mir
+    fi
+    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ] ||
+       [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+      git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
+    fi
 
   # Determine pg_config path
   - |
@@ -125,22 +132,26 @@ install:
       rm -rf /tmp/pg-apt-src
     fi
 
-  # Build pg_jitter (asmjit available on x86_64/arm64 only)
+  # Build pg_jitter (asmjit available on x86_64/amd64/arm64 only)
   - |
     . "$HOME/.travis_env"
     ARCH=$(uname -m)
     CMAKE_ARGS="-DPG_CONFIG=${PG_CONFIG}"
     CMAKE_ARGS="$CMAKE_ARGS -DSLJIT_DIR=${TRAVIS_BUILD_DIR}/deps/sljit"
-    CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir"
     CMAKE_ARGS="$CMAKE_ARGS -DSTRINGZILLA_DIR=${TRAVIS_BUILD_DIR}/deps/stringzilla"
     CMAKE_ARGS="$CMAKE_ARGS -DWITH_PCRE2=ON"
     CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release"
-    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
+    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ] ||
+       [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
       BACKENDS_LIST="sljit;asmjit;mir"
+      CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir"
       CMAKE_ARGS="$CMAKE_ARGS -DASMJIT_DIR=${TRAVIS_BUILD_DIR}/deps/asmjit"
       echo "HAS_ASMJIT=1" >> "$HOME/.travis_env"
+    elif [ "$ARCH" = "s390x" ]; then
+      BACKENDS_LIST="sljit"
     else
       BACKENDS_LIST="sljit;mir"
+      CMAKE_ARGS="$CMAKE_ARGS -DMIR_DIR=${TRAVIS_BUILD_DIR}/deps/mir"
     fi
     cmake -B build $CMAKE_ARGS "-DPG_JITTER_BACKENDS=$BACKENDS_LIST"
     cmake --build build --parallel 2
@@ -521,11 +532,20 @@ script:
             test_name=$(basename "$jit_result")
             baseline_result="$BASELINE_OUTDIR/results/$test_name"
             if [ -f "$baseline_result" ]; then
-              if ! diff -q "$baseline_result" "$jit_result" > /dev/null 2>&1; then
+              baseline_norm=$(mktemp)
+              jit_norm=$(mktemp)
+              sed -e "s#regress-output-baseline#regress-output-CI#g" \
+                  -e "s#regress-output-${BACKEND_NAME}#regress-output-CI#g" \
+                  "$baseline_result" > "$baseline_norm"
+              sed -e "s#regress-output-baseline#regress-output-CI#g" \
+                  -e "s#regress-output-${BACKEND_NAME}#regress-output-CI#g" \
+                  "$jit_result" > "$jit_norm"
+              if ! diff -q "$baseline_norm" "$jit_norm" > /dev/null 2>&1; then
                 echo "    DIFFERS from baseline: $test_name"
-                diff -u "$baseline_result" "$jit_result"
+                diff -u "$baseline_norm" "$jit_norm" || true
                 DIFFS_FOUND=1
               fi
+              rm -f "$baseline_norm" "$jit_norm"
             else
               echo "    NEW (no baseline): $test_name"
               DIFFS_FOUND=1

@@ -48,6 +48,10 @@ typedef struct SharedJitCompiledCode
 	Size		deform_code_size;	/* code bytes only */
 	Size		deform_desc_offset;	/* descriptor offset within page */
 	int			deform_natts;		/* columns */
+	uint32		deform_attrs_hash;	/* descriptor shape hash */
+	uint32		deform_ops_kind;		/* stable TupleTableSlotOps kind */
+	Oid			deform_tdtypeid;	/* descriptor type OID */
+	int32		deform_tdtypmod;	/* descriptor typmod */
 	/* deform page bytes stored at end of DSM, offset = capacity - deform_page_size */
 
 	/* SharedJitCodeEntry entries follow */
@@ -57,6 +61,7 @@ typedef struct SharedJitCodeEntry
 {
 	int			plan_node_id;
 	int			expr_index;			/* ordinal within plan node */
+	uint64		expr_fingerprint;	/* guards against ordinal mismatches */
 	Size		code_size;
 	uint64		dylib_ref_addr;		/* leader's pg_jitter_fallback_step address */
 	char		code_bytes[FLEXIBLE_ARRAY_MEMBER];
@@ -202,11 +207,14 @@ extern void pg_jitter_install_expr(ExprState *state,
 /* Store compiled code in DSM (leader only). Returns true on success. */
 extern bool pg_jitter_store_shared_code(void *shared, const void *code,
 										Size code_size, int node_id,
-										int expr_idx, uint64 dylib_ref_addr);
+										int expr_idx,
+										uint64 expr_fingerprint,
+										uint64 dylib_ref_addr);
 
 /* Find compiled code in DSM (worker). Returns true if found. */
 extern bool pg_jitter_find_shared_code(void *shared, int node_id,
 									   int expr_idx,
+									   uint64 expr_fingerprint,
 									   const void **code_bytes,
 									   Size *code_size,
 									   uint64 *dylib_ref_addr);
@@ -244,6 +252,7 @@ extern int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 extern void pg_jitter_get_expr_identity(PgJitterContext *ctx,
 										ExprState *state,
 										int *node_id, int *expr_idx);
+extern uint64 pg_jitter_expr_fingerprint(ExprState *state);
 
 /*
  * DSM-based shared code management for parallel queries.
