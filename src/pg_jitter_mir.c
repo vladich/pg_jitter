@@ -667,6 +667,15 @@ static bool mir_compile_expr(ExprState *state) {
         npatched = pg_jitter_relocate_dylib_addrs(handle, code_size,
                                                   leader_dylib_ref, worker_ref);
 
+        if (npatched < 0) {
+          pg_jitter_exec_free(handle);
+          elog(WARNING,
+               "pg_jitter[mir]: shared code relocation failed "
+               "node=%d expr=%d, compiling locally",
+               shared_node_id, shared_expr_idx);
+          goto no_shared_code_reuse;
+        }
+
         code_ptr = pg_jitter_exec_code_ptr(handle);
 
         elog(DEBUG1,
@@ -697,6 +706,8 @@ static bool mir_compile_expr(ExprState *state) {
            "pg_jitter[mir]: failed to allocate executable memory "
            "for shared code node=%d expr=%d, compiling locally",
            shared_node_id, shared_expr_idx);
+no_shared_code_reuse:
+      ;
     } else
       elog(DEBUG1,
            "pg_jitter[mir]: worker did not find shared code "
