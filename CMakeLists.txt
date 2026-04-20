@@ -299,6 +299,9 @@ if(WITH_SIMDJSON)
         set_target_properties(simdjson_lib PROPERTIES
             CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(simdjson_lib PRIVATE PG_JITTER_HAVE_SIMDJSON)
+        if(PG_VERSION_NUM LESS 160000 AND NOT MSVC)
+            target_compile_options(simdjson_lib PRIVATE -Wno-register)
+        endif()
         # simdjson MUST be compiled with optimization — without inlining,
         # the tiny SIMD helper functions become real calls and performance
         # drops 20x below PG's native byte-by-byte parser.
@@ -316,6 +319,12 @@ endif()
 function(pg_jitter_configure_target TARGET_NAME)
     target_include_directories(${TARGET_NAME} PRIVATE ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR} src ${PG_EXTRA_INCLUDE_DIRS}
         ${STRINGZILLA_DIR}/include)
+    if(PG_VERSION_NUM LESS 160000 AND NOT MSVC)
+        # PostgreSQL 14/15 headers still use the removed C++17 'register'
+        # storage specifier in inline code paths reached from executor headers.
+        target_compile_options(${TARGET_NAME} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-register>)
+    endif()
     if(PG_JITTER_HAVE_PCRE2)
         target_include_directories(${TARGET_NAME} PRIVATE ${PCRE2_INCLUDE_DIR})
         target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_PCRE2)

@@ -134,6 +134,7 @@ install:
 
   # Build pg_jitter (asmjit available on x86_64/amd64/arm64 only)
   - |
+    set -euo pipefail
     . "$HOME/.travis_env"
     ARCH=$(uname -m)
     CMAKE_ARGS="-DPG_CONFIG=${PG_CONFIG}"
@@ -156,6 +157,12 @@ install:
     cmake -B build $CMAKE_ARGS "-DPG_JITTER_BACKENDS=$BACKENDS_LIST"
     cmake --build build --parallel 2
     ls -la build/pg_jitter*.so
+    for backend in $(echo "$BACKENDS_LIST" | tr ';' ' '); do
+      test -f "build/pg_jitter_${backend}.so" || {
+        echo "missing backend build artifact: build/pg_jitter_${backend}.so"
+        exit 1
+      }
+    done
 
 script:
   - |
