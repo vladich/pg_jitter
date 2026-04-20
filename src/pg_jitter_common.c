@@ -2120,6 +2120,7 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
   SharedJitCodeEntry *entry;
   Size entry_size;
+  Size usable_capacity;
 
   entry_size = MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + code_size);
 
@@ -2127,10 +2128,23 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
   while (pg_atomic_exchange_u32(&sjc->lock, 1) != 0)
     pg_spin_delay();
 
-  /* Check if there's enough space */
-  if (sjc->used + entry_size > sjc->capacity) {
-    elog(DEBUG1, "pg_jitter: DSM full: need %zu bytes, have %zu/%zu",
-         entry_size, sjc->capacity - sjc->used, sjc->capacity);
+  if (sjc->deform_used_size > sjc->capacity) {
+    elog(WARNING,
+         "pg_jitter: invalid shared deform reservation %zu > %zu capacity",
+         sjc->deform_used_size, sjc->capacity);
+    pg_atomic_write_u32(&sjc->lock, 0);
+    return false;
+  }
+
+  usable_capacity = sjc->capacity - sjc->deform_used_size;
+
+  /* Check if there's enough space after reserving the shared-deform tail. */
+  if (sjc->used + entry_size > usable_capacity) {
+    elog(DEBUG1,
+         "pg_jitter: DSM full: need %zu bytes, have %zu/%zu "
+         "(tail reserved=%zu)",
+         entry_size, sjc->used < usable_capacity ? usable_capacity - sjc->used : 0,
+         usable_capacity, sjc->deform_used_size);
     pg_atomic_write_u32(&sjc->lock, 0);
     return false;
   }
@@ -2164,11 +2178,37 @@ bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
                                 uint64 *dylib_ref_addr) {
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
   Size offset;
+  Size usable_capacity;
   int i;
+
+  if (sjc->deform_used_size > sjc->capacity) {
+    elog(WARNING,
+         "pg_jitter: invalid shared deform reservation %zu > %zu capacity",
+         sjc->deform_used_size, sjc->capacity);
+    return false;
+  }
+
+  usable_capacity = sjc->capacity - sjc->deform_used_size;
+  if (sjc->used > usable_capacity) {
+    elog(WARNING,
+         "pg_jitter: invalid shared code usage %zu > %zu usable capacity",
+         sjc->used, usable_capacity);
+    return false;
+  }
 
   offset = MAXALIGN(sizeof(SharedJitCompiledCode));
 
   for (i = 0; i < sjc->num_entries; i++) {
+    Size entry_size;
+
+    if (offset + offsetof(SharedJitCodeEntry, code_bytes) > usable_capacity) {
+      elog(WARNING,
+           "pg_jitter: shared code entry header overruns DSM "
+           "(offset=%zu usable=%zu index=%d)",
+           offset, usable_capacity, i);
+      return false;
+    }
+
     SharedJitCodeEntry *entry = (SharedJitCodeEntry *)((char *)sjc + offset);
 
     if (entry->plan_node_id == node_id && entry->expr_index == expr_idx &&
@@ -2188,8 +2228,17 @@ bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
            (unsigned long long)entry->expr_fingerprint,
            (unsigned long long)expr_fingerprint);
 
-    offset +=
+    entry_size =
         MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + entry->code_size);
+    if (offset + entry_size > usable_capacity) {
+      elog(WARNING,
+           "pg_jitter: shared code entry overruns DSM "
+           "(offset=%zu entry=%zu usable=%zu index=%d)",
+           offset, entry_size, usable_capacity, i);
+      return false;
+    }
+
+    offset += entry_size;
   }
 
   return false;
@@ -2309,12 +2358,14 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   int ninsns;
   int patched = 0;
   int64 delta;
+  Size alloc_size;
 
   if (!info || leader_ref_addr == worker_ref_addr)
     return 0;
 
   delta = (int64)(worker_ref_addr - leader_ref_addr);
   insns = (uint32_t *)info->code_ptr;
+  alloc_size = info->alloc_size;
   ninsns = code_size / 4;
 
   /*
@@ -2323,6 +2374,11 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
    */
 #if defined(__APPLE__)
   pthread_jit_write_protect_np(0);
+#else
+  if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_WRITE) != 0) {
+    elog(WARNING, "pg_jitter: relocate mprotect(RW) failed: %m");
+    return -1;
+  }
 #endif
 
   /*
@@ -2417,6 +2473,11 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 #if defined(__APPLE__)
   /* Restore exec mode */
   pthread_jit_write_protect_np(1);
+#else
+  if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_EXEC) != 0) {
+    elog(WARNING, "pg_jitter: relocate mprotect(RX) failed: %m");
+    return -1;
+  }
 #endif
 
   return patched;

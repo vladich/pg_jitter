@@ -462,6 +462,15 @@ asmjit_compile_expr(ExprState *state)
 														  leader_dylib_ref,
 														  worker_ref);
 
+				if (npatched < 0)
+				{
+					pg_jitter_exec_free(handle);
+					elog(WARNING, "pg_jitter[asmjit]: shared code relocation failed "
+						 "node=%d expr=%d, compiling locally",
+						 shared_node_id, shared_expr_idx);
+					goto no_shared_code_reuse;
+				}
+
 				code_ptr = pg_jitter_exec_code_ptr(handle);
 
 				elog(DEBUG1, "pg_jitter[asmjit]: worker reused shared code "
@@ -490,14 +499,16 @@ asmjit_compile_expr(ExprState *state)
 				return true;
 			}
 
-			elog(WARNING, "pg_jitter[asmjit]: failed to allocate executable memory "
-				 "for shared code node=%d expr=%d, compiling locally",
-				 shared_node_id, shared_expr_idx);
-			/* Fall through to normal compilation */
-		}
-		else
-			elog(DEBUG1, "pg_jitter[asmjit]: worker did not find shared code "
-				 "node=%d expr=%d, compiling locally",
+				elog(WARNING, "pg_jitter[asmjit]: failed to allocate executable memory "
+					 "for shared code node=%d expr=%d, compiling locally",
+					 shared_node_id, shared_expr_idx);
+				/* Fall through to normal compilation */
+no_shared_code_reuse:
+				;
+			}
+			else
+				elog(DEBUG1, "pg_jitter[asmjit]: worker did not find shared code "
+					 "node=%d expr=%d, compiling locally",
 				 shared_node_id, shared_expr_idx);
 		/* Fall through to normal compilation */
 	}

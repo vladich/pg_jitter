@@ -3031,6 +3031,15 @@ static bool sljit_compile_expr(ExprState *state) {
         npatched = pg_jitter_relocate_dylib_addrs(handle, code_size,
                                                   leader_dylib_ref, worker_ref);
 
+        if (npatched < 0) {
+          pg_jitter_exec_free(handle);
+          elog(WARNING,
+               "pg_jitter: shared code relocation failed "
+               "node=%d expr=%d, compiling locally",
+               shared_node_id, shared_expr_idx);
+          goto no_shared_code_reuse;
+        }
+
         code_ptr = pg_jitter_exec_code_ptr(handle);
 
         elog(DEBUG1,
@@ -3060,6 +3069,8 @@ static bool sljit_compile_expr(ExprState *state) {
            "for shared code node=%d expr=%d, compiling locally",
            shared_node_id, shared_expr_idx);
       /* Fall through to normal compilation */
+no_shared_code_reuse:
+      ;
     } else
       elog(DEBUG1,
            "pg_jitter: worker did not find shared code "
