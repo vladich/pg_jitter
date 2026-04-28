@@ -63,6 +63,10 @@ if(_idx GREATER_EQUAL 0)
 else()
     set(PG_JITTER_BUILD_MIR OFF)
 endif()
+set(PG_JITTER_NEEDS_SLJIT OFF)
+if(PG_JITTER_BUILD_SLJIT OR PG_JITTER_BUILD_ASMJIT OR PG_JITTER_BUILD_MIR)
+    set(PG_JITTER_NEEDS_SLJIT ON)
+endif()
 
 # ---------- PostgreSQL paths via pg_config ----------
 set(PG_CONFIG "pg_config" CACHE FILEPATH "Path to pg_config executable")
@@ -152,10 +156,13 @@ set(STRINGZILLA_DIR "${_pg_jitter_default_stringzilla_dir}" CACHE PATH
 set(PCRE2_DIR "${CMAKE_SOURCE_DIR}/../pcre2" CACHE PATH
     "Path to PCRE2 source directory")
 option(WITH_PCRE2 "Enable PCRE2 Unicode-aware regex/LIKE acceleration" ON)
+set(YYJSON_DIR "${CMAKE_SOURCE_DIR}/../yyjson" CACHE PATH
+    "Path to yyjson source directory")
+option(WITH_YYJSON "Enable yyjson JSON parsing acceleration" ON)
 
 
 # Validate dependency directories (only for enabled backends)
-if(PG_JITTER_BUILD_SLJIT)
+if(PG_JITTER_NEEDS_SLJIT)
     if(NOT EXISTS "${SLJIT_DIR}/sljit_src/sljitLir.c")
         message(FATAL_ERROR "sljit not found at ${SLJIT_DIR}. Set -DSLJIT_DIR=/path/to/sljit")
     endif()
@@ -214,17 +221,21 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------- sljit (static library from single source) ----------
-if(PG_JITTER_BUILD_SLJIT)
+if(PG_JITTER_NEEDS_SLJIT)
     add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
     target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
-    target_compile_options(sljit PRIVATE -w)
+    target_compile_options(sljit PRIVATE
+        $<$<C_COMPILER_ID:MSVC>:/w>
+        $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
 endif()
 
 # ---------- MIR (static library) ----------
 if(PG_JITTER_BUILD_MIR)
     add_library(mir_lib STATIC ${MIR_DIR}/mir.c ${MIR_DIR}/mir-gen.c)
     target_include_directories(mir_lib PUBLIC ${MIR_DIR})
-    target_compile_options(mir_lib PRIVATE -std=gnu11 -w)
+    target_compile_options(mir_lib PRIVATE
+        $<$<C_COMPILER_ID:MSVC>:/w>
+        $<$<NOT:$<C_COMPILER_ID:MSVC>>:-std=gnu11 -w>)
 
     find_package(Threads)
     if(Threads_FOUND)
@@ -279,36 +290,27 @@ if(WITH_PCRE2 AND NOT WIN32)
     endif()
 endif()
 
-# ---------- simdjson (optional, C++ static library) ----------
-set(SIMDJSON_DIR "${CMAKE_SOURCE_DIR}/../simdjson/singleheader" CACHE PATH
-    "Path to simdjson singleheader directory")
-option(WITH_SIMDJSON "Enable simdjson SIMD JSON parsing acceleration" ON)
-
-set(PG_JITTER_HAVE_SIMDJSON OFF)
-if(WITH_SIMDJSON)
-    set(_sj_hdr "${SIMDJSON_DIR}/simdjson.h")
-    set(_sj_cpp "${SIMDJSON_DIR}/simdjson.cpp")
-    if(EXISTS "${_sj_hdr}" AND EXISTS "${_sj_cpp}")
-        set(PG_JITTER_HAVE_SIMDJSON ON)
-        add_library(simdjson_lib STATIC
-            ${_sj_cpp}
-            src/pg_jitter_simdjson.cpp)
-        target_include_directories(simdjson_lib PRIVATE
-            ${SIMDJSON_DIR} ${PG_INCLUDEDIR_SERVER} ${PG_INCLUDEDIR}
-            src ${PG_EXTRA_INCLUDE_DIRS})
-        set_target_properties(simdjson_lib PROPERTIES
-            CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
-        target_compile_definitions(simdjson_lib PRIVATE PG_JITTER_HAVE_SIMDJSON)
-        if(PG_VERSION_NUM LESS 160000 AND NOT MSVC)
-            target_compile_options(simdjson_lib PRIVATE -Wno-register)
-        endif()
-        # simdjson MUST be compiled with optimization — without inlining,
-        # the tiny SIMD helper functions become real calls and performance
-        # drops 20x below PG's native byte-by-byte parser.
-        target_compile_options(simdjson_lib PRIVATE -w -O2)
-        message(STATUS "simdjson:           ${_sj_hdr}")
+# ---------- yyjson (optional C static library) ----------
+set(PG_JITTER_HAVE_YYJSON OFF)
+if(WITH_YYJSON)
+    set(_yj_hdr "${YYJSON_DIR}/src/yyjson.h")
+    set(_yj_c "${YYJSON_DIR}/src/yyjson.c")
+    if(EXISTS "${_yj_hdr}" AND EXISTS "${_yj_c}")
+        set(PG_JITTER_HAVE_YYJSON ON)
+        add_library(yyjson_lib STATIC
+            ${_yj_c})
+        target_include_directories(yyjson_lib PRIVATE
+            ${YYJSON_DIR}/src)
+        set_target_properties(yyjson_lib PROPERTIES
+            C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(yyjson_lib PRIVATE
+            YYJSON_READER_DEPTH_LIMIT=6401)
+        target_compile_options(yyjson_lib PRIVATE
+            $<$<C_COMPILER_ID:MSVC>:/w /O2>
+            $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w -O2>)
+        message(STATUS "yyjson:             ${_yj_hdr}")
     else()
-        message(STATUS "simdjson:           not found at ${SIMDJSON_DIR}")
+        message(STATUS "yyjson:             not found at ${YYJSON_DIR}")
     endif()
 endif()
 
@@ -330,30 +332,28 @@ function(pg_jitter_configure_target TARGET_NAME)
         target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_PCRE2)
         target_link_libraries(${TARGET_NAME} PRIVATE pcre2_lib)
     endif()
-    if(PG_JITTER_HAVE_SIMDJSON)
-        target_include_directories(${TARGET_NAME} PRIVATE ${SIMDJSON_DIR})
-        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_SIMDJSON)
-        target_link_libraries(${TARGET_NAME} PRIVATE simdjson_lib)
-        if(LIBCXX)
-            target_link_libraries(${TARGET_NAME} PRIVATE ${LIBCXX})
-        endif()
-        # Force linker to keep simdjson symbols (referenced by JIT at runtime)
-        # pg_jitter_sj_is_json_datum requires PG16+ (EEOP_IS_JSON)
+    if(PG_JITTER_HAVE_YYJSON)
+        target_sources(${TARGET_NAME} PRIVATE src/pg_jitter_yyjson.c)
+        target_include_directories(${TARGET_NAME} PRIVATE ${YYJSON_DIR}/src)
+        target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_YYJSON)
+        target_link_libraries(${TARGET_NAME} PRIVATE yyjson_lib)
+        # Force linker to keep yyjson wrapper symbols referenced by JIT code.
+        # pg_jitter_yj_is_json_datum requires PG16+ (EEOP_IS_JSON)
         if(APPLE)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,_pg_jitter_sj_json_in
-                -Wl,-u,_pg_jitter_sj_jsonb_in)
+                -Wl,-u,_pg_jitter_yj_json_in
+                -Wl,-u,_pg_jitter_yj_jsonb_in)
             if(PG_VERSION_NUM GREATER_EQUAL 160000)
                 target_link_options(${TARGET_NAME} PRIVATE
-                    -Wl,-u,_pg_jitter_sj_is_json_datum)
+                    -Wl,-u,_pg_jitter_yj_is_json_datum)
             endif()
         elseif(UNIX)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,pg_jitter_sj_json_in
-                -Wl,-u,pg_jitter_sj_jsonb_in)
+                -Wl,-u,pg_jitter_yj_json_in
+                -Wl,-u,pg_jitter_yj_jsonb_in)
             if(PG_VERSION_NUM GREATER_EQUAL 160000)
                 target_link_options(${TARGET_NAME} PRIVATE
-                    -Wl,-u,pg_jitter_sj_is_json_datum)
+                    -Wl,-u,pg_jitter_yj_is_json_datum)
             endif()
         endif()
     endif()

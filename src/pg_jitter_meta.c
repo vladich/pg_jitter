@@ -151,6 +151,9 @@ typedef struct MetaJitterContext
 	/* DSM-based shared code state — mirrors JitShareState */
 	MetaJitShareState	share_state;
 
+	/* Mirrors PgJitterContext.aux_context for backend helper allocations */
+	MemoryContext		aux_context;
+
 	/* Bitmask of backends that compiled something in this context */
 	uint8				backends_used;
 
@@ -471,6 +474,7 @@ meta_ensure_context(ExprState *state)
 	ctx->last_plan_node_id = -1;
 	ctx->expr_ordinal = 0;
 	memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
+	ctx->aux_context = NULL;
 	ctx->adaptive_timings = NULL;
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
@@ -1279,6 +1283,12 @@ meta_release_context(JitContext *context)
 		pfree(cc);
 	}
 	ctx->compiled_list = NULL;
+
+	if (ctx->aux_context)
+	{
+		MemoryContextDelete(ctx->aux_context);
+		ctx->aux_context = NULL;
+	}
 
 	/*
 	 * On PG17+ we manage our own ResourceOwnerDesc, so we must call

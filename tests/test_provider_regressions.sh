@@ -384,6 +384,11 @@ INSERT INTO pg_jitter_pcre2_text VALUES
   (repeat('x', 260) || 'alpha123omega' || repeat('y', 260)),
   (repeat('z', 260) || 'ALPHA456OMEGA' || repeat('q', 260)),
   (repeat('n', 300) || 'no_match');
+CREATE TEMP TABLE pg_jitter_pcre2_regex_edge(v text);
+INSERT INTO pg_jitter_pcre2_regex_edge VALUES
+  ('a' || chr(10)),
+  ('word'),
+  ('swords');
 WITH checks(name, ok) AS (
   VALUES
     ('short_ilike',
@@ -400,7 +405,13 @@ WITH checks(name, ok) AS (
       WHERE v ~* '(alpha)([0-9]+)(omega)')),
     ('long_not_regex_icase',
      (SELECT count(*) = 1 FROM pg_jitter_pcre2_text
-      WHERE v !~* '(alpha)([0-9]+)(omega)'))
+      WHERE v !~* '(alpha)([0-9]+)(omega)')),
+    ('raw_regex_hard_end',
+     (SELECT count(*) = 0 FROM pg_jitter_pcre2_regex_edge
+      WHERE v ~ 'a$')),
+    ('raw_regex_word_boundary',
+     (SELECT count(*) = 1 FROM pg_jitter_pcre2_regex_edge
+      WHERE v ~ '\\mword\\M'))
 )
 SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
 FROM checks;"

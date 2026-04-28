@@ -1,14 +1,15 @@
 /*
- * pg_jitter_pcre2.h — PCRE2 integration for Unicode-aware
- * regex and LIKE matching with JIT compilation.
+ * pg_jitter_pcre2.h — PCRE2 integration for regex and LIKE matching
+ * with JIT compilation.
  *
  * Provides compiled-pattern caching and a fast match wrapper that
  * JIT-compiled expression code can call instead of PG's character-level
  * RE_compile_and_execute / MatchText.
  *
- * PCRE2 with PCRE2_UTF + PCRE2_UCP correctly handles Unicode POSIX
- * character classes ([:alpha:], [:upper:], etc.), making it safe for
- * any deterministic collation including ICU and non-C locales.
+ * PCRE2 flags are selected from the database encoding and collation.  UTF8
+ * LIKE uses PCRE2_UTF where the collation semantics are compatible.  Fixed-width
+ * single-byte encodings use byte-mode PCRE2 only where byte semantics match
+ * PostgreSQL semantics.
  */
 #ifndef PG_JITTER_PCRE2_H
 #define PG_JITTER_PCRE2_H
@@ -44,14 +45,21 @@ typedef struct Pcre2CacheEntry {
  * Compile and cache a PCRE2 pattern with JIT.
  *
  * For LIKE patterns, set is_like=true and the function converts SQL LIKE
- * syntax (%, _) to regex.  For raw regex patterns, set is_like=false.
+ * syntax (%, _) to regex.  For raw regex patterns, set is_like=false; the
+ * implementation converts the PostgreSQL ARE subset it can prove equivalent to
+ * PCRE2 and returns NULL for PostgreSQL fallback otherwise.
  *
- * Returns a cached Pcre2CacheEntry pointer valid for the backend's lifetime,
- * or NULL if compilation/JIT fails.
+ * Returns a Pcre2CacheEntry pointer valid for the backend's lifetime, or NULL
+ * if compilation/JIT fails.  Entries returned to generated code are never
+ * invalidated by cache eviction.
  */
+extern bool pg_jitter_pcre2_is_eligible(Oid collid, bool is_like,
+                                         bool case_insensitive);
+
 extern Pcre2CacheEntry *pg_jitter_pcre2_compile(const char *pattern, int patlen,
                                                  bool is_like,
-                                                 bool case_insensitive);
+                                                 bool case_insensitive,
+                                                 Oid collid);
 
 /*
  * Match a text value against a precompiled PCRE2 pattern.

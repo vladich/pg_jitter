@@ -2141,13 +2141,16 @@ int32 jit_resolve_timestamp_field(int64 unit_datum) {
   char *lowunits = downcase_truncate_identifier(
       VARDATA_ANY(unit_text), VARSIZE_ANY_EXHDR(unit_text), false);
   int type, val;
+  int32 result = -1;
   type = DecodeUnits(0, lowunits, &val);
   if (type == UNKNOWN_FIELD)
     type = DecodeSpecial(0, lowunits, &val);
   pfree(lowunits);
   if (type == UNITS || type == RESERV)
-    return val;
-  return -1;
+    result = val;
+  if ((Pointer)unit_text != DatumGetPointer((Datum)unit_datum))
+    pfree(unit_text);
+  return result;
 }
 
 /*
@@ -2921,6 +2924,9 @@ int32 jit_bttext_pattern_cmp(int64 a, int64 b) {
 #define EIC2(pg, rt, a0, a1, iop)                                              \
   {(PGFunction)(pg), DEFERRED, 2, rt, {a0, a1}, iop,                           \
    JIT_FN_FLAG_COLLATION}
+#define EIC2F(pg, jf, rt, a0, a1, iop)                                         \
+  {(PGFunction)(pg), (void *)(jf), 2, rt, {a0, a1}, iop,                       \
+   JIT_FN_FLAG_COLLATION}
 
 /* NULL means no native implementation yet — fall through to fcinfo path */
 #define DEFERRED NULL
@@ -2985,20 +2991,20 @@ const JitDirectFn jit_direct_fns[] = {
     E2(int2ge, jit_int2ge, T32, T32, T32),
 
     /* ---- int48 comparison ---- */
-    E2(int48eq, jit_int48eq, T32, T64, T64),
-    E2(int48ne, jit_int48ne, T32, T64, T64),
-    E2(int48lt, jit_int48lt, T32, T64, T64),
-    E2(int48le, jit_int48le, T32, T64, T64),
-    E2(int48gt, jit_int48gt, T32, T64, T64),
-    E2(int48ge, jit_int48ge, T32, T64, T64),
+    E2(int48eq, jit_int48eq, T32, T32, T64),
+    E2(int48ne, jit_int48ne, T32, T32, T64),
+    E2(int48lt, jit_int48lt, T32, T32, T64),
+    E2(int48le, jit_int48le, T32, T32, T64),
+    E2(int48gt, jit_int48gt, T32, T32, T64),
+    E2(int48ge, jit_int48ge, T32, T32, T64),
 
     /* ---- int84 comparison ---- */
-    E2(int84eq, jit_int84eq, T32, T64, T64),
-    E2(int84ne, jit_int84ne, T32, T64, T64),
-    E2(int84lt, jit_int84lt, T32, T64, T64),
-    E2(int84le, jit_int84le, T32, T64, T64),
-    E2(int84gt, jit_int84gt, T32, T64, T64),
-    E2(int84ge, jit_int84ge, T32, T64, T64),
+    E2(int84eq, jit_int84eq, T32, T64, T32),
+    E2(int84ne, jit_int84ne, T32, T64, T32),
+    E2(int84lt, jit_int84lt, T32, T64, T32),
+    E2(int84le, jit_int84le, T32, T64, T32),
+    E2(int84gt, jit_int84gt, T32, T64, T32),
+    E2(int84ge, jit_int84ge, T32, T64, T32),
 
     /* ---- int24 comparison ---- */
     E2(int24eq, jit_int24eq, T32, T32, T32),
@@ -3418,10 +3424,8 @@ const JitDirectFn jit_direct_fns[] = {
      * Slow path (toasted/compressed/long header) calls jit_texteq/jit_textne.
      * Non-deterministic collations: inline_op is ignored, falls to V1.
      */
-    EIC2(texteq, T32, T64, T64, JIT_INLINE_TEXT_EQ),
-    EIC2(textne, T32, T64, T64, JIT_INLINE_TEXT_NE),
-    EC2(texteq, simd_texteq, T32, T64, T64),
-    EC2(textne, simd_textne, T32, T64, T64),
+    EIC2F(texteq, simd_texteq, T32, T64, T64, JIT_INLINE_TEXT_EQ),
+    EIC2F(textne, simd_textne, T32, T64, T64, JIT_INLINE_TEXT_NE),
     EC2(text_lt, simd_text_lt, T32, T64, T64),
     EC2(text_le, simd_text_le, T32, T64, T64),
     EC2(text_gt, simd_text_gt, T32, T64, T64),

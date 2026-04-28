@@ -415,8 +415,8 @@ add_query "JSONB_extract"       "SELECT SUM((doc->>'a')::int) FROM jsonb_data"
 add_query "JSONB_contains"      "SELECT COUNT(*) FROM jsonb_data WHERE doc @> '{\"a\": 42}'"
 add_query "JSONB_agg"           "SELECT grp_jsonb, COUNT(*), SUM((doc->>'a')::int) FROM jsonb_data GROUP BY grp_jsonb"
 
-# --- JSON Text Parsing (simdjson) ---
-add_section "JSON Text Parsing (simdjson)"
+# --- JSON Text Parsing (yyjson) ---
+add_section "JSON Text Parsing (yyjson)"
 # IS JSON validation on text (EEOP_IS_JSON intercept)
 add_query "IS_JSON_text"        "SELECT COUNT(*) FROM json_text_bench WHERE doc IS JSON"
 add_query "IS_JSON_OBJECT"      "SELECT COUNT(*) FROM json_text_bench WHERE doc IS JSON OBJECT"
@@ -430,7 +430,7 @@ add_query "Cast_jsonb_extract"  "SELECT SUM((doc::jsonb->>'id')::int) FROM json_
 add_query "Cast_jsonb_contains" "SELECT COUNT(*) FROM json_text_bench WHERE doc::jsonb @> '{\"active\": true}'"
 # text → jsonb + aggregation by tier
 add_query "Cast_jsonb_grp_agg"  "SELECT tier, COUNT(*), SUM((doc::jsonb->>'id')::int) FROM json_text_bench GROUP BY tier"
-# large payloads only (tier=2, ~350B) — maximizes simdjson benefit
+# large payloads only (tier=2, ~350B) -- maximizes yyjson benefit
 add_query "Cast_jsonb_large"    "SELECT COUNT(*), SUM((doc::jsonb->>'id')::int) FROM json_text_bench WHERE tier = 2"
 
 # --- Arrays ---

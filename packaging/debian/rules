@@ -13,7 +13,7 @@ override_dh_auto_configure:
 	git clone --depth 1 https://github.com/asmjit/asmjit.git deps/asmjit
 	git clone --depth 1 https://github.com/ashvardanian/StringZilla.git deps/stringzilla
 	git clone --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
-	git clone --depth 1 https://github.com/simdjson/simdjson.git deps/simdjson
+	git clone --depth 1 https://github.com/ibireme/yyjson.git deps/yyjson
 	cd deps/pcre2 && mkdir -p build && cd build && \
 	  cmake .. -DCMAKE_BUILD_TYPE=Release -DPCRE2_SUPPORT_JIT=ON \
 	    -DPCRE2_SUPPORT_UNICODE=ON -DBUILD_SHARED_LIBS=OFF \
@@ -27,7 +27,7 @@ override_dh_auto_configure:
 	  -DMIR_DIR=deps/mir \
 	  -DSTRINGZILLA_DIR=deps/stringzilla \
 	  -DPCRE2_DIR=deps/pcre2 \
-	  -DSIMDJSON_DIR=deps/simdjson/singleheader \
+	  -DYYJSON_DIR=deps/yyjson \
 	  -DCMAKE_BUILD_TYPE=Release
 
 override_dh_auto_build:

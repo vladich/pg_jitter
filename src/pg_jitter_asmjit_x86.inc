@@ -1774,7 +1774,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				int nvals = 0;
 				bool array_has_nulls = false;
 
-				if (eq_dfn && eq_dfn->jit_fn)
+				if (eq_dfn && eq_dfn->jit_fn &&
+					pg_jitter_in_raw_datum_bsearch_safe(
+						op->d.hashedscalararrayop.finfo->fn_addr))
 				{
 					Expr *arrayarg = (Expr *) lsecond(saop->args);
 
@@ -1784,8 +1786,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 						if (!arrayconst->constisnull)
 						{
+							Datum array_datum = arrayconst->constvalue;
 							ArrayType *arr = DatumGetArrayTypeP(
-								arrayconst->constvalue);
+								array_datum);
 							int16 typlen;
 							bool typbyval;
 							char typalign;
@@ -1851,6 +1854,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									sorted_vals[b + 1] = vtmp;
 								}
 							}
+							if ((Pointer) arr != DatumGetPointer(array_datum))
+								pfree(arr);
 						}
 					}
 				}
@@ -2043,22 +2048,19 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				x86::Gp fn_reg = cc.new_gp64();
 				cc.mov(fn_reg, (uint64_t) fn);
-				InvokeNode *invoke;
-				x86::Gp ret_reg = cc.new_gp64();
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *>());
-				invoke->set_arg(0, aggst);
-				invoke->set_arg(1, pt);
-				invoke->set_ret(0, ret_reg);
+					InvokeNode *invoke;
+					x86::Gp ret_reg = cc.new_gp64();
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<uint8_t, void *, void *>());
+					invoke->set_arg(0, aggst);
+					invoke->set_arg(1, pt);
+					invoke->set_ret(0, ret_reg);
 
-#ifdef _WIN64
-				/*
-				 * Zero-extend the bool return value: these functions return
-				 * bool (1 byte in AL).  The Windows x64 ABI does not guarantee
-				 * upper bytes of RAX are cleared for sub-word returns.
-				 */
-				cc.movzx(ret_reg.r32(), ret_reg.r8());
-#endif
+					/*
+					 * Zero-extend the bool return value: only the low byte is
+					 * semantically meaningful for C bool.
+					 */
+					cc.movzx(ret_reg.r32(), ret_reg.r8());
 
 				/* If result == 0 (not distinct), jump to jumpdistinct */
 				if (jumpdistinct >= 0 && jumpdistinct < steps_len)
@@ -2998,16 +3000,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			/* 2-arg: fn(ExprState *state, ExprEvalStep *op) */
 			/*
-			 * ---- IS_JSON (simdjson-accelerated for text input) ----
+			 * ---- IS_JSON (yyjson-accelerated for text input) ----
 			 */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
 			case EEOP_IS_JSON:
 			{
-#ifdef PG_JITTER_HAVE_SIMDJSON
+#ifdef PG_JITTER_HAVE_YYJSON
 				JsonIsPredicate *pred = op->d.is_json.pred;
 				if (exprType(pred->expr) == TEXTOID && !pred->unique_keys)
 				{
-					/* simdjson fast path */
+					/* yyjson fast path */
 					x86::Gp resnull_reg = cc.new_gp64();
 					cc.movzx(resnull_reg, x86::byte_ptr((uint64_t) op->resnull));
 					Label skip_null = cc.new_label();
@@ -3018,9 +3020,9 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					x86::Gp datum_reg = cc.new_gp64();
 					cc.mov(datum_reg, x86::ptr((uint64_t) op->resvalue));
 
-					/* Call pg_jitter_sj_is_json_datum(datum, item_type) */
+					/* Call pg_jitter_yj_is_json_datum(datum, item_type) */
 					x86::Gp fn_reg = cc.new_gp64();
-					cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_sj_is_json_datum);
+					cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_yj_is_json_datum);
 					x86::Gp item_type_reg = cc.new_gp64();
 					cc.mov(item_type_reg, (int64_t) pred->item_type);
 					InvokeNode *invoke;
@@ -3044,7 +3046,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					cc.bind(done);
 					break;
 				}
-#endif /* PG_JITTER_HAVE_SIMDJSON */
+#endif /* PG_JITTER_HAVE_YYJSON */
 				/* Fallback: generic 2-arg call */
 				x86::Gp fn_reg = cc.new_gp64();
 				cc.mov(fn_reg, (uint64_t)(void *) ExecEvalJsonIsPredicate);
@@ -3100,45 +3102,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					invoke_out->set_arg(0, fcinfo_reg);
 					invoke_out->set_ret(0, ret_out);
 
-					/* ret_out = cstring; call input function (or simdjson) */
-#ifdef PG_JITTER_HAVE_SIMDJSON
-					if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-						fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
-					{
-						/* simdjson fast path: sj_fn(cstring, fcinfo_in) -> Datum */
-						void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-									  ? (void *) pg_jitter_sj_json_in
-									  : (void *) pg_jitter_sj_jsonb_in;
-						x86::Gp sj_fn_reg = cc.new_gp64();
-						cc.mov(sj_fn_reg, (uint64_t) sj_fn);
-						x86::Gp fcinfo_reg = cc.new_gp64();
-						cc.mov(fcinfo_reg, (uint64_t) fcinfo_in);
-						InvokeNode *invoke_sj;
-						x86::Gp ret_sj = cc.new_gp64();
-						cc.invoke(Out(invoke_sj), sj_fn_reg,
-								  FuncSignature::build<int64_t, int64_t, void *>());
-						invoke_sj->set_arg(0, ret_out);
-						invoke_sj->set_arg(1, fcinfo_reg);
-						invoke_sj->set_ret(0, ret_sj);
-
-						/* *op->resvalue = ret_sj */
-						cc.mov(x86::ptr((uint64_t) op->resvalue), ret_sj);
-						/* *op->resnull = false (simdjson ereport's on error) */
-						cc.mov(x86::byte_ptr((uint64_t) op->resnull), 0);
-						/* simdjson never uses soft errors, skip the check */
-					}
-					else
-#endif /* PG_JITTER_HAVE_SIMDJSON */
-					{
-						/* Standard input function call */
+						/* ret_out = cstring; use the native input function so
+						 * ErrorSaveContext soft errors stay observable. */
 						cc.mov(x86::ptr((uint64_t) &fcinfo_in->args[0].value), ret_out);
 					}
-				}
-#ifdef PG_JITTER_HAVE_SIMDJSON
-				if (fcinfo_in->flinfo->fn_oid != 321 &&
-					fcinfo_in->flinfo->fn_oid != 3806)
-#endif
-				{
+					{
 					/* fcinfo_in->args[0].isnull = false */
 					cc.mov(x86::byte_ptr((uint64_t) &fcinfo_in->args[0].isnull), 0);
 					/* fcinfo_in->isnull = false */
@@ -3562,23 +3530,20 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(fn_reg, (uint64_t)(void *) op->d.sbsref_subscript.subscriptfunc);
 				x86::Gp op_reg = cc.new_gp64();
 				cc.mov(op_reg, (uint64_t) op);
-				InvokeNode *invoke;
-				x86::Gp ret_reg = cc.new_gp64();
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *, void *>());
-				invoke->set_arg(0, v_state);
-				invoke->set_arg(1, op_reg);
-				invoke->set_arg(2, v_econtext);
-				invoke->set_ret(0, ret_reg);
-#ifdef _WIN64
-				/*
-				 * Zero-extend bool return: subscriptfunc returns bool
-				 * (1 byte in AL). Windows x64 ABI does not guarantee
-				 * upper bytes of RAX are cleared.
-				 */
-				cc.movzx(ret_reg.r32(), ret_reg.r8());
-#endif
-				/* If false (0), jump to jumpdone */
+					InvokeNode *invoke;
+					x86::Gp ret_reg = cc.new_gp64();
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<uint8_t, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+					invoke->set_ret(0, ret_reg);
+					/*
+					 * Zero-extend bool return: subscriptfunc returns bool
+					 * (1 byte).  Only the low byte is semantically meaningful.
+					 */
+					cc.movzx(ret_reg.r32(), ret_reg.r8());
+					/* If false (0), jump to jumpdone */
 				int jumpdone = op->d.sbsref_subscript.jumpdone;
 				cc.test(ret_reg, ret_reg);
 				cc.je(step_labels[jumpdone]);
@@ -3671,40 +3636,40 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					invoke_out->set_arg(0, fcinfo_reg);
 					invoke_out->set_ret(0, ret_out);
 
-					/* ret_out = cstring; call input function (or simdjson) */
-#ifdef PG_JITTER_HAVE_SIMDJSON
+					/* ret_out = cstring; call input function (or yyjson) */
+#ifdef PG_JITTER_HAVE_YYJSON
 					if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
 						fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
 					{
-						/* simdjson fast path: sj_fn(cstring, fcinfo_in) → Datum */
-						void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-									  ? (void *) pg_jitter_sj_json_in
-									  : (void *) pg_jitter_sj_jsonb_in;
-						x86::Gp sj_fn_reg = cc.new_gp64();
-						cc.mov(sj_fn_reg, (uint64_t) sj_fn);
+						/* yyjson fast path: yj_fn(cstring, fcinfo_in) → Datum */
+						void *yj_fn = (fcinfo_in->flinfo->fn_oid == 321)
+									  ? (void *) pg_jitter_yj_json_in
+									  : (void *) pg_jitter_yj_jsonb_in;
+						x86::Gp yj_fn_reg = cc.new_gp64();
+						cc.mov(yj_fn_reg, (uint64_t) yj_fn);
 						x86::Gp fcinfo_reg = cc.new_gp64();
 						cc.mov(fcinfo_reg, (uint64_t) fcinfo_in);
-						InvokeNode *invoke_sj;
-						x86::Gp ret_sj = cc.new_gp64();
-						cc.invoke(Out(invoke_sj), sj_fn_reg,
+						InvokeNode *invoke_yj;
+						x86::Gp ret_yj = cc.new_gp64();
+						cc.invoke(Out(invoke_yj), yj_fn_reg,
 								  FuncSignature::build<int64_t, int64_t, void *>());
-						invoke_sj->set_arg(0, ret_out);
-						invoke_sj->set_arg(1, fcinfo_reg);
-						invoke_sj->set_ret(0, ret_sj);
+						invoke_yj->set_arg(0, ret_out);
+						invoke_yj->set_arg(1, fcinfo_reg);
+						invoke_yj->set_ret(0, ret_yj);
 
-						/* *op->resvalue = ret_sj */
-						cc.mov(x86::ptr((uint64_t) op->resvalue), ret_sj);
+						/* *op->resvalue = ret_yj */
+						cc.mov(x86::ptr((uint64_t) op->resvalue), ret_yj);
 						/* *op->resnull = false */
 						cc.mov(x86::byte_ptr((uint64_t) op->resnull), 0);
 					}
 					else
-#endif /* PG_JITTER_HAVE_SIMDJSON */
+#endif /* PG_JITTER_HAVE_YYJSON */
 					{
 						/* Standard input function call */
 						cc.mov(x86::ptr((uint64_t) &fcinfo_in->args[0].value), ret_out);
 					}
 				}
-#ifdef PG_JITTER_HAVE_SIMDJSON
+#ifdef PG_JITTER_HAVE_YYJSON
 				if (fcinfo_in->flinfo->fn_oid != 321 &&
 					fcinfo_in->flinfo->fn_oid != 3806)
 #endif

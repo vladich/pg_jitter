@@ -34,13 +34,17 @@ extern int32 simd_hashtext(int64 a);
 #define LIKE_MATCH_SUFFIX   2
 #define LIKE_MATCH_INTERIOR 3
 
+struct PgJitterContext;
+
 extern int32 simd_like_match_text(int64 datum, int64 pattern_ptr,
                                   int32 pattern_len, int32 match_type);
 extern int simd_like_classify(const char *pattern, int patlen,
                               const char **literal_out, int *literal_len_out);
+extern const char *simd_like_copy_literal(const char *literal, int literal_len,
+                                          struct PgJitterContext *ctx);
 
 /* ================================================================
- * Compiled LIKE matching (handles ALL case-sensitive patterns)
+ * Compiled LIKE matching (handles byte-width case-sensitive patterns)
  * ================================================================ */
 #define SZ_LIKE_MAX_SEGMENTS 16
 #define SZ_LIKE_MAX_PIECES   8
@@ -56,12 +60,13 @@ typedef struct {
 } SzLikeCompiled;
 
 /*
- * Sentinel: pattern has floating segments with underscores.
- * Backend should skip both compiled LIKE and PCRE2 (use V1).
+ * Sentinel: the backend should skip compiled LIKE and PCRE2 for this pattern
+ * because the generic V1 path is expected to be faster.
  */
 #define SIMD_LIKE_USE_V1 ((SzLikeCompiled *)(intptr_t)1)
 
-extern SzLikeCompiled *simd_like_compile(const char *pattern, int patlen);
+extern SzLikeCompiled *simd_like_compile(const char *pattern, int patlen,
+                                          struct PgJitterContext *ctx);
 extern int32 simd_like_match_compiled(int64 datum, int64 compiled_ptr);
 
 /* ================================================================
@@ -97,7 +102,8 @@ typedef struct Crc32HashTable {
 
 /* Build hash table from sorted int32 values (called at JIT compile time) */
 extern Crc32HashTable *crc32_hash_build_int4(const int32 *vals, int nvals,
-                                              bool has_nulls);
+                                              bool has_nulls,
+                                              struct PgJitterContext *ctx);
 
 /* Probe: returns 1 if found, 0 if not (JIT-callable) */
 extern int32 crc32_hash_probe_int4(int32 val, int64 table_ptr);
@@ -116,7 +122,8 @@ typedef struct SortedInt32Array {
 
 /* Build sorted array (called at JIT compile time) */
 extern SortedInt32Array *sorted_array_build_int4(const int32 *vals, int nvals,
-                                                  bool has_nulls);
+                                                  bool has_nulls,
+                                                  struct PgJitterContext *ctx);
 
 /* Binary search probe: returns 1 if found, 0 if not (JIT-callable) */
 extern int32 sorted_array_probe_int4(int32 val, int64 array_ptr);
@@ -162,7 +169,7 @@ extern int64 jit_jsonb_object_field_text(int64 jb_datum, int64 key_ptr,
 typedef struct TextHashEntry {
     uint32   hash;      /* hybrid hash value, 0 = empty slot */
     uint32   len;       /* text data length (excl varlena header) */
-    const char *data;   /* pointer to text data (TopMemoryContext copy) */
+    const char *data;   /* pointer to text data (JIT aux-context copy) */
 } TextHashEntry;
 
 typedef struct TextHashTable {
@@ -174,7 +181,8 @@ typedef struct TextHashTable {
 
 /* Build text hash table from constant text Datum array (JIT compile time) */
 extern TextHashTable *text_hash_build(Datum *text_datums, int nvals,
-                                       bool has_nulls);
+                                       bool has_nulls,
+                                       struct PgJitterContext *ctx);
 
 /* Runtime probe: returns 1 if found, 0 if not (JIT-callable, 2 args) */
 extern int32 text_hash_probe(int64 datum, int64 table_ptr);

@@ -328,18 +328,18 @@ END $$;
 ANALYZE text_long;
 
 -- ════════════════════════════════════════════════════════════════════
--- JSON text parsing benchmark table (simdjson acceleration)
+-- JSON text parsing benchmark table (yyjson acceleration)
 -- ════════════════════════════════════════════════════════════════════
 
 -- json_text_bench: 500K rows of JSON stored as TEXT
--- Payloads range from ~120 to ~350+ bytes, well above the 64-byte simdjson threshold.
+-- Payloads range from ~120 to ~350+ bytes, well above the 64-byte yyjson threshold.
 -- Three payload tiers exercise different parsing complexity:
 --   small (~120B): flat object, 4 fields
 --   medium (~200B): nested object + small array
 --   large (~350B): deep nesting + larger array + more fields
 CREATE TABLE IF NOT EXISTS json_text_bench (
     id   integer,
-    doc  text,        -- JSON stored as text (the simdjson target)
+    doc  text,        -- JSON stored as text (the yyjson target)
     tier smallint     -- 0=small, 1=medium, 2=large
 );
 
