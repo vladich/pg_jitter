@@ -331,10 +331,18 @@ SECTIONS=()
 add_section() { SECTIONS+=("${#LABELS[@]}:$1"); }
 add_query() { LABELS+=("$1"); QUERIES+=("$2"); }
 
-IN_LIST_128="$(seq -s, 1 128)"
-IN_LIST_4096="$(seq -s, 1 4096)"
-IN_LIST_4097="$(seq -s, 1 4097)"
-IN_LIST_5000="$(seq -s, 1 5000)"
+make_in_list() {
+    python3 - "$1" <<'PY'
+import sys
+n = int(sys.argv[1])
+print(",".join(str(i) for i in range(1, n + 1)))
+PY
+}
+
+IN_LIST_128="$(make_in_list 128)"
+IN_LIST_4096="$(make_in_list 4096)"
+IN_LIST_4097="$(make_in_list 4097)"
+IN_LIST_5000="$(make_in_list 5000)"
 IN_LIST_5000_NULL="NULL,$IN_LIST_5000"
 
 # --- Basic Aggregation ---
