@@ -12,6 +12,30 @@
 #include "miscadmin.h"             /* MaxBackends */
 
 /* ----------------------------------------------------------------
+ * Export control for PostgreSQL-visible module entry points.
+ *
+ * Provider modules are built with hidden visibility so that private helper
+ * code and linked static dependencies do not leak into PostgreSQL's global
+ * dlopen namespace.  PostgreSQL versions before 16 do not mark all loadable
+ * module symbols with a visibility attribute on Unix, so provide one here and
+ * make PG's module/function macros use it.
+ * ---------------------------------------------------------------- */
+#if defined(_WIN32)
+#define PG_JITTER_EXPORT PGDLLEXPORT
+#elif defined(__GNUC__) || defined(__clang__)
+#define PG_JITTER_EXPORT __attribute__((visibility("default")))
+#else
+#define PG_JITTER_EXPORT
+#endif
+
+#if !defined(_WIN32)
+#ifdef PGDLLEXPORT
+#undef PGDLLEXPORT
+#endif
+#define PGDLLEXPORT PG_JITTER_EXPORT
+#endif
+
+/* ----------------------------------------------------------------
  * ProcNumber compat — PG17+ uses ProcNumber (0-based);
  * PG14-16 uses BackendId (1-based).
  * ---------------------------------------------------------------- */

@@ -1554,8 +1554,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					/*
 					 * TIER 0a — FULLY INLINE TEXT EQ/NE.
-					 * Short varlena ≤ 7 data bytes: zero function calls.
-					 * Longer short varlena: memcmp call only.
+					 * Short varlena: exact-length memcmp after header/length checks.
 					 * Non-short (toast/compressed): jit_text_datum_eq/ne.
 					 * Only for deterministic collations; non-deterministic
 					 * falls through to V1.
@@ -1611,31 +1610,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						/* data_len == 0 → result_eq */
 						cc.cbz(data_len.w(), lbl_result_eq);
 
-						/* 6. data_len > 7 → memcmp */
-						cc.cmp(data_len.w(), 7);
-						cc.b(a64::CondCode::kGT, lbl_memcmp);
-
-						/* 7. Inline word comparison (data_len 1-7):
-						 *    Load 8 bytes, shift left by (7-dl)*8, compare */
-						{
-							a64::Gp wa = cc.new_gpx(), wb = cc.new_gpx();
-							a64::Gp shift = cc.new_gpx();
-							cc.ldr(wa, a64::ptr(ta0));
-							cc.ldr(wb, a64::ptr(ta1));
-							/* shift = (7 - data_len) * 8 */
-							cc.mov(shift.w(), 7);
-							cc.sub(shift.w(), shift.w(), data_len.w());
-							cc.lsl(shift.w(), shift.w(), 3);
-							/* Zero-extend shift to 64-bit for LSL */
-							cc.mov(shift.w(), shift.w());
-							cc.lsl(wa, wa, shift);
-							cc.lsl(wb, wb, shift);
-							cc.cmp(wa, wb);
-							cc.b(a64::CondCode::kEQ, lbl_result_eq);
-							cc.b(lbl_result_ne);
-						}
-
-						/* 8. memcmp path (data_len > 7) */
+						/*
+						 * Non-empty short varlena: compare exactly with memcmp. Avoid
+						 * speculative wide loads because short datums may sit at storage
+						 * boundaries.
+						 */
 						cc.bind(lbl_memcmp);
 						{
 							a64::Gp ma0 = cc.new_gpx(), ma1 = cc.new_gpx();
@@ -2093,46 +2072,39 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!asmjit_shared_code_mode)
 				{
 					PGFunction fn = op->d.func.fn_addr;
-					bool is_like_fn = (fn == textlike || fn == textnlike);
-					bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
-					bool is_regex_fn = (fn == textregexeq || fn == textregexne);
-					bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
-					bool vs_negate = (fn == textnlike || fn == texticnlike ||
-									  fn == textregexne || fn == texticregexne);
+					Oid fn_oid = (fcinfo != NULL && fcinfo->flinfo != NULL)
+						? fcinfo->flinfo->fn_oid
+						: InvalidOid;
+					bool is_like_fn = false;
+					bool is_ilike_fn = false;
+					bool is_regex_fn = false;
+					bool is_iregex_fn = false;
+					bool vs_negate = false;
+					Oid pattern_collid = fcinfo->fncollation == InvalidOid
+						? DEFAULT_COLLATION_OID
+						: fcinfo->fncollation;
 
-					if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+					if (pg_jitter_classify_text_pattern_fn(fn, fn_oid,
+														  &is_like_fn,
+														  &is_ilike_fn,
+														  &is_regex_fn,
+														  &is_iregex_fn,
+														  &vs_negate) &&
 						fcinfo->nargs == 2)
 					{
-						/*
-						 * Check if args[1] (the pattern) is a compile-time constant.
-						 * PG's ExecInitFunc directly assigns Const values into
-						 * fcinfo->args[argno] without generating an EEOP_CONST step.
-						 * So if no step writes to args[1], it was pre-initialized
-						 * from a Const node — treat it as constant.
-						 */
-						bool pat_const = true;
-						for (int j = opno - 1; j >= 0; j--)
-						{
-							if (steps[j].resvalue == &fcinfo->args[1].value)
-							{
-								pat_const = (steps[j].opcode == EEOP_CONST);
-								break;
-							}
-						}
+							Datum pat_datum = (Datum) 0;
+							bool pat_isnull = true;
 
-						/*
-						 * LIKE/regex fast paths collation gating:
-						 * - LIKE: StringZilla does pure byte-level matching — safe
-						 *   for any deterministic collation.
-						 * - Regex: PCRE2 with PCRE2_UCP handles Unicode POSIX
-						 *   classes correctly — safe for any deterministic collation.
-						 */
-						bool collation_ok =
-							pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+							bool like_byte_search_ok =
+								simd_like_byte_search_is_eligible(pattern_collid);
 
-						if (pat_const && !fcinfo->args[1].isnull && collation_ok)
+							if (pg_jitter_resolve_constant_func_arg(
+									state, opno, fcinfo, 1, &pat_datum,
+									&pat_isnull) &&
+								!pat_isnull &&
+								like_byte_search_ok)
 						{
-							text *pat_text = DatumGetTextPP(fcinfo->args[1].value);
+							text *pat_text = DatumGetTextPP(pat_datum);
 							char *pat_str = VARDATA_ANY(pat_text);
 							int pat_len = VARSIZE_ANY_EXHDR(pat_text);
 
@@ -2146,6 +2118,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								int literal_len;
 								int match_type = simd_like_classify(
 									pat_str, pat_len, &literal, &literal_len);
+
+								if (match_type >= 0 && literal != NULL)
+									literal = simd_like_copy_literal(literal,
+										literal_len, ctx);
 
 								if (match_type >= 0 && literal != NULL)
 								{
@@ -2212,10 +2188,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 							/* Compiled LIKE path for anchored patterns */
 							bool use_v1 = false;
-														if (!vs_handled && is_like_fn)
+							if (!vs_handled && is_like_fn)
 							{
 								SzLikeCompiled *compiled =
-									simd_like_compile(pat_str, pat_len);
+									simd_like_compile(pat_str, pat_len, ctx);
 								if (compiled == SIMD_LIKE_USE_V1)
 								{
 									use_v1 = true;
@@ -2283,7 +2259,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								bool is_like = is_like_fn || is_ilike_fn;
 								bool case_insens = is_ilike_fn || is_iregex_fn;
 								Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
-									pat_str, pat_len, is_like, case_insens);
+									ctx, pat_str, pat_len, is_like, case_insens,
+									pattern_collid);
 
 								if (pe)
 								{
@@ -2341,6 +2318,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								}
 							}
 #endif /* PG_JITTER_HAVE_PCRE2 */
+							if ((Pointer)pat_text != DatumGetPointer(pat_datum))
+								pfree(pat_text);
 						}
 					}
 				}
@@ -2363,9 +2342,19 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 						if (key_const && !fcinfo->args[1].isnull)
 						{
-							text *key_text = DatumGetTextPP(fcinfo->args[1].value);
+							Datum key_datum = fcinfo->args[1].value;
+							text *key_text = DatumGetTextPP(key_datum);
+							char *key_copy;
 							const char *key_str = VARDATA_ANY(key_text);
 							int key_len = VARSIZE_ANY_EXHDR(key_text);
+
+							key_copy = (char *)pg_jitter_context_alloc(
+								ctx, key_len > 0 ? (Size)key_len : 1);
+							if (key_len > 0)
+								memcpy(key_copy, key_str, key_len);
+							if ((Pointer)key_text != DatumGetPointer(key_datum))
+								pfree(key_text);
+							key_str = key_copy;
 
 							/* Load args[0].value (jsonb datum) */
 							a64::Gp fci_base = cc.new_gpx();
@@ -3557,167 +3546,121 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				 */
 				Datum *sorted_vals = NULL;
 				int nvals = 0;
-				bool array_has_nulls = false;
-				TextHashTable *text_ht = NULL;
+					bool array_has_nulls = false;
+					TextHashTable *text_ht = NULL;
 
-				if (eq_dfn && eq_dfn->jit_fn)
-				{
-					Expr *arrayarg = (Expr *) lsecond(saop->args);
-
-					if (IsA(arrayarg, Const))
+					if (eq_dfn && eq_dfn->jit_fn &&
+						pg_jitter_in_raw_datum_bsearch_safe(
+							op->d.hashedscalararrayop.finfo->fn_addr))
 					{
-						Const *arrayconst = (Const *) arrayarg;
+						Expr *arrayarg = (Expr *) lsecond(saop->args);
 
-						if (!arrayconst->constisnull)
+						if (IsA(arrayarg, Const))
 						{
-							ArrayType *arr = DatumGetArrayTypeP(
-								arrayconst->constvalue);
-							int16 typlen;
-							bool typbyval;
-							char typalign;
-							int nitems;
+							Const *arrayconst = (Const *) arrayarg;
 
-							nitems = ArrayGetNItems(ARR_NDIM(arr),
-													 ARR_DIMS(arr));
-							get_typlenbyvalalign(ARR_ELEMTYPE(arr),
-												 &typlen, &typbyval,
-												 &typalign);
-
-							if (typbyval && nitems > 0 && nitems <= 128)
+							if (!arrayconst->constisnull)
 							{
-								bits8 *bitmap = ARR_NULLBITMAP(arr);
-								char *s = (char *) ARR_DATA_PTR(arr);
-								int bitmask = 1;
+								Datum array_datum = arrayconst->constvalue;
+								ArrayType *arr = DatumGetArrayTypeP(
+									array_datum);
+								int16 typlen;
+								bool typbyval;
+								char typalign;
+								int nitems;
 
-								sorted_vals = (Datum *) palloc(
-									nitems * sizeof(Datum));
-								nvals = 0;
+								nitems = ArrayGetNItems(ARR_NDIM(arr),
+														 ARR_DIMS(arr));
+								get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+									&typlen, &typbyval, &typalign);
 
-								for (int k = 0; k < nitems; k++)
+								if (typbyval && nitems > 0 && nitems <= 128)
 								{
-									if (bitmap &&
-										(*bitmap & bitmask) == 0)
-									{
-										array_has_nulls = true;
-									}
-									else
-									{
-										Datum d = fetch_att(s, true,
-															typlen);
-										sorted_vals[nvals++] = d;
-										s = att_addlength_pointer(s,
-											typlen, s);
-										s = (char *) att_align_nominal(
-											s, typalign);
-									}
+									bits8 *bitmap = ARR_NULLBITMAP(arr);
+									char *s = (char *) ARR_DATA_PTR(arr);
+									int bitmask = 1;
 
-									if (bitmap)
+									sorted_vals = (Datum *) palloc(
+										nitems * sizeof(Datum));
+									nvals = 0;
+
+									for (int k = 0; k < nitems; k++)
 									{
-										bitmask <<= 1;
-										if (bitmask == 0x100)
+										if (bitmap &&
+											(*bitmap & bitmask) == 0)
 										{
-											bitmap++;
-											bitmask = 1;
+											array_has_nulls = true;
+										}
+										else
+										{
+											Datum d = fetch_att(s, true,
+																typlen);
+											sorted_vals[nvals++] = d;
+											s = att_addlength_pointer(s,
+												typlen, s);
+											s = (char *) att_align_nominal(
+												s, typalign);
+										}
+
+										if (bitmap)
+										{
+											bitmask <<= 1;
+											if (bitmask == 0x100)
+											{
+												bitmap++;
+												bitmask = 1;
+											}
 										}
 									}
-								}
 
-								for (int a = 1; a < nvals; a++)
-								{
-									Datum vtmp = sorted_vals[a];
-									int b = a - 1;
-									while (b >= 0 &&
-										   (int64) sorted_vals[b] >
-										   (int64) vtmp)
+									for (int a = 1; a < nvals; a++)
 									{
-										sorted_vals[b + 1] =
-											sorted_vals[b];
-										b--;
+										Datum vtmp = sorted_vals[a];
+										int b = a - 1;
+										while (b >= 0 &&
+											   (int64) sorted_vals[b] >
+											   (int64) vtmp)
+										{
+											sorted_vals[b + 1] =
+												sorted_vals[b];
+											b--;
+										}
+										sorted_vals[b + 1] = vtmp;
 									}
-									sorted_vals[b + 1] = vtmp;
 								}
+								if ((Pointer) arr != DatumGetPointer(array_datum))
+									pfree(arr);
 							}
 						}
 					}
-				}
 
-				/*
-				 * Text IN-list hash table (independent of eq_dfn).
-				 * For text arrays with deterministic collation, build an
-				 * open-addressing hash table at compile time and probe at runtime.
-				 *
-				 * In shared mode: store table pointer in fcinfo->args[1].value
-				 * (overwriting the const array datum). Workers rebuild the table
-				 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
-				 */
-				if (!sorted_vals)
-				{
-					Expr *arrayarg_t = (Expr *) lsecond(saop->args);
-
-					if (IsA(arrayarg_t, Const))
+					/*
+					 * Text IN-list hash table (independent of eq_dfn).
+					 * For text arrays with deterministic collation, build an
+					 * open-addressing hash table at compile time and probe at runtime.
+					 *
+					 * In shared mode: store table pointer in fcinfo->args[1].value
+					 * (overwriting the const array datum). Workers rebuild the table
+					 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
+					 */
+					if (!sorted_vals)
 					{
-						Const *arrayconst_t = (Const *) arrayarg_t;
+						Expr *arrayarg_t = (Expr *) lsecond(saop->args);
 
-						if (!arrayconst_t->constisnull)
+						if (IsA(arrayarg_t, Const))
 						{
-							ArrayType *arr_t =
-								DatumGetArrayTypeP(arrayconst_t->constvalue);
-							int nitems_t = ArrayGetNItems(
-								ARR_NDIM(arr_t), ARR_DIMS(arr_t));
-							int16 typlen_t;
-							bool typbyval_t;
-							char typalign_t;
+							Const *arrayconst_t = (Const *) arrayarg_t;
 
-							get_typlenbyvalalign(ARR_ELEMTYPE(arr_t),
-								&typlen_t, &typbyval_t, &typalign_t);
-
-							if (!typbyval_t &&
-								ARR_ELEMTYPE(arr_t) == TEXTOID &&
-								nitems_t > 0 && nitems_t <= 16384 &&
-								pg_jitter_collation_is_deterministic(
-									fcinfo->fncollation))
+							if (!arrayconst_t->constisnull)
 							{
-								bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
-								char *s_t = (char *) ARR_DATA_PTR(arr_t);
-								int bitmask_t = 1;
-								Datum *text_vals = (Datum *)
-									palloc(nitems_t * sizeof(Datum));
-								int text_nvals = 0;
+								Datum array_datum_t = arrayconst_t->constvalue;
 								bool text_has_nulls = false;
 
-								for (int k = 0; k < nitems_t; k++)
+								text_ht = text_hash_build_from_array(
+									array_datum_t, op, fcinfo,
+									&text_has_nulls, ctx);
+								if (text_ht != NULL)
 								{
-									if (bitmap_t &&
-										(*bitmap_t & bitmask_t) == 0)
-									{
-										text_has_nulls = true;
-									}
-									else
-									{
-										text_vals[text_nvals++] =
-											fetch_att(s_t, false, typlen_t);
-										s_t = att_addlength_pointer(
-											s_t, typlen_t, s_t);
-										s_t = (char *) att_align_nominal(
-											s_t, typalign_t);
-									}
-
-									if (bitmap_t)
-									{
-										bitmask_t <<= 1;
-										if (bitmask_t == 0x100)
-										{
-											bitmap_t++;
-											bitmask_t = 1;
-										}
-									}
-								}
-
-								if (text_nvals > 0)
-								{
-									text_ht = text_hash_build(
-										text_vals, text_nvals,
-										text_has_nulls);
 									array_has_nulls = text_has_nulls;
 									/*
 									 * Store table pointer in fcinfo->args[1].value for
@@ -3728,14 +3671,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									 */
 									fcinfo->args[1].value = PointerGetDatum(text_ht);
 								}
-								pfree(text_vals);
 							}
 						}
 					}
-				}
 
-				if (sorted_vals && nvals > 0)
-				{
+					if (sorted_vals && nvals > 0)
+					{
 					Label lbl_found = cc.new_label();
 					Label lbl_not_found = cc.new_label();
 					Label lbl_null_result = cc.new_label();
@@ -3960,7 +3901,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					invoke_th->set_ret(0, ret_th);
 
 					/* Branch on result */
-					cc.cbnz(ret_th, lbl_found_th);
+					cc.cbnz(ret_th.w(), lbl_found_th);
 
 					/* ---- Not found ---- */
 					cc.bind(lbl_not_found_th);
@@ -4094,15 +4035,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				ASMJIT_MOV_FN(cc, fn_reg, fn);
 				InvokeNode *invoke;
 				a64::Gp ret_reg = cc.new_gpx();
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *>());
-				invoke->set_arg(0, aggst);
-				invoke->set_arg(1, pt);
-				invoke->set_ret(0, ret_reg);
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<uint8_t, void *, void *>());
+					invoke->set_arg(0, aggst);
+					invoke->set_arg(1, pt);
+					invoke->set_ret(0, ret_reg);
+					cc.and_(ret_reg, ret_reg, Imm(0xff));
 
-				/* If result == 0 (not distinct), jump to jumpdistinct */
-				if (jumpdistinct >= 0 && jumpdistinct < steps_len)
-					cc.cbz(ret_reg, step_labels[jumpdistinct]);
+					/* If result == 0 (not distinct), jump to jumpdistinct */
+					if (jumpdistinct >= 0 && jumpdistinct < steps_len)
+						cc.cbz(ret_reg.w(), step_labels[jumpdistinct]);
 				break;
 			}
 #endif /* HAVE_EEOP_AGG_PRESORTED_DISTINCT */
@@ -5519,15 +5461,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							a64::Gp bms_fn = cc.new_gpx();
 							ASMJIT_MOV_FN(cc, bms_fn, (void *) bms_is_member);
 							InvokeNode *invoke;
-							cc.invoke(Out(invoke), bms_fn,
-									  FuncSignature::build<int32_t, int32_t, void *>());
+								cc.invoke(Out(invoke), bms_fn,
+										  FuncSignature::build<uint8_t, int32_t, void *>());
 							invoke->set_arg(0, Imm(attnum));
 							invoke->set_arg(1, v_grouped_cols);
 							invoke->set_ret(0, tmp1);
 						}
 
 						/* if (bms_is_member) skip OR */
-						cc.cbnz(tmp1, lbl_is_member);
+							cc.and_(tmp1, tmp1, Imm(0xff));
+							cc.cbnz(tmp1.w(), lbl_is_member);
 						cc.orr(v_result, v_result, 1);
 						cc.bind(lbl_is_member);
 					}
@@ -5760,76 +5703,69 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			}
 
 			/*
-			 * ---- IS_JSON (simdjson-accelerated for text input) ----
+			 * ---- IS_JSON ----
 			 */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-			case EEOP_IS_JSON:
-			{
-#ifdef PG_JITTER_HAVE_SIMDJSON
-				JsonIsPredicate *pred = op->d.is_json.pred;
-				if (exprType(pred->expr) == TEXTOID && !pred->unique_keys)
+				case EEOP_IS_JSON:
 				{
-					/* simdjson fast path */
-					a64::Gp resval_addr = cc.new_gpx();
-					cc.mov(resval_addr, (uint64_t) op->resvalue);
-					a64::Gp resnull_addr = cc.new_gpx();
-					cc.mov(resnull_addr, (uint64_t) op->resnull);
-					a64::Gp resnull_reg = cc.new_gpx();
-					cc.ldrb(resnull_reg.w(), a64::Mem(resnull_addr));
-					Label skip_null = cc.new_label();
-					cc.cbnz(resnull_reg.w(), skip_null);
+#ifdef PG_JITTER_HAVE_YYJSON
+					JsonIsPredicate *pred = op->d.is_json.pred;
+					if (exprType(pred->expr) == TEXTOID)
+					{
+						a64::Gp resval_addr = cc.new_gpx();
+						cc.mov(resval_addr, (uint64_t) op->resvalue);
+						a64::Gp resnull_addr = cc.new_gpx();
+						cc.mov(resnull_addr, (uint64_t) op->resnull);
+						a64::Gp resnull_reg = cc.new_gpx();
+						cc.ldrb(resnull_reg.w(), a64::ptr(resnull_addr));
+						Label skip_null = cc.new_label();
+						cc.cbnz(resnull_reg.w(), skip_null);
 
-					/* Load *op->resvalue (text Datum) */
-					a64::Gp datum_reg = cc.new_gpx();
-					cc.ldr(datum_reg, a64::Mem(resval_addr));
+						a64::Gp datum_reg = cc.new_gpx();
+						cc.ldr(datum_reg, a64::ptr(resval_addr));
 
-					/* Call pg_jitter_sj_is_json_datum(datum, item_type) */
-					a64::Gp item_type_reg = cc.new_gpx();
-					cc.mov(item_type_reg, (int64_t) pred->item_type);
+						a64::Gp item_type_reg = cc.new_gpx();
+						cc.mov(item_type_reg.w(), (int32_t) pred->item_type);
+						a64::Gp unique_keys_reg = cc.new_gpx();
+						cc.mov(unique_keys_reg.w(), pred->unique_keys ? 1 : 0);
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_yj_is_json_datum);
+						InvokeNode *invoke;
+						a64::Gp ret_reg = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int32_t, int64_t, int32_t, int32_t>());
+						invoke->set_arg(0, datum_reg);
+						invoke->set_arg(1, item_type_reg.w());
+						invoke->set_arg(2, unique_keys_reg.w());
+						invoke->set_ret(0, ret_reg);
+
+						cc.and_(ret_reg, ret_reg, Imm(0xFFFFFFFF));
+						cc.str(ret_reg, a64::ptr(resval_addr));
+						cc.strb(a64::wzr, a64::ptr(resnull_addr));
+
+						Label done = cc.new_label();
+						cc.b(done);
+
+						cc.bind(skip_null);
+						cc.str(a64::xzr, a64::ptr(resval_addr));
+						cc.mov(resnull_reg.w(), 1);
+						cc.strb(resnull_reg.w(), a64::ptr(resnull_addr));
+
+						cc.bind(done);
+						break;
+					}
+#endif /* PG_JITTER_HAVE_YYJSON */
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_sj_is_json_datum);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonIsPredicate);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.mov(op_reg, v_step_base);
 					InvokeNode *invoke;
-					a64::Gp ret_reg = cc.new_gpx();
 					cc.invoke(Out(invoke), fn_reg,
-							  FuncSignature::build<int64_t, int64_t, int64_t>());
-					invoke->set_arg(0, datum_reg);
-					invoke->set_arg(1, item_type_reg);
-					invoke->set_ret(0, ret_reg);
-
-					/* Zero-extend int32 return to Datum (int64) —
-					 * ARM64 leaves upper 32 bits of x0 undefined for
-					 * int32 returns, but Datum comparison needs full 64-bit.
-					 * Mask to lower 32 bits since function returns int32. */
-					cc.and_(ret_reg, ret_reg, Imm(0xFFFFFFFF));
-
-					/* *op->resvalue = BoolGetDatum(ret) */
-					cc.str(ret_reg, a64::Mem(resval_addr));
-
-					Label done = cc.new_label();
-					cc.b(done);
-
-					/* Null path: *op->resvalue = false */
-					cc.bind(skip_null);
-					a64::Gp zero_reg = cc.new_gpx();
-					cc.mov(zero_reg, 0);
-					cc.str(zero_reg, a64::Mem(resval_addr));
-
-					cc.bind(done);
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
 					break;
 				}
-#endif /* PG_JITTER_HAVE_SIMDJSON */
-				/* Fallback: generic 2-arg call */
-				a64::Gp fn_reg = cc.new_gpx();
-				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonIsPredicate);
-				a64::Gp op_reg = cc.new_gpx();
-				cc.mov(op_reg, v_step_base);
-				InvokeNode *invoke;
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<void, void *, void *>());
-				invoke->set_arg(0, v_state);
-				invoke->set_arg(1, op_reg);
-				break;
-			}
 #endif
 
 
@@ -5879,38 +5815,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke_out->set_arg(0, fcinfo_out_reg);
 				invoke_out->set_ret(0, ret_out);
 
-				/* ret_out = cstring Datum; call input function (or simdjson) */
-#ifdef PG_JITTER_HAVE_SIMDJSON
-				if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-					fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
-				{
-					/* simdjson fast path: sj_fn(cstring, fcinfo_in) -> Datum */
-					void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-								  ? (void *) pg_jitter_sj_json_in
-								  : (void *) pg_jitter_sj_jsonb_in;
-					a64::Gp fcinfo_in_reg = cc.new_gpx();
-					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
-					a64::Gp sj_fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, sj_fn_reg, sj_fn);
-					InvokeNode *invoke_sj;
-					a64::Gp ret_sj = cc.new_gpx();
-					cc.invoke(Out(invoke_sj), sj_fn_reg,
-							  FuncSignature::build<int64_t, int64_t, void *>());
-					invoke_sj->set_arg(0, ret_out);
-					invoke_sj->set_arg(1, fcinfo_in_reg);
-					invoke_sj->set_ret(0, ret_sj);
-
-					/* *op->resvalue = ret_sj */
-					cc.str(ret_sj, a64::Mem(resval_addr));
-					/* *op->resnull = false (simdjson ereport's on error) */
-					cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
-					/* simdjson never uses soft errors, skip the check */
-				}
-				else
-#endif /* PG_JITTER_HAVE_SIMDJSON */
-				{
-					/* Standard input function call */
-					a64::Gp fcinfo_in_reg = cc.new_gpx();
+					{
+						/* Native input function keeps ErrorSaveContext soft errors
+						 * visible to IOCOERCE_SAFE. */
+						a64::Gp fcinfo_in_reg = cc.new_gpx();
 					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
 					int64_t in_arg0_val_off = (int64_t)((char*)&fcinfo_in->args[0].value - (char*)fcinfo_in);
 					int64_t in_arg0_null_off = (int64_t)((char*)&fcinfo_in->args[0].isnull - (char*)fcinfo_in);
@@ -6463,15 +6371,16 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				cc.mov(op_reg, v_step_base);
 				InvokeNode *invoke;
 				a64::Gp ret_reg = cc.new_gpx();
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<int64_t, void *, void *, void *>());
-				invoke->set_arg(0, v_state);
-				invoke->set_arg(1, op_reg);
-				invoke->set_arg(2, v_econtext);
-				invoke->set_ret(0, ret_reg);
-				/* If false (0), jump to jumpdone */
-				int jumpdone = op->d.sbsref_subscript.jumpdone;
-				cc.cbz(ret_reg, step_labels[jumpdone]);
+					cc.invoke(Out(invoke), fn_reg,
+							  FuncSignature::build<uint8_t, void *, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
+					invoke->set_arg(2, v_econtext);
+					invoke->set_ret(0, ret_reg);
+					cc.and_(ret_reg, ret_reg, Imm(0xff));
+					/* If false (0), jump to jumpdone */
+					int jumpdone = op->d.sbsref_subscript.jumpdone;
+					cc.cbz(ret_reg.w(), step_labels[jumpdone]);
 				break;
 			}
 
@@ -6565,34 +6474,31 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				invoke_out->set_arg(0, fcinfo_out_reg);
 				invoke_out->set_ret(0, ret_out);
 
-				/* ret_out = cstring Datum; call input function (or simdjson) */
-#ifdef PG_JITTER_HAVE_SIMDJSON
-				if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-					fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
+				/* ret_out = cstring Datum; call input function (or yyjson) */
+#ifdef PG_JITTER_HAVE_YYJSON
+				if (fcinfo_in->flinfo->fn_oid == F_JSONB_IN)
 				{
-					/* simdjson fast path: sj_fn(cstring, fcinfo_in) → Datum */
-					void *sj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-								  ? (void *) pg_jitter_sj_json_in
-								  : (void *) pg_jitter_sj_jsonb_in;
+					/* yyjson fast path: yj_fn(cstring, fcinfo_in) -> Datum */
+					void *yj_fn = (void *) pg_jitter_yj_jsonb_in;
 					a64::Gp fcinfo_in_reg = cc.new_gpx();
 					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
-					a64::Gp sj_fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, sj_fn_reg, sj_fn);
-					InvokeNode *invoke_sj;
-					a64::Gp ret_sj = cc.new_gpx();
-					cc.invoke(Out(invoke_sj), sj_fn_reg,
+					a64::Gp yj_fn_reg = cc.new_gpx();
+					ASMJIT_MOV_FN(cc, yj_fn_reg, yj_fn);
+					InvokeNode *invoke_yj;
+					a64::Gp ret_yj = cc.new_gpx();
+					cc.invoke(Out(invoke_yj), yj_fn_reg,
 							  FuncSignature::build<int64_t, int64_t, void *>());
-					invoke_sj->set_arg(0, ret_out);
-					invoke_sj->set_arg(1, fcinfo_in_reg);
-					invoke_sj->set_ret(0, ret_sj);
+					invoke_yj->set_arg(0, ret_out);
+					invoke_yj->set_arg(1, fcinfo_in_reg);
+					invoke_yj->set_ret(0, ret_yj);
 
-					/* *op->resvalue = ret_sj */
-					cc.str(ret_sj, a64::Mem(resval_addr));
+					/* *op->resvalue = ret_yj */
+					cc.str(ret_yj, a64::Mem(resval_addr));
 					/* *op->resnull = false */
 					cc.strb(zero_reg.w(), a64::Mem(resnull_addr));
 				}
 				else
-#endif /* PG_JITTER_HAVE_SIMDJSON */
+#endif /* PG_JITTER_HAVE_YYJSON */
 				{
 					/* Standard input function call */
 					a64::Gp fcinfo_in_reg = cc.new_gpx();

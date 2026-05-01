@@ -18,7 +18,7 @@ extern "C" {
 #include "utils/fmgrprotos.h"
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
-#include "pg_jitter_simdjson.h"
+#include "pg_jitter_yyjson.h"
 #include "pg_jitter_pcre2.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
@@ -39,6 +39,7 @@ extern "C" {
 #endif
 #include "commands/sequence.h"
 #include "funcapi.h"
+#include "utils/fmgroids.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",
@@ -71,6 +72,8 @@ typedef struct
 #undef recv
 #undef send
 #endif
+
+#include <new>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <asmjit/a64.h>
@@ -107,6 +110,7 @@ static bool asmjit_compile_expr(ExprState *state);
 static bool asmjit_emit_all(CodeHolder &code, ExprState *state,
                             PgJitterContext *ctx,
                             ExprEvalStep *steps, int steps_len);
+static void asmjit_reset_after_error(void);
 
 static void
 asmjit_code_free(void *data)
@@ -126,10 +130,10 @@ asmjit_code_free(void *data)
 #if defined(_MSC_VER) && PG_VERSION_NUM < 160000
 #pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
 #endif
-extern "C" void
+extern "C" PG_JITTER_EXPORT void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
-	cb->reset_after_error = pg_jitter_reset_after_error;
+	cb->reset_after_error = asmjit_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = asmjit_compile_expr;
 
@@ -207,7 +211,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			"Expressions with fewer steps use the interpreter.",
 			NULL,
 			&pg_jitter_min_expr_steps,
-			0,			/* 0 = no threshold (compile everything) */
+			4,			/* skip JIT for expressions with fewer than 4 steps */
 			0,			/* minimum */
 			1000,		/* maximum */
 			PGC_USERSET,
@@ -352,12 +356,113 @@ expr_has_fast_path(ExprState *state)
 	return false;
 }
 
+static bool
+asmjit_expr_allows_shared_code(ExprState *state)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+	/*
+	 * The x86 AsmJIT emitter materializes many ExprEvalStep, FunctionCallInfo,
+	 * resvalue, and resnull addresses as immediates.  Those pointers are
+	 * process-local, so parallel workers must compile their own code.
+	 */
+	(void) state;
+	return false;
+#else
+	for (int i = 0; i < state->steps_len; i++)
+	{
+		ExprEvalStep *step = &state->steps[i];
+
+		switch (ExecEvalStepOp(state, step))
+		{
+			/*
+			 * These ARM64 emitters still materialize process-local ExprEvalStep
+			 * or FunctionCallInfo addresses as immediates.  Shared code may be
+			 * executed in a worker with different expression storage, so keep
+			 * them on the local-compile path until their emitters use
+			 * steps-relative loads throughout.
+			 */
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+			case EEOP_IS_JSON:
+#endif
+#ifdef HAVE_EEOP_HASHDATUM
+			case EEOP_HASHDATUM_SET_INITVAL:
+			case EEOP_HASHDATUM_FIRST:
+			case EEOP_HASHDATUM_FIRST_STRICT:
+			case EEOP_HASHDATUM_NEXT32:
+			case EEOP_HASHDATUM_NEXT32_STRICT:
+#endif
+			case EEOP_PARAM_CALLBACK:
+			case EEOP_SBSREF_SUBSCRIPTS:
+			case EEOP_SBSREF_OLD:
+			case EEOP_SBSREF_ASSIGN:
+			case EEOP_SBSREF_FETCH:
+			case EEOP_IOCOERCE:
+#ifdef HAVE_EEOP_IOCOERCE_SAFE
+				case EEOP_IOCOERCE_SAFE:
+	#endif
+				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+				case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+				case EEOP_AGG_PLAIN_TRANS_BYREF:
+				case EEOP_AGG_DESERIALIZE:
+				case EEOP_AGG_STRICT_DESERIALIZE:
+			case EEOP_ROWCOMPARE_STEP:
+			case EEOP_ROWCOMPARE_FINAL:
+#ifdef HAVE_EEOP_RETURNINGEXPR
+			case EEOP_RETURNINGEXPR:
+#endif
+				return false;
+			case EEOP_FUNCEXPR:
+			case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			case EEOP_FUNCEXPR_STRICT_1:
+			case EEOP_FUNCEXPR_STRICT_2:
+#endif
+			{
+				FunctionCallInfo fcinfo;
+				Datum pat_datum;
+				bool pat_isnull;
+				Oid fn_oid = InvalidOid;
+
+				fcinfo = step->d.func.fcinfo_data;
+				if (fcinfo == NULL || fcinfo->nargs != 2)
+					break;
+				if (fcinfo->flinfo != NULL)
+					fn_oid = fcinfo->flinfo->fn_oid;
+				if (!pg_jitter_classify_text_pattern_fn(step->d.func.fn_addr,
+														fn_oid, NULL, NULL,
+														NULL, NULL, NULL))
+					break;
+				if (pg_jitter_resolve_constant_func_arg(state, i, fcinfo, 1,
+														&pat_datum,
+														&pat_isnull) &&
+					!pat_isnull)
+					return false;
+				break;
+			}
+			default:
+				break;
+		}
+	}
+
+	return true;
+#endif
+}
+
 /* Include architecture-specific code generation */
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include "pg_jitter_asmjit_arm64.inc"
 #elif defined(__x86_64__) || defined(_M_X64)
 #include "pg_jitter_asmjit_x86.inc"
 #endif
+
+static void
+asmjit_reset_after_error(void)
+{
+	asmjit_shared_code_mode = false;
+}
 
 static bool
 asmjit_compile_expr(ExprState *state)
@@ -370,6 +475,7 @@ asmjit_compile_expr(ExprState *state)
 	int				shared_node_id = 0;
 	int				shared_expr_idx = 0;
 	uint64			shared_expr_fingerprint = 0;
+	bool			shared_code_eligible = true;
 
 	if (!state->parent)
 		return false;
@@ -389,6 +495,7 @@ asmjit_compile_expr(ExprState *state)
 	}
 
 	ctx = pg_jitter_get_context(state);
+	shared_code_eligible = asmjit_expr_allows_shared_code(state);
 
 	/*
 	 * Compute expression identity for shared code.
@@ -409,8 +516,10 @@ asmjit_compile_expr(ExprState *state)
 		 * belong to the leader and are invalid in the worker.
 		 */
 #if defined(__aarch64__) || defined(_M_ARM64)
-		asmjit_shared_code_mode = (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED)
-									&& state->parent->state->es_plannedstmt->parallelModeNeeded;
+		asmjit_shared_code_mode =
+			shared_code_eligible &&
+			(pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED) &&
+			state->parent->state->es_plannedstmt->parallelModeNeeded;
 #else
 		asmjit_shared_code_mode = false;
 #endif
@@ -431,8 +540,7 @@ asmjit_compile_expr(ExprState *state)
 	 * Parallel worker: try to use pre-compiled code from the leader.
 	 * If found in DSM, copy to local executable memory and skip compilation.
 	 */
-	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
-		IsParallelWorker())
+	if (asmjit_shared_code_mode && IsParallelWorker())
 	{
 		const void *code_bytes;
 		Size		code_size;
@@ -478,7 +586,7 @@ asmjit_compile_expr(ExprState *state)
 					 shared_node_id, shared_expr_idx, code_size,
 					 npatched);
 
-				pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+				pg_jitter_register_exec_handle(ctx, handle);
 
 				/* Register Windows x64 unwind metadata for SEH-safe longjmp */
 				pg_jitter_win64_register_unwind(code_ptr, code_size);
@@ -499,16 +607,16 @@ asmjit_compile_expr(ExprState *state)
 				return true;
 			}
 
-				elog(WARNING, "pg_jitter[asmjit]: failed to allocate executable memory "
-					 "for shared code node=%d expr=%d, compiling locally",
-					 shared_node_id, shared_expr_idx);
-				/* Fall through to normal compilation */
+		elog(WARNING, "pg_jitter[asmjit]: failed to allocate executable memory "
+			 "for shared code node=%d expr=%d, compiling locally",
+			 shared_node_id, shared_expr_idx);
+		/* Fall through to normal compilation */
 no_shared_code_reuse:
-				;
-			}
-			else
-				elog(DEBUG1, "pg_jitter[asmjit]: worker did not find shared code "
-					 "node=%d expr=%d, compiling locally",
+		;
+		}
+		else
+			elog(DEBUG1, "pg_jitter[asmjit]: worker did not find shared code "
+				 "node=%d expr=%d, compiling locally",
 				 shared_node_id, shared_expr_idx);
 		/* Fall through to normal compilation */
 	}
@@ -518,21 +626,34 @@ no_shared_code_reuse:
 	steps = state->steps;
 	steps_len = state->steps_len;
 
-	ac = new AsmjitCode();
+	ac = new (std::nothrow) AsmjitCode();
+	if (ac == nullptr)
+	{
+		asmjit_shared_code_mode = false;
+		return false;
+	}
 
 	CodeHolder code;
-	code.init(ac->rt.environment());
-
-	if (!asmjit_emit_all(code, state, ctx, steps, steps_len))
+	Error err = code.init(ac->rt.environment());
+	if (err != kErrorOk)
 	{
 		delete ac;
 		asmjit_shared_code_mode = false;
 		return false;
 	}
 
-	Error err = ac->rt.add(&ac->func, &code);
+	if (!asmjit_emit_all(code, state, ctx, steps, steps_len))
+	{
+		elog(DEBUG1, "pg_jitter[asmjit]: emit_all failed");
+		delete ac;
+		asmjit_shared_code_mode = false;
+		return false;
+	}
+
+	err = ac->rt.add(&ac->func, &code);
 	if (err != kErrorOk)
 	{
+		elog(DEBUG1, "pg_jitter[asmjit]: runtime add failed: %u", (unsigned) err);
 		delete ac;
 		asmjit_shared_code_mode = false;
 		return false;
@@ -541,7 +662,7 @@ no_shared_code_reuse:
 	/*
 	 * Leader: store compiled code directly in DSM.
 	 */
-	if (pg_jitter_get_parallel_mode() == PARALLEL_JIT_SHARED &&
+	if (asmjit_shared_code_mode &&
 		!IsParallelWorker() &&
 		(state->parent->state->es_jit_flags & PGJIT_EXPR) &&
 		ctx->share_state.sjc)
@@ -560,17 +681,21 @@ no_shared_code_reuse:
 									(uint64)(uintptr_t) pg_jitter_fallback_step);
 	}
 
+	/*
+	 * From this point onward the file-scoped compile mode is no longer needed.
+	 * Clear it before ownership transfer so a registration ERROR cannot leave
+	 * the next compilation in shared-code mode.
+	 */
+	asmjit_shared_code_mode = false;
+
 	/* Register for cleanup */
-	pg_jitter_register_compiled(ctx, asmjit_code_free, ac);
+	pg_jitter_register_compiled_or_free(ctx, asmjit_code_free, ac);
 
 	/* Register Windows x64 unwind metadata for SEH-safe longjmp */
 	pg_jitter_win64_register_unwind(ac->func, code.code_size());
 
 	/* Set the eval function (with validation wrapper on first call) */
 	pg_jitter_install_expr(state, (ExprStateEvalFunc) ac->func);
-
-	/* Reset shared code mode for next compilation */
-	asmjit_shared_code_mode = false;
 
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter,

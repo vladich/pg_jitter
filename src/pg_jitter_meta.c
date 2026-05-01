@@ -78,6 +78,7 @@ meta_shmem_clear_dsm_handle(void)
 	int		proc_index = JITTER_MY_PROC_INDEX();
 	bool	found;
 	Size	size;
+	MemoryContext oldcontext;
 
 	/* Try to find existing shmem slot table */
 	if (meta_dsm_slots == NULL)
@@ -89,6 +90,7 @@ meta_shmem_clear_dsm_handle(void)
 		size = offsetof(MetaDsmSlotTable, handles) +
 			   sizeof(pg_atomic_uint32) * MaxBackends;
 
+		oldcontext = CurrentMemoryContext;
 		PG_TRY();
 		{
 			meta_dsm_slots = (MetaDsmSlotTable *)
@@ -96,13 +98,18 @@ meta_shmem_clear_dsm_handle(void)
 		}
 		PG_CATCH();
 		{
+			MemoryContextSwitchTo(oldcontext);
 			FlushErrorState();
 			return;
 		}
 		PG_END_TRY();
 
 		if (!found)
-			return;		/* table doesn't exist yet, nothing to clear */
+		{
+			meta_dsm_slots->num_slots = MaxBackends;
+			for (int i = 0; i < MaxBackends; i++)
+				pg_atomic_init_u32(&meta_dsm_slots->handles[i], 0);
+		}
 	}
 
 	if (proc_index >= 0 && proc_index < meta_dsm_slots->num_slots)
@@ -150,6 +157,9 @@ typedef struct MetaJitterContext
 
 	/* DSM-based shared code state — mirrors JitShareState */
 	MetaJitShareState	share_state;
+
+	/* Mirrors PgJitterContext.aux_context for backend helper allocations */
+	MemoryContext		aux_context;
 
 	/* Bitmask of backends that compiled something in this context */
 	uint8				backends_used;
@@ -363,6 +373,7 @@ meta_load_backend(int idx)
 {
 	char			path[MAXPGPATH];
 	JitProviderInit init_fn;
+	MemoryContext	oldcontext;
 
 	Assert(idx >= 0 && idx < PG_JITTER_NUM_BACKENDS);
 
@@ -384,6 +395,7 @@ meta_load_backend(int idx)
 	}
 
 	/* Load and initialize — catch any errors (e.g., missing symbols) */
+	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
 		init_fn = (JitProviderInit)
@@ -402,6 +414,7 @@ meta_load_backend(int idx)
 	}
 	PG_CATCH();
 	{
+		MemoryContextSwitchTo(oldcontext);
 		FlushErrorState();
 		elog(WARNING, "pg_jitter: failed to load backend %s",
 			 backend_libnames[idx]);
@@ -471,6 +484,7 @@ meta_ensure_context(ExprState *state)
 	ctx->last_plan_node_id = -1;
 	ctx->expr_ordinal = 0;
 	memset(&ctx->share_state, 0, sizeof(MetaJitShareState));
+	ctx->aux_context = NULL;
 	ctx->adaptive_timings = NULL;
 
 	MetaRememberContext(CurrentResourceOwner, ctx);
@@ -1280,6 +1294,12 @@ meta_release_context(JitContext *context)
 	}
 	ctx->compiled_list = NULL;
 
+	if (ctx->aux_context)
+	{
+		MemoryContextDelete(ctx->aux_context);
+		ctx->aux_context = NULL;
+	}
+
 	/*
 	 * On PG17+ we manage our own ResourceOwnerDesc, so we must call
 	 * ResourceOwnerForget ourselves.  On PG14-16, PG's jit_release_context()
@@ -1308,7 +1328,7 @@ meta_reset_after_error(void)
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_jitter_current_backend);
 
-Datum
+PG_JITTER_EXPORT Datum
 pg_jitter_current_backend(PG_FUNCTION_ARGS)
 {
 	int val = pg_jitter_backend;
@@ -1330,7 +1350,7 @@ pg_jitter_current_backend(PG_FUNCTION_ARGS)
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats);
 
-Datum
+PG_JITTER_EXPORT Datum
 pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -1502,7 +1522,7 @@ pg_jitter_adaptive_stats(PG_FUNCTION_ARGS)
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(pg_jitter_adaptive_stats_reset);
 
-Datum
+PG_JITTER_EXPORT Datum
 pg_jitter_adaptive_stats_reset(PG_FUNCTION_ARGS)
 {
 	/* Lazily initialize if needed */
@@ -1565,7 +1585,7 @@ meta_detect_default(void)
 #if defined(_MSC_VER) && PG_VERSION_NUM < 160000
 #pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
 #endif
-void
+PG_JITTER_EXPORT void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
 	int		boot_default;

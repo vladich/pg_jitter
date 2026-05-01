@@ -1,0 +1,924 @@
+diff --git a/src/yyjson.c b/src/yyjson.c
+index 6fd6f72..d792c5f 100644
+--- a/src/yyjson.c
++++ b/src/yyjson.c
+@@ -6218,16 +6218,793 @@ fail_depth:             return_err(cur, DEPTH, MSG_DEPTH);
+ }
+
+
+
+ /*==============================================================================
+  * MARK: - JSON Reader (Public)
+  *============================================================================*/
+
++#if !YYJSON_DISABLE_READER
++
++typedef struct yyjson_pg_reader {
++    const u8 *start;
++    const u8 *cur;
++    const u8 *end;
++    bool check_unique_keys;
++    yyjson_pg_text_unicode_validator validate_unicode;
++    void *validate_unicode_ctx;
++    yyjson_alc alc;
++    yyjson_read_err *err;
++} yyjson_pg_reader;
++
++typedef struct yyjson_pg_key {
++    u8 *ptr;
++    usize len;
++} yyjson_pg_key;
++
++typedef struct yyjson_pg_key_slot {
++    usize index;
++    bool used;
++} yyjson_pg_key_slot;
++
++typedef struct yyjson_pg_key_list {
++    yyjson_pg_key *keys;
++    usize count;
++    usize cap;
++    yyjson_pg_key_slot *slots;
++    usize slot_cap;
++} yyjson_pg_key_list;
++
++#define YYJSON_PG_TEXT_KEY_HASH_THRESHOLD ((usize)32)
++
++#if YYJSON_READER_DEPTH_LIMIT
++#define YYJSON_PG_TEXT_DEPTH_LIMIT ((usize)YYJSON_READER_DEPTH_LIMIT - 1)
++#else
++#define YYJSON_PG_TEXT_DEPTH_LIMIT ((usize)6400)
++#endif
++
++static yyjson_inline void yyjson_pg_text_set_error_at(yyjson_pg_reader *r,
++                                                      yyjson_read_code code,
++                                                      const char *msg,
++                                                      const u8 *pos) {
++    if (r->err && r->err->code == YYJSON_READ_SUCCESS) {
++        if (pos < r->start) pos = r->start;
++        if (pos > r->end) pos = r->end;
++        r->err->code = code;
++        r->err->msg = msg;
++        r->err->pos = (usize)(pos - r->start);
++    }
++}
++
++static yyjson_inline void yyjson_pg_text_set_error(yyjson_pg_reader *r,
++                                                   yyjson_read_code code,
++                                                   const char *msg) {
++    yyjson_pg_text_set_error_at(r, code, msg, r->cur);
++}
++
++static yyjson_inline void yyjson_pg_text_free(yyjson_pg_reader *r, void *ptr) {
++    if (ptr) r->alc.free(r->alc.ctx, ptr);
++}
++
++static yyjson_inline bool yyjson_pg_text_is_ws(u8 c) {
++    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
++}
++
++static yyjson_inline bool yyjson_pg_text_is_digit(u8 c) {
++    return c >= '0' && c <= '9';
++}
++
++static yyjson_inline bool yyjson_pg_text_is_hex(u8 c) {
++    return (c >= '0' && c <= '9') ||
++           (c >= 'a' && c <= 'f') ||
++           (c >= 'A' && c <= 'F');
++}
++
++static yyjson_inline int yyjson_pg_text_hex_val(u8 c) {
++    if (c >= '0' && c <= '9') return (int)(c - '0');
++    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
++    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
++    return -1;
++}
++
++static yyjson_inline void yyjson_pg_text_skip_ws(yyjson_pg_reader *r) {
++    while (r->cur < r->end && yyjson_pg_text_is_ws(*r->cur)) r->cur++;
++}
++
++static bool yyjson_pg_text_parse_value(yyjson_pg_reader *r, usize depth,
++                                       yyjson_pg_text_type *type);
++
++static void yyjson_pg_text_keys_free(yyjson_pg_reader *r,
++                                     yyjson_pg_key_list *keys) {
++    usize i;
++
++    for (i = 0; i < keys->count; i++) {
++        yyjson_pg_text_free(r, keys->keys[i].ptr);
++    }
++    yyjson_pg_text_free(r, keys->slots);
++    yyjson_pg_text_free(r, keys->keys);
++    keys->slots = NULL;
++    keys->keys = NULL;
++    keys->count = 0;
++    keys->cap = 0;
++    keys->slot_cap = 0;
++}
++
++static usize yyjson_pg_text_key_hash(const u8 *ptr, usize len) {
++    usize i;
++    u64 hash = U64(0xcbf29ce4, 0x84222325);
++
++    for (i = 0; i < len; i++) {
++        hash ^= (u64)ptr[i];
++        hash *= U64(0x00000100, 0x000001b3);
++    }
++    return (usize)hash;
++}
++
++static void yyjson_pg_text_key_hash_insert(yyjson_pg_key_slot *slots,
++                                           usize slot_cap,
++                                           const yyjson_pg_key *keys,
++                                           usize index) {
++    usize mask = slot_cap - 1;
++    usize pos = yyjson_pg_text_key_hash(keys[index].ptr, keys[index].len) & mask;
++
++    while (slots[pos].used) pos = (pos + 1) & mask;
++    slots[pos].used = true;
++    slots[pos].index = index;
++}
++
++static bool yyjson_pg_text_keys_hash_resize(yyjson_pg_reader *r,
++                                            yyjson_pg_key_list *keys,
++                                            usize needed_count) {
++    yyjson_pg_key_slot *new_slots;
++    usize new_cap = YYJSON_PG_TEXT_KEY_HASH_THRESHOLD * 2;
++    usize new_size;
++    usize i;
++
++    if (needed_count > USIZE_MAX / 2) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                 MSG_MALLOC);
++        return false;
++    }
++    while (new_cap < needed_count * 2) {
++        if (new_cap > USIZE_MAX / 2) {
++            yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                     MSG_MALLOC);
++            return false;
++        }
++        new_cap *= 2;
++    }
++    if (new_cap > USIZE_MAX / sizeof(*new_slots)) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                 MSG_MALLOC);
++        return false;
++    }
++
++    new_size = new_cap * sizeof(*new_slots);
++    new_slots = (yyjson_pg_key_slot *)r->alc.malloc(r->alc.ctx, new_size);
++    if (!new_slots) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                 MSG_MALLOC);
++        return false;
++    }
++    memset(new_slots, 0, new_size);
++
++    for (i = 0; i < keys->count; i++) {
++        yyjson_pg_text_key_hash_insert(new_slots, new_cap, keys->keys, i);
++    }
++
++    yyjson_pg_text_free(r, keys->slots);
++    keys->slots = new_slots;
++    keys->slot_cap = new_cap;
++    return true;
++}
++
++static bool yyjson_pg_text_keys_ensure_hash(yyjson_pg_reader *r,
++                                            yyjson_pg_key_list *keys,
++                                            usize needed_count) {
++    if (keys->slots) {
++        if (needed_count <= keys->slot_cap / 2) return true;
++        return yyjson_pg_text_keys_hash_resize(r, keys, needed_count);
++    }
++
++    if (needed_count < YYJSON_PG_TEXT_KEY_HASH_THRESHOLD) return true;
++    return yyjson_pg_text_keys_hash_resize(r, keys, needed_count);
++}
++
++static bool yyjson_pg_text_keys_append(yyjson_pg_reader *r,
++                                       yyjson_pg_key_list *keys,
++                                       u8 *ptr, usize len) {
++    if (keys->count == keys->cap) {
++        usize new_cap;
++        usize old_size;
++        usize new_size;
++        yyjson_pg_key *new_keys;
++
++        if (keys->cap > USIZE_MAX / sizeof(*new_keys) ||
++            keys->cap > (USIZE_MAX / sizeof(*new_keys)) / 2) {
++            yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                     MSG_MALLOC);
++            return false;
++        }
++        new_cap = keys->cap ? keys->cap * 2 : 8;
++        if (new_cap > USIZE_MAX / sizeof(*new_keys)) {
++            yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                     MSG_MALLOC);
++            return false;
++        }
++        old_size = keys->cap * sizeof(*new_keys);
++        new_size = new_cap * sizeof(*new_keys);
++        new_keys = keys->keys
++                       ? (yyjson_pg_key *)r->alc.realloc(r->alc.ctx,
++                                                         keys->keys, old_size,
++                                                         new_size)
++                       : (yyjson_pg_key *)r->alc.malloc(r->alc.ctx, new_size);
++        if (!new_keys) {
++            yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                     MSG_MALLOC);
++            return false;
++        }
++        keys->keys = new_keys;
++        keys->cap = new_cap;
++    }
++
++    keys->keys[keys->count].ptr = ptr;
++    keys->keys[keys->count].len = len;
++    keys->count++;
++    return true;
++}
++
++static bool yyjson_pg_text_keys_add_unique(yyjson_pg_reader *r,
++                                           yyjson_pg_key_list *keys,
++                                           u8 *ptr, usize len) {
++    usize i;
++
++    if (keys->count == USIZE_MAX) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                 MSG_MALLOC);
++        return false;
++    }
++
++    if (!yyjson_pg_text_keys_ensure_hash(r, keys, keys->count + 1)) {
++        return false;
++    }
++
++    if (keys->slots) {
++        usize mask = keys->slot_cap - 1;
++        usize pos = yyjson_pg_text_key_hash(ptr, len) & mask;
++        usize index;
++
++        while (keys->slots[pos].used) {
++            yyjson_pg_key *key = &keys->keys[keys->slots[pos].index];
++            if (key->len == len &&
++                (len == 0 || memcmp(key->ptr, ptr, len) == 0)) {
++                return false;
++            }
++            pos = (pos + 1) & mask;
++        }
++
++        index = keys->count;
++        if (!yyjson_pg_text_keys_append(r, keys, ptr, len)) {
++            return false;
++        }
++        keys->slots[pos].used = true;
++        keys->slots[pos].index = index;
++        return true;
++    }
++
++    for (i = 0; i < keys->count; i++) {
++        if (keys->keys[i].len == len &&
++            (len == 0 || memcmp(keys->keys[i].ptr, ptr, len) == 0)) {
++            return false;
++        }
++    }
++
++    return yyjson_pg_text_keys_append(r, keys, ptr, len);
++}
++
++static bool yyjson_pg_text_append_byte(yyjson_pg_reader *r, u8 **buf,
++                                       usize *len, usize *cap,
++                                       u8 c) {
++    if (unlikely(*len == USIZE_MAX)) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                 MSG_MALLOC);
++        return false;
++    }
++    if (*len == *cap) {
++        usize min_cap = *len + 1;
++        usize new_cap;
++        u8 *new_buf;
++
++        if (*cap > USIZE_MAX / 2) {
++            new_cap = min_cap;
++        } else {
++            new_cap = *cap ? *cap * 2 : 16;
++            if (new_cap < min_cap) new_cap = min_cap;
++        }
++        new_buf = *buf ? (u8 *)r->alc.realloc(r->alc.ctx, *buf, *cap, new_cap)
++                       : (u8 *)r->alc.malloc(r->alc.ctx, new_cap);
++        if (!new_buf) {
++            yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_MEMORY_ALLOCATION,
++                                     MSG_MALLOC);
++            return false;
++        }
++        *buf = new_buf;
++        *cap = new_cap;
++    }
++    (*buf)[(*len)++] = c;
++    return true;
++}
++
++static bool yyjson_pg_text_append_utf8(yyjson_pg_reader *r, u8 **buf,
++                                       usize *len, usize *cap,
++                                       u32 cp) {
++    if (cp <= 0x7F) {
++        return yyjson_pg_text_append_byte(r, buf, len, cap, (u8)cp);
++    } else if (cp <= 0x7FF) {
++        return yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0xC0 | (cp >> 6))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | (cp & 0x3F)));
++    } else if (cp <= 0xFFFF) {
++        return yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0xE0 | (cp >> 12))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | ((cp >> 6) & 0x3F))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | (cp & 0x3F)));
++    } else if (cp <= 0x10FFFF) {
++        return yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0xF0 | (cp >> 18))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | ((cp >> 12) & 0x3F))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | ((cp >> 6) & 0x3F))) &&
++               yyjson_pg_text_append_byte(r, buf, len, cap,
++                                          (u8)(0x80 | (cp & 0x3F)));
++    }
++    return false;
++}
++
++static bool yyjson_pg_text_read_hex4(const u8 *cur, u32 *out) {
++    int h0 = yyjson_pg_text_hex_val(cur[0]);
++    int h1 = yyjson_pg_text_hex_val(cur[1]);
++    int h2 = yyjson_pg_text_hex_val(cur[2]);
++    int h3 = yyjson_pg_text_hex_val(cur[3]);
++
++    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) return false;
++    *out = ((u32)h0 << 12) | ((u32)h1 << 8) | ((u32)h2 << 4) | (u32)h3;
++    return true;
++}
++
++static bool yyjson_pg_text_read_unicode_escape(yyjson_pg_reader *r,
++                                               const u8 **cur_ptr, u32 *out) {
++    const u8 *cur = *cur_ptr;
++    const u8 *end = r->end;
++    const u8 *escape = cur >= r->start + 2 ? cur - 2 : cur;
++    u32 cp;
++
++    if ((usize)(end - cur) < 4) {
++        yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                    "invalid unicode escape in string", escape);
++        return false;
++    }
++    if (!yyjson_pg_text_read_hex4(cur, &cp)) {
++        yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                    "invalid unicode escape in string", escape);
++        return false;
++    }
++    cur += 4;
++
++    if (cp >= 0xD800 && cp <= 0xDBFF) {
++        u32 lo;
++
++        if ((usize)(end - cur) < 6 || cur[0] != '\\' || cur[1] != 'u') {
++            yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                        "invalid unicode surrogate pair in string",
++                                        escape);
++            return false;
++        }
++        cur += 2;
++        if (!yyjson_pg_text_read_hex4(cur, &lo)) {
++            yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                        "invalid unicode surrogate pair in string",
++                                        escape);
++            return false;
++        }
++        if (lo < 0xDC00 || lo > 0xDFFF) {
++            yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                        "invalid unicode surrogate pair in string",
++                                        escape);
++            return false;
++        }
++        cur += 4;
++        cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
++    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
++        yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                    "invalid unicode surrogate pair in string",
++                                    escape);
++        return false;
++    }
++
++    if (cp == 0) {
++        yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                    "unsupported unicode escape in string",
++                                    escape);
++        return false;
++    }
++    if (r->validate_unicode &&
++        !r->validate_unicode(r->validate_unicode_ctx, cp)) {
++        yyjson_pg_text_set_error_at(r, YYJSON_READ_ERROR_INVALID_STRING,
++                                    "invalid unicode escape in string", escape);
++        return false;
++    }
++    *cur_ptr = cur;
++    *out = cp;
++    return true;
++}
++
++static bool yyjson_pg_text_parse_string(yyjson_pg_reader *r, bool decode,
++                                        u8 **out_ptr, usize *out_len) {
++    const u8 *cur = r->cur;
++    u8 *buf = NULL;
++    usize len = 0;
++    usize cap = 0;
++
++    if (out_ptr) *out_ptr = NULL;
++    if (out_len) *out_len = 0;
++
++    if (cur >= r->end || *cur++ != '"') return false;
++    while (cur < r->end) {
++        u8 c = *cur++;
++
++        if (c == '"') {
++            r->cur = cur;
++            if (out_ptr) {
++                *out_ptr = buf;
++                if (out_len) *out_len = len;
++            } else {
++                yyjson_pg_text_free(r, buf);
++            }
++            return true;
++        }
++        if (c < 0x20) goto fail;
++        if (c == '\\') {
++            if (cur >= r->end) goto fail;
++            c = *cur++;
++            switch (c) {
++                case '"':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '"')) {
++                        goto fail;
++                    }
++                    break;
++                case '\\':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\\')) {
++                        goto fail;
++                    }
++                    break;
++                case '/':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '/')) {
++                        goto fail;
++                    }
++                    break;
++                case 'b':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\b')) {
++                        goto fail;
++                    }
++                    break;
++                case 'f':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\f')) {
++                        goto fail;
++                    }
++                    break;
++                case 'n':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\n')) {
++                        goto fail;
++                    }
++                    break;
++                case 'r':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\r')) {
++                        goto fail;
++                    }
++                    break;
++                case 't':
++                    if (decode &&
++                        !yyjson_pg_text_append_byte(r, &buf, &len, &cap, '\t')) {
++                        goto fail;
++                    }
++                    break;
++                case 'u':
++                    if (decode || r->validate_unicode) {
++                        u32 cp;
++
++                        if (!yyjson_pg_text_read_unicode_escape(r, &cur, &cp)) {
++                            goto fail;
++                        }
++                        if (decode &&
++                            !yyjson_pg_text_append_utf8(r, &buf, &len, &cap,
++                                                        cp)) {
++                            goto fail;
++                        }
++                    } else {
++                        if ((usize)(r->end - cur) < 4) goto fail;
++                        if (!yyjson_pg_text_is_hex(cur[0]) ||
++                            !yyjson_pg_text_is_hex(cur[1]) ||
++                            !yyjson_pg_text_is_hex(cur[2]) ||
++                            !yyjson_pg_text_is_hex(cur[3])) {
++                            goto fail;
++                        }
++                        cur += 4;
++                    }
++                    break;
++                default:
++                    goto fail;
++            }
++        } else if (decode) {
++            if (!yyjson_pg_text_append_byte(r, &buf, &len, &cap, c)) goto fail;
++        }
++    }
++fail:
++    yyjson_pg_text_free(r, buf);
++    return false;
++}
++
++static bool yyjson_pg_text_parse_number(yyjson_pg_reader *r) {
++    const u8 *cur = r->cur;
++
++    if (cur >= r->end) return false;
++    if (*cur == '-') {
++        cur++;
++        if (cur >= r->end) return false;
++    }
++    if (*cur == '0') {
++        cur++;
++    } else if (*cur >= '1' && *cur <= '9') {
++        do {
++            cur++;
++        } while (cur < r->end && yyjson_pg_text_is_digit(*cur));
++    } else {
++        return false;
++    }
++    if (cur < r->end && *cur == '.') {
++        cur++;
++        if (cur >= r->end || !yyjson_pg_text_is_digit(*cur)) return false;
++        do {
++            cur++;
++        } while (cur < r->end && yyjson_pg_text_is_digit(*cur));
++    }
++    if (cur < r->end && (*cur == 'e' || *cur == 'E')) {
++        cur++;
++        if (cur < r->end && (*cur == '+' || *cur == '-')) cur++;
++        if (cur >= r->end || !yyjson_pg_text_is_digit(*cur)) return false;
++        do {
++            cur++;
++        } while (cur < r->end && yyjson_pg_text_is_digit(*cur));
++    }
++    r->cur = cur;
++    return true;
++}
++
++static bool yyjson_pg_text_match_literal(yyjson_pg_reader *r,
++                                         const char *lit, usize len) {
++    if ((usize)(r->end - r->cur) < len) return false;
++    if (memcmp(r->cur, lit, len) != 0) return false;
++    r->cur += len;
++    return true;
++}
++
++static bool yyjson_pg_text_parse_array(yyjson_pg_reader *r, usize depth) {
++    if (unlikely(depth >= YYJSON_PG_TEXT_DEPTH_LIMIT)) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_DEPTH, MSG_DEPTH);
++        return false;
++    }
++
++    r->cur++;
++    yyjson_pg_text_skip_ws(r);
++    if (r->cur < r->end && *r->cur == ']') {
++        r->cur++;
++        return true;
++    }
++    while (true) {
++        if (!yyjson_pg_text_parse_value(r, depth + 1, NULL)) return false;
++        yyjson_pg_text_skip_ws(r);
++        if (r->cur >= r->end) return false;
++        if (*r->cur == ']') {
++            r->cur++;
++            return true;
++        }
++        if (*r->cur != ',') return false;
++        r->cur++;
++        yyjson_pg_text_skip_ws(r);
++        if (r->cur >= r->end || *r->cur == ']') return false;
++    }
++}
++
++static bool yyjson_pg_text_parse_object(yyjson_pg_reader *r, usize depth) {
++    yyjson_pg_key_list keys = { NULL, 0, 0, NULL, 0 };
++
++    if (unlikely(depth >= YYJSON_PG_TEXT_DEPTH_LIMIT)) {
++        yyjson_pg_text_set_error(r, YYJSON_READ_ERROR_DEPTH, MSG_DEPTH);
++        return false;
++    }
++
++    r->cur++;
++    yyjson_pg_text_skip_ws(r);
++    if (r->cur < r->end && *r->cur == '}') {
++        r->cur++;
++        return true;
++    }
++    while (true) {
++        u8 *key = NULL;
++        usize key_len = 0;
++
++        if (!yyjson_pg_text_parse_string(r, r->check_unique_keys,
++                                         r->check_unique_keys ? &key : NULL,
++                                         r->check_unique_keys ? &key_len : NULL)) {
++            goto fail;
++        }
++        if (r->check_unique_keys &&
++            !yyjson_pg_text_keys_add_unique(r, &keys, key, key_len)) {
++            yyjson_pg_text_free(r, key);
++            goto fail;
++        }
++        yyjson_pg_text_skip_ws(r);
++        if (r->cur >= r->end || *r->cur != ':') goto fail;
++        r->cur++;
++        yyjson_pg_text_skip_ws(r);
++        if (!yyjson_pg_text_parse_value(r, depth + 1, NULL)) goto fail;
++        yyjson_pg_text_skip_ws(r);
++        if (r->cur >= r->end) goto fail;
++        if (*r->cur == '}') {
++            r->cur++;
++            yyjson_pg_text_keys_free(r, &keys);
++            return true;
++        }
++        if (*r->cur != ',') goto fail;
++        r->cur++;
++        yyjson_pg_text_skip_ws(r);
++        if (r->cur >= r->end || *r->cur == '}') goto fail;
++    }
++
++fail:
++    yyjson_pg_text_keys_free(r, &keys);
++    return false;
++}
++
++static bool yyjson_pg_text_parse_value(yyjson_pg_reader *r, usize depth,
++                                       yyjson_pg_text_type *type) {
++    if (r->cur >= r->end) return false;
++
++    switch (*r->cur) {
++        case '{':
++            if (type) *type = YYJSON_PG_TEXT_OBJECT;
++            return yyjson_pg_text_parse_object(r, depth);
++        case '[':
++            if (type) *type = YYJSON_PG_TEXT_ARRAY;
++            return yyjson_pg_text_parse_array(r, depth);
++        case '"':
++        {
++            u8 *str = NULL;
++            usize len = 0;
++            bool ok;
++
++            if (type) *type = YYJSON_PG_TEXT_SCALAR;
++            ok = yyjson_pg_text_parse_string(r, r->check_unique_keys,
++                                             r->check_unique_keys ? &str : NULL,
++                                             r->check_unique_keys ? &len : NULL);
++            yyjson_pg_text_free(r, str);
++            return ok;
++        }
++        case 't':
++            if (type) *type = YYJSON_PG_TEXT_SCALAR;
++            return yyjson_pg_text_match_literal(r, "true", 4);
++        case 'f':
++            if (type) *type = YYJSON_PG_TEXT_SCALAR;
++            return yyjson_pg_text_match_literal(r, "false", 5);
++        case 'n':
++            if (type) *type = YYJSON_PG_TEXT_SCALAR;
++            return yyjson_pg_text_match_literal(r, "null", 4);
++        default:
++            if (*r->cur == '-' || yyjson_pg_text_is_digit(*r->cur)) {
++                if (type) *type = YYJSON_PG_TEXT_SCALAR;
++                return yyjson_pg_text_parse_number(r);
++            }
++            return false;
++    }
++}
++
++yyjson_pg_text_type yyjson_read_pg_text_type_opts_err_ex(
++    const char *dat,
++    size_t len,
++    bool check_unique_keys,
++    yyjson_pg_text_unicode_validator validate_unicode,
++    void *validate_ctx,
++    const yyjson_alc *alc_ptr,
++    yyjson_read_err *err) {
++    yyjson_read_err tmp_err;
++    yyjson_alc alc = alc_ptr ? *alc_ptr : YYJSON_DEFAULT_ALC;
++    yyjson_pg_reader r;
++    yyjson_pg_text_type type = YYJSON_PG_TEXT_INVALID;
++
++    if (!err) err = &tmp_err;
++    memset(err, 0, sizeof(*err));
++    if (unlikely(!dat)) {
++        err->code = YYJSON_READ_ERROR_INVALID_PARAMETER;
++        err->msg = "input data is NULL";
++        return YYJSON_PG_TEXT_INVALID;
++    }
++    if (unlikely(!len)) {
++        err->code = YYJSON_READ_ERROR_INVALID_PARAMETER;
++        err->msg = "input length is 0";
++        return YYJSON_PG_TEXT_INVALID;
++    }
++    if (unlikely(!alc.malloc || !alc.realloc || !alc.free)) {
++        err->code = YYJSON_READ_ERROR_INVALID_PARAMETER;
++        err->msg = "input allocator is invalid";
++        return YYJSON_PG_TEXT_INVALID;
++    }
++
++    r.start = (const u8 *)(const void *)dat;
++    r.cur = r.start;
++    r.end = r.cur + len;
++    r.check_unique_keys = check_unique_keys;
++    r.validate_unicode = validate_unicode;
++    r.validate_unicode_ctx = validate_ctx;
++    r.alc = alc;
++    r.err = err;
++    yyjson_pg_text_skip_ws(&r);
++    if (!yyjson_pg_text_parse_value(&r, 0, &type)) {
++        if (err->code == YYJSON_READ_SUCCESS) {
++            err->code = YYJSON_READ_ERROR_JSON_STRUCTURE;
++            err->msg = MSG_CHAR;
++            err->pos = (usize)(r.cur - r.start);
++        }
++        return YYJSON_PG_TEXT_INVALID;
++    }
++    yyjson_pg_text_skip_ws(&r);
++    if (r.cur != r.end) {
++        err->code = YYJSON_READ_ERROR_UNEXPECTED_CONTENT;
++        err->msg = MSG_GARBAGE;
++        err->pos = (usize)(r.cur - r.start);
++        return YYJSON_PG_TEXT_INVALID;
++    }
++    memset(err, 0, sizeof(*err));
++    return type;
++}
++
++yyjson_pg_text_type yyjson_read_pg_text_type_opts_err(const char *dat,
++                                                      size_t len,
++                                                      bool check_unique_keys,
++                                                      const yyjson_alc *alc_ptr,
++                                                      yyjson_read_err *err) {
++    return yyjson_read_pg_text_type_opts_err_ex(dat, len, check_unique_keys,
++                                                NULL, NULL, alc_ptr, err);
++}
++
++yyjson_pg_text_type yyjson_read_pg_text_type_opts(const char *dat, size_t len,
++                                                  bool check_unique_keys) {
++    return yyjson_read_pg_text_type_opts_err(dat, len, check_unique_keys,
++                                             NULL, NULL);
++}
++
++yyjson_pg_text_type yyjson_read_pg_text_type(const char *dat, size_t len) {
++    return yyjson_read_pg_text_type_opts(dat, len, false);
++}
++
++#undef YYJSON_PG_TEXT_DEPTH_LIMIT
++
++#endif /* !YYJSON_DISABLE_READER */
++
+ yyjson_doc *yyjson_read_opts(char *dat, usize len,
+                              yyjson_read_flag flg,
+                              const yyjson_alc *alc_ptr,
+                              yyjson_read_err *err) {
+ #define return_err(_pos, _code, _msg) do { \
+     err->pos = (usize)(_pos); \
+     err->msg = _msg; \
+     err->code = YYJSON_READ_ERROR_##_code; \
+diff --git a/src/yyjson.h b/src/yyjson.h
+index 97c17af..926798f 100644
+--- a/src/yyjson.h
++++ b/src/yyjson.h
+@@ -927,16 +927,121 @@ typedef struct yyjson_read_err {
+     When it's no longer needed, it should be freed with `yyjson_doc_free()`.
+  */
+ yyjson_api yyjson_doc *yyjson_read_opts(char *dat,
+                                         size_t len,
+                                         yyjson_read_flag flg,
+                                         const yyjson_alc *alc,
+                                         yyjson_read_err *err);
+
++/**
++ The JSON text category accepted by yyjson_read_pg_text_type().
++
++ This helper validates PostgreSQL's syntax-only json text rules. It is separate
++ from yyjson_read_opts() and does not change yyjson's standard JSON parser.
++ */
++typedef enum yyjson_pg_text_type {
++    YYJSON_PG_TEXT_INVALID = 0,
++    YYJSON_PG_TEXT_OBJECT = 1,
++    YYJSON_PG_TEXT_ARRAY = 2,
++    YYJSON_PG_TEXT_SCALAR = 3
++} yyjson_pg_text_type;
++
++/**
++ Callback used by yyjson_read_pg_text_type_opts_err_ex() to validate a decoded
++ Unicode escape code point. Return true if the code point is acceptable.
++ */
++typedef bool (*yyjson_pg_text_unicode_validator)(void *ctx, uint32_t codepoint);
++
++/**
++ Validate PostgreSQL json text syntax and return the root item category.
++
++ PostgreSQL's json type checks escape syntax without requiring Unicode escapes
++ to form valid scalar values. For example, a lone surrogate escape is accepted
++ by PostgreSQL json input but rejected by yyjson_read_opts(). This function
++ recognizes that PostgreSQL syntax while returning YYJSON_PG_TEXT_INVALID for
++ malformed JSON. It does not allocate, mutate input, or report errors.
++
++ @param dat The JSON text data, null-terminator is not required.
++ @param len The length of JSON text data in bytes.
++ @return The root item category, or YYJSON_PG_TEXT_INVALID if invalid.
++ */
++yyjson_api yyjson_pg_text_type yyjson_read_pg_text_type(const char *dat,
++                                                        size_t len);
++
++/**
++ Validate PostgreSQL json text syntax and optionally enforce unique object keys.
++
++ When `check_unique_keys` is true, object keys are compared after JSON string
++ escape decoding, and every object in the document must have unique keys. This
++ mode follows PostgreSQL's unique-key validation semantics, including rejection
++ of invalid Unicode escape sequences during string decoding. This function is
++ separate from yyjson_read_opts() and does not change yyjson's standard parser.
++
++ @param dat The JSON text data, null-terminator is not required.
++ @param len The length of JSON text data in bytes.
++ @param check_unique_keys Whether to reject duplicate keys within each object.
++ @return The root item category, or YYJSON_PG_TEXT_INVALID if invalid.
++ */
++yyjson_api yyjson_pg_text_type yyjson_read_pg_text_type_opts(const char *dat,
++                                                             size_t len,
++                                                             bool check_unique_keys);
++
++/**
++ Validate PostgreSQL json text syntax with allocator and error reporting.
++
++ This is the error-reporting form of yyjson_read_pg_text_type_opts(). When
++ `check_unique_keys` is true, temporary memory may be allocated with `alc`.
++ Allocation failures are reported with YYJSON_READ_ERROR_MEMORY_ALLOCATION.
++
++ @param dat The JSON text data, null-terminator is not required.
++ @param len The length of JSON text data in bytes.
++ @param check_unique_keys Whether to reject duplicate keys within each object.
++ @param alc The memory allocator used for temporary validation state.
++    Pass NULL to use the libc's default allocator. If non-NULL, malloc,
++    realloc, and free callbacks must all be set.
++ @param err A pointer to receive error information.
++    Pass NULL if you don't need error information.
++ @return The root item category, or YYJSON_PG_TEXT_INVALID if invalid.
++ */
++yyjson_api yyjson_pg_text_type yyjson_read_pg_text_type_opts_err(const char *dat,
++                                                                 size_t len,
++                                                                 bool check_unique_keys,
++                                                                 const yyjson_alc *alc,
++                                                                 yyjson_read_err *err);
++
++/**
++ Validate PostgreSQL json text syntax with optional Unicode-escape validation.
++
++ This extends yyjson_read_pg_text_type_opts_err() for PostgreSQL integrations
++ that need to validate decoded Unicode escapes against a database encoding. The
++ validator is called only for `\uXXXX` escapes after surrogate-pair decoding.
++ Raw non-escaped bytes are not passed to the validator.
++
++ @param dat The JSON text data, null-terminator is not required.
++ @param len The length of JSON text data in bytes.
++ @param check_unique_keys Whether to reject duplicate keys within each object.
++ @param validate_unicode Optional callback for decoded Unicode escape codepoints.
++ @param validate_ctx User context passed to validate_unicode.
++ @param alc The memory allocator used for temporary validation state.
++    Pass NULL to use the libc's default allocator. If non-NULL, malloc,
++    realloc, and free callbacks must all be set.
++ @param err A pointer to receive error information.
++    Pass NULL if you don't need error information.
++ @return The root item category, or YYJSON_PG_TEXT_INVALID if invalid.
++ */
++yyjson_api yyjson_pg_text_type yyjson_read_pg_text_type_opts_err_ex(
++    const char *dat,
++    size_t len,
++    bool check_unique_keys,
++    yyjson_pg_text_unicode_validator validate_unicode,
++    void *validate_ctx,
++    const yyjson_alc *alc,
++    yyjson_read_err *err);
++
+ /**
+  Read a JSON file.
+
+  This function is thread-safe when:
+  1. The file is not modified by other threads.
+  2. The `alc` is thread-safe or NULL.
+
+  @param path The JSON file's path.

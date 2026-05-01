@@ -18,7 +18,8 @@
 # Dependency paths (override with -D flags):
 #   -DSLJIT_DIR=...   Path to sljit source    (default: ../sljit relative to pg_jitter)
 #   -DASMJIT_DIR=...  Path to asmjit source   (default: ../asmjit relative to pg_jitter)
-#   -DMIR_DIR=...     Path to MIR source      (default: ../mir relative to pg_jitter)
+#   -DMIR_DIR=...     Path to patched MIR source
+#                     (default: ../mir-patched if present, else patched ../mir with warning)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

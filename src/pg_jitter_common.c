@@ -6,8 +6,9 @@
 #include "postgres.h"
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
-#include "pg_jitter_pcre2.h"
 #include "pg_jit_funcs.h"
+#include "pg_jitter_pcre2.h"
+#include "pg_jitter_yyjson.h"
 
 #include "catalog/pg_collation_d.h"
 #include "executor/execExpr.h"
@@ -24,6 +25,7 @@
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/pg_locale.h"
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
@@ -31,7 +33,9 @@
 #include "access/detoast.h"    /* DatumGetTextPP */
 #include "access/htup_details.h"
 #include "utils/resowner.h"
+#include "utils/builtins.h"
 
+#include <stdint.h>
 #include <stdlib.h> /* for atoi */
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || \
@@ -50,6 +54,12 @@
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
+
+#define PG_JITTER_FREE_IF_COPY(ptr, datum)                                    \
+  do {                                                                        \
+    if ((Pointer)(ptr) != DatumGetPointer(datum))                             \
+      pfree(ptr);                                                             \
+  } while (0)
 
 /* GUC: pg_jitter.parallel_mode — shared across backends */
 int pg_jitter_parallel_mode = 1; /* PARALLEL_JIT_PER_WORKER */
@@ -77,6 +87,53 @@ int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
 
 /* GUC: pg_jitter.in_simd_max — max IN list size for SIMD linear scan */
 int pg_jitter_in_simd_max = IN_SIMD_MAX_DEFAULT;
+
+PG_FUNCTION_INFO_V1(pg_jitter_reset_third_party_counters);
+
+PG_JITTER_EXPORT Datum
+pg_jitter_reset_third_party_counters(PG_FUNCTION_ARGS)
+{
+#ifdef PG_JITTER_HAVE_PCRE2
+  pg_jitter_pcre2_compile_counter = 0;
+  pg_jitter_pcre2_match_counter = 0;
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+  pg_jitter_yyjson_is_json_counter = 0;
+  pg_jitter_yyjson_jsonb_in_counter = 0;
+#endif
+
+  PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(pg_jitter_third_party_counter);
+
+PG_JITTER_EXPORT Datum
+pg_jitter_third_party_counter(PG_FUNCTION_ARGS)
+{
+  char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  uint64 value = 0;
+
+#ifdef PG_JITTER_HAVE_PCRE2
+  if (strcmp(name, "pcre2_compile") == 0)
+    value = pg_jitter_pcre2_compile_counter;
+  else if (strcmp(name, "pcre2_match") == 0)
+    value = pg_jitter_pcre2_match_counter;
+  else
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+  if (strcmp(name, "yyjson_is_json") == 0)
+    value = pg_jitter_yyjson_is_json_counter;
+  else if (strcmp(name, "yyjson_jsonb_in") == 0)
+    value = pg_jitter_yyjson_jsonb_in_counter;
+  else
+#endif
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("unknown pg_jitter third-party counter \"%s\"", name)));
+
+  pfree(name);
+  PG_RETURN_INT64((int64) value);
+}
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
@@ -294,6 +351,7 @@ pg_jitter_cpu_has_avx512vl(void)
 static bool pg_jitter_shmem_init(void) {
   bool found;
   Size size;
+  MemoryContext oldcontext;
 
   if (jit_dsm_slots != NULL)
     return true;
@@ -309,6 +367,7 @@ static bool pg_jitter_shmem_init(void) {
   size = offsetof(JitDsmSlotTable, handles) +
          sizeof(pg_atomic_uint32) * MaxBackends;
 
+  oldcontext = CurrentMemoryContext;
   PG_TRY();
   {
     jit_dsm_slots =
@@ -317,6 +376,7 @@ static bool pg_jitter_shmem_init(void) {
   PG_CATCH();
   {
     /* Shmem pool exhausted — fall back to per-worker compilation */
+    MemoryContextSwitchTo(oldcontext);
     FlushErrorState();
     shmem_init_failed = true;
     elog(DEBUG1, "pg_jitter: shmem allocation failed, "
@@ -394,6 +454,59 @@ int pg_jitter_get_min_expr_steps(void) {
     return atoi(val);
 
   return pg_jitter_min_expr_steps;
+}
+
+bool pg_jitter_in_raw_datum_bsearch_safe(PGFunction fn) {
+  /*
+   * The generated IN-list bsearch compares the Datum bit pattern directly and
+   * uses signed integer ordering for branch direction.  Only use it for types
+   * whose equality and ordering are exactly represented by that Datum value.
+   * In particular, float equality is not safe: +0.0 equals -0.0 in PostgreSQL
+   * but has a different bit pattern, and NaN ordering needs special handling.
+   */
+  return fn == int2eq || fn == int4eq || fn == int8eq ||
+         fn == date_eq || fn == timestamp_eq || fn == time_eq ||
+         fn == cash_eq || fn == booleq || fn == chareq || fn == oideq;
+}
+
+bool pg_jitter_in_int32_hash_safe(PGFunction fn) {
+  /*
+   * The CRC32 hash table stores and probes int32 values.  Keep this path to
+   * true 32-bit Datum representations; wider types must use PostgreSQL's
+   * hashed scalar-array implementation or a dedicated 64-bit table.
+   */
+  return fn == int2eq || fn == int4eq || fn == date_eq ||
+         fn == chareq || fn == oideq;
+}
+
+bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
+                                       FunctionCallInfo fcinfo) {
+#if PG_VERSION_NUM >= 150000
+  FmgrInfo *finfo;
+
+  if (op == NULL || fcinfo == NULL ||
+      op->opcode != EEOP_HASHED_SCALARARRAYOP)
+    return false;
+
+  finfo = op->d.hashedscalararrayop.finfo;
+  if (finfo == NULL)
+    return false;
+
+  /*
+   * text_hash_probe is byte equality over text payloads.  That is equivalent
+   * only to PostgreSQL's strict builtin texteq under deterministic collation.
+   * Custom hashable text operators must keep PostgreSQL's own hashed SAOP.
+   */
+  if (!finfo->fn_strict || finfo->fn_oid != F_TEXTEQ ||
+      finfo->fn_addr != texteq)
+    return false;
+
+  return pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+#else
+  (void)op;
+  (void)fcinfo;
+  return false;
+#endif
 }
 
 /*
@@ -523,6 +636,7 @@ PgJitterContext *pg_jitter_get_context(ExprState *state) {
   ctx->resowner = CurrentResourceOwner;
   ctx->last_plan_node_id = -1;
   ctx->expr_ordinal = 0;
+  ctx->aux_context = NULL;
 
   PgJitterRememberContext(CurrentResourceOwner, ctx);
 
@@ -543,6 +657,47 @@ void pg_jitter_register_compiled(PgJitterContext *ctx, void (*free_fn)(void *),
   cc->data = data;
   cc->next = ctx->compiled_list;
   ctx->compiled_list = cc;
+}
+
+/*
+ * Register compiled code and keep ownership transfer exception-safe.  Several
+ * backends allocate executable code outside PostgreSQL memory contexts, so a
+ * MemoryContextAlloc ERROR while linking the cleanup record must release it.
+ */
+void pg_jitter_register_compiled_or_free(PgJitterContext *ctx,
+                                         void (*free_fn)(void *), void *data) {
+  PG_TRY();
+  {
+    pg_jitter_register_compiled(ctx, free_fn, data);
+  }
+  PG_CATCH();
+  {
+    if (free_fn != NULL)
+      free_fn(data);
+    PG_RE_THROW();
+  }
+  PG_END_TRY();
+}
+
+static MemoryContext
+pg_jitter_get_aux_context(PgJitterContext *ctx) {
+  if (ctx == NULL)
+    elog(ERROR, "pg_jitter auxiliary allocation requires a JIT context");
+
+  if (ctx->aux_context == NULL)
+    ctx->aux_context =
+        AllocSetContextCreate(TopMemoryContext, "pg_jitter auxiliary data",
+                              ALLOCSET_DEFAULT_SIZES);
+
+  return ctx->aux_context;
+}
+
+void *pg_jitter_context_alloc(PgJitterContext *ctx, Size size) {
+  return MemoryContextAlloc(pg_jitter_get_aux_context(ctx), size);
+}
+
+void *pg_jitter_context_alloc_zero(PgJitterContext *ctx, Size size) {
+  return MemoryContextAllocZero(pg_jitter_get_aux_context(ctx), size);
 }
 
 /*
@@ -570,6 +725,11 @@ void pg_jitter_release_context(JitContext *context) {
     pfree(cc);
   }
   ctx->compiled_list = NULL;
+
+  if (ctx->aux_context) {
+    MemoryContextDelete(ctx->aux_context);
+    ctx->aux_context = NULL;
+  }
 
   /*
    * On PG17+ we manage our own ResourceOwnerDesc, so we must call
@@ -1838,6 +1998,7 @@ pg_jitter_expr_fingerprint(ExprState *state)
 {
   uint64 hash = UINT64CONST(14695981039346656037);
   int i;
+  bool expr_tree_fingerprinted = false;
 
   hash = pg_jitter_fnv1a_u64(hash, (uint64)PG_VERSION_NUM);
   hash = pg_jitter_fnv1a_u64(hash, (uint64)sizeof(Datum));
@@ -1854,6 +2015,7 @@ pg_jitter_expr_fingerprint(ExprState *state)
       hash = pg_jitter_fnv1a_u64(hash, UINT64CONST(0x4558505254524545));
       hash = pg_jitter_fnv1a_bytes(hash, expr_string, strlen(expr_string));
       pfree(expr_string);
+      expr_tree_fingerprinted = true;
     }
   }
 
@@ -1914,7 +2076,13 @@ pg_jitter_expr_fingerprint(ExprState *state)
 
       case EEOP_CONST:
         hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.isnull);
-        if (!op->d.constval.isnull)
+        /*
+         * nodeToString() serializes Const payloads by value.  When it was
+         * available, avoid mixing process-local byref Datum pointers into a
+         * shared-code fingerprint; only use the raw Datum as a last-resort key
+         * for expression states without a dumpable tree.
+         */
+        if (!op->d.constval.isnull && !expr_tree_fingerprinted)
           hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.value);
         break;
 
@@ -2119,10 +2287,19 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
                                  uint64 dylib_ref_addr) {
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
   SharedJitCodeEntry *entry;
+  Size entry_payload;
   Size entry_size;
   Size usable_capacity;
 
-  entry_size = MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + code_size);
+  if (shared == NULL || code == NULL || code_size == 0)
+    return false;
+
+  if (code_size > SIZE_MAX - offsetof(SharedJitCodeEntry, code_bytes))
+    return false;
+  entry_payload = offsetof(SharedJitCodeEntry, code_bytes) + code_size;
+  if (entry_payload > SIZE_MAX - (MAXIMUM_ALIGNOF - 1))
+    return false;
+  entry_size = MAXALIGN(entry_payload);
 
   /* Spinlock acquire */
   while (pg_atomic_exchange_u32(&sjc->lock, 1) != 0)
@@ -2139,7 +2316,7 @@ bool pg_jitter_store_shared_code(void *shared, const void *code, Size code_size,
   usable_capacity = sjc->capacity - sjc->deform_used_size;
 
   /* Check if there's enough space after reserving the shared-deform tail. */
-  if (sjc->used + entry_size > usable_capacity) {
+  if (sjc->used > usable_capacity || entry_size > usable_capacity - sjc->used) {
     elog(DEBUG1,
          "pg_jitter: DSM full: need %zu bytes, have %zu/%zu "
          "(tail reserved=%zu)",
@@ -2179,37 +2356,85 @@ bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
   SharedJitCompiledCode *sjc = (SharedJitCompiledCode *)shared;
   Size offset;
   Size usable_capacity;
+  Size err_offset = 0;
+  Size err_a = 0;
+  Size err_b = 0;
+  uint64 mismatch_leader_fp = 0;
+  bool have_mismatch = false;
+  bool found = false;
+  int error_code = 0;
+  int err_i = 0;
   int i;
 
-  if (sjc->deform_used_size > sjc->capacity) {
-    elog(WARNING,
-         "pg_jitter: invalid shared deform reservation %zu > %zu capacity",
-         sjc->deform_used_size, sjc->capacity);
+  if (shared == NULL || code_bytes == NULL || code_size == NULL)
     return false;
+
+  *code_bytes = NULL;
+  *code_size = 0;
+  if (dylib_ref_addr != NULL)
+    *dylib_ref_addr = 0;
+
+  /* Synchronize with pg_jitter_store_shared_code while scanning entries. */
+  while (pg_atomic_exchange_u32(&sjc->lock, 1) != 0)
+    pg_spin_delay();
+
+  if (sjc->deform_used_size > sjc->capacity) {
+    error_code = 1;
+    err_a = sjc->deform_used_size;
+    err_b = sjc->capacity;
+    goto done;
   }
 
   usable_capacity = sjc->capacity - sjc->deform_used_size;
   if (sjc->used > usable_capacity) {
-    elog(WARNING,
-         "pg_jitter: invalid shared code usage %zu > %zu usable capacity",
-         sjc->used, usable_capacity);
-    return false;
+    error_code = 2;
+    err_a = sjc->used;
+    err_b = usable_capacity;
+    goto done;
   }
 
   offset = MAXALIGN(sizeof(SharedJitCompiledCode));
 
   for (i = 0; i < sjc->num_entries; i++) {
+    Size entry_payload;
     Size entry_size;
 
-    if (offset + offsetof(SharedJitCodeEntry, code_bytes) > usable_capacity) {
-      elog(WARNING,
-           "pg_jitter: shared code entry header overruns DSM "
-           "(offset=%zu usable=%zu index=%d)",
-           offset, usable_capacity, i);
-      return false;
+    if (offset > usable_capacity ||
+        offsetof(SharedJitCodeEntry, code_bytes) > usable_capacity - offset) {
+      error_code = 3;
+      err_offset = offset;
+      err_a = usable_capacity;
+      err_i = i;
+      goto done;
     }
 
     SharedJitCodeEntry *entry = (SharedJitCodeEntry *)((char *)sjc + offset);
+
+    if (entry->code_size >
+        SIZE_MAX - offsetof(SharedJitCodeEntry, code_bytes)) {
+      error_code = 4;
+      err_offset = offset;
+      err_a = entry->code_size;
+      err_i = i;
+      goto done;
+    }
+    entry_payload = offsetof(SharedJitCodeEntry, code_bytes) + entry->code_size;
+    if (entry_payload > SIZE_MAX - (MAXIMUM_ALIGNOF - 1)) {
+      error_code = 5;
+      err_offset = offset;
+      err_a = entry_payload;
+      err_i = i;
+      goto done;
+    }
+    entry_size = MAXALIGN(entry_payload);
+    if (entry_size > usable_capacity - offset) {
+      error_code = 6;
+      err_offset = offset;
+      err_a = entry_size;
+      err_b = usable_capacity;
+      err_i = i;
+      goto done;
+    }
 
     if (entry->plan_node_id == node_id && entry->expr_index == expr_idx &&
         entry->expr_fingerprint == expr_fingerprint) {
@@ -2217,31 +2442,70 @@ bool pg_jitter_find_shared_code(void *shared, int node_id, int expr_idx,
       *code_size = entry->code_size;
       if (dylib_ref_addr)
         *dylib_ref_addr = entry->dylib_ref_addr;
-      return true;
+      found = true;
+      goto done;
     }
 
-    if (entry->plan_node_id == node_id && entry->expr_index == expr_idx)
-      elog(DEBUG1,
-           "pg_jitter: shared code fingerprint mismatch "
-           "node=%d expr=%d leader=%llx worker=%llx",
-           node_id, expr_idx,
-           (unsigned long long)entry->expr_fingerprint,
-           (unsigned long long)expr_fingerprint);
-
-    entry_size =
-        MAXALIGN(offsetof(SharedJitCodeEntry, code_bytes) + entry->code_size);
-    if (offset + entry_size > usable_capacity) {
-      elog(WARNING,
-           "pg_jitter: shared code entry overruns DSM "
-           "(offset=%zu entry=%zu usable=%zu index=%d)",
-           offset, entry_size, usable_capacity, i);
-      return false;
+    if (entry->plan_node_id == node_id && entry->expr_index == expr_idx &&
+        !have_mismatch) {
+      mismatch_leader_fp = entry->expr_fingerprint;
+      have_mismatch = true;
     }
 
     offset += entry_size;
   }
 
-  return false;
+done:
+  pg_atomic_write_u32(&sjc->lock, 0);
+
+  switch (error_code) {
+    case 1:
+      elog(WARNING,
+           "pg_jitter: invalid shared deform reservation %zu > %zu capacity",
+           err_a, err_b);
+      break;
+    case 2:
+      elog(WARNING,
+           "pg_jitter: invalid shared code usage %zu > %zu usable capacity",
+           err_a, err_b);
+      break;
+    case 3:
+      elog(WARNING,
+           "pg_jitter: shared code entry header overruns DSM "
+           "(offset=%zu usable=%zu index=%d)",
+           err_offset, err_a, err_i);
+      break;
+    case 4:
+      elog(WARNING,
+           "pg_jitter: shared code entry size overflows "
+           "(offset=%zu code=%zu index=%d)",
+           err_offset, err_a, err_i);
+      break;
+    case 5:
+      elog(WARNING,
+           "pg_jitter: shared code aligned entry size overflows "
+           "(offset=%zu entry=%zu index=%d)",
+           err_offset, err_a, err_i);
+      break;
+    case 6:
+      elog(WARNING,
+           "pg_jitter: shared code entry overruns DSM "
+           "(offset=%zu entry=%zu usable=%zu index=%d)",
+           err_offset, err_a, err_b, err_i);
+      break;
+    default:
+      break;
+  }
+
+  if (!found && have_mismatch)
+    elog(DEBUG1,
+         "pg_jitter: shared code fingerprint mismatch "
+         "node=%d expr=%d leader=%llx worker=%llx",
+         node_id, expr_idx,
+         (unsigned long long)mismatch_leader_fp,
+         (unsigned long long)expr_fingerprint);
+
+  return found;
 }
 
 /*
@@ -2267,18 +2531,26 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
   ExecMemInfo *info;
   Size alloc_size;
 
+  if (code_bytes == NULL || code_size == 0 ||
+      code_size > SIZE_MAX - 4095)
+    return NULL;
+
   /*
    * Allocate a fresh MAP_JIT page for the shared code.
    * Each allocation gets its own mmap — avoids interference with sljit's
    * allocator state and ensures clean W^X transitions.
    */
   alloc_size = (code_size + 4095) & ~((Size)4095); /* page-align */
+  info =
+      (ExecMemInfo *)MemoryContextAlloc(TopMemoryContext, sizeof(ExecMemInfo));
 
 #if defined(__APPLE__) && defined(__aarch64__)
   mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE | PROT_EXEC,
              MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-  if (mem == MAP_FAILED)
+  if (mem == MAP_FAILED) {
+    pfree(info);
     return NULL;
+  }
 
   pthread_jit_write_protect_np(0);
   memcpy(mem, code_bytes, code_size);
@@ -2286,20 +2558,27 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
   pthread_jit_write_protect_np(1);
 
   /* Verify: read back the code bytes and compare */
-  if (memcmp(mem, code_bytes, code_size) != 0)
+  if (memcmp(mem, code_bytes, code_size) != 0) {
     elog(WARNING,
-         "pg_jitter: VERIFY FAILED — code bytes don't match after copy!");
+         "pg_jitter: code copy verification failed, compiling locally");
+    munmap(mem, alloc_size);
+    pfree(info);
+    return NULL;
+  }
   else
     elog(DEBUG1, "pg_jitter: copy verified OK (%zu bytes)", code_size);
 #else
   mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
              -1, 0);
-  if (mem == MAP_FAILED)
+  if (mem == MAP_FAILED) {
+    pfree(info);
     return NULL;
+  }
 
   memcpy(mem, code_bytes, code_size);
   if (mprotect(mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
     munmap(mem, alloc_size);
+    pfree(info);
     return NULL;
   }
 #if defined(__aarch64__)
@@ -2307,8 +2586,6 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
 #endif
 #endif
 
-  info =
-      (ExecMemInfo *)MemoryContextAlloc(TopMemoryContext, sizeof(ExecMemInfo));
   info->code_ptr = mem;
   info->alloc_size = alloc_size;
 
@@ -2328,9 +2605,151 @@ void pg_jitter_exec_free(void *ptr) {
   }
 }
 
+void pg_jitter_register_exec_handle(PgJitterContext *ctx, void *handle) {
+  pg_jitter_register_compiled_or_free(ctx, pg_jitter_exec_free, handle);
+}
+
 void *pg_jitter_exec_code_ptr(void *handle) {
   ExecMemInfo *info = (ExecMemInfo *)handle;
   return info->code_ptr;
+}
+
+static bool
+pg_jitter_x86_movabs_followed_by_indirect_branch(const uint8_t *bytes,
+                                                 Size code_size,
+                                                 Size pos, int reg)
+{
+  uint8_t rex = 0;
+  uint8_t modrm;
+  int op;
+  int rm;
+
+  if (pos < code_size && (bytes[pos] & 0xF0) == 0x40)
+    rex = bytes[pos++];
+
+  if (pos + 1 >= code_size || bytes[pos] != 0xFF)
+    return false;
+
+  modrm = bytes[pos + 1];
+  if ((modrm & 0xC0) != 0xC0)
+    return false;
+
+  op = (modrm >> 3) & 7;
+  if (op != 2 && op != 4)
+    return false;
+
+  rm = modrm & 7;
+  if (rex & 0x01)
+    rm |= 8;
+
+  return rm == reg;
+}
+
+static bool
+pg_jitter_reloc_match_worker_addr(void *worker_ptr, uint64 leader_addr,
+                                  int64 delta, uint64 *worker_addr_out)
+{
+  uint64 worker_addr;
+
+  if (worker_ptr == NULL)
+    return false;
+
+  worker_addr = (uint64)(uintptr_t)worker_ptr;
+  if (worker_addr - (uint64)delta != leader_addr)
+    return false;
+
+  *worker_addr_out = worker_addr;
+  return true;
+}
+
+static bool
+pg_jitter_reloc_lookup_known_helper(uint64 leader_addr, int64 delta,
+                                    uint64 *worker_addr_out)
+{
+  static void *fixed_helpers[] = {
+      (void *)pg_jitter_fallback_step,
+      (void *)pg_jitter_agg_trans_init_strict_byval,
+      (void *)pg_jitter_agg_trans_strict_byval,
+      (void *)pg_jitter_agg_trans_byval,
+      (void *)pg_jitter_agg_trans_init_strict_byref,
+      (void *)pg_jitter_agg_trans_strict_byref,
+      (void *)pg_jitter_agg_trans_byref,
+      (void *)pg_jitter_agg_byref_finish,
+      (void *)pg_jitter_compiled_deform_dispatch,
+      (void *)pg_jitter_scalararrayop_loop,
+      (void *)jit_text_datum_eq,
+      (void *)jit_text_datum_ne,
+      (void *)simd_like_match_text,
+      (void *)simd_like_match_compiled,
+      (void *)crc32_hash_probe_int4,
+      (void *)text_hash_probe,
+      (void *)sorted_array_probe_int4,
+      (void *)jit_jsonb_object_field_text,
+      (void *)jit_error_int2_overflow,
+      (void *)jit_error_int4_overflow,
+      (void *)jit_error_int8_overflow,
+      (void *)jit_error_division_by_zero,
+      (void *)jit_error_float_overflow,
+      (void *)jit_error_float_underflow,
+      (void *)pg_jitter_case_bsearch_eq_i32,
+      (void *)pg_jitter_case_bsearch_lt_i32,
+      (void *)pg_jitter_case_bsearch_le_i32,
+      (void *)pg_jitter_case_bsearch_gt_i32,
+      (void *)pg_jitter_case_bsearch_ge_i32,
+      (void *)pg_jitter_case_bsearch_eq_i64,
+      (void *)pg_jitter_case_bsearch_lt_i64,
+      (void *)pg_jitter_case_bsearch_le_i64,
+      (void *)pg_jitter_case_bsearch_gt_i64,
+      (void *)pg_jitter_case_bsearch_ge_i64,
+      (void *)pg_jitter_case_bsearch_eq_u32,
+      (void *)pg_jitter_case_bsearch_lt_u32,
+      (void *)pg_jitter_case_bsearch_le_u32,
+      (void *)pg_jitter_case_bsearch_gt_u32,
+      (void *)pg_jitter_case_bsearch_ge_u32,
+      (void *)pg_jitter_case_bsearch_eq_i16,
+      (void *)pg_jitter_case_bsearch_lt_i16,
+      (void *)pg_jitter_case_bsearch_le_i16,
+      (void *)pg_jitter_case_bsearch_gt_i16,
+      (void *)pg_jitter_case_bsearch_ge_i16,
+      (void *)pg_jitter_case_bsearch_eq_f4,
+      (void *)pg_jitter_case_bsearch_lt_f4,
+      (void *)pg_jitter_case_bsearch_le_f4,
+      (void *)pg_jitter_case_bsearch_gt_f4,
+      (void *)pg_jitter_case_bsearch_ge_f4,
+      (void *)pg_jitter_case_bsearch_eq_f8,
+      (void *)pg_jitter_case_bsearch_lt_f8,
+      (void *)pg_jitter_case_bsearch_le_f8,
+      (void *)pg_jitter_case_bsearch_gt_f8,
+      (void *)pg_jitter_case_bsearch_ge_f8,
+      (void *)pg_jitter_case_bsearch_eq_generic,
+      (void *)pg_jitter_case_bsearch_lt_generic,
+      (void *)pg_jitter_case_bsearch_le_generic,
+      (void *)pg_jitter_case_bsearch_gt_generic,
+      (void *)pg_jitter_case_bsearch_ge_generic,
+#ifdef PG_JITTER_HAVE_PCRE2
+      (void *)pg_jitter_pcre2_match_raw,
+      (void *)pg_jitter_pcre2_match_text,
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+#if PG_VERSION_NUM >= 160000
+      (void *)pg_jitter_yj_is_json_datum,
+#endif
+      (void *)pg_jitter_yj_jsonb_in,
+#endif
+  };
+
+  for (Size i = 0; i < lengthof(fixed_helpers); i++)
+    if (pg_jitter_reloc_match_worker_addr(fixed_helpers[i], leader_addr,
+                                          delta, worker_addr_out))
+      return true;
+
+  for (int i = 0; i < jit_direct_fns_count; i++)
+    if (pg_jitter_reloc_match_worker_addr(jit_direct_fns[i].jit_fn,
+                                          leader_addr, delta,
+                                          worker_addr_out))
+      return true;
+
+  return false;
 }
 
 /*
@@ -2342,10 +2761,10 @@ void *pg_jitter_exec_code_ptr(void *handle) {
  * x86_64: Scans for MOV r, imm64 (MOVABS) instructions — REX.W prefix
  * (0x48 or 0x49) followed by opcode 0xB8-0xBF with an 8-byte immediate.
  *
- * For each matched instruction, reconstructs the embedded 64-bit address.
- * If the address falls within a generous range around the leader's dylib
- * reference address, it's assumed to be a dylib function pointer and is
- * relocated by adding the delta between leader and worker addresses.
+ * For each matched instruction, reconstructs the embedded 64-bit address and
+ * relocates it only when it exactly matches a known pg_jitter helper address
+ * after applying the leader-to-worker ASLR delta.  This avoids depending on a
+ * dylib size/layout window as third-party integrations change provider size.
  *
  * Returns the number of addresses patched.
  */
@@ -2357,6 +2776,7 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   uint32_t *insns;
   int ninsns;
   int patched = 0;
+  bool unknown_call_target = false;
   int64 delta;
   Size alloc_size;
 
@@ -2422,28 +2842,30 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
     addr |= (uint64)((w2 >> 5) & 0xFFFF) << 32;
     addr |= (uint64)((w3 >> 5) & 0xFFFF) << 48;
 
-    /*
-     * Check if this address is within the dylib's address range.
-     * The dylib is ~512KB, so any function should be within ±512KB
-     * of the reference (pg_jitter_fallback_step).
-     */
-    int64 offset_from_ref = (int64)(addr - leader_ref_addr);
-
     /* Check what instruction follows the MOVZ+3×MOVK sequence */
     uint32_t w4 = (i + 4 < ninsns) ? insns[i + 4] : 0;
     bool is_blr = (w4 & 0xFFFFFC1F) == (0xD63F0000 | rd); /* BLR Xrd */
     bool is_br = (w4 & 0xFFFFFC1F) == (0xD61F0000 | rd);  /* BR Xrd */
+    uint64 new_addr = 0;
+    bool is_known_helper =
+        pg_jitter_reloc_lookup_known_helper(addr, delta, &new_addr);
 
     elog(DEBUG1,
          "pg_jitter: relocate scan insn[%d] rd=x%d addr=%lx "
-         "offset_from_ref=%ld next_insn=%08x is_call=%d",
-         i, rd, (unsigned long)addr, (long)offset_from_ref, w4,
-         (int)(is_blr || is_br));
+         "next_insn=%08x is_call=%d known_helper=%d",
+         i, rd, (unsigned long)addr, w4, (int)(is_blr || is_br),
+         (int)is_known_helper);
 
-    if (offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000) {
-      /* Relocate: add delta to get worker's address */
-      uint64 new_addr = addr + delta;
+    if ((is_blr || is_br) && !is_known_helper) {
+      elog(WARNING,
+           "pg_jitter: shared code contains unrelocatable ARM64 call target "
+           "insn[%d] rd=x%d addr=%lx",
+           i, rd, (unsigned long)addr);
+      unknown_call_target = true;
+      continue;
+    }
 
+    if ((is_blr || is_br) && is_known_helper) {
       elog(DEBUG1,
            "pg_jitter: relocate PATCH insn[%d] rd=x%d "
            "old=%lx new=%lx delta=%ld",
@@ -2480,11 +2902,12 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   }
 #endif
 
-  return patched;
+  return unknown_call_target ? -1 : patched;
 #elif defined(__x86_64__) || defined(_M_X64)
   ExecMemInfo *info = (ExecMemInfo *)handle;
   uint8_t *bytes;
   int patched = 0;
+  bool unknown_call_target = false;
   int64 delta;
   Size alloc_size;
 
@@ -2501,7 +2924,7 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
    */
   if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_WRITE) != 0) {
     elog(WARNING, "pg_jitter: relocate mprotect(RW) failed: %m");
-    return 0;
+    return -1;
   }
 
   /*
@@ -2528,23 +2951,32 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 
     /* Extract 8-byte little-endian immediate from bytes[i+2..i+9] */
     uint64 addr;
+    int reg = (opc & 7) | ((rex & 1) ? 8 : 0);
+    bool is_call_or_jump =
+        pg_jitter_x86_movabs_followed_by_indirect_branch(bytes, code_size,
+                                                         i + 10, reg);
     memcpy(&addr, &bytes[i + 2], sizeof(uint64));
 
-    /*
-     * Check if this address is within the dylib's address range.
-     * Same heuristic as ARM64: ±512KB of the reference address.
-     */
-    int64 offset_from_ref = (int64)(addr - leader_ref_addr);
+    uint64 new_addr = 0;
+    bool is_known_helper =
+        pg_jitter_reloc_lookup_known_helper(addr, delta, &new_addr);
 
     elog(DEBUG1,
          "pg_jitter: relocate scan byte[%zu] rex=0x%02x opc=0x%02x "
-         "addr=%lx offset_from_ref=%ld",
-         i, rex, opc, (unsigned long)addr, (long)offset_from_ref);
+         "addr=%lx is_call=%d known_helper=%d",
+         i, rex, opc, (unsigned long)addr, (int)is_call_or_jump,
+         (int)is_known_helper);
 
-    if (offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000) {
-      /* Relocate: add delta to get worker's address */
-      uint64 new_addr = addr + delta;
+    if (is_call_or_jump && !is_known_helper) {
+      elog(WARNING,
+           "pg_jitter: shared code contains unrelocatable x86_64 call target "
+           "byte[%zu] addr=%lx",
+           i, (unsigned long)addr);
+      unknown_call_target = true;
+      continue;
+    }
 
+    if (is_call_or_jump && is_known_helper) {
       elog(DEBUG1,
            "pg_jitter: relocate PATCH byte[%zu] "
            "old=%lx new=%lx delta=%ld",
@@ -2559,12 +2991,14 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   }
 
   /* Restore executable permission */
-  if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_EXEC) != 0)
+  if (mprotect(info->code_ptr, alloc_size, PROT_READ | PROT_EXEC) != 0) {
     elog(WARNING, "pg_jitter: relocate mprotect(RX) failed: %m");
+    return -1;
+  }
 
   /* No I-cache flush needed on x86_64 (coherent I-cache) */
 
-  return patched;
+  return unknown_call_target ? -1 : patched;
 #else
   /* Unsupported architecture */
   return 0;
@@ -2852,9 +3286,8 @@ pg_jitter_collation_is_c(Oid collid)
 /*
  * pg_jitter_collation_is_deterministic — check if collation is deterministic.
  *
- * LIKE and regex matching in PostgreSQL are byte-level operations that produce
- * correct results for any deterministic collation. This is used to gate the
- * StringZilla/PCRE2 LIKE/regex fast paths, which are also byte-level.
+ * This is used to gate bytewise StringZilla text/LIKE fast paths.  PCRE2 has
+ * its own encoding/collation eligibility gate before it compiles a pattern.
  */
 bool
 pg_jitter_collation_is_deterministic(Oid collid)
@@ -2887,6 +3320,106 @@ pg_jitter_collation_is_deterministic(Oid collid)
 #endif
   cached_collid = collid;
   return cached_result;
+}
+
+bool
+pg_jitter_classify_text_pattern_fn(PGFunction fn, Oid fn_oid,
+                                   bool *is_like, bool *is_ilike,
+                                   bool *is_regex, bool *is_iregex,
+                                   bool *negate)
+{
+  bool like = false;
+  bool ilike = false;
+  bool regex = false;
+  bool iregex = false;
+  bool neg = false;
+
+  switch (fn_oid) {
+    case F_TEXTLIKE:
+      like = true;
+      break;
+    case F_TEXTNLIKE:
+      like = true;
+      neg = true;
+      break;
+    case F_TEXTICLIKE:
+      ilike = true;
+      break;
+    case F_TEXTICNLIKE:
+      ilike = true;
+      neg = true;
+      break;
+    case F_TEXTREGEXEQ:
+      regex = true;
+      break;
+    case F_TEXTREGEXNE:
+      regex = true;
+      neg = true;
+      break;
+    case F_TEXTICREGEXEQ:
+      iregex = true;
+      break;
+    case F_TEXTICREGEXNE:
+      iregex = true;
+      neg = true;
+      break;
+    default:
+      if (fn == textlike || fn == textnlike) {
+        like = true;
+        neg = (fn == textnlike);
+      } else if (fn == texticlike || fn == texticnlike) {
+        ilike = true;
+        neg = (fn == texticnlike);
+      } else if (fn == textregexeq || fn == textregexne) {
+        regex = true;
+        neg = (fn == textregexne);
+      } else if (fn == texticregexeq || fn == texticregexne) {
+        iregex = true;
+        neg = (fn == texticregexne);
+      } else {
+        return false;
+      }
+      break;
+  }
+
+  if (is_like != NULL)
+    *is_like = like;
+  if (is_ilike != NULL)
+    *is_ilike = ilike;
+  if (is_regex != NULL)
+    *is_regex = regex;
+  if (is_iregex != NULL)
+    *is_iregex = iregex;
+  if (negate != NULL)
+    *negate = neg;
+  return true;
+}
+
+bool
+pg_jitter_resolve_constant_func_arg(ExprState *state, int opno,
+                                    FunctionCallInfo fcinfo, int argno,
+                                    Datum *value, bool *isnull)
+{
+  ExprEvalStep *steps;
+
+  if (state == NULL || fcinfo == NULL || argno < 0 || argno >= fcinfo->nargs ||
+      value == NULL || isnull == NULL)
+    return false;
+
+  steps = state->steps;
+  for (int j = opno - 1; j >= 0; j--) {
+    if (steps[j].resvalue == &fcinfo->args[argno].value) {
+      if (ExecEvalStepOp(state, &steps[j]) != EEOP_CONST)
+        return false;
+      *value = steps[j].d.constval.value;
+      *isnull = steps[j].d.constval.isnull;
+      return true;
+    }
+  }
+
+  *value = fcinfo->args[argno].value;
+  *isnull = fcinfo->args[argno].isnull;
+  return true;
 }
 
 /* ----------------------------------------------------------------
@@ -2951,7 +3484,8 @@ add_cmp_group(CmpClassEntry *e, int *n,
 static void
 build_cmp_class_table(void)
 {
-  CmpClassEntry *e = malloc(sizeof(CmpClassEntry) * 128);
+  CmpClassEntry *e = MemoryContextAlloc(TopMemoryContext,
+                                        sizeof(CmpClassEntry) * 128);
   int n = 0;
 
   /* --- Tier 1: byval types --- */
@@ -3243,7 +3777,44 @@ cmp_threshold_result_text_memcmp(const void *a, const void *b)
   int cmp = memcmp(VARDATA_ANY(t1), VARDATA_ANY(t2), minlen);
   if (cmp == 0)
     cmp = (len1 > len2) - (len1 < len2);
+  PG_JITTER_FREE_IF_COPY(t1, da);
+  PG_JITTER_FREE_IF_COPY(t2, db);
   return cmp;
+}
+
+static bool
+case_bsearch_generic_eq_can_memcmp(const CaseBSearchDesc *desc)
+{
+  pg_locale_t locale;
+  bool deterministic;
+
+  if (desc->cmp_fn != (PGFunction)texteq)
+    return false;
+
+  if (!OidIsValid(desc->cmp_collation) ||
+      desc->cmp_collation == C_COLLATION_OID)
+    return false;
+
+  locale = pg_newlocale_from_collation(desc->cmp_collation);
+  deterministic = (locale == NULL) ? true : locale->deterministic;
+
+  return deterministic && !pg_jitter_collation_is_c(desc->cmp_collation);
+}
+
+static bool
+case_range_upper_sentinel_representable(CaseBSearchType bs_type, Datum upper)
+{
+  switch (bs_type)
+  {
+    case CASE_BS_I16:
+      return DatumGetInt32(upper) <= PG_INT16_MAX;
+    case CASE_BS_I32:
+      return DatumGetInt32(upper) < PG_INT32_MAX;
+    case CASE_BS_I64:
+      return DatumGetInt64(upper) < PG_INT64_MAX;
+    default:
+      return false;
+  }
 }
 
 /*
@@ -3439,6 +4010,7 @@ pg_jitter_detect_case_bsearch(ExprState *state,
     /* Check for ELSE: step at j should be EEOP_CONST (the ELSE result) */
     {
       int else_start = j;
+      ExprEvalOp else_op;
 
       if (else_start >= steps_len)
       {
@@ -3446,8 +4018,8 @@ pg_jitter_detect_case_bsearch(ExprState *state,
         continue;
       }
 
-      ExprEvalOp else_op = ExecEvalStepOp(state, &steps[else_start]);
-      if (else_op != EEOP_CONST)
+      else_op = ExecEvalStepOp(state, &steps[else_start]);
+      if (else_op != EEOP_CONST || steps[else_start].d.constval.isnull)
       {
         i++;
         continue;
@@ -3652,11 +4224,20 @@ pg_jitter_detect_case_bsearch(ExprState *state,
         /* Copy thresholds from fcinfo->args[1].value */
         switch (bs_type)
         {
-          case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16:
+          case CASE_BS_I32: case CASE_BS_U32:
           {
             int32 *thresh = (int32 *)ptr;
             for (int k = 0; k < branch_count; k++)
               thresh[k] = DatumGetInt32(
+                steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value);
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          case CASE_BS_I16:
+          {
+            int32 *thresh = (int32 *)ptr;
+            for (int k = 0; k < branch_count; k++)
+              thresh[k] = (int16)DatumGetInt32(
                 steps[i + k * STRIDE + 1].d.func.fcinfo_data->args[1].value);
             cbi->thresholds = (Datum *)thresh;
             break;
@@ -3741,7 +4322,24 @@ pg_jitter_detect_case_bsearch(ExprState *state,
 
           if (cmp_func)
           {
+            bool duplicate_threshold = false;
+
             qsort(pairs, branch_count, sizeof(ThresholdResult), cmp_func);
+            for (int k = 1; k < branch_count; k++)
+            {
+              if (cmp_func(&pairs[k - 1], &pairs[k]) == 0)
+              {
+                duplicate_threshold = true;
+                break;
+              }
+            }
+            if (duplicate_threshold)
+            {
+              pfree(pairs);
+              pfree(desc);
+              i = j;
+              continue;
+            }
 
             for (int k = 0; k < branch_count; k++)
             {
@@ -3771,26 +4369,27 @@ pg_jitter_detect_case_bsearch(ExprState *state,
         if (is_equality && bs_type == CASE_BS_GENERIC && desc->cmp_order_fn != NULL)
         {
           ThresholdResult *pairs = palloc(sizeof(ThresholdResult) * branch_count);
+          bool duplicate_threshold = false;
+
           for (int k = 0; k < branch_count; k++)
           {
             pairs[k].threshold = ((Datum *)cbi->thresholds)[k];
             pairs[k].result = cbi->results[k];
           }
 
-          bool use_memcmp_sort = false;
-          if (OidIsValid(desc->cmp_collation) &&
-              desc->cmp_collation != C_COLLATION_OID)
-          {
-            pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-            bool deterministic = (locale == NULL) ? true : locale->deterministic;
-            if (deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
-              use_memcmp_sort = true;
-          }
-
-          if (use_memcmp_sort)
+          if (case_bsearch_generic_eq_can_memcmp(desc))
           {
             qsort(pairs, branch_count, sizeof(ThresholdResult),
                   cmp_threshold_result_text_memcmp);
+            for (int k = 1; k < branch_count; k++)
+            {
+              if (cmp_threshold_result_text_memcmp(&pairs[k - 1],
+                                                   &pairs[k]) == 0)
+              {
+                duplicate_threshold = true;
+                break;
+              }
+            }
           }
           else
           {
@@ -3799,6 +4398,22 @@ pg_jitter_detect_case_bsearch(ExprState *state,
             cmp_ctx.collation = desc->cmp_collation;
             qsort_arg(pairs, branch_count, sizeof(ThresholdResult),
                       cmp_threshold_result_generic, &cmp_ctx);
+            for (int k = 1; k < branch_count; k++)
+            {
+              if (cmp_threshold_result_generic(&pairs[k - 1],
+                                               &pairs[k], &cmp_ctx) == 0)
+              {
+                duplicate_threshold = true;
+                break;
+              }
+            }
+          }
+          if (duplicate_threshold)
+          {
+            pfree(pairs);
+            pfree(desc);
+            i = j;
+            continue;
           }
 
           for (int k = 0; k < branch_count; k++)
@@ -3984,13 +4599,41 @@ pg_jitter_detect_case_bsearch(ExprState *state,
           case CASE_BS_I16: hi = (int16)DatumGetInt32(high_k); lo = (int16)DatumGetInt32(low_next); break;
           default: contiguous = false; continue;
         }
+        if (upper_inclusive &&
+            !case_range_upper_sentinel_representable(bs_type, high_k))
+        {
+          contiguous = false;
+          break;
+        }
         if ((upper_inclusive ? hi + 1 : hi) != lo) contiguous = false;
       }
 
       if (!contiguous) { i = j; continue; }
 
-      /* Check for ELSE at j */
-      if (j >= steps_len) { i++; continue; }
+      if (upper_inclusive)
+      {
+        for (int k = 0; k < branch_count && contiguous; k++)
+        {
+          int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+          Datum upper =
+              steps[upper_step].d.func.fcinfo_data->args[1].value;
+
+          if (!case_range_upper_sentinel_representable(bs_type, upper))
+            contiguous = false;
+        }
+      }
+
+      if (!contiguous) { i = j; continue; }
+
+      /* Check for a non-null CONST ELSE at j. The value-returning helper
+       * has no side channel for NULLs or arbitrary ELSE expression steps. */
+      if (j >= steps_len ||
+          ExecEvalStepOp(state, &steps[j]) != EEOP_CONST ||
+          steps[j].d.constval.isnull)
+      {
+        i = j;
+        continue;
+      }
 
       /* Build CaseBSearchInfo — store branch indices in results */
       {
@@ -4037,11 +4680,22 @@ pg_jitter_detect_case_bsearch(ExprState *state,
         /* Extract upper boundaries */
         switch (bs_type)
         {
-          case CASE_BS_I32: case CASE_BS_U32: case CASE_BS_I16: {
+          case CASE_BS_I32: case CASE_BS_U32: {
             int32 *thresh = (int32 *)ptr;
             for (int k = 0; k < branch_count; k++) {
               int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
               int32 v = DatumGetInt32(steps[upper_step].d.func.fcinfo_data->args[1].value);
+              thresh[k] = upper_inclusive ? v + 1 : v;
+            }
+            cbi->thresholds = (Datum *)thresh;
+            break;
+          }
+          case CASE_BS_I16: {
+            int32 *thresh = (int32 *)ptr;
+            for (int k = 0; k < branch_count; k++) {
+              int upper_step = then_steps[k] - RANGE_WHEN_LEN + 4;
+              int32 v = (int16)DatumGetInt32(
+                  steps[upper_step].d.func.fcinfo_data->args[1].value);
               thresh[k] = upper_inclusive ? v + 1 : v;
             }
             cbi->thresholds = (Datum *)thresh;
@@ -4420,11 +5074,14 @@ pg_jitter_case_bsearch_eq_u32(int32 val, const CaseBSearchDesc *desc)
 #define BSEARCH_BODY_I16(OP) \
   const int32 *thresholds = BSEARCH_THRESH_I32(desc); \
   const Datum *results = BSEARCH_RESULTS_I32(desc); \
+  int16 v = (int16)val; \
   int n = desc->n; \
+  if (desc->has_range_min && v < (int16)DatumGetInt32(desc->range_min)) \
+    return desc->default_val; \
   int lo = 0, hi = n; \
   while (lo < hi) { \
     int mid = lo + (hi - lo) / 2; \
-    if ((int16)val OP (int16)thresholds[mid]) hi = mid; \
+    if ((int32)v OP thresholds[mid]) hi = mid; \
     else lo = mid + 1; \
   } \
   return lo < n ? results[lo] : desc->default_val;
@@ -4443,9 +5100,9 @@ pg_jitter_case_bsearch_eq_i16(int32 val, const CaseBSearchDesc *desc)
   while (lo <= hi)
   {
     int mid = lo + (hi - lo) / 2;
-    if ((int16)sorted_vals[mid] == (int16)val)
+    if (sorted_vals[mid] == (int16)val)
       return results[mid];
-    else if ((int16)sorted_vals[mid] < (int16)val)
+    else if (sorted_vals[mid] < (int16)val)
       lo = mid + 1;
     else
       hi = mid - 1;
@@ -4596,27 +5253,7 @@ pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc *desc)
 
   if (desc->cmp_order_fn != NULL)
   {
-    bool use_memcmp = false;
-
-    /*
-     * For deterministic non-C collations, the _lt ordering function uses
-     * pg_strncoll (very expensive).  Since we only need to find an equal
-     * element, any consistent total order works — use memcmp instead.
-     * Thresholds are pre-sorted by memcmp at setup time for this case.
-     */
-    if (OidIsValid(desc->cmp_collation) &&
-        desc->cmp_collation != C_COLLATION_OID)
-    {
-      pg_locale_t locale = pg_newlocale_from_collation(desc->cmp_collation);
-      /*
-       * PG14-17: pg_newlocale_from_collation() returns NULL for the
-       * default libc collation.  NULL means deterministic (byte-equal).
-       * PG18+ always returns a valid locale struct.
-       */
-      bool deterministic = (locale == NULL) ? true : locale->deterministic;
-      if (deterministic && !pg_jitter_collation_is_c(desc->cmp_collation))
-        use_memcmp = true;
-    }
+    bool use_memcmp = case_bsearch_generic_eq_can_memcmp(desc);
 
     /* Binary search: thresholds are sorted ascending */
     int lo = 0, hi = desc->n - 1;
@@ -5275,6 +5912,11 @@ pg_jitter_setup_shared_in_hash(ExprState *state,
                                 ExprEvalStep *steps, int steps_len)
 {
 #if PG_VERSION_NUM >= 150000
+  PgJitterContext *ctx = NULL;
+
+  if (state && state->parent && state->parent->state->es_jit)
+    ctx = (PgJitterContext *)state->parent->state->es_jit;
+
   for (int i = 0; i < steps_len; i++)
   {
     ExprEvalStep *op = &steps[i];
@@ -5296,123 +5938,13 @@ pg_jitter_setup_shared_in_hash(ExprState *state,
     if (arrayconst->constisnull)
       continue;
 
-    ArrayType *arr = DatumGetArrayTypeP(arrayconst->constvalue);
-    if (ARR_ELEMTYPE(arr) != TEXTOID)
-      continue;
+    Datum array_datum = arrayconst->constvalue;
+    TextHashTable *tht;
 
-    int nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
-    if (nitems <= 0 || nitems > 16384)
-      continue;
-
-    if (!pg_jitter_collation_is_deterministic(fcinfo->fncollation))
-      continue;
-
-    /* Extract text values from array */
-    int16 typlen;
-    bool typbyval;
-    char typalign;
-    get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
-
-    bits8 *bitmap = ARR_NULLBITMAP(arr);
-    char *s = (char *)ARR_DATA_PTR(arr);
-    int bitmask = 1;
-    Datum *text_vals = palloc(nitems * sizeof(Datum));
-    int nvals = 0;
-    bool has_nulls = false;
-
-    for (int k = 0; k < nitems; k++)
-    {
-      if (bitmap && (*bitmap & bitmask) == 0)
-      {
-        has_nulls = true;
-      }
-      else
-      {
-        text_vals[nvals++] = fetch_att(s, false, typlen);
-        s = att_addlength_pointer(s, typlen, s);
-        s = (char *)att_align_nominal(s, typalign);
-      }
-
-      if (bitmap)
-      {
-        bitmask <<= 1;
-        if (bitmask == 0x100)
-        {
-          bitmap++;
-          bitmask = 1;
-        }
-      }
-    }
-
-    if (nvals > 0)
-    {
-      TextHashTable *tht = text_hash_build(text_vals, nvals, has_nulls);
+    tht = text_hash_build_from_array(array_datum, op, fcinfo, NULL, ctx);
+    if (tht != NULL)
       fcinfo->args[1].value = PointerGetDatum(tht);
-    }
-    pfree(text_vals);
   }
-
-  /*
-   * Also rebuild PCRE2 cache entries for LIKE/regex patterns.
-   * Workers need their own process-local Pcre2CacheEntry in
-   * fcinfo->flinfo->fn_extra.
-   */
-#ifdef PG_JITTER_HAVE_PCRE2
-  for (int i = 0; i < steps_len; i++)
-  {
-    ExprEvalStep *op = &steps[i];
-    ExprEvalOp opc = op->opcode;
-
-    if (opc != EEOP_FUNCEXPR_STRICT
-#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
-        && opc != EEOP_FUNCEXPR_STRICT_1
-        && opc != EEOP_FUNCEXPR_STRICT_2
-#endif
-        && opc != EEOP_FUNCEXPR)
-      continue;
-
-    FunctionCallInfo fcinfo2 = op->d.func.fcinfo_data;
-    if (fcinfo2->nargs != 2)
-      continue;
-
-    PGFunction fn = op->d.func.fn_addr;
-    bool is_like = (fn == textlike || fn == textnlike ||
-                    fn == texticlike || fn == texticnlike);
-    bool is_regex = (fn == textregexeq || fn == textregexne ||
-                     fn == texticregexeq || fn == texticregexne);
-
-    if (!is_like && !is_regex)
-      continue;
-
-    /* Check for constant pattern (same logic as JIT compile time) */
-    bool pat_const = true;
-    for (int j = i - 1; j >= 0; j--)
-    {
-      if (steps[j].resvalue == &fcinfo2->args[1].value)
-      {
-        pat_const = (steps[j].opcode == EEOP_CONST);
-        break;
-      }
-    }
-
-    if (!pat_const || fcinfo2->args[1].isnull)
-      continue;
-    if (!pg_jitter_collation_is_deterministic(fcinfo2->fncollation))
-      continue;
-
-    text *pat_text = DatumGetTextPP(fcinfo2->args[1].value);
-    char *pat_str = VARDATA_ANY(pat_text);
-    int pat_len = VARSIZE_ANY_EXHDR(pat_text);
-    bool case_insens = (fn == texticlike || fn == texticnlike ||
-                        fn == texticregexeq || fn == texticregexne);
-
-    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
-        pat_str, pat_len, is_like, case_insens);
-
-    if (pe)
-      fcinfo2->flinfo->fn_extra = pe;
-  }
-#endif /* PG_JITTER_HAVE_PCRE2 */
 
 #endif /* PG_VERSION_NUM >= 150000 */
 }

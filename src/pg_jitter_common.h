@@ -26,10 +26,21 @@ extern bool pg_jitter_collation_is_c(Oid collid);
 
 /*
  * pg_jitter_collation_is_deterministic — check if a collation is deterministic.
- * LIKE/regex matching is byte-level and safe for any deterministic collation.
- * Used to gate StringZilla/PCRE2 LIKE/regex fast paths.
+ * Used to gate bytewise StringZilla text/LIKE fast paths.  PCRE2 has an
+ * additional encoding/collation eligibility gate in pg_jitter_pcre2.c.
  */
 extern bool pg_jitter_collation_is_deterministic(Oid collid);
+
+extern bool pg_jitter_classify_text_pattern_fn(PGFunction fn, Oid fn_oid,
+                                                bool *is_like,
+                                                bool *is_ilike,
+                                                bool *is_regex,
+                                                bool *is_iregex,
+                                                bool *negate);
+extern bool pg_jitter_resolve_constant_func_arg(ExprState *state, int opno,
+                                                 FunctionCallInfo fcinfo,
+                                                 int argno, Datum *value,
+                                                 bool *isnull);
 
 /*
  * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
@@ -120,6 +131,9 @@ typedef struct PgJitterContext
 
 	/* DSM-based shared code state for parallel queries */
 	JitShareState	share_state;
+
+	/* Query-lifetime helper allocations embedded in generated code */
+	MemoryContext	aux_context;
 } PgJitterContext;
 
 /* Get-or-create a PgJitterContext from the EState */
@@ -129,6 +143,11 @@ extern PgJitterContext *pg_jitter_get_context(ExprState *state);
 extern void pg_jitter_register_compiled(PgJitterContext *ctx,
 										void (*free_fn)(void *),
 										void *data);
+extern void pg_jitter_register_compiled_or_free(PgJitterContext *ctx,
+												void (*free_fn)(void *),
+												void *data);
+extern void *pg_jitter_context_alloc(PgJitterContext *ctx, Size size);
+extern void *pg_jitter_context_alloc_zero(PgJitterContext *ctx, Size size);
 
 /*
  * Windows x64 unwind table registration for JIT code.
@@ -227,6 +246,9 @@ extern void *pg_jitter_copy_to_executable(const void *code_bytes,
 /* Free executable memory allocated by pg_jitter_copy_to_executable. */
 extern void pg_jitter_exec_free(void *ptr);
 
+/* Register copied executable memory, freeing it if registration throws. */
+extern void pg_jitter_register_exec_handle(PgJitterContext *ctx, void *handle);
+
 /* Get the executable code pointer from a handle returned by pg_jitter_copy_to_executable. */
 extern void *pg_jitter_exec_code_ptr(void *handle);
 
@@ -237,10 +259,10 @@ extern void *pg_jitter_exec_code_ptr(void *handle);
  * addresses pointing into pg_jitter_sljit.dylib are WRONG in the worker
  * because the dylib loads at a different ASLR base address.
  *
- * This function scans ARM64 MOVZ+3xMOVK sequences in the code, identifies
- * addresses in the leader's dylib range, and patches them to the worker's
- * addresses using the delta between leader_ref_addr and worker_ref_addr
- * (both pg_jitter_fallback_step addresses).
+ * This function scans absolute call targets in the code, identifies exact
+ * known pg_jitter helper addresses from the leader process, and patches them
+ * to the worker's addresses using the delta between leader_ref_addr and
+ * worker_ref_addr (both pg_jitter_fallback_step addresses).
  *
  * Must be called AFTER pg_jitter_copy_to_executable and BEFORE the code runs.
  * The handle must point to a writable+executable MAP_JIT region.
@@ -323,6 +345,10 @@ extern int pg_jitter_get_parallel_mode(void);
 extern int pg_jitter_get_min_expr_steps(void);
 extern bool pg_jitter_get_deform_avx512(void);
 extern int pg_jitter_get_deform_avx512_min_cols(void);
+extern bool pg_jitter_in_raw_datum_bsearch_safe(PGFunction fn);
+extern bool pg_jitter_in_int32_hash_safe(PGFunction fn);
+extern bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
+											  FunctionCallInfo fcinfo);
 
 /*
  * Loop-based deform for wide tables.
@@ -372,7 +398,7 @@ extern void *pg_jitter_compile_deform_loop(TupleDesc desc,
 										   struct sljit_generate_code_buffer *gen_buf);
 extern void pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot,
 											   int natts);
-extern void pg_jitter_deform_dispatch_reset_fastpath(void);
+extern PG_JITTER_EXPORT void pg_jitter_deform_dispatch_reset_fastpath(void);
 
 /*
  * Shared deform for parallel I-cache sharing.
@@ -545,13 +571,12 @@ extern Datum pg_jitter_case_bsearch_eq_generic(Datum val, const CaseBSearchDesc 
 extern void *pg_jitter_select_bsearch_helper(const CaseBSearchInfo *cbi);
 
 /*
- * Shared-mode setup for IN-list hash tables and PCRE2 patterns.
+ * Shared-mode setup for IN-list hash tables.
  *
  * Called by both leader (during compilation) and workers (after DSM
  * attachment). Scans expression steps for HASHED_SCALARARRAYOP with
  * text arrays and builds process-local TextHashTable, storing the
- * pointer in fcinfo->args[1].value. Also rebuilds PCRE2 cache
- * entries for any regex/LIKE patterns used in the expression.
+ * pointer in fcinfo->args[1].value.
  */
 extern void pg_jitter_setup_shared_in_hash(ExprState *state,
                                             ExprEvalStep *steps,

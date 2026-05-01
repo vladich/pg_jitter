@@ -127,8 +127,8 @@ When CASE binary search is active, the linear WHEN-condition steps are dead code
 ### Build System
 
 - CMake extracts `PG_VERSION_NUM` from `pg_config --version` for feature gating
-- `PG_JITTER_HAVE_SIMDJSON` + `PG_VERSION_NUM >= 160000` guards for IS JSON support
-- Separate `-Wl,-u` linker flags for PG14/15 (no `pg_jitter_sj_is_json_datum`)
+- `PG_JITTER_HAVE_YYJSON` + `PG_VERSION_NUM >= 160000` guards for IS JSON support
+- Separate `-Wl,-u` linker flags for PG14/15 (no `pg_jitter_yj_is_json_datum`)
 
 ## Regression Testing
 

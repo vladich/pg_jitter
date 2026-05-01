@@ -19,6 +19,7 @@
 #   --md FILE          Markdown output file (default: BENCHMARKS.md in repo root)
 #   --no-md            Skip BENCHMARKS.md generation
 set -e
+trap 'echo "ERROR: bench_comprehensive.sh failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -111,7 +112,7 @@ detect_dlsuffix() {
 }
 
 ensure_pg_running() {
-    if ! "$PGBIN/pg_isready" -p "$PGPORT" -q 2>/dev/null; then
+    if ! "$PGBIN/pg_isready" -p "$PGPORT" -d "$PGDB" -q 2>/dev/null; then
         echo " (server down, restarting)"
         if [ -n "$PGDATA" ]; then
             "$PGCTL" -D "$PGDATA" stop -m immediate 2>/dev/null || true
@@ -365,10 +366,18 @@ SECTION_NAMES=()
 add_section() { SECTIONS+=("${#LABELS[@]}:$1"); SECTION_NAMES+=("$1"); }
 add_query() { LABELS+=("$1"); QUERIES+=("$2"); }
 
-IN_LIST_128="$(seq -s, 1 128)"
-IN_LIST_4096="$(seq -s, 1 4096)"
-IN_LIST_4097="$(seq -s, 1 4097)"
-IN_LIST_5000="$(seq -s, 1 5000)"
+make_in_list() {
+    python3 - "$1" <<'PY'
+import sys
+n = int(sys.argv[1])
+print(",".join(str(i) for i in range(1, n + 1)))
+PY
+}
+
+IN_LIST_128="$(make_in_list 128)"
+IN_LIST_4096="$(make_in_list 4096)"
+IN_LIST_4097="$(make_in_list 4097)"
+IN_LIST_5000="$(make_in_list 5000)"
 IN_LIST_5000_NULL="NULL,$IN_LIST_5000"
 
 # --- Basic Aggregation ---
@@ -667,13 +676,16 @@ if [ "$MD_ONLY" -eq 0 ]; then
 # ================================================================
 prewarm_tables() {
     echo -n "  Prewarming buffer cache..."
-    psql_cmd -q -c "
+    if psql_cmd -q -c "
 CREATE EXTENSION IF NOT EXISTS pg_prewarm;
 SELECT pg_prewarm(c.oid::regclass, 'buffer')
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'i');
-" > /dev/null 2>&1
-    echo " done."
+" > /dev/null 2>&1; then
+        echo " done."
+    else
+        echo " skipped (pg_prewarm unavailable)."
+    fi
 }
 prewarm_tables
 
@@ -738,17 +750,14 @@ run_one_benchmark() {
     local exec_times=()
     for r in $(seq 1 "$NRUNS"); do
         local t
-        t=$(get_exec_time "$query" "$jit_on" "$backend")
-        exec_times+=("$t")
+        t=$(get_exec_time "$query" "$jit_on" "$backend" || true)
+        if [ -n "$t" ]; then
+            exec_times+=("$t")
+        fi
     done
 
     # Check for crash
-    local all_empty=1
-    for t in "${exec_times[@]}"; do
-        [ -n "$t" ] && all_empty=0
-    done
-
-    if [ "$all_empty" -eq 1 ]; then
+    if [ "${#exec_times[@]}" -eq 0 ]; then
         echo "${label},$bname,CRASH,0,0,0,0,0" >> "$CSV_FILE"
         crash_counts[$bi]=$((crash_count + 1))
         ensure_pg_running

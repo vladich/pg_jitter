@@ -74,6 +74,22 @@ jobs:
           repository: ashvardanian/StringZilla
           path: deps/stringzilla
 
+      # ---- yyjson (PostgreSQL JSON syntax helpers) ----
+      - name: Clone yyjson
+        if: runner.os != 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: ibireme/yyjson
+          ref: f0fbeae7cc40218fd1af310391cdf83cfc1abff1
+          path: deps/yyjson
+
+      - name: Patch yyjson
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          git -C deps/yyjson apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/yyjson-pg-jitter.patch"
+          git -C deps/yyjson diff --check
+
       # ---- PCRE2 (Unicode-aware regex/LIKE with JIT) ----
       - name: Clone PCRE2
         if: runner.os != 'Windows'
@@ -149,6 +165,7 @@ jobs:
           EXTRA_ARGS="$EXTRA_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
           EXTRA_ARGS="$EXTRA_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
           EXTRA_ARGS="$EXTRA_ARGS -DPCRE2_DIR=${{ github.workspace }}/deps/pcre2"
+          EXTRA_ARGS="$EXTRA_ARGS -DYYJSON_DIR=${{ github.workspace }}/deps/yyjson"
           if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
             EXTRA_ARGS="$EXTRA_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
           fi
