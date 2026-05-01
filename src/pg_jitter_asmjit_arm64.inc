@@ -2072,40 +2072,38 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				if (!asmjit_shared_code_mode)
 				{
 					PGFunction fn = op->d.func.fn_addr;
-					bool is_like_fn = (fn == textlike || fn == textnlike);
-					bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
-					bool is_regex_fn = (fn == textregexeq || fn == textregexne);
-					bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
-					bool vs_negate = (fn == textnlike || fn == texticnlike ||
-									  fn == textregexne || fn == texticregexne);
+					Oid fn_oid = (fcinfo != NULL && fcinfo->flinfo != NULL)
+						? fcinfo->flinfo->fn_oid
+						: InvalidOid;
+					bool is_like_fn = false;
+					bool is_ilike_fn = false;
+					bool is_regex_fn = false;
+					bool is_iregex_fn = false;
+					bool vs_negate = false;
+					Oid pattern_collid = fcinfo->fncollation == InvalidOid
+						? DEFAULT_COLLATION_OID
+						: fcinfo->fncollation;
 
-					if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+					if (pg_jitter_classify_text_pattern_fn(fn, fn_oid,
+														  &is_like_fn,
+														  &is_ilike_fn,
+														  &is_regex_fn,
+														  &is_iregex_fn,
+														  &vs_negate) &&
 						fcinfo->nargs == 2)
 					{
-						/*
-						 * Check if args[1] (the pattern) is a compile-time constant.
-						 * PG's ExecInitFunc directly assigns Const values into
-						 * fcinfo->args[argno] without generating an EEOP_CONST step.
-						 * So if no step writes to args[1], it was pre-initialized
-						 * from a Const node — treat it as constant.
-						 */
-							bool pat_const = true;
-							for (int j = opno - 1; j >= 0; j--)
-							{
-								if (steps[j].resvalue == &fcinfo->args[1].value)
-								{
-									pat_const = (steps[j].opcode == EEOP_CONST);
-									break;
-								}
-							}
+							Datum pat_datum = (Datum) 0;
+							bool pat_isnull = true;
 
 							bool like_byte_search_ok =
-								simd_like_byte_search_is_eligible(fcinfo->fncollation);
+								simd_like_byte_search_is_eligible(pattern_collid);
 
-							if (pat_const && !fcinfo->args[1].isnull &&
+							if (pg_jitter_resolve_constant_func_arg(
+									state, opno, fcinfo, 1, &pat_datum,
+									&pat_isnull) &&
+								!pat_isnull &&
 								like_byte_search_ok)
 						{
-							Datum pat_datum = fcinfo->args[1].value;
 							text *pat_text = DatumGetTextPP(pat_datum);
 							char *pat_str = VARDATA_ANY(pat_text);
 							int pat_len = VARSIZE_ANY_EXHDR(pat_text);
@@ -2262,7 +2260,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								bool case_insens = is_ilike_fn || is_iregex_fn;
 								Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
 									ctx, pat_str, pat_len, is_like, case_insens,
-									fcinfo->fncollation);
+									pattern_collid);
 
 								if (pe)
 								{

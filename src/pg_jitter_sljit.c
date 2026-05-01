@@ -81,6 +81,40 @@ static const struct config_enum_entry parallel_jit_options[] = {
  */
 static bool sljit_shared_code_mode = false;
 
+static bool
+sljit_step_has_constant_text_pattern(ExprState *state, int opno)
+{
+  ExprEvalStep *step = &state->steps[opno];
+  FunctionCallInfo fcinfo;
+  Datum pat_datum;
+  bool pat_isnull;
+  Oid fn_oid = InvalidOid;
+
+  switch (ExecEvalStepOp(state, step)) {
+    case EEOP_FUNCEXPR:
+    case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+    case EEOP_FUNCEXPR_STRICT_1:
+    case EEOP_FUNCEXPR_STRICT_2:
+#endif
+      break;
+    default:
+      return false;
+  }
+
+  fcinfo = step->d.func.fcinfo_data;
+  if (fcinfo == NULL || fcinfo->nargs != 2)
+    return false;
+  if (fcinfo->flinfo != NULL)
+    fn_oid = fcinfo->flinfo->fn_oid;
+  if (!pg_jitter_classify_text_pattern_fn(step->d.func.fn_addr, fn_oid,
+                                          NULL, NULL, NULL, NULL, NULL))
+    return false;
+  return pg_jitter_resolve_constant_func_arg(state, opno, fcinfo, 1,
+                                             &pat_datum, &pat_isnull) &&
+         !pat_isnull;
+}
+
 /*
  * Per-compilation flag: when true, TIER 0 inline ops and SIMD text
  * comparison are enabled. Controlled by PGJIT_INLINE flag from PG's
@@ -723,6 +757,15 @@ static bool sljit_expr_allows_shared_code(ExprState *state) {
       case EEOP_RETURNINGEXPR:
 #endif
         return false;
+      case EEOP_FUNCEXPR:
+      case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+      case EEOP_FUNCEXPR_STRICT_1:
+      case EEOP_FUNCEXPR_STRICT_2:
+#endif
+        if (sljit_step_has_constant_text_pattern(state, i))
+          return false;
+        break;
       default:
         break;
     }
@@ -2913,13 +2956,16 @@ static bool sljit_compile_expr(ExprState *state) {
 #endif
         {
           PGFunction fn = steps[i].d.func.fn_addr;
+          FunctionCallInfo fcinfo = steps[i].d.func.fcinfo_data;
+          Oid fn_oid = (fcinfo != NULL && fcinfo->flinfo != NULL)
+                           ? fcinfo->flinfo->fn_oid
+                           : InvalidOid;
           if (jit_find_direct_fn(fn) != NULL)
             has_inlineable = true;
           /* Also check for text/regex/LIKE functions */
-          else if (fn == textlike || fn == textnlike ||
-                   fn == texticlike || fn == texticnlike ||
-                   fn == textregexeq || fn == textregexne ||
-                   fn == texticregexeq || fn == texticregexne)
+          else if (pg_jitter_classify_text_pattern_fn(fn, fn_oid,
+                                                       NULL, NULL, NULL, NULL,
+                                                       NULL))
             has_inlineable = true;
           break;
         }
@@ -4264,37 +4310,36 @@ no_shared_code_reuse:
              */
             if (!sljit_shared_code_mode) {
               PGFunction fn = op->d.func.fn_addr;
-              bool is_like_fn = (fn == textlike || fn == textnlike);
-              bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
-              bool is_regex_fn = (fn == textregexeq || fn == textregexne);
-              bool is_iregex_fn = (fn == texticregexeq || fn == texticregexne);
-              bool vs_negate = (fn == textnlike || fn == texticnlike ||
-                                fn == textregexne || fn == texticregexne);
+              Oid fn_oid = (fcinfo != NULL && fcinfo->flinfo != NULL)
+                               ? fcinfo->flinfo->fn_oid
+                               : InvalidOid;
+              bool is_like_fn = false;
+              bool is_ilike_fn = false;
+              bool is_regex_fn = false;
+              bool is_iregex_fn = false;
+              bool vs_negate = false;
+              Oid pattern_collid = fcinfo->fncollation == InvalidOid
+                                      ? DEFAULT_COLLATION_OID
+                                      : fcinfo->fncollation;
 
-              if ((is_like_fn || is_ilike_fn || is_regex_fn || is_iregex_fn) &&
+              if (pg_jitter_classify_text_pattern_fn(fn, fn_oid,
+                                                     &is_like_fn,
+                                                     &is_ilike_fn,
+                                                     &is_regex_fn,
+                                                     &is_iregex_fn,
+                                                     &vs_negate) &&
                   fcinfo->nargs == 2) {
-                /*
-                 * Check if args[1] (the pattern) is a compile-time constant.
-                 * PG's ExecInitFunc directly assigns Const values into
-                 * fcinfo->args[argno] without generating an EEOP_CONST step.
-                 * So if no step writes to args[1], it was pre-initialized
-                 * from a Const node — treat it as constant.
-                 */
-                bool pat_const = true;
-                for (int j = opno - 1; j >= 0; j--) {
-                  if (steps[j].resvalue == &fcinfo->args[1].value) {
-                    /* A step writes to args[1] — only constant if EEOP_CONST */
-                    pat_const = (steps[j].opcode == EEOP_CONST);
-                    break;
-                  }
-                }
+                Datum pat_datum = (Datum) 0;
+                bool pat_isnull = true;
 
                 bool like_byte_search_ok =
-                    simd_like_byte_search_is_eligible(fcinfo->fncollation);
+                    simd_like_byte_search_is_eligible(pattern_collid);
 
-                if (pat_const && !fcinfo->args[1].isnull &&
+                if (pg_jitter_resolve_constant_func_arg(state, opno, fcinfo,
+                                                        1, &pat_datum,
+                                                        &pat_isnull) &&
+                    !pat_isnull &&
                     like_byte_search_ok) {
-                  Datum pat_datum = fcinfo->args[1].value;
                   text *pat_text = DatumGetTextPP(pat_datum);
                   char *pat_str = VARDATA_ANY(pat_text);
                   int pat_len = VARSIZE_ANY_EXHDR(pat_text);
@@ -4532,7 +4577,7 @@ no_shared_code_reuse:
                     bool case_insens = is_ilike_fn || is_iregex_fn;
 	                    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
 	                        ctx, pat_str, pat_len, is_like, case_insens,
-	                        fcinfo->fncollation);
+	                        pattern_collid);
 
                     if (pe) {
                       /* Inline fast path: extract short text and call raw

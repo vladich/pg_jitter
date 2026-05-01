@@ -42,6 +42,9 @@ static bool yj_encoding_checked = false;
 static bool yj_is_utf8 = false;
 static bool yj_is_sql_ascii = false;
 
+uint64 pg_jitter_yyjson_is_json_counter = 0;
+uint64 pg_jitter_yyjson_jsonb_in_counter = 0;
+
 #if PG_VERSION_NUM < 160000
 static bool
 yj_unicode_escape_error_is_validation_failure(int sqlerrcode)
@@ -598,6 +601,7 @@ pg_jitter_yj_is_json_datum(Datum datum, int32 item_type, int32 unique_keys)
 	input.data = NULL;
 	input.len = 0;
 	input.converted = NULL;
+	pg_jitter_yyjson_is_json_counter++;
 
 	PG_TRY();
 	{
@@ -677,6 +681,7 @@ pg_jitter_yj_jsonb_in(Datum cstring_datum, FunctionCallInfo fcinfo)
 	input.data = NULL;
 	input.len = 0;
 	input.converted = NULL;
+	pg_jitter_yyjson_jsonb_in_counter++;
 
 	PG_TRY();
 	{

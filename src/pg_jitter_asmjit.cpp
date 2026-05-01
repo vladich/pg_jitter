@@ -370,7 +370,9 @@ asmjit_expr_allows_shared_code(ExprState *state)
 #else
 	for (int i = 0; i < state->steps_len; i++)
 	{
-		switch (ExecEvalStepOp(state, &state->steps[i]))
+		ExprEvalStep *step = &state->steps[i];
+
+		switch (ExecEvalStepOp(state, step))
 		{
 			/*
 			 * These ARM64 emitters still materialize process-local ExprEvalStep
@@ -406,12 +408,40 @@ asmjit_expr_allows_shared_code(ExprState *state)
 				case EEOP_AGG_PLAIN_TRANS_BYREF:
 				case EEOP_AGG_DESERIALIZE:
 				case EEOP_AGG_STRICT_DESERIALIZE:
-				case EEOP_ROWCOMPARE_STEP:
+			case EEOP_ROWCOMPARE_STEP:
 			case EEOP_ROWCOMPARE_FINAL:
 #ifdef HAVE_EEOP_RETURNINGEXPR
 			case EEOP_RETURNINGEXPR:
 #endif
 				return false;
+			case EEOP_FUNCEXPR:
+			case EEOP_FUNCEXPR_STRICT:
+#ifdef HAVE_EEOP_FUNCEXPR_STRICT_12
+			case EEOP_FUNCEXPR_STRICT_1:
+			case EEOP_FUNCEXPR_STRICT_2:
+#endif
+			{
+				FunctionCallInfo fcinfo;
+				Datum pat_datum;
+				bool pat_isnull;
+				Oid fn_oid = InvalidOid;
+
+				fcinfo = step->d.func.fcinfo_data;
+				if (fcinfo == NULL || fcinfo->nargs != 2)
+					break;
+				if (fcinfo->flinfo != NULL)
+					fn_oid = fcinfo->flinfo->fn_oid;
+				if (!pg_jitter_classify_text_pattern_fn(step->d.func.fn_addr,
+														fn_oid, NULL, NULL,
+														NULL, NULL, NULL))
+					break;
+				if (pg_jitter_resolve_constant_func_arg(state, i, fcinfo, 1,
+														&pat_datum,
+														&pat_isnull) &&
+					!pat_isnull)
+					return false;
+				break;
+			}
 			default:
 				break;
 		}
@@ -614,6 +644,7 @@ no_shared_code_reuse:
 
 	if (!asmjit_emit_all(code, state, ctx, steps, steps_len))
 	{
+		elog(DEBUG1, "pg_jitter[asmjit]: emit_all failed");
 		delete ac;
 		asmjit_shared_code_mode = false;
 		return false;
@@ -622,6 +653,7 @@ no_shared_code_reuse:
 	err = ac->rt.add(&ac->func, &code);
 	if (err != kErrorOk)
 	{
+		elog(DEBUG1, "pg_jitter[asmjit]: runtime add failed: %u", (unsigned) err);
 		delete ac;
 		asmjit_shared_code_mode = false;
 		return false;

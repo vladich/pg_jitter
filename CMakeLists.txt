@@ -324,7 +324,11 @@ endfunction()
 set(PG_JITTER_PROVIDER_EXPORTS
     Pg_magic_func
     _PG_jit_provider_init
-    pg_jitter_deform_dispatch_reset_fastpath)
+    pg_jitter_deform_dispatch_reset_fastpath
+    pg_jitter_reset_third_party_counters
+    pg_finfo_pg_jitter_reset_third_party_counters
+    pg_jitter_third_party_counter
+    pg_finfo_pg_jitter_third_party_counter)
 
 set(PG_JITTER_META_EXPORTS
     Pg_magic_func
@@ -404,7 +408,17 @@ if(WITH_PCRE2 AND NOT WIN32)
     else()
         # Try system-installed pcre2
         find_path(_pcre2_sys_hdr NAMES pcre2.h)
-        find_library(_pcre2_sys_lib NAMES pcre2-8)
+        if(_pcre2_sys_hdr)
+            get_filename_component(_pcre2_sys_prefix "${_pcre2_sys_hdr}" DIRECTORY)
+            find_library(_pcre2_hdr_lib NAMES pcre2-8
+                PATHS "${_pcre2_sys_prefix}/lib" "${_pcre2_sys_prefix}/lib64"
+                NO_DEFAULT_PATH)
+        endif()
+        if(_pcre2_hdr_lib)
+            set(_pcre2_sys_lib "${_pcre2_hdr_lib}")
+        else()
+            find_library(_pcre2_sys_lib NAMES pcre2-8)
+        endif()
         if(_pcre2_sys_hdr AND _pcre2_sys_lib)
             set(PG_JITTER_HAVE_PCRE2 ON)
             set(PCRE2_INCLUDE_DIR "${_pcre2_sys_hdr}")

@@ -31,6 +31,17 @@ extern bool pg_jitter_collation_is_c(Oid collid);
  */
 extern bool pg_jitter_collation_is_deterministic(Oid collid);
 
+extern bool pg_jitter_classify_text_pattern_fn(PGFunction fn, Oid fn_oid,
+                                                bool *is_like,
+                                                bool *is_ilike,
+                                                bool *is_regex,
+                                                bool *is_iregex,
+                                                bool *negate);
+extern bool pg_jitter_resolve_constant_func_arg(ExprState *state, int opno,
+                                                 FunctionCallInfo fcinfo,
+                                                 int argno, Datum *value,
+                                                 bool *isnull);
+
 /*
  * SharedJitCompiledCode / SharedJitCodeEntry — structures for sharing
  * compiled JIT code between leader and parallel workers via DSM.
@@ -387,7 +398,7 @@ extern void *pg_jitter_compile_deform_loop(TupleDesc desc,
 										   struct sljit_generate_code_buffer *gen_buf);
 extern void pg_jitter_compiled_deform_dispatch(TupleTableSlot *slot,
 											   int natts);
-extern void pg_jitter_deform_dispatch_reset_fastpath(void);
+extern PG_JITTER_EXPORT void pg_jitter_deform_dispatch_reset_fastpath(void);
 
 /*
  * Shared deform for parallel I-cache sharing.

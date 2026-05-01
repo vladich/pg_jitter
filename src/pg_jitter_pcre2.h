@@ -94,6 +94,9 @@ extern int32 pg_jitter_pcre2_match_raw(int64 entry_ptr, int64 data_ptr,
  */
 extern int32 pg_jitter_pcre2_match_text(int64 datum, int64 entry_ptr);
 
+extern uint64 pg_jitter_pcre2_compile_counter;
+extern uint64 pg_jitter_pcre2_match_counter;
+
 #endif /* PG_JITTER_HAVE_PCRE2 */
 
 #endif /* PG_JITTER_PCRE2_H */

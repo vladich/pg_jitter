@@ -20,6 +20,9 @@ extern int32 pg_jitter_yj_is_json_datum(Datum datum, int32 item_type,
 extern Datum pg_jitter_yj_jsonb_in(Datum cstring_datum,
 								   FunctionCallInfo fcinfo);
 
+extern uint64 pg_jitter_yyjson_is_json_counter;
+extern uint64 pg_jitter_yyjson_jsonb_in_counter;
+
 #endif /* PG_JITTER_HAVE_YYJSON */
 
 #endif /* PG_JITTER_YYJSON_H */

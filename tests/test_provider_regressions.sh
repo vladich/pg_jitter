@@ -135,6 +135,63 @@ backend_settings() {
     fi
 }
 
+provider_library() {
+    local backend="$1"
+
+    printf 'pg_jitter_%s' "$backend"
+}
+
+counter_backends() {
+    local backend="$1"
+
+    if [ "$backend" = "auto" ]; then
+        detect_backends
+    else
+        printf '%s\n' "$backend"
+    fi
+}
+
+third_party_counter_functions() {
+    local backend="$1"
+    local counter_backend provider_lib
+
+    while IFS= read -r counter_backend; do
+        provider_lib="$(provider_library "$counter_backend")"
+        cat <<SQL
+CREATE OR REPLACE FUNCTION pg_temp.pg_jitter_reset_third_party_counters_${counter_backend}()
+RETURNS void AS '$provider_lib', 'pg_jitter_reset_third_party_counters'
+LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION pg_temp.pg_jitter_third_party_counter_${counter_backend}(text)
+RETURNS int8 AS '$provider_lib', 'pg_jitter_third_party_counter'
+LANGUAGE C STRICT;
+SQL
+    done < <(counter_backends "$backend")
+}
+
+third_party_counter_reset_calls() {
+    local backend="$1"
+    local counter_backend
+
+    while IFS= read -r counter_backend; do
+        printf 'SELECT pg_temp.pg_jitter_reset_third_party_counters_%s();\n' \
+            "$counter_backend"
+    done < <(counter_backends "$backend")
+}
+
+third_party_counter_expr() {
+    local backend="$1"
+    local counter_name="$2"
+    local counter_backend sep=""
+
+    printf '('
+    while IFS= read -r counter_backend; do
+        printf "%spg_temp.pg_jitter_third_party_counter_%s('%s')" \
+            "$sep" "$counter_backend" "$counter_name"
+        sep=" + "
+    done < <(counter_backends "$backend")
+    printf ')'
+}
+
 verify_backend_active() {
     local backend="$1"
     local expected_provider active_provider smoke_out
@@ -273,6 +330,12 @@ for backend in "${BACKENDS[@]}"; do
 $(backend_settings "$backend")
 $JIT_SETTINGS
 "
+    third_party_counter_sql="$(third_party_counter_functions "$backend")"
+    third_party_counter_reset_sql="$(third_party_counter_reset_calls "$backend")"
+    pcre2_compile_counter_expr="$(third_party_counter_expr "$backend" pcre2_compile)"
+    pcre2_match_counter_expr="$(third_party_counter_expr "$backend" pcre2_match)"
+    yyjson_is_json_counter_expr="$(third_party_counter_expr "$backend" yyjson_is_json)"
+    yyjson_jsonb_in_counter_expr="$(third_party_counter_expr "$backend" yyjson_jsonb_in)"
     simd_inlist_settings=""
     if [ "$backend" = "sljit" ]; then
         simd_inlist_settings="SET pg_jitter.in_simd_max = 64;"
@@ -590,6 +653,7 @@ FROM checks;"
 	    fi
 
 	    pcre2_contract_sql="$backend_jit_settings
+$third_party_counter_sql
 	SET enable_indexscan = off;
 	SET enable_bitmapscan = off;
 	CREATE TEMP TABLE pg_jitter_pcre2_contract_text(v text);
@@ -620,6 +684,7 @@ FROM checks;"
 	       v ~ '^[[:alpha:]]$' AS regex_alpha,
 	       v ~ '^.$' AS regex_any
 	FROM pg_jitter_pcre2_contract_text;
+$third_party_counter_reset_sql
 	SET jit = on;
 	CREATE TEMP TABLE pg_jitter_pcre2_contract_jit AS
 	SELECT v,
@@ -642,9 +707,21 @@ FROM checks;"
 	  (SELECT * FROM pg_jitter_pcre2_contract_jit
 	   EXCEPT
 	   SELECT * FROM pg_jitter_pcre2_contract_native)
+	),
+	diff_count AS (
+	  SELECT count(*) AS n FROM diff
+	),
+	counters AS (
+	  SELECT $pcre2_compile_counter_expr AS pcre2_compile,
+	         $pcre2_match_counter_expr AS pcre2_match
 	)
-	SELECT CASE WHEN count(*) = 0 THEN 'ok' ELSE 'diff=' || count(*)::text END
-	FROM diff;"
+	SELECT CASE
+	         WHEN diff_count.n <> 0 THEN 'diff=' || diff_count.n::text
+	         WHEN counters.pcre2_compile <= 0 THEN 'pcre2_compile_not_selected'
+	         WHEN counters.pcre2_match <= 0 THEN 'pcre2_match_not_selected'
+	         ELSE 'ok'
+	       END
+	FROM diff_count, counters;"
 
 	    set +e
 	    pcre2_contract_out="$(printf '%s\n' "$pcre2_contract_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
@@ -827,6 +904,7 @@ FROM checks;"
 	        fi
 
 	        yyjson_contract_sql="$backend_jit_settings
+$third_party_counter_sql
 	SET enable_indexscan = off;
 	SET enable_bitmapscan = off;
 	CREATE TEMP TABLE pg_jitter_yyjson_contract_corpus(name text, js text);
@@ -854,6 +932,7 @@ FROM checks;"
 	       js IS JSON SCALAR AS is_scalar,
 	       js IS JSON WITH UNIQUE KEYS AS unique_keys
 	FROM pg_jitter_yyjson_contract_corpus;
+$third_party_counter_reset_sql
 	SET jit = on;
 	CREATE TEMP TABLE pg_jitter_yyjson_contract_jit AS
 	SELECT name,
@@ -900,10 +979,23 @@ FROM checks;"
 	     EXCEPT
 	     SELECT * FROM pg_jitter_yyjson_jsonb_contract_native)
 	  ) d
+	),
+	diff_summary AS (
+	  SELECT COALESCE(string_agg(kind || '=' || n::text, ', ' ORDER BY kind)
+	                  FILTER (WHERE n <> 0), 'ok') AS result
+	  FROM diff
+	),
+	counters AS (
+	  SELECT $yyjson_is_json_counter_expr AS yyjson_is_json,
+	         $yyjson_jsonb_in_counter_expr AS yyjson_jsonb_in
 	)
-	SELECT COALESCE(string_agg(kind || '=' || n::text, ', ' ORDER BY kind)
-	                FILTER (WHERE n <> 0), 'ok')
-	FROM diff;"
+	SELECT CASE
+	         WHEN diff_summary.result <> 'ok' THEN diff_summary.result
+	         WHEN counters.yyjson_is_json <= 0 THEN 'yyjson_is_json_not_selected'
+	         WHEN counters.yyjson_jsonb_in <= 0 THEN 'yyjson_jsonb_in_not_selected'
+	         ELSE 'ok'
+	       END
+	FROM diff_summary, counters;"
 
 	        set +e
 	        yyjson_contract_out="$(printf '%s\n' "$yyjson_contract_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"

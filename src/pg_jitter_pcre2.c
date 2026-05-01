@@ -37,6 +37,9 @@
 static Pcre2CacheEntry *pcre2_cache[PCRE2_CACHE_SIZE];
 static uint64 pcre2_lru_clock = 0;
 
+uint64 pg_jitter_pcre2_compile_counter = 0;
+uint64 pg_jitter_pcre2_match_counter = 0;
+
 static void
 pg_jitter_pcre2_free_entry(Pcre2CacheEntry *entry)
 {
@@ -1117,6 +1120,14 @@ pg_jitter_pcre2_should_retry_without_jit(int rc)
 	if (rc == PCRE2_ERROR_JIT_STACKLIMIT)
 		return true;
 #endif
+#ifdef PCRE2_ERROR_JIT_BADOPTION
+	if (rc == PCRE2_ERROR_JIT_BADOPTION)
+		return true;
+#endif
+#ifdef PCRE2_ERROR_JIT_UNSUPPORTED
+	if (rc == PCRE2_ERROR_JIT_UNSUPPORTED)
+		return true;
+#endif
 #ifdef PCRE2_ERROR_MATCHLIMIT
 	if (rc == PCRE2_ERROR_MATCHLIMIT)
 		return true;
@@ -1244,6 +1255,7 @@ pg_jitter_pcre2_compile(PgJitterContext *ctx,
 			pfree(regex_str);
 			if (!pg_jitter_pcre2_pin_entry(ctx, entry))
 				return NULL;
+			pg_jitter_pcre2_compile_counter++;
 			return entry;
 		}
 	}
@@ -1266,14 +1278,14 @@ pg_jitter_pcre2_compile(PgJitterContext *ctx,
 		return NULL;
 	}
 
-	/* JIT compile — if it fails, fall back to V1 */
-	if (pcre2_jit_compile(code, PCRE2_JIT_COMPLETE) != 0)
-	{
-		pcre2_code_free(code);
-		pfree(entry);
-		pfree(regex_str);
-		return NULL;
-	}
+	/*
+	 * JIT compile when the linked PCRE2 library supports it.  Some packaged or
+	 * locally-built PCRE2 libraries expose the JIT API but are configured
+	 * without JIT support; keep the compiled pattern and let the match wrapper
+	 * retry with pcre2_match() instead of falling all the way back to
+	 * PostgreSQL's regex engine.
+	 */
+	(void) pcre2_jit_compile(code, PCRE2_JIT_COMPLETE);
 
 	/*
 	 * Create reusable match_data with the pattern's capture capacity.  This uses
@@ -1339,6 +1351,7 @@ pg_jitter_pcre2_compile(PgJitterContext *ctx,
 	if (!pg_jitter_pcre2_publish_and_pin_entry(ctx, slot, entry))
 		return NULL;
 
+	pg_jitter_pcre2_compile_counter++;
 	return entry;
 }
 
@@ -1356,6 +1369,7 @@ pg_jitter_pcre2_match(Pcre2CacheEntry *entry, const char *data, int len)
 	    (data == NULL && len > 0))
 		return false;
 
+	pg_jitter_pcre2_match_counter++;
 	match_options = pg_jitter_pcre2_match_options(entry);
 	rc = pcre2_jit_match(entry->code,
 	                     (PCRE2_SPTR)data, len,
@@ -1390,6 +1404,7 @@ pg_jitter_pcre2_match_raw(int64 entry_ptr, int64 data_ptr, int32 len)
 	    (data == NULL && len > 0))
 		return 0;
 
+	pg_jitter_pcre2_match_counter++;
 	match_options = pg_jitter_pcre2_match_options(entry);
 #ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
 	if (entry->jit_fast)

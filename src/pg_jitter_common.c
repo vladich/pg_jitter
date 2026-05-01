@@ -33,6 +33,7 @@
 #include "access/detoast.h"    /* DatumGetTextPP */
 #include "access/htup_details.h"
 #include "utils/resowner.h"
+#include "utils/builtins.h"
 
 #include <stdint.h>
 #include <stdlib.h> /* for atoi */
@@ -86,6 +87,53 @@ int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
 
 /* GUC: pg_jitter.in_simd_max — max IN list size for SIMD linear scan */
 int pg_jitter_in_simd_max = IN_SIMD_MAX_DEFAULT;
+
+PG_FUNCTION_INFO_V1(pg_jitter_reset_third_party_counters);
+
+PG_JITTER_EXPORT Datum
+pg_jitter_reset_third_party_counters(PG_FUNCTION_ARGS)
+{
+#ifdef PG_JITTER_HAVE_PCRE2
+  pg_jitter_pcre2_compile_counter = 0;
+  pg_jitter_pcre2_match_counter = 0;
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+  pg_jitter_yyjson_is_json_counter = 0;
+  pg_jitter_yyjson_jsonb_in_counter = 0;
+#endif
+
+  PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(pg_jitter_third_party_counter);
+
+PG_JITTER_EXPORT Datum
+pg_jitter_third_party_counter(PG_FUNCTION_ARGS)
+{
+  char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  uint64 value = 0;
+
+#ifdef PG_JITTER_HAVE_PCRE2
+  if (strcmp(name, "pcre2_compile") == 0)
+    value = pg_jitter_pcre2_compile_counter;
+  else if (strcmp(name, "pcre2_match") == 0)
+    value = pg_jitter_pcre2_match_counter;
+  else
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+  if (strcmp(name, "yyjson_is_json") == 0)
+    value = pg_jitter_yyjson_is_json_counter;
+  else if (strcmp(name, "yyjson_jsonb_in") == 0)
+    value = pg_jitter_yyjson_jsonb_in_counter;
+  else
+#endif
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("unknown pg_jitter third-party counter \"%s\"", name)));
+
+  pfree(name);
+  PG_RETURN_INT64((int64) value);
+}
 
 /* ----------------------------------------------------------------
  * Shared memory slot table for DSM handle passing
@@ -3272,6 +3320,106 @@ pg_jitter_collation_is_deterministic(Oid collid)
 #endif
   cached_collid = collid;
   return cached_result;
+}
+
+bool
+pg_jitter_classify_text_pattern_fn(PGFunction fn, Oid fn_oid,
+                                   bool *is_like, bool *is_ilike,
+                                   bool *is_regex, bool *is_iregex,
+                                   bool *negate)
+{
+  bool like = false;
+  bool ilike = false;
+  bool regex = false;
+  bool iregex = false;
+  bool neg = false;
+
+  switch (fn_oid) {
+    case F_TEXTLIKE:
+      like = true;
+      break;
+    case F_TEXTNLIKE:
+      like = true;
+      neg = true;
+      break;
+    case F_TEXTICLIKE:
+      ilike = true;
+      break;
+    case F_TEXTICNLIKE:
+      ilike = true;
+      neg = true;
+      break;
+    case F_TEXTREGEXEQ:
+      regex = true;
+      break;
+    case F_TEXTREGEXNE:
+      regex = true;
+      neg = true;
+      break;
+    case F_TEXTICREGEXEQ:
+      iregex = true;
+      break;
+    case F_TEXTICREGEXNE:
+      iregex = true;
+      neg = true;
+      break;
+    default:
+      if (fn == textlike || fn == textnlike) {
+        like = true;
+        neg = (fn == textnlike);
+      } else if (fn == texticlike || fn == texticnlike) {
+        ilike = true;
+        neg = (fn == texticnlike);
+      } else if (fn == textregexeq || fn == textregexne) {
+        regex = true;
+        neg = (fn == textregexne);
+      } else if (fn == texticregexeq || fn == texticregexne) {
+        iregex = true;
+        neg = (fn == texticregexne);
+      } else {
+        return false;
+      }
+      break;
+  }
+
+  if (is_like != NULL)
+    *is_like = like;
+  if (is_ilike != NULL)
+    *is_ilike = ilike;
+  if (is_regex != NULL)
+    *is_regex = regex;
+  if (is_iregex != NULL)
+    *is_iregex = iregex;
+  if (negate != NULL)
+    *negate = neg;
+  return true;
+}
+
+bool
+pg_jitter_resolve_constant_func_arg(ExprState *state, int opno,
+                                    FunctionCallInfo fcinfo, int argno,
+                                    Datum *value, bool *isnull)
+{
+  ExprEvalStep *steps;
+
+  if (state == NULL || fcinfo == NULL || argno < 0 || argno >= fcinfo->nargs ||
+      value == NULL || isnull == NULL)
+    return false;
+
+  steps = state->steps;
+  for (int j = opno - 1; j >= 0; j--) {
+    if (steps[j].resvalue == &fcinfo->args[argno].value) {
+      if (ExecEvalStepOp(state, &steps[j]) != EEOP_CONST)
+        return false;
+      *value = steps[j].d.constval.value;
+      *isnull = steps[j].d.constval.isnull;
+      return true;
+    }
+  }
+
+  *value = fcinfo->args[argno].value;
+  *isnull = fcinfo->args[argno].isnull;
+  return true;
 }
 
 /* ----------------------------------------------------------------

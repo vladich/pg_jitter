@@ -1118,36 +1118,39 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						if (!asmjit_shared_code_mode)
 						{
 							PGFunction fn = op->d.func.fn_addr;
-							bool is_like_fn = (fn == textlike || fn == textnlike);
-							bool is_ilike_fn = (fn == texticlike || fn == texticnlike);
-							bool is_regex_fn = (fn == textregexeq || fn == textregexne);
-							bool is_iregex_fn = (fn == texticregexeq ||
-												 fn == texticregexne);
-							bool vs_negate = (fn == textnlike || fn == texticnlike ||
-											  fn == textregexne || fn == texticregexne);
+							Oid fn_oid = (fcinfo != NULL && fcinfo->flinfo != NULL)
+								? fcinfo->flinfo->fn_oid
+								: InvalidOid;
+							bool is_like_fn = false;
+							bool is_ilike_fn = false;
+							bool is_regex_fn = false;
+							bool is_iregex_fn = false;
+							bool vs_negate = false;
+							Oid pattern_collid = fcinfo->fncollation == InvalidOid
+								? DEFAULT_COLLATION_OID
+								: fcinfo->fncollation;
 
-							if ((is_like_fn || is_ilike_fn || is_regex_fn ||
-								 is_iregex_fn) &&
+							if (pg_jitter_classify_text_pattern_fn(fn, fn_oid,
+																  &is_like_fn,
+																  &is_ilike_fn,
+																  &is_regex_fn,
+																  &is_iregex_fn,
+																  &vs_negate) &&
 								fcinfo->nargs == 2)
 							{
-								bool pat_const = true;
-								for (int j = opno - 1; j >= 0; j--)
-								{
-									if (steps[j].resvalue == &fcinfo->args[1].value)
-									{
-										pat_const = (steps[j].opcode == EEOP_CONST);
-										break;
-									}
-								}
+								Datum pat_datum = (Datum) 0;
+								bool pat_isnull = true;
 
 									bool like_byte_search_ok =
 										simd_like_byte_search_is_eligible(
-											fcinfo->fncollation);
+											pattern_collid);
 
-									if (pat_const && !fcinfo->args[1].isnull &&
+									if (pg_jitter_resolve_constant_func_arg(
+											state, opno, fcinfo, 1, &pat_datum,
+											&pat_isnull) &&
+										!pat_isnull &&
 										like_byte_search_ok)
 								{
-									Datum pat_datum = fcinfo->args[1].value;
 									text *pat_text = DatumGetTextPP(pat_datum);
 									char *pat_str = VARDATA_ANY(pat_text);
 									int pat_len = VARSIZE_ANY_EXHDR(pat_text);
@@ -1255,7 +1258,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 												pg_jitter_pcre2_compile(
 													ctx, pat_str, pat_len,
 													is_like, case_insens,
-													fcinfo->fncollation);
+													pattern_collid);
 
 										if (pe)
 										{
@@ -3245,20 +3248,25 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					JsonIsPredicate *pred = op->d.is_json.pred;
 					if (exprType(pred->expr) == TEXTOID)
 					{
+						x86::Gp resvalue_addr = cc.new_gp64();
+						x86::Gp resnull_addr = cc.new_gp64();
+						cc.mov(resvalue_addr, (uint64_t) op->resvalue);
+						cc.mov(resnull_addr, (uint64_t) op->resnull);
+
 						x86::Gp resnull_reg = cc.new_gp64();
-						cc.movzx(resnull_reg, x86::byte_ptr((uint64_t) op->resnull));
+						cc.movzx(resnull_reg, x86::byte_ptr(resnull_addr));
 						Label skip_null = cc.new_label();
 						cc.test(resnull_reg, resnull_reg);
 						cc.jne(skip_null);
 
 						x86::Gp datum_reg = cc.new_gp64();
-						cc.mov(datum_reg, x86::ptr((uint64_t) op->resvalue));
+						cc.mov(datum_reg, x86::ptr(resvalue_addr));
 
 						x86::Gp fn_reg = cc.new_gp64();
 						cc.mov(fn_reg, (uint64_t)(void *) pg_jitter_yj_is_json_datum);
-						x86::Gp item_type_reg = cc.new_gp64();
-						cc.mov(item_type_reg, (int64_t) pred->item_type);
-						x86::Gp unique_keys_reg = cc.new_gp64();
+						x86::Gp item_type_reg = cc.new_gp32();
+						cc.mov(item_type_reg, (int32_t) pred->item_type);
+						x86::Gp unique_keys_reg = cc.new_gp32();
 						cc.mov(unique_keys_reg, pred->unique_keys ? 1 : 0);
 						InvokeNode *invoke;
 						x86::Gp ret_reg = cc.new_gp64();
@@ -3307,39 +3315,51 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			 * On soft error: *op->resnull = true, *op->resvalue = 0.
 			 */
 			case EEOP_IOCOERCE_SAFE:
-			{
-				FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
-				FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+				{
+					FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+					FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+					x86::Gp resvalue_addr = cc.new_gp64();
+					x86::Gp resnull_addr = cc.new_gp64();
+					x86::Gp fcinfo_out_reg = cc.new_gp64();
+					x86::Gp fcinfo_in_reg = cc.new_gp64();
+					cc.mov(resvalue_addr, (uint64_t) op->resvalue);
+					cc.mov(resnull_addr, (uint64_t) op->resnull);
+					cc.mov(fcinfo_out_reg, (uint64_t) fcinfo_out);
+					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
 
-				/* if (*op->resnull) skip */
-				x86::Gp resnull_reg = cc.new_gp64();
-				cc.movzx(resnull_reg, x86::byte_ptr((uint64_t) op->resnull));
-				Label skip_null = cc.new_label();
-				cc.test(resnull_reg, resnull_reg);
-				cc.jne(skip_null);
+					/* if (*op->resnull) skip */
+					x86::Gp resnull_reg = cc.new_gp64();
+					cc.movzx(resnull_reg, x86::byte_ptr(resnull_addr));
+					Label skip_null = cc.new_label();
+					cc.test(resnull_reg, resnull_reg);
+					cc.jne(skip_null);
 
-				/* Setup output function call */
-				/* fcinfo_out->args[0].value = *op->resvalue */
-				x86::Gp resval_reg = cc.new_gp64();
-				cc.mov(resval_reg, x86::ptr((uint64_t) op->resvalue));
-				cc.mov(x86::ptr((uint64_t) &fcinfo_out->args[0].value), resval_reg);
-				/* fcinfo_out->args[0].isnull = false */
-				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->args[0].isnull), 0);
-				/* fcinfo_out->isnull = false */
-				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->isnull), 0);
+					/* Setup output function call */
+					/* fcinfo_out->args[0].value = *op->resvalue */
+					x86::Gp resval_reg = cc.new_gp64();
+					cc.mov(resval_reg, x86::ptr(resvalue_addr));
+					cc.mov(x86::ptr(fcinfo_out_reg,
+									 (int32_t)((char *)&fcinfo_out->args[0].value -
+											   (char *)fcinfo_out)),
+						   resval_reg);
+					/* fcinfo_out->args[0].isnull = false */
+					cc.mov(x86::byte_ptr(fcinfo_out_reg,
+										  (int32_t)((char *)&fcinfo_out->args[0].isnull -
+													(char *)fcinfo_out)), 0);
+					/* fcinfo_out->isnull = false */
+					cc.mov(x86::byte_ptr(fcinfo_out_reg,
+										  offsetof(FunctionCallInfoBaseData, isnull)), 0);
 
 				/* R0 = fn_addr_out(fcinfo_out) */
 				{
-					x86::Gp fn_out = cc.new_gp64();
-					cc.mov(fn_out, (uint64_t)(void *) fcinfo_out->flinfo->fn_addr);
-					x86::Gp fcinfo_reg = cc.new_gp64();
-					cc.mov(fcinfo_reg, (uint64_t) fcinfo_out);
-					InvokeNode *invoke_out;
-					x86::Gp ret_out = cc.new_gp64();
-					cc.invoke(Out(invoke_out), fn_out,
-							  FuncSignature::build<int64_t, void *>());
-					invoke_out->set_arg(0, fcinfo_reg);
-					invoke_out->set_ret(0, ret_out);
+						x86::Gp fn_out = cc.new_gp64();
+						cc.mov(fn_out, (uint64_t)(void *) fcinfo_out->flinfo->fn_addr);
+						InvokeNode *invoke_out;
+						x86::Gp ret_out = cc.new_gp64();
+						cc.invoke(Out(invoke_out), fn_out,
+								  FuncSignature::build<int64_t, void *>());
+						invoke_out->set_arg(0, fcinfo_out_reg);
+						invoke_out->set_ret(0, ret_out);
 
 						/* ret_out = cstring; use the native input function so
 						 * ErrorSaveContext soft errors stay observable. */
@@ -3841,38 +3861,50 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 			/* IOCOERCE: two function calls — output fn -> cstring -> input fn */
 			case EEOP_IOCOERCE:
-			{
-				FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
-				FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+				{
+					FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out;
+					FunctionCallInfo fcinfo_in = op->d.iocoerce.fcinfo_data_in;
+					x86::Gp resvalue_addr = cc.new_gp64();
+					x86::Gp resnull_addr = cc.new_gp64();
+						x86::Gp fcinfo_out_reg = cc.new_gp64();
+						x86::Gp fcinfo_in_reg = cc.new_gp64();
+						cc.mov(resvalue_addr, (uint64_t) op->resvalue);
+						cc.mov(resnull_addr, (uint64_t) op->resnull);
+						cc.mov(fcinfo_out_reg, (uint64_t) fcinfo_out);
+						cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
 
-				/* if (*op->resnull) skip */
-				x86::Gp resnull_reg = cc.new_gp64();
-				cc.movzx(resnull_reg, x86::byte_ptr((uint64_t) op->resnull));
+					/* if (*op->resnull) skip */
+					x86::Gp resnull_reg = cc.new_gp64();
+					cc.movzx(resnull_reg, x86::byte_ptr(resnull_addr));
 				Label skip_null = cc.new_label();
 				cc.test(resnull_reg, resnull_reg);
 				cc.jne(skip_null);
 
-				/* Setup output function call */
-				/* fcinfo_out->args[0].value = *op->resvalue */
-				x86::Gp resval_reg = cc.new_gp64();
-				cc.mov(resval_reg, x86::ptr((uint64_t) op->resvalue));
-				cc.mov(x86::ptr((uint64_t) &fcinfo_out->args[0].value), resval_reg);
-				/* fcinfo_out->args[0].isnull = false */
-				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->args[0].isnull), 0);
-				/* fcinfo_out->isnull = false */
-				cc.mov(x86::byte_ptr((uint64_t) &fcinfo_out->isnull), 0);
+					/* Setup output function call */
+					/* fcinfo_out->args[0].value = *op->resvalue */
+					x86::Gp resval_reg = cc.new_gp64();
+					cc.mov(resval_reg, x86::ptr(resvalue_addr));
+					cc.mov(x86::ptr(fcinfo_out_reg,
+									 (int32_t)((char *)&fcinfo_out->args[0].value -
+											   (char *)fcinfo_out)),
+						   resval_reg);
+					/* fcinfo_out->args[0].isnull = false */
+					cc.mov(x86::byte_ptr(fcinfo_out_reg,
+										  (int32_t)((char *)&fcinfo_out->args[0].isnull -
+													(char *)fcinfo_out)), 0);
+					/* fcinfo_out->isnull = false */
+					cc.mov(x86::byte_ptr(fcinfo_out_reg,
+										  offsetof(FunctionCallInfoBaseData, isnull)), 0);
 
 				/* R0 = fn_addr_out(fcinfo_out) */
 				{
-					x86::Gp fn_out = cc.new_gp64();
-					cc.mov(fn_out, (uint64_t)(void *) fcinfo_out->flinfo->fn_addr);
-					x86::Gp fcinfo_reg = cc.new_gp64();
-					cc.mov(fcinfo_reg, (uint64_t) fcinfo_out);
-					InvokeNode *invoke_out;
-					x86::Gp ret_out = cc.new_gp64();
-					cc.invoke(Out(invoke_out), fn_out,
-							  FuncSignature::build<int64_t, void *>());
-					invoke_out->set_arg(0, fcinfo_reg);
+						x86::Gp fn_out = cc.new_gp64();
+						cc.mov(fn_out, (uint64_t)(void *) fcinfo_out->flinfo->fn_addr);
+						InvokeNode *invoke_out;
+						x86::Gp ret_out = cc.new_gp64();
+						cc.invoke(Out(invoke_out), fn_out,
+								  FuncSignature::build<int64_t, void *>());
+						invoke_out->set_arg(0, fcinfo_out_reg);
 					invoke_out->set_ret(0, ret_out);
 
 					/* ret_out = cstring; call input function (or yyjson) */
@@ -3880,63 +3912,66 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					if (fcinfo_in->flinfo->fn_oid == F_JSONB_IN)
 					{
 						/* yyjson fast path: yj_fn(cstring, fcinfo_in) -> Datum */
-						void *yj_fn = (void *) pg_jitter_yj_jsonb_in;
-						x86::Gp yj_fn_reg = cc.new_gp64();
-						cc.mov(yj_fn_reg, (uint64_t) yj_fn);
-						x86::Gp fcinfo_reg = cc.new_gp64();
-						cc.mov(fcinfo_reg, (uint64_t) fcinfo_in);
-						InvokeNode *invoke_yj;
-						x86::Gp ret_yj = cc.new_gp64();
-						cc.invoke(Out(invoke_yj), yj_fn_reg,
-								  FuncSignature::build<int64_t, int64_t, void *>());
-						invoke_yj->set_arg(0, ret_out);
-						invoke_yj->set_arg(1, fcinfo_reg);
-						invoke_yj->set_ret(0, ret_yj);
+							void *yj_fn = (void *) pg_jitter_yj_jsonb_in;
+							x86::Gp yj_fn_reg = cc.new_gp64();
+							cc.mov(yj_fn_reg, (uint64_t) yj_fn);
+							InvokeNode *invoke_yj;
+							x86::Gp ret_yj = cc.new_gp64();
+							cc.invoke(Out(invoke_yj), yj_fn_reg,
+									  FuncSignature::build<int64_t, int64_t, void *>());
+							invoke_yj->set_arg(0, ret_out);
+							invoke_yj->set_arg(1, fcinfo_in_reg);
+							invoke_yj->set_ret(0, ret_yj);
 
-						/* *op->resvalue = ret_yj */
-						cc.mov(x86::ptr((uint64_t) op->resvalue), ret_yj);
-						/* *op->resnull = false */
-						cc.mov(x86::byte_ptr((uint64_t) op->resnull), 0);
-					}
-					else
+							/* *op->resvalue = ret_yj */
+							cc.mov(x86::ptr(resvalue_addr), ret_yj);
+							/* *op->resnull = false */
+							cc.mov(x86::byte_ptr(resnull_addr), 0);
+						}
+						else
 #endif /* PG_JITTER_HAVE_YYJSON */
-					{
-						/* Standard input function call */
-						cc.mov(x86::ptr((uint64_t) &fcinfo_in->args[0].value), ret_out);
+						{
+							/* Standard input function call */
+							cc.mov(x86::ptr(fcinfo_in_reg,
+											 (int32_t)((char *)&fcinfo_in->args[0].value -
+													   (char *)fcinfo_in)),
+								   ret_out);
+						}
 					}
-				}
 #ifdef PG_JITTER_HAVE_YYJSON
 				if (fcinfo_in->flinfo->fn_oid != F_JSONB_IN)
 #endif
-				{
-					/* fcinfo_in->args[0].isnull = false */
-					cc.mov(x86::byte_ptr((uint64_t) &fcinfo_in->args[0].isnull), 0);
-					/* fcinfo_in->isnull = false */
-					cc.mov(x86::byte_ptr((uint64_t) &fcinfo_in->isnull), 0);
+					{
+						/* fcinfo_in->args[0].isnull = false */
+						cc.mov(x86::byte_ptr(fcinfo_in_reg,
+											  (int32_t)((char *)&fcinfo_in->args[0].isnull -
+														(char *)fcinfo_in)), 0);
+						/* fcinfo_in->isnull = false */
+						cc.mov(x86::byte_ptr(fcinfo_in_reg,
+											  offsetof(FunctionCallInfoBaseData, isnull)), 0);
 
 					/* R0 = fn_addr_in(fcinfo_in) */
 					{
-						x86::Gp fn_in = cc.new_gp64();
-						cc.mov(fn_in, (uint64_t)(void *) fcinfo_in->flinfo->fn_addr);
-						x86::Gp fcinfo_reg = cc.new_gp64();
-						cc.mov(fcinfo_reg, (uint64_t) fcinfo_in);
-						InvokeNode *invoke_in;
-						x86::Gp ret_in = cc.new_gp64();
-						cc.invoke(Out(invoke_in), fn_in,
-								  FuncSignature::build<int64_t, void *>());
-						invoke_in->set_arg(0, fcinfo_reg);
-						invoke_in->set_ret(0, ret_in);
+							x86::Gp fn_in = cc.new_gp64();
+							cc.mov(fn_in, (uint64_t)(void *) fcinfo_in->flinfo->fn_addr);
+							InvokeNode *invoke_in;
+							x86::Gp ret_in = cc.new_gp64();
+							cc.invoke(Out(invoke_in), fn_in,
+									  FuncSignature::build<int64_t, void *>());
+							invoke_in->set_arg(0, fcinfo_in_reg);
+							invoke_in->set_ret(0, ret_in);
 
-						/* *op->resvalue = ret_in */
-						cc.mov(x86::ptr((uint64_t) op->resvalue), ret_in);
+							/* *op->resvalue = ret_in */
+							cc.mov(x86::ptr(resvalue_addr), ret_in);
+						}
+						/* *op->resnull = fcinfo_in->isnull */
+						{
+							x86::Gp isnull_reg = cc.new_gp64();
+							cc.movzx(isnull_reg, x86::byte_ptr(fcinfo_in_reg,
+																offsetof(FunctionCallInfoBaseData, isnull)));
+							cc.mov(x86::byte_ptr(resnull_addr), isnull_reg.r8());
+						}
 					}
-					/* *op->resnull = fcinfo_in->isnull */
-					{
-						x86::Gp isnull_reg = cc.new_gp64();
-						cc.movzx(isnull_reg, x86::byte_ptr((uint64_t) &fcinfo_in->isnull));
-						cc.mov(x86::byte_ptr((uint64_t) op->resnull), isnull_reg.r8());
-					}
-				}
 
 				cc.bind(skip_null);
 				break;
@@ -4110,6 +4145,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 	Error err = cc.finalize();
 	if (err != kErrorOk)
 	{
+		elog(DEBUG1, "pg_jitter[asmjit]: x86 finalize failed: %u",
+			 (unsigned) err);
 		pfree(step_labels);
 		return false;
 	}
