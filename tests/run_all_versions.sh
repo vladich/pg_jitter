@@ -86,6 +86,32 @@ pg_src()  { echo "$PG_SRC_BASE/v$1"; }
 pg_data() { echo "$PGDATA_BASE/v$1"; }
 pg_port() { echo $((5430 + $1)); }
 
+pg_env() {
+    local ver=$1
+    shift
+    local pg_config="$(pg_bin "$ver")/pg_config"
+    local libdir dynlib_var path_sep dynlib_path current
+
+    libdir="$("$pg_config" --libdir)"
+    case "$(uname -s)" in
+        Darwin) dynlib_var=DYLD_LIBRARY_PATH; path_sep=: ;;
+        MINGW*|MSYS*|CYGWIN*) dynlib_var=PATH; path_sep=';' ;;
+        *) dynlib_var=LD_LIBRARY_PATH; path_sep=: ;;
+    esac
+
+    dynlib_path="$libdir"
+    if [ -d "$libdir/postgresql" ] && [ "$libdir/postgresql" != "$libdir" ]; then
+        dynlib_path="$libdir/postgresql$path_sep$dynlib_path"
+    fi
+
+    current="${!dynlib_var:-}"
+    if [ -n "$current" ]; then
+        env "$dynlib_var=$dynlib_path$path_sep$current" "$@"
+    else
+        env "$dynlib_var=$dynlib_path" "$@"
+    fi
+}
+
 init_cluster() {
     local ver=$1
     local bindir=$(pg_bin $ver)
@@ -97,12 +123,13 @@ init_cluster() {
     else
         log "PG$ver: initializing data directory at $datadir"
         mkdir -p "$(dirname "$datadir")"
-        "$bindir/initdb" -D "$datadir" --no-locale -E UTF8 -A trust > "$RESULTS_DIR/initdb_$ver.log" 2>&1
+        pg_env "$ver" "$bindir/initdb" -D "$datadir" --no-locale -E UTF8 -A trust > "$RESULTS_DIR/initdb_$ver.log" 2>&1
     fi
 
     # Ensure port and JIT settings are correct (idempotent)
     # Remove any existing pg_jitter settings block, then append fresh
-    sed -i '/^# -- pg_jitter test settings --$/,/^# -- end pg_jitter --$/d' "$datadir/postgresql.conf"
+    sed -i.bak '/^# -- pg_jitter test settings --$/,/^# -- end pg_jitter --$/d' "$datadir/postgresql.conf"
+    rm -f "$datadir/postgresql.conf.bak"
     cat >> "$datadir/postgresql.conf" <<EOF
 # -- pg_jitter test settings --
 port = $port
@@ -124,10 +151,10 @@ start_pg() {
     local datadir=$(pg_data $ver)
     local port=$(pg_port $ver)
 
-    if "$bindir/pg_isready" -p "$port" -q 2>/dev/null; then
+    if pg_env "$ver" "$bindir/pg_isready" -p "$port" -q 2>/dev/null; then
         return 0
     fi
-    "$bindir/pg_ctl" -D "$datadir" -l "$datadir/logfile" start -w > /dev/null 2>&1
+    pg_env "$ver" "$bindir/pg_ctl" -D "$datadir" -l "$datadir/logfile" start -w > /dev/null 2>&1
     sleep 1
 }
 
@@ -136,8 +163,8 @@ stop_pg() {
     local bindir=$(pg_bin $ver)
     local datadir=$(pg_data $ver)
 
-    "$bindir/pg_ctl" -D "$datadir" stop -m fast -w -t 30 > /dev/null 2>&1 ||
-        "$bindir/pg_ctl" -D "$datadir" stop -m immediate -w -t 30 > /dev/null 2>&1 ||
+    pg_env "$ver" "$bindir/pg_ctl" -D "$datadir" stop -m fast -w -t 30 > /dev/null 2>&1 ||
+        pg_env "$ver" "$bindir/pg_ctl" -D "$datadir" stop -m immediate -w -t 30 > /dev/null 2>&1 ||
         true
     sleep 1
 }
@@ -166,7 +193,7 @@ run_psql() {
     local ver=$1; shift
     local port=$(pg_port $ver)
     local bindir=$(pg_bin $ver)
-    "$bindir/psql" -p "$port" "$@"
+    pg_env "$ver" "$bindir/psql" -p "$port" "$@"
 }
 
 provider_modes_for_version() {
@@ -357,7 +384,7 @@ for VER in "${VERSIONS[@]}"; do
         REGRESS_LOG="$RESULTS_DIR/pg_regress_$VER.log"
         log "PG$VER: Running full pg_regress for backends: $REGRESS_BACKENDS_FOR_VER"
         stop_pg "$VER"
-        if "$PROJECT_DIR/tests/run_pg_regress.sh" \
+        if pg_env "$VER" "$PROJECT_DIR/tests/run_pg_regress.sh" \
             --pg-config "$PG_CONFIG" \
             --pg-src "$PG_SRC" \
             --port "$PORT" \
@@ -375,18 +402,25 @@ for VER in "${VERSIONS[@]}"; do
         start_pg "$VER"
     fi
 
-    # ---- Step 5: Create regression database + benchmark setup ----
+    # ---- Step 5: Create regression database + optional benchmark setup ----
     ensure_db "$VER" regression
-    log "PG$VER: Setting up benchmark tables..."
-    run_psql "$VER" -d regression -f "$PROJECT_DIR/tests/bench_setup.sql" > /dev/null 2>&1 || true
-    run_psql "$VER" -d regression -f "$PROJECT_DIR/tests/bench_setup_extra.sql" > /dev/null 2>&1 || true
-    log "PG$VER: Tables ready"
+    if [ "$SKIP_BENCH" -eq 0 ]; then
+        log "PG$VER: Setting up benchmark tables..."
+        run_psql "$VER" -d regression -f "$PROJECT_DIR/tests/bench_setup.sql" > /dev/null 2>&1 || true
+        run_psql "$VER" -d regression -f "$PROJECT_DIR/tests/bench_setup_extra.sql" > /dev/null 2>&1 || true
+        log "PG$VER: Tables ready"
+    else
+        log "PG$VER: Benchmark table setup skipped (--skip-bench)"
+    fi
 
     # ---- Step 6: Correctness tests per backend ----
     log "PG$VER: Running correctness tests..."
     CORR_OK=0
     CORR_FAIL=0
-    mapfile -t PROVIDER_MODES < <(provider_modes_for_version "$VER")
+    PROVIDER_MODES=()
+    while IFS= read -r provider_mode; do
+        PROVIDER_MODES+=("$provider_mode")
+    done < <(provider_modes_for_version "$VER")
 
     for backend in "${PROVIDER_MODES[@]}"; do
         log "PG$VER:   Testing $backend..."
@@ -400,7 +434,7 @@ for VER in "${VERSIONS[@]}"; do
         fi
 
         BUG_OUTFILE="$RESULTS_DIR/test_${VER}_${backend}_provider_regressions.log"
-        if ! "$PROJECT_DIR/tests/test_provider_regressions.sh" \
+        if ! pg_env "$VER" "$PROJECT_DIR/tests/test_provider_regressions.sh" \
             --pg-config "$(pg_bin "$VER")/pg_config" \
             --host /tmp \
             --port "$PORT" \
@@ -416,7 +450,7 @@ for VER in "${VERSIONS[@]}"; do
         fi
 
         SURFACE_OUTFILE="$RESULTS_DIR/test_${VER}_${backend}_function_surface.log"
-        if ! "$PROJECT_DIR/tests/test_function_surface.sh" \
+        if ! pg_env "$VER" "$PROJECT_DIR/tests/test_function_surface.sh" \
             --pg-config "$(pg_bin "$VER")/pg_config" \
             --host /tmp \
             --port "$PORT" \
@@ -437,7 +471,7 @@ for VER in "${VERSIONS[@]}"; do
     done
     log "PG$VER: Correctness: $CORR_OK pass, $CORR_FAIL fail"
 
-    # ---- Step 7: Quick sanity test — run a few queries per backend ----
+    # ---- Step 7: Quick sanity test — run a self-contained query per backend ----
     log "PG$VER: Running quick sanity checks..."
     for backend in "${PROVIDER_MODES[@]}"; do
         set_jit_backend "$VER" "$backend"
@@ -449,9 +483,9 @@ for VER in "${VERSIONS[@]}"; do
         fi
 
         RESULT=$(run_psql "$VER" -d regression -X -q -t -A -c "
-SET jit = on; SET jit_above_cost = 0;
-SELECT SUM(val1) FROM bench_data;
-" 2>/dev/null | tail -n 1 || echo "FAIL")
+	SET jit = on; SET jit_above_cost = 0;
+	SELECT SUM(i) FROM generate_series(1,1000) AS g(i) WHERE i > 10;
+	" 2>/dev/null | tail -n 1 || echo "FAIL")
         if [ -n "$RESULT" ] && [ "$RESULT" != "FAIL" ]; then
             log "PG$VER:   $backend sanity: OK (SUM=$RESULT)"
         else
@@ -511,12 +545,12 @@ SELECT COUNT(*) FROM ultra_wide;
                     continue
                 fi
 
-                if ! "$BINDIR/pg_isready" -p "$PORT" -q 2>/dev/null; then
+                if ! pg_env "$VER" "$BINDIR/pg_isready" -p "$PORT" -q 2>/dev/null; then
                     restart_pg "$VER" || true
                 fi
 
                 get_exec_time "$VER" "${QUERIES[$qi]}" "on" > /dev/null 2>&1 || true  # warmup
-                if ! "$BINDIR/pg_isready" -p "$PORT" -q 2>/dev/null; then
+                if ! pg_env "$VER" "$BINDIR/pg_isready" -p "$PORT" -q 2>/dev/null; then
                     restart_pg "$VER" || true
                 fi
 

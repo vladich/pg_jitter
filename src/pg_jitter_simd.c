@@ -22,12 +22,9 @@
 
 #include <limits.h>
 
-/*
- * StringZilla configuration: we only need compare + hash.
- * Define SZ_DYNAMIC_DISPATCH=0 to use compile-time NEON detection.
- */
-#define SZ_DYNAMIC_DISPATCH 0
-#include "stringzilla/stringzilla.h"
+#include "pg_jitter_stringzilla_config.h"
+#include "stringzilla/find.h"
+#include "stringzilla/hash.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -215,13 +212,16 @@ simd_text_smaller(int64 a, int64 b, int32 collid)
 int64
 simd_upper(int64 a, int32 collid)
 {
+	Datum da = (Datum)a;
 	struct varlena *v = (struct varlena *)DatumGetPointer(a);
 	text *detoasted = NULL;
 	char *data;
 	int len;
+	char *out_str = NULL;
+	text *result = NULL;
 
 	if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))) {
-		detoasted = DatumGetTextPP((Datum)a);
+		detoasted = DatumGetTextPP(da);
 		data = VARDATA_ANY(detoasted);
 		len = VARSIZE_ANY_EXHDR(detoasted);
 	} else {
@@ -229,42 +229,60 @@ simd_upper(int64 a, int32 collid)
 		len = VARSIZE_ANY_EXHDR(v);
 	}
 
-	/* Non-C collation: use PG's locale-aware str_toupper */
-	if (!pg_jitter_collation_is_c((Oid)collid)) {
-		char *out_str = str_toupper(data, len, (Oid)collid);
-		int rlen = strlen(out_str);
-		text *result = (text *)palloc(VARHDRSZ + rlen);
-		SET_VARSIZE(result, VARHDRSZ + rlen);
-		memcpy(VARDATA(result), out_str, rlen);
-		pfree(out_str);
-		if (detoasted != NULL)
-			JIT_FREE_IF_COPY(detoasted, (Datum)a);
-		return PointerGetDatum(result);
-	}
+	PG_TRY();
+	{
+		/* Non-C collation: use PG's locale-aware str_toupper */
+		if (!pg_jitter_collation_is_c((Oid)collid)) {
+			int rlen;
 
-	/* C/POSIX: ASCII fast-path, convert a-z → A-Z */
-	text *result = (text *)palloc(VARHDRSZ + len);
-	SET_VARSIZE(result, VARHDRSZ + len);
-	char *out = VARDATA(result);
-	for (int i = 0; i < len; i++) {
-		unsigned char c = (unsigned char)data[i];
-		out[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+			out_str = str_toupper(data, len, (Oid)collid);
+			rlen = strlen(out_str);
+			result = (text *)palloc(VARHDRSZ + rlen);
+			SET_VARSIZE(result, VARHDRSZ + rlen);
+			memcpy(VARDATA(result), out_str, rlen);
+			pfree(out_str);
+			out_str = NULL;
+		} else {
+			/* C/POSIX: ASCII fast-path, convert a-z to A-Z */
+			char *out;
+
+			result = (text *)palloc(VARHDRSZ + len);
+			SET_VARSIZE(result, VARHDRSZ + len);
+			out = VARDATA(result);
+			for (int i = 0; i < len; i++) {
+				unsigned char c = (unsigned char)data[i];
+				out[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+			}
+		}
 	}
+	PG_CATCH();
+	{
+		if (out_str != NULL)
+			pfree(out_str);
+		if (detoasted != NULL)
+			JIT_FREE_IF_COPY(detoasted, da);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	if (detoasted != NULL)
-		JIT_FREE_IF_COPY(detoasted, (Datum)a);
+		JIT_FREE_IF_COPY(detoasted, da);
 	return PointerGetDatum(result);
 }
 
 int64
 simd_lower(int64 a, int32 collid)
 {
+	Datum da = (Datum)a;
 	struct varlena *v = (struct varlena *)DatumGetPointer(a);
 	text *detoasted = NULL;
 	char *data;
 	int len;
+	char *out_str = NULL;
+	text *result = NULL;
 
 	if (unlikely(VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v))) {
-		detoasted = DatumGetTextPP((Datum)a);
+		detoasted = DatumGetTextPP(da);
 		data = VARDATA_ANY(detoasted);
 		len = VARSIZE_ANY_EXHDR(detoasted);
 	} else {
@@ -272,27 +290,42 @@ simd_lower(int64 a, int32 collid)
 		len = VARSIZE_ANY_EXHDR(v);
 	}
 
-	if (!pg_jitter_collation_is_c((Oid)collid)) {
-		char *out_str = str_tolower(data, len, (Oid)collid);
-		int rlen = strlen(out_str);
-		text *result = (text *)palloc(VARHDRSZ + rlen);
-		SET_VARSIZE(result, VARHDRSZ + rlen);
-		memcpy(VARDATA(result), out_str, rlen);
-		pfree(out_str);
-		if (detoasted != NULL)
-			JIT_FREE_IF_COPY(detoasted, (Datum)a);
-		return PointerGetDatum(result);
-	}
+	PG_TRY();
+	{
+		if (!pg_jitter_collation_is_c((Oid)collid)) {
+			int rlen;
 
-	text *result = (text *)palloc(VARHDRSZ + len);
-	SET_VARSIZE(result, VARHDRSZ + len);
-	char *out = VARDATA(result);
-	for (int i = 0; i < len; i++) {
-		unsigned char c = (unsigned char)data[i];
-		out[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+			out_str = str_tolower(data, len, (Oid)collid);
+			rlen = strlen(out_str);
+			result = (text *)palloc(VARHDRSZ + rlen);
+			SET_VARSIZE(result, VARHDRSZ + rlen);
+			memcpy(VARDATA(result), out_str, rlen);
+			pfree(out_str);
+			out_str = NULL;
+		} else {
+			char *out;
+
+			result = (text *)palloc(VARHDRSZ + len);
+			SET_VARSIZE(result, VARHDRSZ + len);
+			out = VARDATA(result);
+			for (int i = 0; i < len; i++) {
+				unsigned char c = (unsigned char)data[i];
+				out[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+			}
+		}
 	}
+	PG_CATCH();
+	{
+		if (out_str != NULL)
+			pfree(out_str);
+		if (detoasted != NULL)
+			JIT_FREE_IF_COPY(detoasted, da);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	if (detoasted != NULL)
-		JIT_FREE_IF_COPY(detoasted, (Datum)a);
+		JIT_FREE_IF_COPY(detoasted, da);
 	return PointerGetDatum(result);
 }
 
@@ -329,6 +362,18 @@ simd_hashtext(int64 a)
 #define LIKE_MATCH_PREFIX   1
 #define LIKE_MATCH_SUFFIX   2
 #define LIKE_MATCH_INTERIOR 3
+
+bool
+simd_like_byte_search_is_eligible(Oid collid)
+{
+	if (!pg_jitter_collation_is_deterministic(collid))
+		return false;
+
+	if (pg_database_encoding_max_length() == 1)
+		return true;
+
+	return GetDatabaseEncoding() == PG_UTF8;
+}
 
 int32
 simd_like_match_text(int64 datum, int64 pattern_ptr, int32 pattern_len,
@@ -386,6 +431,10 @@ simd_like_classify(const char *pattern, int patlen,
 	bool has_leading_pct = false;
 	bool has_trailing_pct = false;
 	int start = 0, end = patlen;
+
+	if (pg_database_encoding_max_length() != 1 &&
+		GetDatabaseEncoding() != PG_UTF8)
+		return -1;
 
 	/* Strip leading % */
 	if (patlen > 0 && pattern[0] == '%') {
@@ -458,6 +507,13 @@ simd_like_compile(const char *pattern, int patlen, PgJitterContext *ctx)
 #define PC_LITERAL    0
 #define PC_PERCENT    1
 #define PC_UNDERSCORE 2
+
+	if (patlen < 0)
+		return NULL;
+
+	if (pg_database_encoding_max_length() != 1 &&
+		GetDatabaseEncoding() != PG_UTF8)
+		return NULL;
 
 	Size scratch_size = patlen > 0 ? (Size)patlen : 1;
 	uint8 *kinds = palloc(scratch_size);  /* at most patlen logical chars */
@@ -552,6 +608,11 @@ simd_like_compile(const char *pattern, int patlen, PgJitterContext *ctx)
 		c->anchored_start = !match_all;
 		c->anchored_end = !match_all;
 		return c;
+	}
+
+	if ((Size) total_literal > MaxAllocSize - sizeof(SzLikeCompiled)) {
+		pfree(kinds); pfree(chars);
+		return NULL;
 	}
 
 	{
@@ -796,29 +857,61 @@ done:
 /* ================================================================
  * CRC32 open-addressing hash table for large IN lists
  * ================================================================ */
-#include "port/pg_crc32c.h"
-#ifdef _WIN64
-#include "pg_crc32c_compat.h"
+static inline uint32
+pg_jitter_crc32c_sw_raw(uint32 crc, const void *data, Size len)
+{
+	const uint8 *p = (const uint8 *) data;
+
+	while (len-- > 0)
+	{
+		crc ^= *p++;
+		for (int bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ (0x82F63B78U & (0U - (crc & 1U)));
+	}
+	return crc;
+}
+
+static inline uint32
+pg_jitter_crc32c_raw(uint32 crc, const void *data, Size len)
+{
+#if (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
+	if (pg_jitter_cpu_has_sse42())
+	{
+		const uint8 *p = (const uint8 *) data;
+
+#if defined(_M_X64)
+		for (; len >= 8; p += 8, len -= 8)
+		{
+			uint64 word64;
+
+			memcpy(&word64, p, sizeof(word64));
+			crc = (uint32) _mm_crc32_u64(crc, word64);
+		}
 #endif
+		for (; len >= 4; p += 4, len -= 4)
+		{
+			uint32 word32;
+
+			memcpy(&word32, p, sizeof(word32));
+			crc = _mm_crc32_u32(crc, word32);
+		}
+		for (; len > 0; p++, len--)
+			crc = _mm_crc32_u8(crc, *p);
+		return crc;
+	}
+#endif
+
+	return pg_jitter_crc32c_sw_raw(crc, data, len);
+}
 
 static inline uint32
 crc32_hash_int4(int32 val)
 {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-	uint32 crc = 0xFFFFFFFF;
-	__asm__ volatile("crc32cw %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)val));
-	return crc;
-#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
-	return _mm_crc32_u32(0xFFFFFFFF, (uint32)val);
-#else
-	/* Fallback: use PG's CRC32C combiner, but keep the raw pre-FIN value.
-	 * The JIT emits raw CRC32 instructions for this hash table, so build
-	 * and probe must use the same convention on every platform. */
-	pg_crc32c crc;
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, &val, sizeof(val));
-	return (uint32)crc;
-#endif
+	/* Keep the raw pre-FIN value. The JIT emits raw CRC32 instructions for
+	 * this hash table, so build and probe must use the same convention. */
+	uint32 word = (uint32) val;
+
+	return pg_jitter_crc32c_raw(0xFFFFFFFFU, &word, sizeof(word));
 }
 
 Crc32HashTable *
@@ -1208,41 +1301,8 @@ text_hybrid_hash(const char *data, int len)
 
     if (len <= 16)
     {
-        /* Short strings: hardware CRC32C */
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-        uint32 crc = 0xFFFFFFFF;
-        int i = 0;
-        /* Process 4 bytes at a time */
-        for (; i + 4 <= len; i += 4)
-        {
-            uint32 word;
-            memcpy(&word, data + i, 4);
-            __asm__ volatile("crc32cw %w0, %w0, %w1" : "+r"(crc) : "r"(word));
-        }
-        /* Process remaining bytes */
-        for (; i < len; i++)
-            __asm__ volatile("crc32cb %w0, %w0, %w1" : "+r"(crc) : "r"((uint32)(uint8)data[i]));
-        h = crc;
-#elif (defined(__x86_64__) && defined(__SSE4_2__)) || defined(_M_X64)
-        uint32 crc = 0xFFFFFFFF;
-        int i = 0;
-        for (; i + 4 <= len; i += 4)
-        {
-            uint32 word;
-            memcpy(&word, data + i, 4);
-            crc = _mm_crc32_u32(crc, word);
-        }
-        for (; i < len; i++)
-            crc = _mm_crc32_u8(crc, (uint8)data[i]);
-        h = crc;
-#else
-        /* Fallback: PG's CRC32C */
-        pg_crc32c crc;
-        INIT_CRC32C(crc);
-        COMP_CRC32C(crc, data, len);
-        FIN_CRC32C(crc);
-        h = (uint32)crc;
-#endif
+        /* Short strings: runtime-gated CRC32C, with a software fallback. */
+        h = pg_jitter_crc32c_raw(0xFFFFFFFFU, data, (Size) len);
     }
     else
     {
@@ -1288,27 +1348,133 @@ text_hash_build(Datum *text_datums, int nvals, bool has_nulls,
 
     for (int i = 0; i < nvals; i++)
     {
-        text *t = DatumGetTextPP(text_datums[i]);
-        int len = VARSIZE_ANY_EXHDR(t);
-        const char *src = VARDATA_ANY(t);
+        Datum datum = text_datums[i];
+        text *t = NULL;
 
-        uint32 h = text_hybrid_hash(src, len);
-        uint32 idx = h & ht->mask;
+        PG_TRY();
+        {
+            int len;
+            const char *src;
+            uint32 h;
+            uint32 idx;
+            char *datacopy;
 
-        /* Linear probe for empty slot */
-        while (ht->entries[idx].hash != 0)
-            idx = (idx + 1) & ht->mask;
+            t = DatumGetTextPP(datum);
+            len = VARSIZE_ANY_EXHDR(t);
+            src = VARDATA_ANY(t);
 
-        /* Copy text data into the JIT context for generated-code lifetime. */
-        char *datacopy = pg_jitter_context_alloc(ctx, len);
-        memcpy(datacopy, src, len);
+            h = text_hybrid_hash(src, len);
+            idx = h & ht->mask;
 
-        ht->entries[idx].hash = h;
-        ht->entries[idx].len = len;
-        ht->entries[idx].data = datacopy;
+            /* Linear probe for empty slot */
+            while (ht->entries[idx].hash != 0)
+                idx = (idx + 1) & ht->mask;
 
-        JIT_FREE_IF_COPY(t, text_datums[i]);
+            /* Copy text data into the JIT context for generated-code lifetime. */
+            datacopy = pg_jitter_context_alloc(ctx, len);
+            memcpy(datacopy, src, len);
+
+            ht->entries[idx].hash = h;
+            ht->entries[idx].len = len;
+            ht->entries[idx].data = datacopy;
+
+            JIT_FREE_IF_COPY(t, datum);
+            t = NULL;
+        }
+        PG_CATCH();
+        {
+            if (t != NULL)
+                JIT_FREE_IF_COPY(t, datum);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
     }
+
+    return ht;
+}
+
+TextHashTable *
+text_hash_build_from_array(Datum array_datum, ExprEvalStep *op,
+                           FunctionCallInfo fcinfo, bool *has_nulls_out,
+                           PgJitterContext *ctx)
+{
+    ArrayType *arr = NULL;
+    Datum *text_vals = NULL;
+    TextHashTable *ht = NULL;
+    bool has_nulls = false;
+
+    if (has_nulls_out != NULL)
+        *has_nulls_out = false;
+
+    if (!pg_jitter_text_hash_saop_eligible(op, fcinfo))
+        return NULL;
+
+    PG_TRY();
+    {
+        int nitems;
+        int16 typlen;
+        bool typbyval;
+        char typalign;
+
+        arr = DatumGetArrayTypeP(array_datum);
+        nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+        get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+
+        if (!typbyval && ARR_ELEMTYPE(arr) == TEXTOID &&
+            nitems > 0 && nitems <= 16384)
+        {
+            bits8 *bitmap = ARR_NULLBITMAP(arr);
+            char *s = (char *)ARR_DATA_PTR(arr);
+            int bitmask = 1;
+            int text_nvals = 0;
+
+            text_vals = palloc(nitems * sizeof(Datum));
+
+            for (int k = 0; k < nitems; k++)
+            {
+                if (bitmap && (*bitmap & bitmask) == 0)
+                {
+                    has_nulls = true;
+                }
+                else
+                {
+                    text_vals[text_nvals++] = fetch_att(s, false, typlen);
+                    s = att_addlength_pointer(s, typlen, s);
+                    s = (char *)att_align_nominal(s, typalign);
+                }
+
+                if (bitmap)
+                {
+                    bitmask <<= 1;
+                    if (bitmask == 0x100)
+                    {
+                        bitmap++;
+                        bitmask = 1;
+                    }
+                }
+            }
+
+            if (text_nvals > 0)
+                ht = text_hash_build(text_vals, text_nvals, has_nulls, ctx);
+        }
+    }
+    PG_CATCH();
+    {
+        if (text_vals != NULL)
+            pfree(text_vals);
+        if (arr != NULL && (Pointer)arr != DatumGetPointer(array_datum))
+            pfree(arr);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (text_vals != NULL)
+        pfree(text_vals);
+    if (arr != NULL && (Pointer)arr != DatumGetPointer(array_datum))
+        pfree(arr);
+
+    if (has_nulls_out != NULL)
+        *has_nulls_out = has_nulls;
 
     return ht;
 }
@@ -1363,61 +1529,93 @@ int64
 jit_jsonb_object_field_text(int64 jb_datum, int64 key_ptr,
                              int32 key_len, int64 isnull_ptr)
 {
+	Datum jb_input = (Datum)jb_datum;
 	bool *isnull = (bool *)(uintptr_t)isnull_ptr;
-	Jsonb *jb = DatumGetJsonbP((Datum)jb_datum);
+	Jsonb *jb = DatumGetJsonbP(jb_input);
 	const char *key = (const char *)(uintptr_t)key_ptr;
 	JsonbValue vbuf;
 	JsonbValue *v;
+	int64 result = 0;
+	char *cstr = NULL;
+	StringInfoData jtext;
+	bool jtext_valid = false;
 
-	if (!JB_ROOT_IS_OBJECT(jb))
+	memset(&jtext, 0, sizeof(jtext));
+
+	PG_TRY();
 	{
-		*isnull = true;
-		return (int64)0;
-	}
-
-	v = getKeyJsonValueFromContainer(&jb->root, key, key_len, &vbuf);
-
-	if (v == NULL || v->type == jbvNull)
-	{
-		*isnull = true;
-		return (int64)0;
-	}
-
-	*isnull = false;
-
-	switch (v->type)
-	{
-		case jbvString:
-			return (int64)(Datum)PointerGetDatum(
-				cstring_to_text_with_len(v->val.string.val,
-				                         v->val.string.len));
-
-		case jbvNumeric:
+		if (!JB_ROOT_IS_OBJECT(jb))
 		{
-			char *cstr = DatumGetCString(
-				DirectFunctionCall1(numeric_out,
-				                    PointerGetDatum(v->val.numeric)));
-			return (int64)(Datum)PointerGetDatum(cstring_to_text(cstr));
-		}
-
-		case jbvBool:
-			return v->val.boolean
-				? (int64)(Datum)PointerGetDatum(
-					cstring_to_text_with_len("true", 4))
-				: (int64)(Datum)PointerGetDatum(
-					cstring_to_text_with_len("false", 5));
-
-		case jbvBinary:
-		{
-			StringInfoData jtext;
-			initStringInfo(&jtext);
-			JsonbToCString(&jtext, v->val.binary.data, v->val.binary.len);
-			return (int64)(Datum)PointerGetDatum(
-				cstring_to_text_with_len(jtext.data, jtext.len));
-		}
-
-		default:
 			*isnull = true;
-			return (int64)0;
+		}
+		else
+		{
+			v = getKeyJsonValueFromContainer(&jb->root, key, key_len, &vbuf);
+
+			if (v == NULL || v->type == jbvNull)
+			{
+				*isnull = true;
+			}
+			else
+			{
+				*isnull = false;
+
+				switch (v->type)
+				{
+					case jbvString:
+						result = (int64)(Datum)PointerGetDatum(
+							cstring_to_text_with_len(v->val.string.val,
+													 v->val.string.len));
+						break;
+
+					case jbvNumeric:
+						cstr = DatumGetCString(
+							DirectFunctionCall1(numeric_out,
+												PointerGetDatum(v->val.numeric)));
+						result = (int64)(Datum)PointerGetDatum(
+							cstring_to_text(cstr));
+						pfree(cstr);
+						cstr = NULL;
+						break;
+
+					case jbvBool:
+						result = v->val.boolean
+							? (int64)(Datum)PointerGetDatum(
+								cstring_to_text_with_len("true", 4))
+							: (int64)(Datum)PointerGetDatum(
+								cstring_to_text_with_len("false", 5));
+						break;
+
+					case jbvBinary:
+						initStringInfo(&jtext);
+						jtext_valid = true;
+						JsonbToCString(&jtext, v->val.binary.data,
+									   v->val.binary.len);
+						result = (int64)(Datum)PointerGetDatum(
+							cstring_to_text_with_len(jtext.data, jtext.len));
+						pfree(jtext.data);
+						jtext.data = NULL;
+						jtext_valid = false;
+						break;
+
+					default:
+						*isnull = true;
+						break;
+				}
+			}
+		}
 	}
+	PG_CATCH();
+	{
+		if (cstr != NULL)
+			pfree(cstr);
+		if (jtext_valid && jtext.data != NULL)
+			pfree(jtext.data);
+		JIT_FREE_IF_COPY(jb, jb_input);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	JIT_FREE_IF_COPY(jb, jb_input);
+	return result;
 }

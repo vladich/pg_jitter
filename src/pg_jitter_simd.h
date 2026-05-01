@@ -38,6 +38,7 @@ struct PgJitterContext;
 
 extern int32 simd_like_match_text(int64 datum, int64 pattern_ptr,
                                   int32 pattern_len, int32 match_type);
+extern bool simd_like_byte_search_is_eligible(Oid collid);
 extern int simd_like_classify(const char *pattern, int patlen,
                               const char **literal_out, int *literal_len_out);
 extern const char *simd_like_copy_literal(const char *literal, int literal_len,
@@ -49,10 +50,10 @@ extern const char *simd_like_copy_literal(const char *literal, int literal_len,
 #define SZ_LIKE_MAX_SEGMENTS 16
 #define SZ_LIKE_MAX_PIECES   8
 
-typedef struct { uint8 offset; uint8 len; const char *data; } SzPiece;
-typedef struct { uint8 width; uint8 num_pieces; uint8 longest_idx; SzPiece pieces[SZ_LIKE_MAX_PIECES]; } SzSegment;
+typedef struct { int32 offset; int32 len; const char *data; } SzPiece;
+typedef struct { int32 width; uint8 num_pieces; uint8 longest_idx; SzPiece pieces[SZ_LIKE_MAX_PIECES]; } SzSegment;
 typedef struct {
-	int16 min_len;
+	int32 min_len;
 	uint8 num_segments;
 	bool anchored_start;
 	bool anchored_end;
@@ -183,6 +184,11 @@ typedef struct TextHashTable {
 extern TextHashTable *text_hash_build(Datum *text_datums, int nvals,
                                        bool has_nulls,
                                        struct PgJitterContext *ctx);
+extern TextHashTable *text_hash_build_from_array(Datum array_datum,
+                                                  struct ExprEvalStep *op,
+                                                  FunctionCallInfo fcinfo,
+                                                  bool *has_nulls_out,
+                                                  struct PgJitterContext *ctx);
 
 /* Runtime probe: returns 1 if found, 0 if not (JIT-callable, 2 args) */
 extern int32 text_hash_probe(int64 datum, int64 table_ptr);

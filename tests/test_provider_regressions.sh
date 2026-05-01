@@ -49,12 +49,32 @@ fi
 PSQL="$PGBIN/psql"
 PG_ISREADY="$PGBIN/pg_isready"
 
+case "$(uname -s)" in
+    Darwin) PG_DYNLIB_VAR=DYLD_LIBRARY_PATH; PG_PATH_SEP=: ;;
+    MINGW*|MSYS*|CYGWIN*) PG_DYNLIB_VAR=PATH; PG_PATH_SEP=';' ;;
+    *) PG_DYNLIB_VAR=LD_LIBRARY_PATH; PG_PATH_SEP=: ;;
+esac
+PG_DYNLIB_PATH="$PG_LIBDIR"
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PG_LIBDIR" ]; then
+    PG_DYNLIB_PATH="$PG_LIBDIR/postgresql$PG_PATH_SEP$PG_DYNLIB_PATH"
+fi
+
+pg_env() {
+    local current="${!PG_DYNLIB_VAR:-}"
+
+    if [ -n "$current" ]; then
+        env "$PG_DYNLIB_VAR=$PG_DYNLIB_PATH$PG_PATH_SEP$current" "$@"
+    else
+        env "$PG_DYNLIB_VAR=$PG_DYNLIB_PATH" "$@"
+    fi
+}
+
 psql_cmd() {
-    "$PSQL" -h "$PGHOST" -p "$PGPORT" -d "$PGDB" -X "$@"
+    pg_env "$PSQL" -h "$PGHOST" -p "$PGPORT" -d "$PGDB" -X "$@"
 }
 
 server_ready() {
-    "$PG_ISREADY" -h "$PGHOST" -p "$PGPORT" -d "$PGDB" >/dev/null 2>&1
+    pg_env "$PG_ISREADY" -h "$PGHOST" -p "$PGPORT" -d "$PGDB" >/dev/null 2>&1
 }
 
 detect_backends() {
@@ -93,6 +113,10 @@ else
     read -r -a BACKENDS <<< "$BACKEND"
 fi
 
+PG_VERSION_NUM="$(psql_cmd -q -t -A -v ON_ERROR_STOP=1 -c "SHOW server_version_num;" | tr -d '[:space:]')"
+BACKEND_OUTFILE="$(mktemp "${TMPDIR:-/tmp}/pg_jitter_provider_backend.XXXXXX")"
+trap 'rm -f "$BACKEND_OUTFILE"' EXIT
+
 JIT_SETTINGS="
 SET jit = on;
 SET jit_above_cost = 0;
@@ -106,7 +130,60 @@ FAIL=0
 backend_settings() {
     local backend="$1"
 
-    printf "SET pg_jitter.backend = '%s';\n" "$backend"
+    if [ "$PG_VERSION_NUM" -ge 170000 ]; then
+        printf "SET pg_jitter.backend = '%s';\n" "$backend"
+    fi
+}
+
+verify_backend_active() {
+    local backend="$1"
+    local expected_provider active_provider smoke_out
+
+    if [ "$PG_VERSION_NUM" -ge 170000 ]; then
+        expected_provider="pg_jitter"
+    else
+        expected_provider="pg_jitter_$backend"
+    fi
+
+    active_provider="$(psql_cmd -q -t -A -v ON_ERROR_STOP=1 -c "SHOW jit_provider;" | tail -n 1)"
+    if [ "$active_provider" != "$expected_provider" ]; then
+        printf 'expected jit_provider=%s, got %s\n' "$expected_provider" "$active_provider"
+        printf 'Activate the provider with ALTER SYSTEM and restart before running this script.\n'
+        return 1
+    fi
+
+    if [ "$PG_VERSION_NUM" -ge 170000 ]; then
+        local backend_output active_backend
+
+        backend_output="$(psql_cmd -q -t -A -v ON_ERROR_STOP=1 -c "$(backend_settings "$backend")
+SHOW pg_jitter.backend;" 2>&1)" || {
+            printf '%s\n' "$backend_output"
+            return 1
+        }
+        active_backend="$(printf '%s\n' "$backend_output" | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$active_backend" != "$backend" ]; then
+            printf 'expected pg_jitter.backend=%s, got output:\n%s\n' "$backend" "$backend_output"
+            return 1
+        fi
+    fi
+
+    smoke_out="$(psql_cmd -q -t -A -v ON_ERROR_STOP=1 -c "$(backend_settings "$backend")
+SET jit = on;
+SET jit_above_cost = 0;
+SET jit_inline_above_cost = 0;
+SET jit_optimize_above_cost = 0;
+SELECT SUM(i) FROM generate_series(1,1000) AS g(i) WHERE i > 10;" 2>&1)" || {
+        printf 'forced-JIT smoke query failed:\n%s\n' "$smoke_out"
+        return 1
+    }
+
+    if printf '%s\n' "$smoke_out" |
+       grep -q 'invalid value for parameter "pg_jitter.backend"'; then
+        printf 'forced-JIT smoke query reported invalid backend:\n%s\n' "$smoke_out"
+        return 1
+    fi
+
+    return 0
 }
 
 int4_array_1_to_n() {
@@ -185,10 +262,9 @@ inlist_check_rows() {
 for backend in "${BACKENDS[@]}"; do
     echo "=== backend: $backend ==="
 
-    if ! psql_cmd -q -v ON_ERROR_STOP=1 -c "$(backend_settings "$backend")
-SHOW pg_jitter.backend;" >/tmp/pg_jitter_provider_backend.out 2>&1; then
+    if ! verify_backend_active "$backend" > "$BACKEND_OUTFILE" 2>&1; then
         echo "FAIL: could not select pg_jitter backend '$backend'"
-        sed -n '1,80p' /tmp/pg_jitter_provider_backend.out
+        sed -n '1,80p' "$BACKEND_OUTFILE"
         FAIL=$((FAIL + 1))
         continue
     fi
@@ -301,6 +377,69 @@ FROM checks;"
         fi
     fi
 
+    shift_sql="$(backend_settings "$backend")
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+DROP TABLE IF EXISTS pg_jitter_shift_vals;
+CREATE TEMP TABLE pg_jitter_shift_vals(a2 int2, a4 int4, a8 int8, s int4);
+INSERT INTO pg_jitter_shift_vals VALUES
+  (1, 1, 1, 0),
+  (1, 1, 1, 31),
+  (1, 1, 1, 32),
+  (1, 1, 1, -1),
+  (-1, -1, -1, 31),
+  (-1, -1, -1, 32),
+  (-1, -1, -1, 64),
+  (-1, -1, -1, -1);
+SET jit = off;
+CREATE TEMP TABLE pg_jitter_shift_expected AS
+SELECT a2 << s AS i2l, a2 >> s AS i2r,
+       a4 << s AS i4l, a4 >> s AS i4r,
+       a8 << s AS i8l, a8 >> s AS i8r
+FROM pg_jitter_shift_vals
+ORDER BY a2, a4, a8, s;
+$backend_jit_settings
+CREATE TEMP TABLE pg_jitter_shift_got AS
+SELECT a2 << s AS i2l, a2 >> s AS i2r,
+       a4 << s AS i4l, a4 >> s AS i4r,
+       a8 << s AS i8l, a8 >> s AS i8r
+FROM pg_jitter_shift_vals
+ORDER BY a2, a4, a8, s;
+WITH diff AS (
+  (SELECT * FROM pg_jitter_shift_expected EXCEPT ALL
+   SELECT * FROM pg_jitter_shift_got)
+  UNION ALL
+  (SELECT * FROM pg_jitter_shift_got EXCEPT ALL
+   SELECT * FROM pg_jitter_shift_expected)
+)
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM diff)
+            THEN 'ok'
+            ELSE 'integer_shift_edges_mismatch'
+       END;"
+
+    set +e
+    shift_out="$(printf '%s\n' "$shift_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    shift_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: integer shift edge coverage crashed or wedged the server"
+        printf '%s\n' "$shift_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$shift_rc" -ne 0 ]; then
+        echo "FAIL: integer shift edge coverage raised an unexpected SQL error"
+        printf '%s\n' "$shift_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    else
+        shift_out="$(printf '%s\n' "$shift_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$shift_out" != "ok" ]; then
+            echo "FAIL: integer shift edge checks failed: $shift_out"
+            FAIL=$((FAIL + 1))
+        else
+            echo "PASS: integer shift edge checks match PostgreSQL"
+        fi
+    fi
+
     endian_sql="$backend_jit_settings
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
@@ -388,7 +527,10 @@ CREATE TEMP TABLE pg_jitter_pcre2_regex_edge(v text);
 INSERT INTO pg_jitter_pcre2_regex_edge VALUES
   ('a' || chr(10)),
   ('word'),
-  ('swords');
+  ('swords'),
+  ('abb'),
+  ('aba'),
+  (repeat('a', 255));
 WITH checks(name, ok) AS (
   VALUES
     ('short_ilike',
@@ -408,10 +550,18 @@ WITH checks(name, ok) AS (
       WHERE v !~* '(alpha)([0-9]+)(omega)')),
     ('raw_regex_hard_end',
      (SELECT count(*) = 0 FROM pg_jitter_pcre2_regex_edge
-      WHERE v ~ 'a$')),
+      WHERE v = 'a' || chr(10) AND v ~ 'a$')),
     ('raw_regex_word_boundary',
      (SELECT count(*) = 1 FROM pg_jitter_pcre2_regex_edge
-      WHERE v ~ '\\mword\\M'))
+      WHERE v ~ '\\mword\\M')),
+    ('raw_regex_lookaround_capture_numbering',
+     (SELECT count(*) = 1 AND min(v) = 'abb'
+      FROM pg_jitter_pcre2_regex_edge
+      WHERE v ~ '(?=(a))a(b)\\1')),
+    ('raw_regex_max_bound',
+     (SELECT count(*) = 1
+      FROM pg_jitter_pcre2_regex_edge
+      WHERE v ~ '^a{255}$'))
 )
 SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
 FROM checks;"
@@ -436,10 +586,350 @@ FROM checks;"
             FAIL=$((FAIL + 1))
         else
             echo "PASS: PCRE2 LIKE/regex checks match PostgreSQL"
-        fi
+	        fi
+	    fi
+
+	    pcre2_contract_sql="$backend_jit_settings
+	SET enable_indexscan = off;
+	SET enable_bitmapscan = off;
+	CREATE TEMP TABLE pg_jitter_pcre2_contract_text(v text);
+	INSERT INTO pg_jitter_pcre2_contract_text VALUES
+	  ('abc'),
+	  ('abc' || chr(10)),
+	  ('a' || chr(10) || 'b'),
+	  ('word'),
+	  ('sword'),
+	  ('words'),
+	  ('Alpha123omega'),
+	  (repeat('x', 260) || 'alpha123omega' || repeat('y', 260)),
+	  ('abb'),
+	  ('aba'),
+	  ('é'),
+	  ('_');
+	SET jit = off;
+	CREATE TEMP TABLE pg_jitter_pcre2_contract_native AS
+	SELECT v,
+	       v LIKE 'a_c' AS like_single,
+	       v LIKE 'abc%' AS like_prefix,
+	       v LIKE '%bc' AS like_suffix,
+	       v ILIKE 'alpha123%' AS ilike_prefix,
+	       v ~ '^a.c$' AS regex_dot,
+	       v ~ 'a$' AS regex_hard_end,
+	       v ~ '\\mword\\M' AS regex_word,
+	       v ~ '(?=(a))a(b)\\1' AS regex_lookaround_capture,
+	       v ~ '^[[:alpha:]]$' AS regex_alpha,
+	       v ~ '^.$' AS regex_any
+	FROM pg_jitter_pcre2_contract_text;
+	SET jit = on;
+	CREATE TEMP TABLE pg_jitter_pcre2_contract_jit AS
+	SELECT v,
+	       v LIKE 'a_c' AS like_single,
+	       v LIKE 'abc%' AS like_prefix,
+	       v LIKE '%bc' AS like_suffix,
+	       v ILIKE 'alpha123%' AS ilike_prefix,
+	       v ~ '^a.c$' AS regex_dot,
+	       v ~ 'a$' AS regex_hard_end,
+	       v ~ '\\mword\\M' AS regex_word,
+	       v ~ '(?=(a))a(b)\\1' AS regex_lookaround_capture,
+	       v ~ '^[[:alpha:]]$' AS regex_alpha,
+	       v ~ '^.$' AS regex_any
+	FROM pg_jitter_pcre2_contract_text;
+	WITH diff AS (
+	  (SELECT * FROM pg_jitter_pcre2_contract_native
+	   EXCEPT
+	   SELECT * FROM pg_jitter_pcre2_contract_jit)
+	  UNION ALL
+	  (SELECT * FROM pg_jitter_pcre2_contract_jit
+	   EXCEPT
+	   SELECT * FROM pg_jitter_pcre2_contract_native)
+	)
+	SELECT CASE WHEN count(*) = 0 THEN 'ok' ELSE 'diff=' || count(*)::text END
+	FROM diff;"
+
+	    set +e
+	    pcre2_contract_out="$(printf '%s\n' "$pcre2_contract_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+	    pcre2_contract_rc=$?
+	    set -e
+
+	    if ! server_ready; then
+	        echo "FAIL: PCRE2 native-vs-JIT contract coverage crashed or wedged the server"
+	        printf '%s\n' "$pcre2_contract_out" | sed -n '1,80p'
+	        FAIL=$((FAIL + 1))
+	    elif [ "$pcre2_contract_rc" -ne 0 ]; then
+	        echo "FAIL: PCRE2 native-vs-JIT contract coverage raised an unexpected SQL error"
+	        printf '%s\n' "$pcre2_contract_out" | sed -n '1,120p'
+	        FAIL=$((FAIL + 1))
+	    else
+	        pcre2_contract_out="$(printf '%s\n' "$pcre2_contract_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+	        if [ "$pcre2_contract_out" != "ok" ]; then
+	            echo "FAIL: PCRE2 native-vs-JIT contract mismatch: $pcre2_contract_out"
+	            FAIL=$((FAIL + 1))
+	        else
+	            echo "PASS: PCRE2 native-vs-JIT contract corpus matches PostgreSQL"
+	        fi
+	    fi
+
+	    pcre2_lookaround_error_sql="$backend_jit_settings
+	SET enable_indexscan = off;
+	SET enable_bitmapscan = off;
+	CREATE TEMP TABLE pg_jitter_pcre2_lookaround_error(v text);
+INSERT INTO pg_jitter_pcre2_lookaround_error VALUES ('aa');
+SELECT count(*) FROM pg_jitter_pcre2_lookaround_error
+WHERE v ~ '(a)(?=\\1)';"
+
+    set +e
+    pcre2_lookaround_error_out="$(printf '%s\n' "$pcre2_lookaround_error_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    pcre2_lookaround_error_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: PCRE2 lookaround backref error coverage crashed or wedged the server"
+        printf '%s\n' "$pcre2_lookaround_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$pcre2_lookaround_error_rc" -eq 0 ]; then
+        echo "FAIL: PCRE2 lookaround backref coverage did not raise PostgreSQL regex error"
+        printf '%s\n' "$pcre2_lookaround_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif printf '%s\n' "$pcre2_lookaround_error_out" | grep -q "invalid regular expression"; then
+        echo "PASS: PCRE2 lookaround backrefs fall back to PostgreSQL regex errors"
+    else
+        echo "FAIL: PCRE2 lookaround backref coverage raised an unexpected error"
+        printf '%s\n' "$pcre2_lookaround_error_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
     fi
 
-    inlist_sql="$backend_jit_settings
+    pcre2_bound_error_sql="$backend_jit_settings
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_pcre2_bound_error(v text);
+INSERT INTO pg_jitter_pcre2_bound_error VALUES (repeat('a', 256));
+SELECT count(*) FROM pg_jitter_pcre2_bound_error
+WHERE v ~ 'a{256}';"
+
+    set +e
+    pcre2_bound_error_out="$(printf '%s\n' "$pcre2_bound_error_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    pcre2_bound_error_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: PCRE2 over-DUPMAX bound coverage crashed or wedged the server"
+        printf '%s\n' "$pcre2_bound_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$pcre2_bound_error_rc" -eq 0 ]; then
+        echo "FAIL: PCRE2 over-DUPMAX bound coverage did not raise PostgreSQL regex error"
+        printf '%s\n' "$pcre2_bound_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif printf '%s\n' "$pcre2_bound_error_out" | grep -q "invalid regular expression"; then
+        echo "PASS: PCRE2 over-DUPMAX bounds fall back to PostgreSQL regex errors"
+    else
+        echo "FAIL: PCRE2 over-DUPMAX bound coverage raised an unexpected error"
+        printf '%s\n' "$pcre2_bound_error_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    fi
+
+    pcre2_constraint_quantifier_error_sql="$backend_jit_settings
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_pcre2_constraint_error(v text);
+INSERT INTO pg_jitter_pcre2_constraint_error VALUES ('word');
+SELECT count(*) FROM pg_jitter_pcre2_constraint_error
+WHERE v ~ '\\m+';"
+
+    set +e
+    pcre2_constraint_quantifier_error_out="$(printf '%s\n' "$pcre2_constraint_quantifier_error_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    pcre2_constraint_quantifier_error_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: PCRE2 quantified-constraint coverage crashed or wedged the server"
+        printf '%s\n' "$pcre2_constraint_quantifier_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$pcre2_constraint_quantifier_error_rc" -eq 0 ]; then
+        echo "FAIL: PCRE2 quantified-constraint coverage did not raise PostgreSQL regex error"
+        printf '%s\n' "$pcre2_constraint_quantifier_error_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif printf '%s\n' "$pcre2_constraint_quantifier_error_out" | grep -q "invalid regular expression"; then
+        echo "PASS: PCRE2 quantified constraints fall back to PostgreSQL regex errors"
+    else
+        echo "FAIL: PCRE2 quantified-constraint coverage raised an unexpected error"
+        printf '%s\n' "$pcre2_constraint_quantifier_error_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    fi
+
+    if [ "$PG_VERSION_NUM" -ge 160000 ]; then
+        yyjson_is_json_sql="$backend_jit_settings
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_yyjson_is_json(name text, js text);
+INSERT INTO pg_jitter_yyjson_is_json VALUES
+  ('plain_nul_escape', '\"\\u0000\"'),
+  ('plain_lone_surrogate', '{\"x\":\"\\uD800\"}'),
+  ('plain_bad_hex', '\"\\uD80Z\"'),
+  ('unique_duplicate_decoded_key', '{\"a\":1,\"\\u0061\":2}'),
+  ('unique_lone_surrogate_value', '{\"x\":\"\\uD800\"}'),
+  ('unique_nul_key', '{\"\\u0000\":1}'),
+  ('unique_nested_ok', '{\"a\":1,\"b\":[{\"a\":1},{\"a\":2}]}');
+WITH checks(name, ok) AS (
+  VALUES
+    ('syntax_allows_nul_escape',
+     (SELECT bool_and(js IS JSON)
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'plain_nul_escape')),
+    ('syntax_allows_lone_surrogate',
+     (SELECT bool_and(js IS JSON)
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'plain_lone_surrogate')),
+    ('syntax_rejects_bad_hex',
+     (SELECT bool_and(NOT (js IS JSON))
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'plain_bad_hex')),
+    ('unique_rejects_duplicate_decoded_key',
+     (SELECT bool_and(NOT (js IS JSON WITH UNIQUE KEYS))
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'unique_duplicate_decoded_key')),
+    ('unique_rejects_lone_surrogate_value',
+     (SELECT bool_and(NOT (js IS JSON WITH UNIQUE KEYS))
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'unique_lone_surrogate_value')),
+    ('unique_rejects_nul_key',
+     (SELECT bool_and(NOT (js IS JSON WITH UNIQUE KEYS))
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'unique_nul_key')),
+    ('unique_accepts_nested_ok',
+     (SELECT bool_and(js IS JSON WITH UNIQUE KEYS)
+      FROM pg_jitter_yyjson_is_json
+      WHERE name = 'unique_nested_ok'))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+        set +e
+        yyjson_is_json_out="$(printf '%s\n' "$yyjson_is_json_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+        yyjson_is_json_rc=$?
+        set -e
+
+        if ! server_ready; then
+            echo "FAIL: yyjson IS JSON coverage crashed or wedged the server"
+            printf '%s\n' "$yyjson_is_json_out" | sed -n '1,80p'
+            FAIL=$((FAIL + 1))
+        elif [ "$yyjson_is_json_rc" -ne 0 ]; then
+            echo "FAIL: yyjson IS JSON coverage raised an unexpected SQL error"
+            printf '%s\n' "$yyjson_is_json_out" | sed -n '1,120p'
+            FAIL=$((FAIL + 1))
+	        else
+	            yyjson_is_json_out="$(printf '%s\n' "$yyjson_is_json_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+	            if [ "$yyjson_is_json_out" != "ok" ]; then
+	                echo "FAIL: yyjson IS JSON checks failed: $yyjson_is_json_out"
+                FAIL=$((FAIL + 1))
+            else
+	                echo "PASS: yyjson IS JSON syntax and unique-key semantics match PostgreSQL"
+	            fi
+	        fi
+
+	        yyjson_contract_sql="$backend_jit_settings
+	SET enable_indexscan = off;
+	SET enable_bitmapscan = off;
+	CREATE TEMP TABLE pg_jitter_yyjson_contract_corpus(name text, js text);
+	INSERT INTO pg_jitter_yyjson_contract_corpus VALUES
+	  ('empty', ''),
+	  ('space', '   '),
+	  ('short_object', '{\"a\":1}'),
+	  ('short_array', '[1,true,null]'),
+	  ('short_scalar', '\"x\"'),
+	  ('plain_nul_escape', '\"\\u0000\"'),
+	  ('plain_lone_surrogate', '{\"x\":\"\\uD800\"}'),
+	  ('unicode_pair', '\"\\uD834\\uDD1E\"'),
+	  ('bad_pair', '\"\\uD834x\"'),
+	  ('dup_plain', '{\"a\":1,\"a\":2}'),
+	  ('dup_decoded', '{\"a\":1,\"\\u0061\":2}'),
+	  ('nested_dup', '{\"a\":[{\"b\":1,\"b\":2}]}'),
+	  ('nested_distinct', '{\"a\":[{\"b\":1},{\"b\":2}]}'),
+	  ('large', '{\"a\":[' || repeat('{\"b\":1},', 90) || '{\"c\":2}]}');
+	SET jit = off;
+	CREATE TEMP TABLE pg_jitter_yyjson_contract_native AS
+	SELECT name,
+	       js IS JSON AS is_json,
+	       js IS JSON OBJECT AS is_object,
+	       js IS JSON ARRAY AS is_array,
+	       js IS JSON SCALAR AS is_scalar,
+	       js IS JSON WITH UNIQUE KEYS AS unique_keys
+	FROM pg_jitter_yyjson_contract_corpus;
+	SET jit = on;
+	CREATE TEMP TABLE pg_jitter_yyjson_contract_jit AS
+	SELECT name,
+	       js IS JSON AS is_json,
+	       js IS JSON OBJECT AS is_object,
+	       js IS JSON ARRAY AS is_array,
+	       js IS JSON SCALAR AS is_scalar,
+	       js IS JSON WITH UNIQUE KEYS AS unique_keys
+	FROM pg_jitter_yyjson_contract_corpus;
+	CREATE TEMP TABLE pg_jitter_yyjson_contract_valid(name text, js text);
+	INSERT INTO pg_jitter_yyjson_contract_valid VALUES
+	  ('short_object', '{\"a\":1}'),
+	  ('short_array', '[1,true,null]'),
+	  ('short_scalar', '\"x\"'),
+	  ('unicode_pair', '\"\\uD834\\uDD1E\"'),
+	  ('large', '{\"a\":[' || repeat('{\"b\":1},', 90) || '{\"c\":2}]}');
+	SET jit = off;
+	CREATE TEMP TABLE pg_jitter_yyjson_jsonb_contract_native AS
+	SELECT name, js::jsonb::text AS rendered
+	FROM pg_jitter_yyjson_contract_valid;
+	SET jit = on;
+	CREATE TEMP TABLE pg_jitter_yyjson_jsonb_contract_jit AS
+	SELECT name, js::jsonb::text AS rendered
+	FROM pg_jitter_yyjson_contract_valid;
+	WITH diff AS (
+	  SELECT 'is_json' AS kind, count(*) AS n
+	  FROM (
+	    (SELECT * FROM pg_jitter_yyjson_contract_native
+	     EXCEPT
+	     SELECT * FROM pg_jitter_yyjson_contract_jit)
+	    UNION ALL
+	    (SELECT * FROM pg_jitter_yyjson_contract_jit
+	     EXCEPT
+	     SELECT * FROM pg_jitter_yyjson_contract_native)
+	  ) d
+	  UNION ALL
+	  SELECT 'jsonb', count(*)
+	  FROM (
+	    (SELECT * FROM pg_jitter_yyjson_jsonb_contract_native
+	     EXCEPT
+	     SELECT * FROM pg_jitter_yyjson_jsonb_contract_jit)
+	    UNION ALL
+	    (SELECT * FROM pg_jitter_yyjson_jsonb_contract_jit
+	     EXCEPT
+	     SELECT * FROM pg_jitter_yyjson_jsonb_contract_native)
+	  ) d
+	)
+	SELECT COALESCE(string_agg(kind || '=' || n::text, ', ' ORDER BY kind)
+	                FILTER (WHERE n <> 0), 'ok')
+	FROM diff;"
+
+	        set +e
+	        yyjson_contract_out="$(printf '%s\n' "$yyjson_contract_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+	        yyjson_contract_rc=$?
+	        set -e
+
+	        if ! server_ready; then
+	            echo "FAIL: yyjson native-vs-JIT contract coverage crashed or wedged the server"
+	            printf '%s\n' "$yyjson_contract_out" | sed -n '1,80p'
+	            FAIL=$((FAIL + 1))
+	        elif [ "$yyjson_contract_rc" -ne 0 ]; then
+	            echo "FAIL: yyjson native-vs-JIT contract coverage raised an unexpected SQL error"
+	            printf '%s\n' "$yyjson_contract_out" | sed -n '1,120p'
+	            FAIL=$((FAIL + 1))
+	        else
+	            yyjson_contract_out="$(printf '%s\n' "$yyjson_contract_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+	            if [ "$yyjson_contract_out" != "ok" ]; then
+	                echo "FAIL: yyjson native-vs-JIT contract mismatch: $yyjson_contract_out"
+	                FAIL=$((FAIL + 1))
+	            else
+	                echo "PASS: yyjson native-vs-JIT contract corpus matches PostgreSQL"
+	            fi
+	        fi
+	    fi
+
+	    inlist_sql="$backend_jit_settings
 $simd_inlist_settings
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;

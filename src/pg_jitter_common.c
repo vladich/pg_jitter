@@ -7,6 +7,8 @@
 #include "pg_jitter_common.h"
 #include "pg_jitter_simd.h"
 #include "pg_jit_funcs.h"
+#include "pg_jitter_pcre2.h"
+#include "pg_jitter_yyjson.h"
 
 #include "catalog/pg_collation_d.h"
 #include "executor/execExpr.h"
@@ -23,6 +25,7 @@
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/array.h"
+#include "utils/fmgroids.h"
 #include "utils/pg_locale.h"
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"            /* VARDATA_ANY, VARSIZE_ANY_EXHDR */
@@ -300,6 +303,7 @@ pg_jitter_cpu_has_avx512vl(void)
 static bool pg_jitter_shmem_init(void) {
   bool found;
   Size size;
+  MemoryContext oldcontext;
 
   if (jit_dsm_slots != NULL)
     return true;
@@ -315,6 +319,7 @@ static bool pg_jitter_shmem_init(void) {
   size = offsetof(JitDsmSlotTable, handles) +
          sizeof(pg_atomic_uint32) * MaxBackends;
 
+  oldcontext = CurrentMemoryContext;
   PG_TRY();
   {
     jit_dsm_slots =
@@ -323,6 +328,7 @@ static bool pg_jitter_shmem_init(void) {
   PG_CATCH();
   {
     /* Shmem pool exhausted — fall back to per-worker compilation */
+    MemoryContextSwitchTo(oldcontext);
     FlushErrorState();
     shmem_init_failed = true;
     elog(DEBUG1, "pg_jitter: shmem allocation failed, "
@@ -423,6 +429,36 @@ bool pg_jitter_in_int32_hash_safe(PGFunction fn) {
    */
   return fn == int2eq || fn == int4eq || fn == date_eq ||
          fn == chareq || fn == oideq;
+}
+
+bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
+                                       FunctionCallInfo fcinfo) {
+#if PG_VERSION_NUM >= 150000
+  FmgrInfo *finfo;
+
+  if (op == NULL || fcinfo == NULL ||
+      op->opcode != EEOP_HASHED_SCALARARRAYOP)
+    return false;
+
+  finfo = op->d.hashedscalararrayop.finfo;
+  if (finfo == NULL)
+    return false;
+
+  /*
+   * text_hash_probe is byte equality over text payloads.  That is equivalent
+   * only to PostgreSQL's strict builtin texteq under deterministic collation.
+   * Custom hashable text operators must keep PostgreSQL's own hashed SAOP.
+   */
+  if (!finfo->fn_strict || finfo->fn_oid != F_TEXTEQ ||
+      finfo->fn_addr != texteq)
+    return false;
+
+  return pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+#else
+  (void)op;
+  (void)fcinfo;
+  return false;
+#endif
 }
 
 /*
@@ -573,6 +609,26 @@ void pg_jitter_register_compiled(PgJitterContext *ctx, void (*free_fn)(void *),
   cc->data = data;
   cc->next = ctx->compiled_list;
   ctx->compiled_list = cc;
+}
+
+/*
+ * Register compiled code and keep ownership transfer exception-safe.  Several
+ * backends allocate executable code outside PostgreSQL memory contexts, so a
+ * MemoryContextAlloc ERROR while linking the cleanup record must release it.
+ */
+void pg_jitter_register_compiled_or_free(PgJitterContext *ctx,
+                                         void (*free_fn)(void *), void *data) {
+  PG_TRY();
+  {
+    pg_jitter_register_compiled(ctx, free_fn, data);
+  }
+  PG_CATCH();
+  {
+    if (free_fn != NULL)
+      free_fn(data);
+    PG_RE_THROW();
+  }
+  PG_END_TRY();
 }
 
 static MemoryContext
@@ -1894,6 +1950,7 @@ pg_jitter_expr_fingerprint(ExprState *state)
 {
   uint64 hash = UINT64CONST(14695981039346656037);
   int i;
+  bool expr_tree_fingerprinted = false;
 
   hash = pg_jitter_fnv1a_u64(hash, (uint64)PG_VERSION_NUM);
   hash = pg_jitter_fnv1a_u64(hash, (uint64)sizeof(Datum));
@@ -1910,6 +1967,7 @@ pg_jitter_expr_fingerprint(ExprState *state)
       hash = pg_jitter_fnv1a_u64(hash, UINT64CONST(0x4558505254524545));
       hash = pg_jitter_fnv1a_bytes(hash, expr_string, strlen(expr_string));
       pfree(expr_string);
+      expr_tree_fingerprinted = true;
     }
   }
 
@@ -1970,7 +2028,13 @@ pg_jitter_expr_fingerprint(ExprState *state)
 
       case EEOP_CONST:
         hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.isnull);
-        if (!op->d.constval.isnull)
+        /*
+         * nodeToString() serializes Const payloads by value.  When it was
+         * available, avoid mixing process-local byref Datum pointers into a
+         * shared-code fingerprint; only use the raw Datum as a last-resort key
+         * for expression states without a dumpable tree.
+         */
+        if (!op->d.constval.isnull && !expr_tree_fingerprinted)
           hash = pg_jitter_fnv1a_u64(hash, (uint64)op->d.constval.value);
         break;
 
@@ -2429,12 +2493,16 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
    * allocator state and ensures clean W^X transitions.
    */
   alloc_size = (code_size + 4095) & ~((Size)4095); /* page-align */
+  info =
+      (ExecMemInfo *)MemoryContextAlloc(TopMemoryContext, sizeof(ExecMemInfo));
 
 #if defined(__APPLE__) && defined(__aarch64__)
   mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE | PROT_EXEC,
              MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-  if (mem == MAP_FAILED)
+  if (mem == MAP_FAILED) {
+    pfree(info);
     return NULL;
+  }
 
   pthread_jit_write_protect_np(0);
   memcpy(mem, code_bytes, code_size);
@@ -2442,20 +2510,27 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
   pthread_jit_write_protect_np(1);
 
   /* Verify: read back the code bytes and compare */
-  if (memcmp(mem, code_bytes, code_size) != 0)
+  if (memcmp(mem, code_bytes, code_size) != 0) {
     elog(WARNING,
-         "pg_jitter: VERIFY FAILED — code bytes don't match after copy!");
+         "pg_jitter: code copy verification failed, compiling locally");
+    munmap(mem, alloc_size);
+    pfree(info);
+    return NULL;
+  }
   else
     elog(DEBUG1, "pg_jitter: copy verified OK (%zu bytes)", code_size);
 #else
   mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
              -1, 0);
-  if (mem == MAP_FAILED)
+  if (mem == MAP_FAILED) {
+    pfree(info);
     return NULL;
+  }
 
   memcpy(mem, code_bytes, code_size);
   if (mprotect(mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
     munmap(mem, alloc_size);
+    pfree(info);
     return NULL;
   }
 #if defined(__aarch64__)
@@ -2463,8 +2538,6 @@ void *pg_jitter_copy_to_executable(const void *code_bytes, Size code_size) {
 #endif
 #endif
 
-  info =
-      (ExecMemInfo *)MemoryContextAlloc(TopMemoryContext, sizeof(ExecMemInfo));
   info->code_ptr = mem;
   info->alloc_size = alloc_size;
 
@@ -2482,6 +2555,10 @@ void pg_jitter_exec_free(void *ptr) {
     munmap(info->code_ptr, info->alloc_size);
     pfree(info);
   }
+}
+
+void pg_jitter_register_exec_handle(PgJitterContext *ctx, void *handle) {
+  pg_jitter_register_compiled_or_free(ctx, pg_jitter_exec_free, handle);
 }
 
 void *pg_jitter_exec_code_ptr(void *handle) {
@@ -2520,6 +2597,113 @@ pg_jitter_x86_movabs_followed_by_indirect_branch(const uint8_t *bytes,
   return rm == reg;
 }
 
+static bool
+pg_jitter_reloc_match_worker_addr(void *worker_ptr, uint64 leader_addr,
+                                  int64 delta, uint64 *worker_addr_out)
+{
+  uint64 worker_addr;
+
+  if (worker_ptr == NULL)
+    return false;
+
+  worker_addr = (uint64)(uintptr_t)worker_ptr;
+  if (worker_addr - (uint64)delta != leader_addr)
+    return false;
+
+  *worker_addr_out = worker_addr;
+  return true;
+}
+
+static bool
+pg_jitter_reloc_lookup_known_helper(uint64 leader_addr, int64 delta,
+                                    uint64 *worker_addr_out)
+{
+  static void *fixed_helpers[] = {
+      (void *)pg_jitter_fallback_step,
+      (void *)pg_jitter_agg_trans_init_strict_byval,
+      (void *)pg_jitter_agg_trans_strict_byval,
+      (void *)pg_jitter_agg_trans_byval,
+      (void *)pg_jitter_agg_trans_init_strict_byref,
+      (void *)pg_jitter_agg_trans_strict_byref,
+      (void *)pg_jitter_agg_trans_byref,
+      (void *)pg_jitter_agg_byref_finish,
+      (void *)pg_jitter_compiled_deform_dispatch,
+      (void *)pg_jitter_scalararrayop_loop,
+      (void *)jit_text_datum_eq,
+      (void *)jit_text_datum_ne,
+      (void *)simd_like_match_text,
+      (void *)simd_like_match_compiled,
+      (void *)crc32_hash_probe_int4,
+      (void *)text_hash_probe,
+      (void *)sorted_array_probe_int4,
+      (void *)jit_jsonb_object_field_text,
+      (void *)jit_error_int2_overflow,
+      (void *)jit_error_int4_overflow,
+      (void *)jit_error_int8_overflow,
+      (void *)jit_error_division_by_zero,
+      (void *)jit_error_float_overflow,
+      (void *)jit_error_float_underflow,
+      (void *)pg_jitter_case_bsearch_eq_i32,
+      (void *)pg_jitter_case_bsearch_lt_i32,
+      (void *)pg_jitter_case_bsearch_le_i32,
+      (void *)pg_jitter_case_bsearch_gt_i32,
+      (void *)pg_jitter_case_bsearch_ge_i32,
+      (void *)pg_jitter_case_bsearch_eq_i64,
+      (void *)pg_jitter_case_bsearch_lt_i64,
+      (void *)pg_jitter_case_bsearch_le_i64,
+      (void *)pg_jitter_case_bsearch_gt_i64,
+      (void *)pg_jitter_case_bsearch_ge_i64,
+      (void *)pg_jitter_case_bsearch_eq_u32,
+      (void *)pg_jitter_case_bsearch_lt_u32,
+      (void *)pg_jitter_case_bsearch_le_u32,
+      (void *)pg_jitter_case_bsearch_gt_u32,
+      (void *)pg_jitter_case_bsearch_ge_u32,
+      (void *)pg_jitter_case_bsearch_eq_i16,
+      (void *)pg_jitter_case_bsearch_lt_i16,
+      (void *)pg_jitter_case_bsearch_le_i16,
+      (void *)pg_jitter_case_bsearch_gt_i16,
+      (void *)pg_jitter_case_bsearch_ge_i16,
+      (void *)pg_jitter_case_bsearch_eq_f4,
+      (void *)pg_jitter_case_bsearch_lt_f4,
+      (void *)pg_jitter_case_bsearch_le_f4,
+      (void *)pg_jitter_case_bsearch_gt_f4,
+      (void *)pg_jitter_case_bsearch_ge_f4,
+      (void *)pg_jitter_case_bsearch_eq_f8,
+      (void *)pg_jitter_case_bsearch_lt_f8,
+      (void *)pg_jitter_case_bsearch_le_f8,
+      (void *)pg_jitter_case_bsearch_gt_f8,
+      (void *)pg_jitter_case_bsearch_ge_f8,
+      (void *)pg_jitter_case_bsearch_eq_generic,
+      (void *)pg_jitter_case_bsearch_lt_generic,
+      (void *)pg_jitter_case_bsearch_le_generic,
+      (void *)pg_jitter_case_bsearch_gt_generic,
+      (void *)pg_jitter_case_bsearch_ge_generic,
+#ifdef PG_JITTER_HAVE_PCRE2
+      (void *)pg_jitter_pcre2_match_raw,
+      (void *)pg_jitter_pcre2_match_text,
+#endif
+#ifdef PG_JITTER_HAVE_YYJSON
+#if PG_VERSION_NUM >= 160000
+      (void *)pg_jitter_yj_is_json_datum,
+#endif
+      (void *)pg_jitter_yj_jsonb_in,
+#endif
+  };
+
+  for (Size i = 0; i < lengthof(fixed_helpers); i++)
+    if (pg_jitter_reloc_match_worker_addr(fixed_helpers[i], leader_addr,
+                                          delta, worker_addr_out))
+      return true;
+
+  for (int i = 0; i < jit_direct_fns_count; i++)
+    if (pg_jitter_reloc_match_worker_addr(jit_direct_fns[i].jit_fn,
+                                          leader_addr, delta,
+                                          worker_addr_out))
+      return true;
+
+  return false;
+}
+
 /*
  * Relocate dylib function addresses in copied executable code.
  *
@@ -2529,10 +2713,10 @@ pg_jitter_x86_movabs_followed_by_indirect_branch(const uint8_t *bytes,
  * x86_64: Scans for MOV r, imm64 (MOVABS) instructions — REX.W prefix
  * (0x48 or 0x49) followed by opcode 0xB8-0xBF with an 8-byte immediate.
  *
- * For each matched instruction, reconstructs the embedded 64-bit address.
- * If the address falls within a generous range around the leader's dylib
- * reference address, it's assumed to be a dylib function pointer and is
- * relocated by adding the delta between leader and worker addresses.
+ * For each matched instruction, reconstructs the embedded 64-bit address and
+ * relocates it only when it exactly matches a known pg_jitter helper address
+ * after applying the leader-to-worker ASLR delta.  This avoids depending on a
+ * dylib size/layout window as third-party integrations change provider size.
  *
  * Returns the number of addresses patched.
  */
@@ -2544,6 +2728,7 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   uint32_t *insns;
   int ninsns;
   int patched = 0;
+  bool unknown_call_target = false;
   int64 delta;
   Size alloc_size;
 
@@ -2609,29 +2794,30 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
     addr |= (uint64)((w2 >> 5) & 0xFFFF) << 32;
     addr |= (uint64)((w3 >> 5) & 0xFFFF) << 48;
 
-    /*
-     * Check if this address is within the dylib's address range.
-     * The dylib is ~512KB, so any function should be within ±512KB
-     * of the reference (pg_jitter_fallback_step).
-     */
-    int64 offset_from_ref = (int64)(addr - leader_ref_addr);
-
     /* Check what instruction follows the MOVZ+3×MOVK sequence */
     uint32_t w4 = (i + 4 < ninsns) ? insns[i + 4] : 0;
     bool is_blr = (w4 & 0xFFFFFC1F) == (0xD63F0000 | rd); /* BLR Xrd */
     bool is_br = (w4 & 0xFFFFFC1F) == (0xD61F0000 | rd);  /* BR Xrd */
+    uint64 new_addr = 0;
+    bool is_known_helper =
+        pg_jitter_reloc_lookup_known_helper(addr, delta, &new_addr);
 
     elog(DEBUG1,
          "pg_jitter: relocate scan insn[%d] rd=x%d addr=%lx "
-         "offset_from_ref=%ld next_insn=%08x is_call=%d",
-         i, rd, (unsigned long)addr, (long)offset_from_ref, w4,
-         (int)(is_blr || is_br));
+         "next_insn=%08x is_call=%d known_helper=%d",
+         i, rd, (unsigned long)addr, w4, (int)(is_blr || is_br),
+         (int)is_known_helper);
 
-    if ((is_blr || is_br) &&
-        offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000) {
-      /* Relocate: add delta to get worker's address */
-      uint64 new_addr = addr + delta;
+    if ((is_blr || is_br) && !is_known_helper) {
+      elog(WARNING,
+           "pg_jitter: shared code contains unrelocatable ARM64 call target "
+           "insn[%d] rd=x%d addr=%lx",
+           i, rd, (unsigned long)addr);
+      unknown_call_target = true;
+      continue;
+    }
 
+    if ((is_blr || is_br) && is_known_helper) {
       elog(DEBUG1,
            "pg_jitter: relocate PATCH insn[%d] rd=x%d "
            "old=%lx new=%lx delta=%ld",
@@ -2668,11 +2854,12 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
   }
 #endif
 
-  return patched;
+  return unknown_call_target ? -1 : patched;
 #elif defined(__x86_64__) || defined(_M_X64)
   ExecMemInfo *info = (ExecMemInfo *)handle;
   uint8_t *bytes;
   int patched = 0;
+  bool unknown_call_target = false;
   int64 delta;
   Size alloc_size;
 
@@ -2722,23 +2909,26 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
                                                          i + 10, reg);
     memcpy(&addr, &bytes[i + 2], sizeof(uint64));
 
-    /*
-     * Check if this address is within the dylib's address range.
-     * Same heuristic as ARM64: ±512KB of the reference address.
-     */
-    int64 offset_from_ref = (int64)(addr - leader_ref_addr);
+    uint64 new_addr = 0;
+    bool is_known_helper =
+        pg_jitter_reloc_lookup_known_helper(addr, delta, &new_addr);
 
     elog(DEBUG1,
          "pg_jitter: relocate scan byte[%zu] rex=0x%02x opc=0x%02x "
-         "addr=%lx offset_from_ref=%ld is_call=%d",
-         i, rex, opc, (unsigned long)addr, (long)offset_from_ref,
-         (int)is_call_or_jump);
+         "addr=%lx is_call=%d known_helper=%d",
+         i, rex, opc, (unsigned long)addr, (int)is_call_or_jump,
+         (int)is_known_helper);
 
-    if (is_call_or_jump &&
-        offset_from_ref >= -0x80000 && offset_from_ref <= 0x80000) {
-      /* Relocate: add delta to get worker's address */
-      uint64 new_addr = addr + delta;
+    if (is_call_or_jump && !is_known_helper) {
+      elog(WARNING,
+           "pg_jitter: shared code contains unrelocatable x86_64 call target "
+           "byte[%zu] addr=%lx",
+           i, (unsigned long)addr);
+      unknown_call_target = true;
+      continue;
+    }
 
+    if (is_call_or_jump && is_known_helper) {
       elog(DEBUG1,
            "pg_jitter: relocate PATCH byte[%zu] "
            "old=%lx new=%lx delta=%ld",
@@ -2760,7 +2950,7 @@ int pg_jitter_relocate_dylib_addrs(void *handle, Size code_size,
 
   /* No I-cache flush needed on x86_64 (coherent I-cache) */
 
-  return patched;
+  return unknown_call_target ? -1 : patched;
 #else
   /* Unsupported architecture */
   return 0;
@@ -3146,7 +3336,8 @@ add_cmp_group(CmpClassEntry *e, int *n,
 static void
 build_cmp_class_table(void)
 {
-  CmpClassEntry *e = malloc(sizeof(CmpClassEntry) * 128);
+  CmpClassEntry *e = MemoryContextAlloc(TopMemoryContext,
+                                        sizeof(CmpClassEntry) * 128);
   int n = 0;
 
   /* --- Tier 1: byval types --- */
@@ -5600,70 +5791,11 @@ pg_jitter_setup_shared_in_hash(ExprState *state,
       continue;
 
     Datum array_datum = arrayconst->constvalue;
-    ArrayType *arr = DatumGetArrayTypeP(array_datum);
+    TextHashTable *tht;
 
-    if (ARR_ELEMTYPE(arr) == TEXTOID)
-    {
-      int nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
-
-      if (nitems > 0 && nitems <= 16384 &&
-          pg_jitter_collation_is_deterministic(fcinfo->fncollation))
-      {
-        /* Extract text values from array */
-        int16 typlen;
-        bool typbyval;
-        char typalign;
-        bits8 *bitmap;
-        char *s;
-        int bitmask;
-        Datum *text_vals;
-        int nvals;
-        bool has_nulls;
-
-        get_typlenbyvalalign(TEXTOID, &typlen, &typbyval, &typalign);
-
-        bitmap = ARR_NULLBITMAP(arr);
-        s = (char *)ARR_DATA_PTR(arr);
-        bitmask = 1;
-        text_vals = palloc(nitems * sizeof(Datum));
-        nvals = 0;
-        has_nulls = false;
-
-        for (int k = 0; k < nitems; k++)
-        {
-          if (bitmap && (*bitmap & bitmask) == 0)
-          {
-            has_nulls = true;
-          }
-          else
-          {
-            text_vals[nvals++] = fetch_att(s, false, typlen);
-            s = att_addlength_pointer(s, typlen, s);
-            s = (char *)att_align_nominal(s, typalign);
-          }
-
-          if (bitmap)
-          {
-            bitmask <<= 1;
-            if (bitmask == 0x100)
-            {
-              bitmap++;
-              bitmask = 1;
-            }
-          }
-        }
-
-        if (nvals > 0)
-        {
-          TextHashTable *tht = text_hash_build(text_vals, nvals, has_nulls, ctx);
-          fcinfo->args[1].value = PointerGetDatum(tht);
-        }
-        pfree(text_vals);
-      }
-    }
-
-    if ((Pointer)arr != DatumGetPointer(array_datum))
-      pfree(arr);
+    tht = text_hash_build_from_array(array_datum, op, fcinfo, NULL, ctx);
+    if (tht != NULL)
+      fcinfo->args[1].value = PointerGetDatum(tht);
   }
 
 #endif /* PG_VERSION_NUM >= 150000 */

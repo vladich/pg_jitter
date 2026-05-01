@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # run_pg_regress.sh - Run PostgreSQL pg_regress for pg_jitter backends.
 #
-# Typical local use with an existing server:
+# Typical local use with an isolated temporary cluster:
 #   ./tests/run_pg_regress.sh \
 #     --pg-config ~/postgres_install/v17/bin/pg_config \
 #     --pg-src ~/postgres_versions/v17 \
 #     --port 5433 \
 #     --backends "sljit asmjit mir auto"
 #
-# Safer isolated use: initialize a fresh temporary cluster per backend.
+# Using an already-running cluster is destructive and requires an explicit
+# opt-in:
 #   ./tests/run_pg_regress.sh \
 #     --pg-config ~/postgres_install/v17/bin/pg_config \
 #     --pg-src ~/postgres_versions/v17 \
 #     --port 5433 \
-#     --fresh-cluster
+#     --use-running-cluster \
+#     --allow-destructive-cleanup
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,9 +26,11 @@ PGPORT="${PGPORT:-5433}"
 PGHOST="${PGHOST:-/tmp}"
 PG_SRC="${PG_SRC:-}"
 BACKENDS="${BACKENDS:-}"
-FRESH_CLUSTER=0
+FRESH_CLUSTER=1
+USE_RUNNING_CLUSTER=0
+ALLOW_DESTRUCTIVE_CLEANUP=0
 KEEP_CLUSTER=0
-PGDATA_OVERRIDE="${PGDATA:-}"
+PGDATA_OVERRIDE=""
 OUTPUT_DIR=""
 MAX_CONCURRENT_TESTS=20
 MAX_CONNECTIONS=1
@@ -44,6 +48,12 @@ Options:
   --backends LIST        Space-separated backend list
                          (default: direct backends, plus auto on PG17+)
   --fresh-cluster        Reinitialize a temporary cluster for each backend
+                         (default)
+  --use-running-cluster  Use an already-running server instead of a temporary
+                         cluster. This is destructive and also requires
+                         --allow-destructive-cleanup.
+  --allow-destructive-cleanup
+                         Permit database/object cleanup on --use-running-cluster
   --datadir DIR          Data directory for --fresh-cluster
                          (default: /tmp/pg_jitter_regress_pgMAJOR_PORT)
   --keep-cluster         Do not stop/remove the fresh cluster on exit
@@ -62,7 +72,9 @@ while [[ $# -gt 0 ]]; do
         --port) PGPORT="$2"; shift 2 ;;
         --host) PGHOST="$2"; shift 2 ;;
         --backends) BACKENDS="$2"; shift 2 ;;
-        --fresh-cluster) FRESH_CLUSTER=1; shift ;;
+        --fresh-cluster) FRESH_CLUSTER=1; USE_RUNNING_CLUSTER=0; shift ;;
+        --use-running-cluster) FRESH_CLUSTER=0; USE_RUNNING_CLUSTER=1; shift ;;
+        --allow-destructive-cleanup) ALLOW_DESTRUCTIVE_CLEANUP=1; shift ;;
         --datadir) PGDATA_OVERRIDE="$2"; shift 2 ;;
         --keep-cluster) KEEP_CLUSTER=1; shift ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
@@ -95,6 +107,26 @@ PGCTL="$PGBIN/pg_ctl"
 INITDB="$PGBIN/initdb"
 PG_MAJOR="$("$PG_CONFIG" --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')"
 
+case "$(uname -s)" in
+    Darwin) PG_DYNLIB_VAR=DYLD_LIBRARY_PATH; PG_PATH_SEP=: ;;
+    MINGW*|MSYS*|CYGWIN*) PG_DYNLIB_VAR=PATH; PG_PATH_SEP=';' ;;
+    *) PG_DYNLIB_VAR=LD_LIBRARY_PATH; PG_PATH_SEP=: ;;
+esac
+PG_DYNLIB_PATH="$PG_LIBDIR"
+if [ -d "$PG_LIBDIR/postgresql" ] && [ "$PG_LIBDIR/postgresql" != "$PG_LIBDIR" ]; then
+    PG_DYNLIB_PATH="$PG_LIBDIR/postgresql$PG_PATH_SEP$PG_DYNLIB_PATH"
+fi
+
+pg_env() {
+    local current="${!PG_DYNLIB_VAR:-}"
+
+    if [ -n "$current" ]; then
+        env "$PG_DYNLIB_VAR=$PG_DYNLIB_PATH$PG_PATH_SEP$current" "$@"
+    else
+        env "$PG_DYNLIB_VAR=$PG_DYNLIB_PATH" "$@"
+    fi
+}
+
 if [ -z "$BACKENDS" ]; then
     case "$(uname -m)" in
         x86_64|amd64|AMD64|aarch64|arm64)
@@ -118,11 +150,11 @@ SUMMARY_FILE="$OUTPUT_DIR/summary.txt"
 : > "$SUMMARY_FILE"
 
 psql_postgres() {
-    "$PSQL" -h "$PGHOST" -p "$PGPORT" -d postgres -X "$@"
+    pg_env "$PSQL" -h "$PGHOST" -p "$PGPORT" -d postgres -X "$@"
 }
 
 pg_ready() {
-    "$PGBIN/pg_isready" -h "$PGHOST" -p "$PGPORT" -q >/dev/null 2>&1
+    pg_env "$PGBIN/pg_isready" -h "$PGHOST" -p "$PGPORT" -q >/dev/null 2>&1
 }
 
 log_summary() {
@@ -251,6 +283,12 @@ verify_backend_libraries() {
 
 verify_backend_libraries
 
+if [ "$USE_RUNNING_CLUSTER" -eq 1 ] && [ "$ALLOW_DESTRUCTIVE_CLEANUP" -ne 1 ]; then
+    echo "ERROR: --use-running-cluster performs destructive cleanup." >&2
+    echo "Re-run with --allow-destructive-cleanup only for a disposable cluster." >&2
+    exit 1
+fi
+
 if [ "$FRESH_CLUSTER" -eq 1 ]; then
     PGDATA_TEST="${PGDATA_OVERRIDE:-/tmp/pg_jitter_regress_pg${PG_MAJOR}_${PGPORT}}"
     if [[ "$PGDATA_TEST" != /tmp/pg_jitter_regress_* ]]; then
@@ -280,15 +318,15 @@ fi
 
 stop_fresh_cluster() {
     if [ "$FRESH_CLUSTER" -eq 1 ] && [ "$KEEP_CLUSTER" -eq 0 ] && [ -n "${PGDATA_TEST:-}" ]; then
-        "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
+        pg_env "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
     fi
 }
 
 restore_existing_cluster() {
     if [ "$FRESH_CLUSTER" -eq 0 ] && [ -n "$ORIG_PROVIDER" ]; then
         if ! pg_ready; then
-            "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
-            "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+            pg_env "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
+            pg_env "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
         fi
 
         psql_postgres -q -c "ALTER SYSTEM SET jit_provider = '$ORIG_PROVIDER';" >/dev/null 2>&1 || true
@@ -299,7 +337,7 @@ restore_existing_cluster() {
         [ -n "$ORIG_JIT_OPTIMIZE" ] &&
             psql_postgres -q -c "ALTER SYSTEM SET jit_optimize_above_cost = '$ORIG_JIT_OPTIMIZE';" >/dev/null 2>&1 || true
         psql_postgres -q -c "ALTER SYSTEM RESET pg_jitter.backend;" >/dev/null 2>&1 || true
-        "$PGCTL" -D "$PGDATA_TEST" restart -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+        pg_env "$PGCTL" -D "$PGDATA_TEST" restart -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
     fi
 }
 
@@ -313,10 +351,10 @@ start_fresh_cluster() {
     local backend="$1"
     local log_file="$OUTPUT_DIR/postgresql_${backend}.log"
 
-    "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
+    pg_env "$PGCTL" -D "$PGDATA_TEST" stop -m immediate -w >/dev/null 2>&1 || true
     rm -rf "$PGDATA_TEST"
 
-    "$INITDB" -D "$PGDATA_TEST" --no-locale -E UTF8 -A trust --no-instructions \
+    pg_env "$INITDB" -D "$PGDATA_TEST" --no-locale -E UTF8 -A trust --no-instructions \
         > "$OUTPUT_DIR/initdb_${backend}.log" 2>&1
 
     {
@@ -331,13 +369,13 @@ start_fresh_cluster() {
         echo "log_min_messages = warning"
     } >> "$PGDATA_TEST/postgresql.conf"
 
-    "$PGCTL" -D "$PGDATA_TEST" -l "$log_file" start -w >/dev/null
+    pg_env "$PGCTL" -D "$PGDATA_TEST" -l "$log_file" start -w >/dev/null
 }
 
 ensure_pg_running() {
     if ! pg_ready; then
-        "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
-        "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
+        pg_env "$PGCTL" -D "$PGDATA_TEST" stop -m immediate >/dev/null 2>&1 || true
+        pg_env "$PGCTL" -D "$PGDATA_TEST" start -l "$PGDATA_TEST/logfile" -w >/dev/null 2>&1 || true
         sleep 1
     fi
 }
@@ -426,7 +464,7 @@ set_backend() {
         psql_postgres -q -c "ALTER SYSTEM SET jit_provider = '$expected_provider';" >/dev/null
     fi
 
-    "$PGCTL" -D "$PGDATA_TEST" restart -l "$OUTPUT_DIR/postgresql_${backend}.log" -w >/dev/null 2>&1
+    pg_env "$PGCTL" -D "$PGDATA_TEST" restart -l "$OUTPUT_DIR/postgresql_${backend}.log" -w >/dev/null 2>&1
     sleep 1
 
     local active_provider
@@ -512,7 +550,7 @@ run_backend() {
     set +e
     (
         cd "$REGRESS_DIR"
-        PGPORT="$PGPORT" "$PG_REGRESS" \
+        pg_env env PGPORT="$PGPORT" "$PG_REGRESS" \
             --inputdir="$REGRESS_DIR" \
             --outputdir="$outdir" \
             --bindir="$PGBIN" \

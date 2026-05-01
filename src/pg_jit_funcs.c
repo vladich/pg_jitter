@@ -427,26 +427,65 @@ int64 jit_int8smaller(int64 a, int64 b) { return (a <= b) ? a : b; }
  * TIER 1: int bitwise (18 functions)
  * ================================================================ */
 
+static inline int32
+jit_sar32_defined(int32 a, uint32 sh)
+{
+  uint32 ua = (uint32)a;
+
+  if (sh == 0)
+    return a;
+  if (a >= 0)
+    return (int32)(ua >> sh);
+  return (int32)(~(~ua >> sh));
+}
+
+static inline int64
+jit_sar64_defined(int64 a, uint32 sh)
+{
+  uint64 ua = (uint64)a;
+
+  if (sh == 0)
+    return a;
+  if (a >= 0)
+    return (int64)(ua >> sh);
+  return (int64)(~(~ua >> sh));
+}
+
 int32 jit_int2and(int32 a, int32 b) { return (int32)((int16)a & (int16)b); }
 int32 jit_int2or(int32 a, int32 b) { return (int32)((int16)a | (int16)b); }
 int32 jit_int2xor(int32 a, int32 b) { return (int32)((int16)a ^ (int16)b); }
 int32 jit_int2not(int32 a) { return (int32)(~(int16)a); }
-int32 jit_int2shl(int32 a, int32 b) { return (int32)((int16)a << b); }
-int32 jit_int2shr(int32 a, int32 b) { return (int32)((int16)a >> b); }
+int32 jit_int2shl(int32 a, int32 b) {
+  uint32 sh = (uint32)b & 31U;
+  uint32 ua = (uint32)(int32)(int16)a;
+  return (int32)(int16)(ua << sh);
+}
+int32 jit_int2shr(int32 a, int32 b) {
+  uint32 sh = (uint32)b & 31U;
+  return (int32)(int16)jit_sar32_defined((int32)(int16)a, sh);
+}
 
 int32 jit_int4and(int32 a, int32 b) { return a & b; }
 int32 jit_int4or(int32 a, int32 b) { return a | b; }
 int32 jit_int4xor(int32 a, int32 b) { return a ^ b; }
 int32 jit_int4not(int32 a) { return ~a; }
-int32 jit_int4shl(int32 a, int32 b) { return a << b; }
-int32 jit_int4shr(int32 a, int32 b) { return a >> b; }
+int32 jit_int4shl(int32 a, int32 b) {
+  return (int32)((uint32)a << ((uint32)b & 31U));
+}
+int32 jit_int4shr(int32 a, int32 b) {
+  return jit_sar32_defined(a, (uint32)b & 31U);
+}
 
 int64 jit_int8and(int64 a, int64 b) { return a & b; }
 int64 jit_int8or(int64 a, int64 b) { return a | b; }
 int64 jit_int8xor(int64 a, int64 b) { return a ^ b; }
 int64 jit_int8not(int64 a) { return ~a; }
-int64 jit_int8shl(int64 a, int64 b) { return a << (int)b; }
-int64 jit_int8shr(int64 a, int64 b) { return a >> (int)b; }
+int64 jit_int8shl(int64 a, int32 b) {
+  return (int64)((uint64)a << ((uint32)b & 63U));
+}
+int64 jit_int8shr(int64 a, int32 b) {
+  return jit_sar64_defined(a, (uint32)b & 63U);
+}
 
 /* ================================================================
  * TIER 1: float8 arithmetic (4 functions)
@@ -3089,8 +3128,8 @@ const JitDirectFn jit_direct_fns[] = {
     E2(int8or, jit_int8or, T64, T64, T64),
     E2(int8xor, jit_int8xor, T64, T64, T64),
     E1(int8not, jit_int8not, T64, T64),
-    E2(int8shl, jit_int8shl, T64, T64, T64),
-    E2(int8shr, jit_int8shr, T64, T64, T64),
+    E2(int8shl, jit_int8shl, T64, T64, T32),
+    E2(int8shr, jit_int8shr, T64, T64, T32),
 
     /* ---- float8 arithmetic ---- */
     EI2(float8pl, jit_float8pl, T64, T64, T64, JIT_INLINE_FLOAT8_ADD),
@@ -3413,7 +3452,8 @@ const JitDirectFn jit_direct_fns[] = {
 
     /*
      * Text/varchar comparison — SIMD-accelerated via StringZilla.
-     * Uses sz_order/sz_equal for C/POSIX collation, falls back to
+     * Uses sz_equal for equality and unsigned-byte memcmp for C/POSIX ordering,
+     * then falls back to
      * varstr_cmp for non-C/non-deterministic collations.
      * hashtext uses PG's hash_any (Jenkins lookup3) for hash join
      * correctness — must match PG's built-in hash exactly.

@@ -1554,8 +1554,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				{
 					/*
 					 * TIER 0a — FULLY INLINE TEXT EQ/NE.
-					 * Short varlena ≤ 7 data bytes: zero function calls.
-					 * Longer short varlena: memcmp call only.
+					 * Short varlena: exact-length memcmp after header/length checks.
 					 * Non-short (toast/compressed): jit_text_datum_eq/ne.
 					 * Only for deterministic collations; non-deterministic
 					 * falls through to V1.
@@ -1611,31 +1610,11 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						/* data_len == 0 → result_eq */
 						cc.cbz(data_len.w(), lbl_result_eq);
 
-						/* 6. data_len > 7 → memcmp */
-						cc.cmp(data_len.w(), 7);
-						cc.b(a64::CondCode::kGT, lbl_memcmp);
-
-						/* 7. Inline word comparison (data_len 1-7):
-						 *    Load 8 bytes, shift left by (7-dl)*8, compare */
-						{
-							a64::Gp wa = cc.new_gpx(), wb = cc.new_gpx();
-							a64::Gp shift = cc.new_gpx();
-							cc.ldr(wa, a64::ptr(ta0));
-							cc.ldr(wb, a64::ptr(ta1));
-							/* shift = (7 - data_len) * 8 */
-							cc.mov(shift.w(), 7);
-							cc.sub(shift.w(), shift.w(), data_len.w());
-							cc.lsl(shift.w(), shift.w(), 3);
-							/* Zero-extend shift to 64-bit for LSL */
-							cc.mov(shift.w(), shift.w());
-							cc.lsl(wa, wa, shift);
-							cc.lsl(wb, wb, shift);
-							cc.cmp(wa, wb);
-							cc.b(a64::CondCode::kEQ, lbl_result_eq);
-							cc.b(lbl_result_ne);
-						}
-
-						/* 8. memcmp path (data_len > 7) */
+						/*
+						 * Non-empty short varlena: compare exactly with memcmp. Avoid
+						 * speculative wide loads because short datums may sit at storage
+						 * boundaries.
+						 */
 						cc.bind(lbl_memcmp);
 						{
 							a64::Gp ma0 = cc.new_gpx(), ma1 = cc.new_gpx();
@@ -2110,25 +2089,21 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 						 * So if no step writes to args[1], it was pre-initialized
 						 * from a Const node — treat it as constant.
 						 */
-						bool pat_const = true;
-						for (int j = opno - 1; j >= 0; j--)
-						{
-							if (steps[j].resvalue == &fcinfo->args[1].value)
+							bool pat_const = true;
+							for (int j = opno - 1; j >= 0; j--)
 							{
-								pat_const = (steps[j].opcode == EEOP_CONST);
-								break;
+								if (steps[j].resvalue == &fcinfo->args[1].value)
+								{
+									pat_const = (steps[j].opcode == EEOP_CONST);
+									break;
+								}
 							}
-						}
 
-						/*
-						 * StringZilla LIKE uses byte-level matching and only needs a
-						 * deterministic collation.  PCRE2 applies a stricter
-						 * encoding/collation check inside pg_jitter_pcre2_compile().
-						 */
-						bool collation_ok =
-							pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+							bool like_byte_search_ok =
+								simd_like_byte_search_is_eligible(fcinfo->fncollation);
 
-						if (pat_const && !fcinfo->args[1].isnull && collation_ok)
+							if (pat_const && !fcinfo->args[1].isnull &&
+								like_byte_search_ok)
 						{
 							Datum pat_datum = fcinfo->args[1].value;
 							text *pat_text = DatumGetTextPP(pat_datum);
@@ -2286,7 +2261,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								bool is_like = is_like_fn || is_ilike_fn;
 								bool case_insens = is_ilike_fn || is_iregex_fn;
 								Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
-									pat_str, pat_len, is_like, case_insens,
+									ctx, pat_str, pat_len, is_like, case_insens,
 									fcinfo->fncollation);
 
 								if (pe)
@@ -3666,10 +3641,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 					 * For text arrays with deterministic collation, build an
 					 * open-addressing hash table at compile time and probe at runtime.
 					 *
-				 * In shared mode: store table pointer in fcinfo->args[1].value
-				 * (overwriting the const array datum). Workers rebuild the table
-				 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
-				 */
+					 * In shared mode: store table pointer in fcinfo->args[1].value
+					 * (overwriting the const array datum). Workers rebuild the table
+					 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
+					 */
 					if (!sorted_vals)
 					{
 						Expr *arrayarg_t = (Expr *) lsecond(saop->args);
@@ -3681,64 +3656,13 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 							if (!arrayconst_t->constisnull)
 							{
 								Datum array_datum_t = arrayconst_t->constvalue;
-								ArrayType *arr_t =
-									DatumGetArrayTypeP(array_datum_t);
-								int nitems_t = ArrayGetNItems(
-									ARR_NDIM(arr_t), ARR_DIMS(arr_t));
-								int16 typlen_t;
-								bool typbyval_t;
-								char typalign_t;
-
-								get_typlenbyvalalign(ARR_ELEMTYPE(arr_t),
-									&typlen_t, &typbyval_t, &typalign_t);
-
-								if (!typbyval_t &&
-									ARR_ELEMTYPE(arr_t) == TEXTOID &&
-								nitems_t > 0 && nitems_t <= 16384 &&
-								pg_jitter_collation_is_deterministic(
-									fcinfo->fncollation))
-							{
-								bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
-								char *s_t = (char *) ARR_DATA_PTR(arr_t);
-								int bitmask_t = 1;
-								Datum *text_vals = (Datum *)
-									palloc(nitems_t * sizeof(Datum));
-								int text_nvals = 0;
 								bool text_has_nulls = false;
 
-								for (int k = 0; k < nitems_t; k++)
+								text_ht = text_hash_build_from_array(
+									array_datum_t, op, fcinfo,
+									&text_has_nulls, ctx);
+								if (text_ht != NULL)
 								{
-									if (bitmap_t &&
-										(*bitmap_t & bitmask_t) == 0)
-									{
-										text_has_nulls = true;
-									}
-									else
-									{
-										text_vals[text_nvals++] =
-											fetch_att(s_t, false, typlen_t);
-										s_t = att_addlength_pointer(
-											s_t, typlen_t, s_t);
-										s_t = (char *) att_align_nominal(
-											s_t, typalign_t);
-									}
-
-									if (bitmap_t)
-									{
-										bitmask_t <<= 1;
-										if (bitmask_t == 0x100)
-										{
-											bitmap_t++;
-											bitmask_t = 1;
-										}
-									}
-								}
-
-								if (text_nvals > 0)
-								{
-									text_ht = text_hash_build(
-										text_vals, text_nvals,
-										text_has_nulls, ctx);
 									array_has_nulls = text_has_nulls;
 									/*
 									 * Store table pointer in fcinfo->args[1].value for
@@ -3749,16 +3673,12 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									 */
 									fcinfo->args[1].value = PointerGetDatum(text_ht);
 								}
-								pfree(text_vals);
-								}
-								if ((Pointer) arr_t != DatumGetPointer(array_datum_t))
-									pfree(arr_t);
 							}
 						}
 					}
 
-				if (sorted_vals && nvals > 0)
-				{
+					if (sorted_vals && nvals > 0)
+					{
 					Label lbl_found = cc.new_label();
 					Label lbl_not_found = cc.new_label();
 					Label lbl_null_result = cc.new_label();
@@ -5785,76 +5705,69 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 			}
 
 			/*
-			 * ---- IS_JSON (yyjson-accelerated for text input) ----
+			 * ---- IS_JSON ----
 			 */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
-			case EEOP_IS_JSON:
-			{
-#ifdef PG_JITTER_HAVE_YYJSON
-				JsonIsPredicate *pred = op->d.is_json.pred;
-				if (exprType(pred->expr) == TEXTOID && !pred->unique_keys)
+				case EEOP_IS_JSON:
 				{
-					/* yyjson fast path */
-					a64::Gp resval_addr = cc.new_gpx();
-					cc.mov(resval_addr, (uint64_t) op->resvalue);
-					a64::Gp resnull_addr = cc.new_gpx();
-					cc.mov(resnull_addr, (uint64_t) op->resnull);
-					a64::Gp resnull_reg = cc.new_gpx();
-					cc.ldrb(resnull_reg.w(), a64::Mem(resnull_addr));
-					Label skip_null = cc.new_label();
-					cc.cbnz(resnull_reg.w(), skip_null);
+#ifdef PG_JITTER_HAVE_YYJSON
+					JsonIsPredicate *pred = op->d.is_json.pred;
+					if (exprType(pred->expr) == TEXTOID)
+					{
+						a64::Gp resval_addr = cc.new_gpx();
+						cc.mov(resval_addr, (uint64_t) op->resvalue);
+						a64::Gp resnull_addr = cc.new_gpx();
+						cc.mov(resnull_addr, (uint64_t) op->resnull);
+						a64::Gp resnull_reg = cc.new_gpx();
+						cc.ldrb(resnull_reg.w(), a64::ptr(resnull_addr));
+						Label skip_null = cc.new_label();
+						cc.cbnz(resnull_reg.w(), skip_null);
 
-					/* Load *op->resvalue (text Datum) */
-					a64::Gp datum_reg = cc.new_gpx();
-					cc.ldr(datum_reg, a64::Mem(resval_addr));
+						a64::Gp datum_reg = cc.new_gpx();
+						cc.ldr(datum_reg, a64::ptr(resval_addr));
 
-					/* Call pg_jitter_yj_is_json_datum(datum, item_type) */
-					a64::Gp item_type_reg = cc.new_gpx();
-					cc.mov(item_type_reg.w(), (int32_t) pred->item_type);
+						a64::Gp item_type_reg = cc.new_gpx();
+						cc.mov(item_type_reg.w(), (int32_t) pred->item_type);
+						a64::Gp unique_keys_reg = cc.new_gpx();
+						cc.mov(unique_keys_reg.w(), pred->unique_keys ? 1 : 0);
+						a64::Gp fn_reg = cc.new_gpx();
+						ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_yj_is_json_datum);
+						InvokeNode *invoke;
+						a64::Gp ret_reg = cc.new_gpx();
+						cc.invoke(Out(invoke), fn_reg,
+								  FuncSignature::build<int32_t, int64_t, int32_t, int32_t>());
+						invoke->set_arg(0, datum_reg);
+						invoke->set_arg(1, item_type_reg.w());
+						invoke->set_arg(2, unique_keys_reg.w());
+						invoke->set_ret(0, ret_reg);
+
+						cc.and_(ret_reg, ret_reg, Imm(0xFFFFFFFF));
+						cc.str(ret_reg, a64::ptr(resval_addr));
+						cc.strb(a64::wzr, a64::ptr(resnull_addr));
+
+						Label done = cc.new_label();
+						cc.b(done);
+
+						cc.bind(skip_null);
+						cc.str(a64::xzr, a64::ptr(resval_addr));
+						cc.mov(resnull_reg.w(), 1);
+						cc.strb(resnull_reg.w(), a64::ptr(resnull_addr));
+
+						cc.bind(done);
+						break;
+					}
+#endif /* PG_JITTER_HAVE_YYJSON */
 					a64::Gp fn_reg = cc.new_gpx();
-					ASMJIT_MOV_FN(cc, fn_reg, (void *) pg_jitter_yj_is_json_datum);
+					ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonIsPredicate);
+					a64::Gp op_reg = cc.new_gpx();
+					cc.mov(op_reg, v_step_base);
 					InvokeNode *invoke;
-					a64::Gp ret_reg = cc.new_gpx();
 					cc.invoke(Out(invoke), fn_reg,
-							  FuncSignature::build<int32_t, int64_t, int32_t>());
-					invoke->set_arg(0, datum_reg);
-					invoke->set_arg(1, item_type_reg.w());
-					invoke->set_ret(0, ret_reg);
-
-					/* Zero-extend int32 return to Datum (int64) —
-					 * ARM64 leaves upper 32 bits of x0 undefined for
-					 * int32 returns, but Datum comparison needs full 64-bit.
-					 * Mask to lower 32 bits since function returns int32. */
-					cc.and_(ret_reg, ret_reg, Imm(0xFFFFFFFF));
-
-					/* *op->resvalue = BoolGetDatum(ret) */
-					cc.str(ret_reg, a64::Mem(resval_addr));
-
-					Label done = cc.new_label();
-					cc.b(done);
-
-					/* Null path: *op->resvalue = false */
-					cc.bind(skip_null);
-					a64::Gp zero_reg = cc.new_gpx();
-					cc.mov(zero_reg, 0);
-					cc.str(zero_reg, a64::Mem(resval_addr));
-
-					cc.bind(done);
+							  FuncSignature::build<void, void *, void *>());
+					invoke->set_arg(0, v_state);
+					invoke->set_arg(1, op_reg);
 					break;
 				}
-#endif /* PG_JITTER_HAVE_YYJSON */
-				/* Fallback: generic 2-arg call */
-				a64::Gp fn_reg = cc.new_gpx();
-				ASMJIT_MOV_FN(cc, fn_reg, (void *) ExecEvalJsonIsPredicate);
-				a64::Gp op_reg = cc.new_gpx();
-				cc.mov(op_reg, v_step_base);
-				InvokeNode *invoke;
-				cc.invoke(Out(invoke), fn_reg,
-						  FuncSignature::build<void, void *, void *>());
-				invoke->set_arg(0, v_state);
-				invoke->set_arg(1, op_reg);
-				break;
-			}
 #endif
 
 
@@ -6565,13 +6478,10 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 
 				/* ret_out = cstring Datum; call input function (or yyjson) */
 #ifdef PG_JITTER_HAVE_YYJSON
-				if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-					fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */)
+				if (fcinfo_in->flinfo->fn_oid == F_JSONB_IN)
 				{
-					/* yyjson fast path: yj_fn(cstring, fcinfo_in) → Datum */
-					void *yj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-								  ? (void *) pg_jitter_yj_json_in
-								  : (void *) pg_jitter_yj_jsonb_in;
+					/* yyjson fast path: yj_fn(cstring, fcinfo_in) -> Datum */
+					void *yj_fn = (void *) pg_jitter_yj_jsonb_in;
 					a64::Gp fcinfo_in_reg = cc.new_gpx();
 					cc.mov(fcinfo_in_reg, (uint64_t) fcinfo_in);
 					a64::Gp yj_fn_reg = cc.new_gpx();

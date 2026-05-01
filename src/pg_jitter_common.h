@@ -132,6 +132,9 @@ extern PgJitterContext *pg_jitter_get_context(ExprState *state);
 extern void pg_jitter_register_compiled(PgJitterContext *ctx,
 										void (*free_fn)(void *),
 										void *data);
+extern void pg_jitter_register_compiled_or_free(PgJitterContext *ctx,
+												void (*free_fn)(void *),
+												void *data);
 extern void *pg_jitter_context_alloc(PgJitterContext *ctx, Size size);
 extern void *pg_jitter_context_alloc_zero(PgJitterContext *ctx, Size size);
 
@@ -232,6 +235,9 @@ extern void *pg_jitter_copy_to_executable(const void *code_bytes,
 /* Free executable memory allocated by pg_jitter_copy_to_executable. */
 extern void pg_jitter_exec_free(void *ptr);
 
+/* Register copied executable memory, freeing it if registration throws. */
+extern void pg_jitter_register_exec_handle(PgJitterContext *ctx, void *handle);
+
 /* Get the executable code pointer from a handle returned by pg_jitter_copy_to_executable. */
 extern void *pg_jitter_exec_code_ptr(void *handle);
 
@@ -242,10 +248,10 @@ extern void *pg_jitter_exec_code_ptr(void *handle);
  * addresses pointing into pg_jitter_sljit.dylib are WRONG in the worker
  * because the dylib loads at a different ASLR base address.
  *
- * This function scans ARM64 MOVZ+3xMOVK sequences in the code, identifies
- * addresses in the leader's dylib range, and patches them to the worker's
- * addresses using the delta between leader_ref_addr and worker_ref_addr
- * (both pg_jitter_fallback_step addresses).
+ * This function scans absolute call targets in the code, identifies exact
+ * known pg_jitter helper addresses from the leader process, and patches them
+ * to the worker's addresses using the delta between leader_ref_addr and
+ * worker_ref_addr (both pg_jitter_fallback_step addresses).
  *
  * Must be called AFTER pg_jitter_copy_to_executable and BEFORE the code runs.
  * The handle must point to a writable+executable MAP_JIT region.
@@ -330,6 +336,8 @@ extern bool pg_jitter_get_deform_avx512(void);
 extern int pg_jitter_get_deform_avx512_min_cols(void);
 extern bool pg_jitter_in_raw_datum_bsearch_safe(PGFunction fn);
 extern bool pg_jitter_in_int32_hash_safe(PGFunction fn);
+extern bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
+											  FunctionCallInfo fcinfo);
 
 /*
  * Loop-based deform for wide tables.

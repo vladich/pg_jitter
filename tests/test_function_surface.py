@@ -671,6 +671,19 @@ class Psql:
         lib_postgresql = Path(self.libdir) / "postgresql"
         if lib_postgresql.is_dir() and lib_postgresql != Path(self.pkglibdir):
             self.pkglib_candidates.append(lib_postgresql)
+        self.env = os.environ.copy()
+        if sys.platform == "darwin":
+            dynlib_var = "DYLD_LIBRARY_PATH"
+        elif os.name == "nt":
+            dynlib_var = "PATH"
+        else:
+            dynlib_var = "LD_LIBRARY_PATH"
+        lib_paths = [self.libdir]
+        if lib_postgresql.is_dir():
+            lib_paths.insert(0, str(lib_postgresql))
+        if self.env.get(dynlib_var):
+            lib_paths.append(self.env[dynlib_var])
+        self.env[dynlib_var] = os.pathsep.join(lib_paths)
         self.psql = str(Path(self.bindir) / "psql")
 
     def _pg_config(self, arg: str) -> str:
@@ -690,6 +703,7 @@ class Psql:
             "-c", sql,
         ]
         proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                              env=self.env,
                               stderr=subprocess.STDOUT)
         if proc.returncode != 0:
             raise RuntimeError(proc.stdout.strip())
@@ -808,7 +822,7 @@ def extract_direct_fns(project_dir: Path, pg_version_num: int) -> set[str]:
 
     active_body = "\n".join(active_lines)
     pattern = re.compile(
-        r"\b(?:E[0-4]|EI[0-4]|EC[0-4]|EIC[0-4])\s*\(\s*"
+        r"\b(?:E|EI|EC|EIC)[0-4]F?\s*\(\s*"
         r"([A-Za-z_][A-Za-z0-9_]*)"
     )
     return {match.group(1) for match in pattern.finditer(active_body)}

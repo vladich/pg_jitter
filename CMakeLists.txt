@@ -141,10 +141,32 @@ endif()
 # ---------- Dependency directories ----------
 set(SLJIT_DIR "${CMAKE_SOURCE_DIR}/../sljit" CACHE PATH
     "Path to sljit source directory")
-set(MIR_DIR "${CMAKE_SOURCE_DIR}/../mir-patched" CACHE PATH
-    "Path to MIR source directory")
 set(ASMJIT_DIR "${CMAKE_SOURCE_DIR}/../asmjit" CACHE PATH
     "Path to AsmJIT source directory")
+
+set(_pg_jitter_patched_mir_dir "${CMAKE_SOURCE_DIR}/../mir-patched")
+set(_pg_jitter_default_mir_dir "${_pg_jitter_patched_mir_dir}")
+set(_pg_jitter_mir_default_fallback OFF)
+if(NOT EXISTS "${_pg_jitter_default_mir_dir}/mir.c"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/../mir/mir.c")
+    set(_pg_jitter_default_mir_dir "${CMAKE_SOURCE_DIR}/../mir")
+    set(_pg_jitter_mir_default_fallback ON)
+endif()
+set(MIR_DIR "${_pg_jitter_default_mir_dir}" CACHE PATH
+    "Path to MIR source directory")
+if("${MIR_DIR}" STREQUAL "${_pg_jitter_patched_mir_dir}"
+   AND NOT EXISTS "${MIR_DIR}/mir.c"
+   AND EXISTS "${_pg_jitter_default_mir_dir}/mir.c")
+    set(MIR_DIR "${_pg_jitter_default_mir_dir}" CACHE PATH
+        "Path to MIR source directory" FORCE)
+    set(_pg_jitter_mir_default_fallback ON)
+endif()
+if(_pg_jitter_mir_default_fallback AND PG_JITTER_BUILD_MIR)
+    message(WARNING
+        "MIR defaulted to ../mir because ../mir-patched was not found. "
+        "../mir must be the patched MIR tree; set -DMIR_DIR explicitly "
+        "if your checkout lives elsewhere.")
+endif()
 
 set(_pg_jitter_default_stringzilla_dir "${CMAKE_SOURCE_DIR}/../stringzilla")
 if(NOT EXISTS "${_pg_jitter_default_stringzilla_dir}/include/stringzilla/stringzilla.h"
@@ -172,6 +194,65 @@ if(PG_JITTER_BUILD_MIR)
     if(NOT EXISTS "${MIR_DIR}/mir.c")
         message(FATAL_ERROR "MIR not found at ${MIR_DIR}. Set -DMIR_DIR=/path/to/mir")
     endif()
+    if(NOT EXISTS "${MIR_DIR}/mir.h")
+        message(FATAL_ERROR "MIR header not found at ${MIR_DIR}/mir.h. Set -DMIR_DIR=/path/to/mir")
+    endif()
+    if(NOT EXISTS "${MIR_DIR}/mir-gen.c")
+        message(FATAL_ERROR "MIR generator source not found at ${MIR_DIR}/mir-gen.c. Set -DMIR_DIR=/path/to/mir")
+    endif()
+    if(NOT EXISTS "${MIR_DIR}/mir-gen-x86_64.c")
+        message(FATAL_ERROR "MIR x86_64 generator source not found at ${MIR_DIR}/mir-gen-x86_64.c. Set -DMIR_DIR=/path/to/mir")
+    endif()
+    file(READ "${MIR_DIR}/mir.h" _pg_jitter_mir_header)
+    file(READ "${MIR_DIR}/mir-gen.c" _pg_jitter_mir_gen)
+    file(READ "${MIR_DIR}/mir-gen-x86_64.c" _pg_jitter_mir_gen_x86_64)
+    set(_pg_jitter_mir_text
+        "${_pg_jitter_mir_header}\n${_pg_jitter_mir_gen}\n${_pg_jitter_mir_gen_x86_64}")
+    if(NOT _pg_jitter_mir_text MATCHES "MIR_UEXT32")
+        message(FATAL_ERROR
+            "MIR at ${MIR_DIR} lacks patched unsigned-extension opcodes "
+            "required by pg_jitter. Use the patched MIR tree or set -DMIR_DIR.")
+    endif()
+    if(NOT _pg_jitter_mir_text MATCHES "MIR_NO_RED_ZONE_ABI")
+        message(FATAL_ERROR
+            "MIR at ${MIR_DIR} lacks patched no-red-zone x86_64 support "
+            "required by pg_jitter on Windows. Use the patched MIR tree or set -DMIR_DIR.")
+    endif()
+    if(EXISTS "${MIR_DIR}/CMakeLists.txt")
+        file(READ "${MIR_DIR}/CMakeLists.txt" _pg_jitter_mir_cmake)
+        if(NOT _pg_jitter_mir_cmake MATCHES "MIR_PARALLEL_GEN")
+            message(FATAL_ERROR
+                "MIR at ${MIR_DIR} lacks the patched parallel-generation build marker "
+                "required by pg_jitter. Use the patched MIR tree or set -DMIR_DIR.")
+        endif()
+        unset(_pg_jitter_mir_cmake)
+    endif()
+    include(CheckCSourceCompiles)
+    set(_pg_jitter_save_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+    set(_pg_jitter_save_required_definitions "${CMAKE_REQUIRED_DEFINITIONS}")
+    set(CMAKE_REQUIRED_INCLUDES "${MIR_DIR}")
+    set(CMAKE_REQUIRED_DEFINITIONS "${_pg_jitter_save_required_definitions}")
+    unset(PG_JITTER_MIR_API_PROBE_COMPILES CACHE)
+    check_c_source_compiles("
+        #include <mir.h>
+        int main(void)
+        {
+            MIR_insn_code_t code = MIR_UEXT32;
+            MIR_type_t type = MIR_T_U32;
+            return (int) code + (int) type;
+        }"
+        PG_JITTER_MIR_API_PROBE_COMPILES)
+    set(CMAKE_REQUIRED_INCLUDES "${_pg_jitter_save_required_includes}")
+    set(CMAKE_REQUIRED_DEFINITIONS "${_pg_jitter_save_required_definitions}")
+    if(NOT PG_JITTER_MIR_API_PROBE_COMPILES)
+        message(FATAL_ERROR
+            "MIR at ${MIR_DIR} failed pg_jitter's patched API compile probe. "
+            "Use the patched MIR tree or set -DMIR_DIR.")
+    endif()
+    unset(_pg_jitter_mir_header)
+    unset(_pg_jitter_mir_gen)
+    unset(_pg_jitter_mir_gen_x86_64)
+    unset(_pg_jitter_mir_text)
     message(STATUS "MIR directory:      ${MIR_DIR}")
 endif()
 if(PG_JITTER_BUILD_ASMJIT)
@@ -215,6 +296,46 @@ else()
     set(PG_JITTER_LINK_FLAGS "")
 endif()
 
+function(pg_jitter_apply_exports TARGET_NAME)
+    set(_symbols ${ARGN})
+    set(_export_dir "${CMAKE_CURRENT_BINARY_DIR}/exports")
+    file(MAKE_DIRECTORY "${_export_dir}")
+
+    if(APPLE)
+        set(_export_file "${_export_dir}/${TARGET_NAME}.exports")
+        file(WRITE "${_export_file}" "")
+        foreach(_sym IN LISTS _symbols)
+            file(APPEND "${_export_file}" "_${_sym}\n")
+        endforeach()
+        target_link_options(${TARGET_NAME} PRIVATE
+            "-Wl,-exported_symbols_list,${_export_file}")
+    elseif(UNIX)
+        set(_export_file "${_export_dir}/${TARGET_NAME}.map")
+        file(WRITE "${_export_file}" "PG_JITTER_1 {\n  global:\n")
+        foreach(_sym IN LISTS _symbols)
+            file(APPEND "${_export_file}" "    ${_sym};\n")
+        endforeach()
+        file(APPEND "${_export_file}" "  local:\n    *;\n};\n")
+        target_link_options(${TARGET_NAME} PRIVATE
+            "-Wl,--version-script=${_export_file}")
+    endif()
+endfunction()
+
+set(PG_JITTER_PROVIDER_EXPORTS
+    Pg_magic_func
+    _PG_jit_provider_init
+    pg_jitter_deform_dispatch_reset_fastpath)
+
+set(PG_JITTER_META_EXPORTS
+    Pg_magic_func
+    _PG_jit_provider_init
+    pg_jitter_current_backend
+    pg_finfo_pg_jitter_current_backend
+    pg_jitter_adaptive_stats
+    pg_finfo_pg_jitter_adaptive_stats
+    pg_jitter_adaptive_stats_reset
+    pg_finfo_pg_jitter_adaptive_stats_reset)
+
 # ==========================================================================
 # Third-party libraries (only for enabled backends)
 # ==========================================================================
@@ -224,6 +345,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(PG_JITTER_NEEDS_SLJIT)
     add_library(sljit STATIC ${SLJIT_DIR}/sljit_src/sljitLir.c)
     target_include_directories(sljit PUBLIC ${SLJIT_DIR}/sljit_src)
+    set_target_properties(sljit PROPERTIES
+        C_VISIBILITY_PRESET hidden)
     target_compile_options(sljit PRIVATE
         $<$<C_COMPILER_ID:MSVC>:/w>
         $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
@@ -233,6 +356,8 @@ endif()
 if(PG_JITTER_BUILD_MIR)
     add_library(mir_lib STATIC ${MIR_DIR}/mir.c ${MIR_DIR}/mir-gen.c)
     target_include_directories(mir_lib PUBLIC ${MIR_DIR})
+    set_target_properties(mir_lib PROPERTIES
+        C_VISIBILITY_PRESET hidden)
     target_compile_options(mir_lib PRIVATE
         $<$<C_COMPILER_ID:MSVC>:/w>
         $<$<NOT:$<C_COMPILER_ID:MSVC>>:-std=gnu11 -w>)
@@ -254,6 +379,12 @@ if(PG_JITTER_BUILD_ASMJIT)
     set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
     set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(${ASMJIT_DIR} ${CMAKE_BINARY_DIR}/asmjit)
+    if(TARGET asmjit)
+        set_target_properties(asmjit PROPERTIES
+            C_VISIBILITY_PRESET hidden
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON)
+    endif()
 endif()
 
 # ---------- PCRE2 (optional, static library with JIT) ----------
@@ -265,6 +396,7 @@ if(WITH_PCRE2 AND NOT WIN32)
     if(EXISTS "${_pcre2_lib}" AND EXISTS "${_pcre2_hdr}")
         set(PG_JITTER_HAVE_PCRE2 ON)
         set(PCRE2_INCLUDE_DIR "${PCRE2_DIR}/build/interface")
+        set(PCRE2_LIBRARY_FOR_CHECK "${_pcre2_lib}")
         add_library(pcre2_lib STATIC IMPORTED)
         set_target_properties(pcre2_lib PROPERTIES
             IMPORTED_LOCATION "${_pcre2_lib}")
@@ -276,6 +408,7 @@ if(WITH_PCRE2 AND NOT WIN32)
         if(_pcre2_sys_hdr AND _pcre2_sys_lib)
             set(PG_JITTER_HAVE_PCRE2 ON)
             set(PCRE2_INCLUDE_DIR "${_pcre2_sys_hdr}")
+            set(PCRE2_LIBRARY_FOR_CHECK "${_pcre2_sys_lib}")
             if(_pcre2_sys_lib MATCHES "\\.a$")
                 add_library(pcre2_lib STATIC IMPORTED)
             else()
@@ -289,6 +422,45 @@ if(WITH_PCRE2 AND NOT WIN32)
         endif()
     endif()
 endif()
+set(PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE OFF)
+if(PG_JITTER_HAVE_PCRE2)
+    include(CheckCSourceCompiles)
+    set(_pg_jitter_save_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+    set(_pg_jitter_save_required_definitions "${CMAKE_REQUIRED_DEFINITIONS}")
+    set(_pg_jitter_save_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+    set(CMAKE_REQUIRED_INCLUDES "${PCRE2_INCLUDE_DIR}")
+    set(CMAKE_REQUIRED_DEFINITIONS
+        ${_pg_jitter_save_required_definitions}
+        -DPCRE2_CODE_UNIT_WIDTH=8)
+    set(CMAKE_REQUIRED_LIBRARIES "${PCRE2_LIBRARY_FOR_CHECK}")
+    check_c_source_compiles("
+        #define PCRE2_CODE_UNIT_WIDTH 8
+        #include <pcre2.h>
+        int main(void)
+        {
+        #ifndef PCRE2_JIT_FAST_API
+        # error PCRE2_JIT_FAST_API is unavailable
+        #endif
+            pcre2_code *code = 0;
+            pcre2_match_data *match_data = 0;
+            pcre2_jit_stack *jit_stack = 0;
+            pcre2_jit_fast_context *ctx =
+                pcre2_jit_fast_context_create(code, PCRE2_JIT_COMPLETE,
+                                              match_data, jit_stack);
+            (void)pcre2_jit_fast_match(ctx, (PCRE2_SPTR)\"\", 0, 0, 0);
+            pcre2_jit_fast_context_free(ctx);
+            return 0;
+        }"
+        PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE)
+    set(CMAKE_REQUIRED_INCLUDES "${_pg_jitter_save_required_includes}")
+    set(CMAKE_REQUIRED_DEFINITIONS "${_pg_jitter_save_required_definitions}")
+    set(CMAKE_REQUIRED_LIBRARIES "${_pg_jitter_save_required_libraries}")
+    if(PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE)
+        message(STATUS "PCRE2 fast JIT:     enabled")
+    else()
+        message(STATUS "PCRE2 fast JIT:     disabled (fast API unavailable or not linkable)")
+    endif()
+endif()
 
 # ---------- yyjson (optional C static library) ----------
 set(PG_JITTER_HAVE_YYJSON OFF)
@@ -296,18 +468,116 @@ if(WITH_YYJSON)
     set(_yj_hdr "${YYJSON_DIR}/src/yyjson.h")
     set(_yj_c "${YYJSON_DIR}/src/yyjson.c")
     if(EXISTS "${_yj_hdr}" AND EXISTS "${_yj_c}")
+        file(READ "${_yj_hdr}" _yj_header_text)
+        file(READ "${_yj_c}" _yj_source_text)
+        if(NOT _yj_header_text MATCHES "yyjson_pg_text_unicode_validator"
+           OR NOT _yj_header_text MATCHES "yyjson_read_pg_text_type_opts_err_ex"
+           OR NOT _yj_source_text MATCHES "yyjson_read_pg_text_type_opts_err_ex"
+           OR NOT _yj_source_text MATCHES "validate_unicode")
+            message(FATAL_ERROR
+                "yyjson at ${YYJSON_DIR} lacks pg_jitter's PostgreSQL JSON "
+                "syntax helper yyjson_read_pg_text_type_opts_err_ex with "
+                "Unicode-escape validation. "
+                "Use the patched ../yyjson checkout or set -DYYJSON_DIR.")
+        endif()
+        set(PG_JITTER_YYJSON_PG_API_PROBE_TRUSTED OFF CACHE BOOL
+            "Trust patched yyjson PostgreSQL syntax API when cross-compiling without an emulator")
+        if(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+            if(NOT PG_JITTER_YYJSON_PG_API_PROBE_TRUSTED)
+                message(FATAL_ERROR
+                    "yyjson at ${YYJSON_DIR} must pass pg_jitter's PostgreSQL "
+                    "JSON syntax API runtime probe, but this is a cross build "
+                    "without CMAKE_CROSSCOMPILING_EMULATOR. Configure with an "
+                    "emulator or set -DPG_JITTER_YYJSON_PG_API_PROBE_TRUSTED=ON "
+                    "only when the patched yyjson checkout has been verified.")
+            endif()
+            set(PG_JITTER_YYJSON_PG_API_PROBE_RUNS TRUE)
+        else()
+            include(CheckCSourceRuns)
+            set(_pg_jitter_save_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+            set(_pg_jitter_save_required_definitions "${CMAKE_REQUIRED_DEFINITIONS}")
+            set(CMAKE_REQUIRED_INCLUDES "${YYJSON_DIR}/src")
+            set(CMAKE_REQUIRED_DEFINITIONS
+                ${_pg_jitter_save_required_definitions}
+                -DYYJSON_READER_DEPTH_LIMIT=6401)
+            unset(PG_JITTER_YYJSON_PG_API_PROBE_RUNS CACHE)
+            check_c_source_runs([=[
+            #include <stdint.h>
+            #include <stdbool.h>
+            #include "yyjson.c"
+            static bool pg_jitter_yyjson_probe_validate(void *ctx,
+                                                        uint32_t codepoint)
+            {
+                (void) ctx;
+                return codepoint != 0x00E9;
+            }
+            int main(void)
+            {
+                yyjson_read_err err;
+                static const char object_json[] =
+                    {'{', '"', 'a', '"', ':', '1', '}', 0};
+                static const char duplicate_json[] =
+                    {'{', '"', 'a', '"', ':', '1', ',',
+                     '"', 'a', '"', ':', '2', '}', 0};
+                static const char unicode_json[] =
+                    {0x22, 0x5C, 0x75, 0x30, 0x30, 0x45, 0x39, 0x22, 0};
+                yyjson_alc invalid_alc = {0, 0, 0, 0};
+                yyjson_pg_text_type object_type =
+                    yyjson_read_pg_text_type_opts_err_ex(object_json,
+                                                         sizeof(object_json) - 1,
+                                                         true,
+                                                         pg_jitter_yyjson_probe_validate,
+                                                         0, 0, &err);
+                yyjson_pg_text_type duplicate_type =
+                    yyjson_read_pg_text_type_opts_err_ex(duplicate_json,
+                                                         sizeof(duplicate_json) - 1,
+                                                         true,
+                                                         pg_jitter_yyjson_probe_validate,
+                                                         0, 0, &err);
+                yyjson_pg_text_type unicode_type =
+                    yyjson_read_pg_text_type_opts_err_ex(unicode_json,
+                                                         sizeof(unicode_json) - 1,
+                                                         false,
+                                                         pg_jitter_yyjson_probe_validate,
+                                                         0, 0, &err);
+                yyjson_pg_text_type invalid_allocator_type =
+                    yyjson_read_pg_text_type_opts_err_ex(object_json,
+                                                         sizeof(object_json) - 1,
+                                                         true,
+                                                         pg_jitter_yyjson_probe_validate,
+                                                         0, &invalid_alc, &err);
+                return object_type == YYJSON_PG_TEXT_OBJECT &&
+                    duplicate_type == YYJSON_PG_TEXT_INVALID &&
+                    unicode_type == YYJSON_PG_TEXT_INVALID &&
+                    invalid_allocator_type == YYJSON_PG_TEXT_INVALID &&
+                    err.code == YYJSON_READ_ERROR_INVALID_PARAMETER ? 0 : 1;
+            }
+            ]=]
+                PG_JITTER_YYJSON_PG_API_PROBE_RUNS)
+            set(CMAKE_REQUIRED_INCLUDES "${_pg_jitter_save_required_includes}")
+            set(CMAKE_REQUIRED_DEFINITIONS "${_pg_jitter_save_required_definitions}")
+        endif()
+        if(NOT PG_JITTER_YYJSON_PG_API_PROBE_RUNS)
+            message(FATAL_ERROR
+                "yyjson at ${YYJSON_DIR} failed pg_jitter's PostgreSQL JSON "
+                "syntax API runtime probe. Use the patched ../yyjson checkout "
+                "or set -DYYJSON_DIR.")
+        endif()
+        unset(_yj_header_text)
+        unset(_yj_source_text)
         set(PG_JITTER_HAVE_YYJSON ON)
         add_library(yyjson_lib STATIC
             ${_yj_c})
         target_include_directories(yyjson_lib PRIVATE
             ${YYJSON_DIR}/src)
         set_target_properties(yyjson_lib PROPERTIES
-            C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
+            C_STANDARD 11 POSITION_INDEPENDENT_CODE ON
+            C_VISIBILITY_PRESET hidden)
         target_compile_definitions(yyjson_lib PRIVATE
             YYJSON_READER_DEPTH_LIMIT=6401)
         target_compile_options(yyjson_lib PRIVATE
-            $<$<C_COMPILER_ID:MSVC>:/w /O2>
-            $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w -O2>)
+            $<$<C_COMPILER_ID:MSVC>:/O2>
+            $<$<NOT:$<C_COMPILER_ID:MSVC>>:-O2>)
         message(STATUS "yyjson:             ${_yj_hdr}")
     else()
         message(STATUS "yyjson:             not found at ${YYJSON_DIR}")
@@ -330,6 +600,10 @@ function(pg_jitter_configure_target TARGET_NAME)
     if(PG_JITTER_HAVE_PCRE2)
         target_include_directories(${TARGET_NAME} PRIVATE ${PCRE2_INCLUDE_DIR})
         target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_PCRE2)
+        if(PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE)
+            target_compile_definitions(${TARGET_NAME} PRIVATE
+                PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE)
+        endif()
         target_link_libraries(${TARGET_NAME} PRIVATE pcre2_lib)
     endif()
     if(PG_JITTER_HAVE_YYJSON)
@@ -338,10 +612,8 @@ function(pg_jitter_configure_target TARGET_NAME)
         target_compile_definitions(${TARGET_NAME} PRIVATE PG_JITTER_HAVE_YYJSON)
         target_link_libraries(${TARGET_NAME} PRIVATE yyjson_lib)
         # Force linker to keep yyjson wrapper symbols referenced by JIT code.
-        # pg_jitter_yj_is_json_datum requires PG16+ (EEOP_IS_JSON)
         if(APPLE)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,_pg_jitter_yj_json_in
                 -Wl,-u,_pg_jitter_yj_jsonb_in)
             if(PG_VERSION_NUM GREATER_EQUAL 160000)
                 target_link_options(${TARGET_NAME} PRIVATE
@@ -349,7 +621,6 @@ function(pg_jitter_configure_target TARGET_NAME)
             endif()
         elseif(UNIX)
             target_link_options(${TARGET_NAME} PRIVATE
-                -Wl,-u,pg_jitter_yj_json_in
                 -Wl,-u,pg_jitter_yj_jsonb_in)
             if(PG_VERSION_NUM GREATER_EQUAL 160000)
                 target_link_options(${TARGET_NAME} PRIVATE
@@ -369,15 +640,36 @@ function(pg_jitter_configure_target TARGET_NAME)
     set_target_properties(${TARGET_NAME} PROPERTIES
         PREFIX ""
         SUFFIX "${PG_JITTER_SHARED_SUFFIX}"
-        C_VISIBILITY_PRESET default
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
     )
     target_link_options(${TARGET_NAME} PRIVATE ${PG_JITTER_LINK_FLAGS})
+    pg_jitter_apply_exports(${TARGET_NAME} ${PG_JITTER_PROVIDER_EXPORTS})
 endfunction()
 
 # ==========================================================================
 # Backend targets
 # ==========================================================================
 set(COMMON_SRC src/pg_jitter_common.c src/pg_jit_funcs.c src/pg_jit_tier2_wrappers.c src/pg_jitter_simd.c src/pg_jitter_pcre2.c)
+
+set(PG_JITTER_SIMD_COMPILE_OPTIONS "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    if(MSVC)
+        list(APPEND PG_JITTER_SIMD_COMPILE_OPTIONS /arch:AVX2)
+    else()
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("-mavx2" PG_JITTER_CC_HAS_MAVX2)
+        if(PG_JITTER_CC_HAS_MAVX2)
+            list(APPEND PG_JITTER_SIMD_COMPILE_OPTIONS -mavx2)
+        endif()
+    endif()
+endif()
+if(PG_JITTER_SIMD_COMPILE_OPTIONS)
+    set_source_files_properties(src/pg_jitter_simd.c PROPERTIES
+        COMPILE_OPTIONS "${PG_JITTER_SIMD_COMPILE_OPTIONS}")
+    message(STATUS "StringZilla SIMD C flags: ${PG_JITTER_SIMD_COMPILE_OPTIONS}")
+endif()
 
 # Collect targets for install
 set(PG_JITTER_TARGETS "")
@@ -399,7 +691,6 @@ if(PG_JITTER_BUILD_ASMJIT)
     target_link_libraries(pg_jitter_asmjit PRIVATE asmjit::asmjit sljit)
     target_compile_definitions(pg_jitter_asmjit PRIVATE PG_JITTER_HAVE_SLJIT_DEFORM)
     pg_jitter_configure_target(pg_jitter_asmjit)
-    set_target_properties(pg_jitter_asmjit PROPERTIES CXX_VISIBILITY_PRESET default)
     list(APPEND PG_JITTER_TARGETS pg_jitter_asmjit)
 endif()
 
@@ -426,9 +717,10 @@ endif()
 set_target_properties(pg_jitter PROPERTIES
     PREFIX ""
     SUFFIX "${PG_JITTER_SHARED_SUFFIX}"
-    C_VISIBILITY_PRESET default
+    C_VISIBILITY_PRESET hidden
 )
 target_link_options(pg_jitter PRIVATE ${PG_JITTER_LINK_FLAGS})
+pg_jitter_apply_exports(pg_jitter ${PG_JITTER_META_EXPORTS})
 list(APPEND PG_JITTER_TARGETS pg_jitter)
 
 # ==========================================================================

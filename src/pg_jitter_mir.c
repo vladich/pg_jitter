@@ -37,6 +37,7 @@
 #endif
 #include "commands/sequence.h"
 #include "funcapi.h"
+#include "utils/fmgroids.h"
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <libkern/OSCacheControl.h>
@@ -103,16 +104,20 @@ typedef struct {
 
 static MirSentinelEntry mir_sentinels[MIR_MAX_SENTINELS];
 static int mir_n_sentinels = 0;
+static bool mir_sentinel_overflow = false;
 
 /*
  * Generate a sentinel address with all 4 halfwords non-zero.
  * Pattern: 0xCAFE_<idx>001_BABE_<idx>001 where idx varies.
  */
-static uint64 mir_alloc_sentinel(void *real_addr) {
-  int idx = mir_n_sentinels;
+static bool mir_alloc_sentinel(void *real_addr, uint64 *sentinel_out) {
+  int idx;
   uint64 s;
 
-  Assert(idx < MIR_MAX_SENTINELS);
+  if (mir_n_sentinels >= MIR_MAX_SENTINELS)
+    return false;
+
+  idx = mir_n_sentinels;
 
   /*
    * Construct sentinel with all 4 halfwords non-zero.
@@ -125,7 +130,8 @@ static uint64 mir_alloc_sentinel(void *real_addr) {
   mir_sentinels[idx].sentinel = s;
   mir_n_sentinels++;
 
-  return s;
+  *sentinel_out = s;
+  return true;
 }
 
 /*
@@ -133,9 +139,17 @@ static uint64 mir_alloc_sentinel(void *real_addr) {
  * real address otherwise.
  */
 static void *mir_extern_addr(void *real_addr) {
-  if (!mir_shared_code_mode)
+  uint64 sentinel;
+
+  if (!mir_shared_code_mode || mir_sentinel_overflow)
     return real_addr;
-  return (void *)(uintptr_t)mir_alloc_sentinel(real_addr);
+
+  if (!mir_alloc_sentinel(real_addr, &sentinel)) {
+    mir_sentinel_overflow = true;
+    return real_addr;
+  }
+
+  return (void *)(uintptr_t)sentinel;
 }
 
 /*
@@ -269,8 +283,11 @@ static void mir_ctx_free(void *data) {
     if (st->unwind_codes)
       pfree(st->unwind_codes);
 #endif
-    MIR_gen_finish(st->ctx);
-    MIR_finish(st->ctx);
+    if (st->ctx)
+    {
+      MIR_gen_finish(st->ctx);
+      MIR_finish(st->ctx);
+    }
     pfree(st);
   }
 }
@@ -292,7 +309,7 @@ static MIR_context_t mir_get_or_create_ctx(PgJitterContext *jctx) {
     st->module_counter = 0;
 
     /* Register for cleanup when this JitContext is released */
-    pg_jitter_register_compiled(jctx, mir_ctx_free, st);
+    pg_jitter_register_compiled_or_free(jctx, mir_ctx_free, st);
 
     mir_current_state = st;
     mir_current_jctx = jctx;
@@ -310,7 +327,8 @@ static MIR_context_t mir_get_or_create_ctx(PgJitterContext *jctx) {
 #if defined(_MSC_VER) && PG_VERSION_NUM < 160000
 #pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
 #endif
-void _PG_jit_provider_init(JitProviderCallbacks *cb) {
+PG_JITTER_EXPORT void
+_PG_jit_provider_init(JitProviderCallbacks *cb) {
   cb->reset_after_error = mir_reset_after_error;
   cb->release_context = pg_jitter_release_context;
   cb->compile_expr = mir_compile_expr;
@@ -374,15 +392,15 @@ void _PG_jit_provider_init(JitProviderCallbacks *cb) {
 }
 
 /*
- * Error reset — intentionally a no-op.
- *
- * Per-query MIR contexts are freed via mir_ctx_free() called from
- * pg_jitter_release_context() through the ResourceOwner machinery.
- * A cursor surviving a ROLLBACK TO SAVEPOINT keeps its ResourceOwner
- * alive, so its JitContext (and MIR context) won't be freed until the
- * cursor is closed.
+ * ERROR cleanup for file-scoped per-compilation state.  Per-query MIR
+ * contexts are still released through pg_jitter_release_context().
  */
-static void mir_reset_after_error(void) { /* nothing to do */ }
+static void mir_reset_after_error(void) {
+  mir_shared_code_mode = false;
+  mir_n_sentinels = 0;
+  mir_sentinel_overflow = false;
+  mir_name_counter = 0;
+}
 
 /*
  * Helper: get econtext slot offset for a given opcode.
@@ -768,7 +786,7 @@ static bool mir_compile_expr(ExprState *state) {
              shared_node_id, shared_expr_idx, code_size, npatched, code_ptr,
              (unsigned long)leader_dylib_ref, (unsigned long)worker_ref);
 
-        pg_jitter_register_compiled(jctx, pg_jitter_exec_free, handle);
+        pg_jitter_register_exec_handle(jctx, handle);
 
         /* Worker: set up process-local data structures.
          * Leader stored pointers in step data; worker needs its own. */
@@ -965,22 +983,23 @@ no_shared_code_reuse:
   MIR_item_t import_htgd = MIR_new_import(ctx, "htgd_fn");
 
 #ifdef PG_JITTER_HAVE_YYJSON
-#if PG_VERSION_NUM >= 160000
-  /* Proto for yyjson IS_JSON: (Datum, int32) -> int32 */
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
+  /* Proto for yyjson IS_JSON: (Datum, int32, int32) -> int32 */
   MIR_item_t proto_yj_is_json;
   {
     MIR_type_t rt32 = MIR_T_I32;
-    proto_yj_is_json = MIR_new_proto(ctx, "p_yjisj", 1, &rt32, 2,
-                                      MIR_T_I64, "datum", MIR_T_I32, "itype");
+    proto_yj_is_json = MIR_new_proto(ctx, "p_yjisj", 1, &rt32, 3,
+                                      MIR_T_I64, "datum", MIR_T_I32, "itype",
+                                      MIR_T_I32, "ukeys");
   }
 #endif
 
-  /* Proto for yyjson json_in/jsonb_in: (Datum, FunctionCallInfo) -> Datum */
-  MIR_item_t proto_yj_json_in;
+  /* Proto for yyjson jsonb_in: (Datum, FunctionCallInfo) -> Datum */
+  MIR_item_t proto_yj_jsonb_in;
   {
     MIR_type_t rt64 = MIR_T_I64;
-    proto_yj_json_in = MIR_new_proto(ctx, "p_yjjin", 1, &rt64, 2,
-                                      MIR_T_I64, "cstr", MIR_T_P, "fci");
+    proto_yj_jsonb_in = MIR_new_proto(ctx, "p_yjjbin", 1, &rt64, 2,
+                                       MIR_T_I64, "cstr", MIR_T_P, "fci");
   }
 #endif
 
@@ -999,10 +1018,9 @@ no_shared_code_reuse:
 #endif
 
 #ifdef PG_JITTER_HAVE_YYJSON
-#if PG_VERSION_NUM >= 160000
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
   MIR_item_t import_yj_is_json = MIR_new_import(ctx, "yj_is_json");
 #endif
-  MIR_item_t import_yj_json_in = MIR_new_import(ctx, "yj_json_in");
   MIR_item_t import_yj_jsonb_in = MIR_new_import(ctx, "yj_jsonb_in");
 #endif
 
@@ -2131,8 +2149,7 @@ no_shared_code_reuse:
             pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
           /*
            * TIER 0a — FULLY INLINE TEXT EQ/NE.
-           * Short varlena (≤ 7 data bytes): zero function calls.
-           * Longer short varlena: memcmp call only.
+           * Short varlena: exact-length memcmp after header/length checks.
            * Non-short (toast/compressed): call jit_text_datum_eq/ne.
            * Only for deterministic collations; non-deterministic falls
            * through to V1.
@@ -2159,10 +2176,6 @@ no_shared_code_reuse:
             MIR_reg_t tlen = mir_new_reg(ctx, f, MIR_T_I64, rn);
             snprintf(rn, sizeof(rn), "ttmp_%d", opno);
             MIR_reg_t ttmp = mir_new_reg(ctx, f, MIR_T_I64, rn);
-            snprintf(rn, sizeof(rn), "twa_%d", opno);
-            MIR_reg_t twa = mir_new_reg(ctx, f, MIR_T_I64, rn);
-            snprintf(rn, sizeof(rn), "twb_%d", opno);
-            MIR_reg_t twb = mir_new_reg(ctx, f, MIR_T_I64, rn);
 
             int64_t val_off_0 =
                 (int64_t)((char *)&fcinfo->args[0].value - (char *)fcinfo);
@@ -2257,54 +2270,11 @@ no_shared_code_reuse:
                                          MIR_new_reg_op(ctx, tlen),
                                          MIR_new_int_op(ctx, 0)));
 
-            /* 6. data_len > 7 → memcmp */
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_BGTS,
-                                         MIR_new_label_op(ctx, lbl_memcmp),
-                                         MIR_new_reg_op(ctx, tlen),
-                                         MIR_new_int_op(ctx, 7)));
-
-            /* 7. Inline word comparison (data_len 1-7):
-             *    Load 8 bytes, shift left by (7-data_len)*8, compare */
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, twa),
-                                         MIR_new_mem_op(ctx, MIR_T_I64, 0,
-                                                        ta0, 0, 1)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, twb),
-                                         MIR_new_mem_op(ctx, MIR_T_I64, 0,
-                                                        ta1, 0, 1)));
-            /* shift = (7 - data_len) * 8 */
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_SUB,
-                                         MIR_new_reg_op(ctx, ttmp),
-                                         MIR_new_int_op(ctx, 7),
-                                         MIR_new_reg_op(ctx, tlen)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_LSH,
-                                         MIR_new_reg_op(ctx, ttmp),
-                                         MIR_new_reg_op(ctx, ttmp),
-                                         MIR_new_int_op(ctx, 3)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_LSH,
-                                         MIR_new_reg_op(ctx, twa),
-                                         MIR_new_reg_op(ctx, twa),
-                                         MIR_new_reg_op(ctx, ttmp)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_LSH,
-                                         MIR_new_reg_op(ctx, twb),
-                                         MIR_new_reg_op(ctx, twb),
-                                         MIR_new_reg_op(ctx, ttmp)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_BEQ,
-                                         MIR_new_label_op(ctx, lbl_result_eq),
-                                         MIR_new_reg_op(ctx, twa),
-                                         MIR_new_reg_op(ctx, twb)));
-            MIR_append_insn(ctx, func_item,
-                            MIR_new_insn(ctx, MIR_JMP,
-                                         MIR_new_label_op(ctx, lbl_result_ne)));
-
-            /* 8. memcmp path (data_len > 7) */
+            /*
+             * Non-empty short varlena: compare exactly with memcmp. Do
+             * not use speculative wide loads because the datum can sit at
+             * a tuple/chunk boundary.
+             */
             MIR_append_insn(ctx, func_item, lbl_memcmp);
             MIR_append_insn(ctx, func_item,
                             MIR_new_insn(ctx, MIR_ADD,
@@ -2898,15 +2868,11 @@ no_shared_code_reuse:
                 }
               }
 
-              /*
-               * StringZilla LIKE uses byte-level matching and only needs a
-               * deterministic collation.  PCRE2 applies a stricter
-               * encoding/collation check inside pg_jitter_pcre2_compile().
-               */
-              bool collation_ok =
-                  pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+              bool like_byte_search_ok =
+                  simd_like_byte_search_is_eligible(fcinfo->fncollation);
 
-              if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
+              if (pat_const && !fcinfo->args[1].isnull &&
+                  like_byte_search_ok) {
                 Datum pat_datum = fcinfo->args[1].value;
                 text *pat_text = DatumGetTextPP(pat_datum);
                 char *pat_str = VARDATA_ANY(pat_text);
@@ -3100,9 +3066,9 @@ no_shared_code_reuse:
                 if (!vs_handled && !use_v1) {
                   bool is_like = is_like_fn || is_ilike_fn;
                   bool case_insens = is_ilike_fn || is_iregex_fn;
-                  Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
-                      pat_str, pat_len, is_like, case_insens,
-                      fcinfo->fncollation);
+	                  Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+	                      jctx, pat_str, pat_len, is_like, case_insens,
+	                      fcinfo->fncollation);
 
                   if (pe) {
                     char rd_name[32], re_name[32];
@@ -4883,60 +4849,21 @@ no_shared_code_reuse:
 
           if (!arrayconst_t->constisnull) {
             Datum array_datum_t = arrayconst_t->constvalue;
-            ArrayType *arr_t = DatumGetArrayTypeP(array_datum_t);
-            int nitems_t = ArrayGetNItems(ARR_NDIM(arr_t), ARR_DIMS(arr_t));
-            int16 typlen_t;
-            bool typbyval_t;
-            char typalign_t;
+            bool text_has_nulls = false;
 
-            get_typlenbyvalalign(ARR_ELEMTYPE(arr_t), &typlen_t,
-                                 &typbyval_t, &typalign_t);
-
-            if (!typbyval_t && ARR_ELEMTYPE(arr_t) == TEXTOID &&
-                nitems_t > 0 && nitems_t <= 16384 &&
-                pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
-              bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
-              char *s_t = (char *)ARR_DATA_PTR(arr_t);
-              int bitmask_t = 1;
-              Datum *text_vals = palloc(nitems_t * sizeof(Datum));
-              int text_nvals = 0;
-              bool text_has_nulls = false;
-
-              for (int k = 0; k < nitems_t; k++) {
-                if (bitmap_t && (*bitmap_t & bitmask_t) == 0) {
-                  text_has_nulls = true;
-                } else {
-                  text_vals[text_nvals++] = fetch_att(s_t, false, typlen_t);
-                  s_t = att_addlength_pointer(s_t, typlen_t, s_t);
-                  s_t = (char *)att_align_nominal(s_t, typalign_t);
-                }
-
-                if (bitmap_t) {
-                  bitmask_t <<= 1;
-                  if (bitmask_t == 0x100) {
-                    bitmap_t++;
-                    bitmask_t = 1;
-                  }
-                }
-              }
-
-              if (text_nvals > 0) {
-                text_ht = text_hash_build(text_vals, text_nvals,
-                                           text_has_nulls, jctx);
-                array_has_nulls = text_has_nulls;
-                /*
-                 * Store table pointer in fcinfo->args[1].value for
-                 * shared mode. Workers will rebuild the table and
-                 * store their own pointer here. In non-shared mode
-                 * this is harmless (overwritten const array datum
-                 * is no longer needed).
-                 */
-                fcinfo->args[1].value = PointerGetDatum(text_ht);
-              }
-              pfree(text_vals);
+            text_ht = text_hash_build_from_array(array_datum_t, op, fcinfo,
+                                                 &text_has_nulls, jctx);
+            if (text_ht != NULL) {
+              array_has_nulls = text_has_nulls;
+              /*
+               * Store table pointer in fcinfo->args[1].value for
+               * shared mode. Workers will rebuild the table and
+               * store their own pointer here. In non-shared mode
+               * this is harmless (overwritten const array datum
+               * is no longer needed).
+               */
+              fcinfo->args[1].value = PointerGetDatum(text_ht);
             }
-            if ((Pointer)arr_t != DatumGetPointer(array_datum_t))
-              pfree(arr_t);
           }
         }
       }
@@ -6930,31 +6857,34 @@ no_shared_code_reuse:
     }
 
     /*
-     * ---- IS_JSON (yyjson-accelerated for text input) ----
+     * ---- IS_JSON ----
      */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
     case EEOP_IS_JSON: {
 #ifdef PG_JITTER_HAVE_YYJSON
       JsonIsPredicate *pred = op->d.is_json.pred;
-      if (exprType(pred->expr) == TEXTOID && !pred->unique_keys) {
-        /* yyjson fast path */
+
+      if (exprType(pred->expr) == TEXTOID) {
         MIR_label_t skip_null = MIR_new_label(ctx);
         MIR_label_t done_label = MIR_new_label(ctx);
+        MIR_reg_t r_item_type =
+            mir_new_reg(ctx, f, MIR_T_I64, "itype");
+        MIR_reg_t r_unique_keys =
+            mir_new_reg(ctx, f, MIR_T_I64, "ukeys");
+        MIR_reg_t r_yj_result =
+            mir_new_reg(ctx, f, MIR_T_I64, "yjres");
 
-        /* Load *op->resnull */
         MIR_STEP_LOAD(r_tmp1, opno, resnull);
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_tmp2),
                          MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1)));
-        /* If resnull != 0, skip to null path */
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, skip_null),
                          MIR_new_reg_op(ctx, r_tmp2),
                          MIR_new_int_op(ctx, 0)));
 
-        /* Load *op->resvalue (text Datum) */
         MIR_STEP_LOAD(r_tmp1, opno, resvalue);
         MIR_append_insn(
             ctx, func_item,
@@ -6962,27 +6892,27 @@ no_shared_code_reuse:
                          MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1)));
 
         /*
-         * Call pg_jitter_yj_is_json_datum(datum, item_type) → r_yj_result.
-         * MIR only allows I64 integer function locals; the proto above is what
-         * fixes the direct-call ABI width to (Datum, int32) -> int32.
+         * MIR locals are I64 here; the proto fixes the direct-call ABI width to
+         * (Datum, int32, int32) -> int32 before the value is zero-extended for
+         * Datum.
          */
-        MIR_reg_t r_item_type =
-            mir_new_reg(ctx, f, MIR_T_I64, "itype");
-        MIR_reg_t r_yj_result =
-            mir_new_reg(ctx, f, MIR_T_I64, "yjres");
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_item_type),
                          MIR_new_int_op(ctx, (int32_t)pred->item_type)));
         MIR_append_insn(
             ctx, func_item,
-            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_yj_is_json),
+            MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, r_unique_keys),
+                         MIR_new_int_op(ctx, pred->unique_keys ? 1 : 0)));
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_call_insn(ctx, 6, MIR_new_ref_op(ctx, proto_yj_is_json),
                               MIR_new_ref_op(ctx, import_yj_is_json),
                               MIR_new_reg_op(ctx, r_yj_result),
                               MIR_new_reg_op(ctx, r_tmp2),
-                              MIR_new_reg_op(ctx, r_item_type)));
+                              MIR_new_reg_op(ctx, r_item_type),
+                              MIR_new_reg_op(ctx, r_unique_keys)));
 
-        /* *op->resvalue = BoolGetDatum(r_yj_result) — zero-extend I32 to I64 */
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_UEXT32, MIR_new_reg_op(ctx, r_tmp2),
@@ -6993,12 +6923,16 @@ no_shared_code_reuse:
             MIR_new_insn(ctx, MIR_MOV,
                          MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
                          MIR_new_reg_op(ctx, r_tmp2)));
-
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 0)));
         MIR_append_insn(
             ctx, func_item,
             MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, done_label)));
 
-        /* Null path: *op->resvalue = BoolGetDatum(false) = 0 */
         MIR_append_insn(ctx, func_item, skip_null);
         MIR_STEP_LOAD(r_tmp1, opno, resvalue);
         MIR_append_insn(
@@ -7006,12 +6940,17 @@ no_shared_code_reuse:
             MIR_new_insn(ctx, MIR_MOV,
                          MIR_new_mem_op(ctx, MIR_T_I64, 0, r_tmp1, 0, 1),
                          MIR_new_int_op(ctx, 0)));
+        MIR_STEP_LOAD(r_tmp1, opno, resnull);
+        MIR_append_insn(
+            ctx, func_item,
+            MIR_new_insn(ctx, MIR_MOV,
+                         MIR_new_mem_op(ctx, MIR_T_U8, 0, r_tmp1, 0, 1),
+                         MIR_new_int_op(ctx, 1)));
 
         MIR_append_insn(ctx, func_item, done_label);
         break;
       }
 #endif /* PG_JITTER_HAVE_YYJSON */
-      /* Fallback: generic 2-arg call */
       MIR_STEP_ADDR_RAW(r_tmp1, opno, 0, (uint64_t)op);
       MIR_append_insn(
           ctx, func_item,
@@ -7745,15 +7684,12 @@ no_shared_code_reuse:
       MIR_STEP_LOAD(r_fci_in, opno, d.iocoerce.fcinfo_data_in);
 
 #ifdef PG_JITTER_HAVE_YYJSON
-      if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-          fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */) {
-        /* yyjson fast path: yj_fn(cstring, fcinfo_in) → Datum */
-        MIR_item_t yj_import = (fcinfo_in->flinfo->fn_oid == 321)
-                                    ? import_yj_json_in
-                                    : import_yj_jsonb_in;
+      if (fcinfo_in->flinfo->fn_oid == F_JSONB_IN) {
+        /* yyjson fast path: yj_fn(cstring, fcinfo_in) -> Datum */
+        MIR_item_t yj_import = import_yj_jsonb_in;
         MIR_append_insn(
             ctx, func_item,
-            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_yj_json_in),
+            MIR_new_call_insn(ctx, 5, MIR_new_ref_op(ctx, proto_yj_jsonb_in),
                               MIR_new_ref_op(ctx, yj_import),
                               MIR_new_reg_op(ctx, r_tmp2),
                               MIR_new_reg_op(ctx, r_tmp2),
@@ -8820,6 +8756,7 @@ no_shared_code_reuse:
 
     /* Reset sentinel table for this compilation */
     mir_n_sentinels = 0;
+    mir_sentinel_overflow = false;
 
     /* Load external symbols (sentinels in shared mode) */
     MIR_load_external(ctx, "fallback_step",
@@ -9235,27 +9172,27 @@ no_shared_code_reuse:
     }
 
 #ifdef PG_JITTER_HAVE_YYJSON
-#if PG_VERSION_NUM >= 160000
+#ifdef HAVE_EEOP_JSON_CONSTRUCTOR
     MIR_load_external(ctx, "yj_is_json",
                       mir_extern_addr((void *)pg_jitter_yj_is_json_datum));
 #endif
-    MIR_load_external(ctx, "yj_json_in",
-                      mir_extern_addr((void *)pg_jitter_yj_json_in));
     MIR_load_external(ctx, "yj_jsonb_in",
                       mir_extern_addr((void *)pg_jitter_yj_jsonb_in));
 #endif
 
     MIR_link(ctx, MIR_set_lazy_gen_interface, NULL);
 
-    code = MIR_gen(ctx, func_item);
-    if (!code) {
-      pfree(step_labels);
-      pfree(step_fn_imports);
-      pfree(step_direct_imports);
-      pfree(ioc_in_imports);
-      mir_shared_code_mode = false;
-      return false;
-    }
+	    code = MIR_gen(ctx, func_item);
+	    if (!code) {
+	      pfree(step_labels);
+	      pfree(step_fn_imports);
+	      pfree(step_direct_imports);
+	      pfree(ioc_in_imports);
+	      mir_shared_code_mode = false;
+	      mir_n_sentinels = 0;
+	      mir_sentinel_overflow = false;
+	      return false;
+	    }
 
     /*
      * MIR_gen() returns a thunk address, not the actual machine code.
@@ -9306,6 +9243,8 @@ no_shared_code_reuse:
         pfree(step_direct_imports);
         pfree(ioc_in_imports);
         mir_shared_code_mode = false;
+        mir_n_sentinels = 0;
+        mir_sentinel_overflow = false;
         return false;
       }
 
@@ -9350,6 +9289,14 @@ no_shared_code_reuse:
       }
 #endif
 
+      if (patch_ok && npatched != mir_n_sentinels) {
+        elog(WARNING,
+             "pg_jitter[mir]: incomplete sentinel patching "
+             "(patched %d/%d addresses); rejecting generated code",
+             npatched, mir_n_sentinels);
+        patch_ok = false;
+      }
+
       if (!patch_ok) {
         MIR_unload_module(ctx, m);
         pfree(step_labels);
@@ -9357,9 +9304,16 @@ no_shared_code_reuse:
         pfree(step_direct_imports);
         pfree(ioc_in_imports);
         mir_shared_code_mode = false;
+        mir_n_sentinels = 0;
+        mir_sentinel_overflow = false;
         return false;
       }
     }
+
+    if (mir_sentinel_overflow)
+      elog(DEBUG1,
+           "pg_jitter[mir]: external sentinel table exhausted; generated "
+           "code will execute locally and will not be stored in shared DSM");
 
 #ifdef _WIN64
     /* Register Windows x64 SEH unwind metadata for longjmp safety */
@@ -9394,6 +9348,7 @@ no_shared_code_reuse:
      * Use f->machine_code (actual code), not `code` (thunk).
      */
     if (mir_shared_code_mode &&
+        !mir_sentinel_overflow &&
         !IsParallelWorker() &&
         (state->parent->state->es_jit_flags & PGJIT_EXPR) &&
         jctx->share_state.sjc) {
@@ -9427,6 +9382,8 @@ no_shared_code_reuse:
 
   /* Reset shared code mode for next compilation */
   mir_shared_code_mode = false;
+  mir_n_sentinels = 0;
+  mir_sentinel_overflow = false;
 
   INSTR_TIME_SET_CURRENT(endtime);
   INSTR_TIME_ACCUM_DIFF(jctx->base.instr.generation_counter, endtime,

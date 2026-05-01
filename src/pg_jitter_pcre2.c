@@ -2,7 +2,9 @@
  * pg_jitter_pcre2.c — PCRE2 pattern cache and match wrappers
  *
  * Compiled patterns are JIT-compiled via PCRE2's built-in SLJIT JIT and
- * cached in a per-backend LRU cache for reuse across rows and queries.
+ * cached in a backend-local LRU directory for reuse across rows and queries.
+ * Generated code pins returned entries, so eviction removes only cache lookup
+ * ownership; live generated-code pointers remain valid until context release.
  */
 #include "postgres.h"
 
@@ -22,6 +24,9 @@
 
 /* Pre-allocated stack size for JIT backtracking (matches PCRE2's MACHINE_STACK_SIZE) */
 #define PJ_STACK_SIZE   32768
+#define PG_JITTER_PCRE2_MATCH_LIMIT 10000000U
+#define PG_JITTER_PCRE2_DEPTH_LIMIT 10000000U
+#define PG_JITTER_PCRE2_HEAP_LIMIT_KIB 65536U
 
 /* ================================================================
  * Pattern cache
@@ -29,21 +34,147 @@
 #define PCRE2_CACHE_SIZE 64
 #define PCRE2_MAX_PATTERN_BYTES 65536
 
-typedef struct Pcre2CacheKey {
-	char    pattern[256]; /* truncated pattern for hash key */
-	int     patlen;       /* full pattern length */
-	uint32  flags;        /* PCRE2 compile flags */
-} Pcre2CacheKey;
+static Pcre2CacheEntry *pcre2_cache[PCRE2_CACHE_SIZE];
+static uint64 pcre2_lru_clock = 0;
 
-typedef struct Pcre2CacheSlot {
-	Pcre2CacheKey     key;
-	Pcre2CacheEntry   entry;
-	int               lru_counter;
-} Pcre2CacheSlot;
+static void
+pg_jitter_pcre2_free_entry(Pcre2CacheEntry *entry)
+{
+	if (entry == NULL)
+		return;
 
-static Pcre2CacheSlot pcre2_cache[PCRE2_CACHE_SIZE];
-static int pcre2_cache_used = 0;
-static int pcre2_lru_clock = 0;
+	Assert(entry->refcount == 0);
+	Assert(!entry->in_cache);
+
+#ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
+	if (entry->jit_fast)
+		pcre2_jit_fast_context_free(entry->jit_fast);
+#endif
+	if (entry->match_context)
+		pcre2_match_context_free(entry->match_context);
+	if (entry->jit_stack)
+		pcre2_jit_stack_free(entry->jit_stack);
+	if (entry->match_data)
+		pcre2_match_data_free(entry->match_data);
+	if (entry->code)
+		pcre2_code_free(entry->code);
+	if (entry->pattern)
+		pfree(entry->pattern);
+	pfree(entry);
+}
+
+static void
+pg_jitter_pcre2_unpin_entry(void *data)
+{
+	Pcre2CacheEntry *entry = (Pcre2CacheEntry *) data;
+
+	if (entry == NULL)
+		return;
+
+	Assert(entry->refcount > 0);
+	entry->refcount--;
+	if (entry->refcount == 0 && !entry->in_cache)
+		pg_jitter_pcre2_free_entry(entry);
+}
+
+static bool
+pg_jitter_pcre2_pin_entry(PgJitterContext *ctx, Pcre2CacheEntry *entry)
+{
+	if (ctx == NULL || entry == NULL)
+		return false;
+
+	pg_jitter_register_compiled(ctx, pg_jitter_pcre2_unpin_entry, entry);
+	entry->refcount++;
+	return true;
+}
+
+static bool
+pg_jitter_pcre2_publish_and_pin_entry(PgJitterContext *ctx, int slot,
+									  Pcre2CacheEntry *entry)
+{
+	bool pinned = false;
+
+	Assert(slot >= 0 && slot < PCRE2_CACHE_SIZE);
+	Assert(entry != NULL);
+
+	entry->in_cache = true;
+	entry->lru_counter = ++pcre2_lru_clock;
+	pcre2_cache[slot] = entry;
+
+	PG_TRY();
+	{
+		pinned = pg_jitter_pcre2_pin_entry(ctx, entry);
+	}
+	PG_CATCH();
+	{
+		if (pcre2_cache[slot] == entry)
+			pcre2_cache[slot] = NULL;
+		entry->in_cache = false;
+		pg_jitter_pcre2_free_entry(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (pinned)
+		return true;
+
+	if (pcre2_cache[slot] == entry)
+		pcre2_cache[slot] = NULL;
+	entry->in_cache = false;
+	pg_jitter_pcre2_free_entry(entry);
+	return false;
+}
+
+static int
+pg_jitter_pcre2_choose_slot(void)
+{
+	int unpinned_slot = -1;
+	int pinned_slot = -1;
+	uint64 unpinned_oldest = 0;
+	uint64 pinned_oldest = 0;
+
+	for (int i = 0; i < PCRE2_CACHE_SIZE; i++)
+	{
+		Pcre2CacheEntry *entry = pcre2_cache[i];
+
+		if (entry == NULL)
+			return i;
+
+		if (entry->refcount == 0)
+		{
+			if (unpinned_slot < 0 || entry->lru_counter < unpinned_oldest)
+			{
+				unpinned_slot = i;
+				unpinned_oldest = entry->lru_counter;
+			}
+		}
+		else if (pinned_slot < 0 || entry->lru_counter < pinned_oldest)
+		{
+			pinned_slot = i;
+			pinned_oldest = entry->lru_counter;
+		}
+	}
+
+	return unpinned_slot >= 0 ? unpinned_slot : pinned_slot;
+}
+
+static void
+pg_jitter_pcre2_evict_slot(int slot)
+{
+	Pcre2CacheEntry *entry;
+
+	Assert(slot >= 0 && slot < PCRE2_CACHE_SIZE);
+
+	entry = pcre2_cache[slot];
+	if (entry == NULL)
+		return;
+
+	entry->in_cache = false;
+	pcre2_cache[slot] = NULL;
+
+	if (entry->refcount == 0)
+		pg_jitter_pcre2_free_entry(entry);
+}
 
 bool
 pg_jitter_pcre2_is_eligible(Oid collid, bool is_like, bool case_insensitive)
@@ -147,9 +278,18 @@ like_to_regex(const char *like_pat, int like_len, int *regex_len_out)
 	if (ntokens_alloc > MaxAllocSize / sizeof(*tokens))
 		return NULL;
 
-	buf = MemoryContextAlloc(TopMemoryContext, max_len);
-	tokens = MemoryContextAlloc(TopMemoryContext,
-	                            ntokens_alloc * sizeof(*tokens));
+	buf = MemoryContextAllocExtended(TopMemoryContext, max_len,
+	                                 MCXT_ALLOC_NO_OOM);
+	if (buf == NULL)
+		return NULL;
+	tokens = MemoryContextAllocExtended(TopMemoryContext,
+	                                    ntokens_alloc * sizeof(*tokens),
+	                                    MCXT_ALLOC_NO_OOM);
+	if (tokens == NULL)
+	{
+		pfree(buf);
+		return NULL;
+	}
 
 	for (int i = 0; i < like_len; i++)
 	{
@@ -277,11 +417,293 @@ pcre2_regex_append_byte(char *buf, Size cap, Size *pos, unsigned char c)
 }
 
 static bool
-raw_regex_dollar_is_constraint(const char *pattern, int patlen, int pos)
+raw_regex_ascii_is_alnum(unsigned char c)
 {
-	int			next = pos + 1;
+	return (c >= 'A' && c <= 'Z') ||
+		(c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9');
+}
 
-	return next >= patlen || pattern[next] == '|' || pattern[next] == ')';
+static bool
+raw_regex_ascii_is_digit(unsigned char c)
+{
+	return c >= '0' && c <= '9';
+}
+
+static bool
+raw_regex_parse_bound_number(const char *pattern, int patlen, int *idx,
+							 int *value)
+{
+	int			n = 0;
+
+	if (*idx >= patlen ||
+		!raw_regex_ascii_is_digit((unsigned char) pattern[*idx]))
+		return false;
+
+	do
+	{
+		n = n * 10 + (pattern[*idx] - '0');
+		if (n > 255)
+			return false;
+		(*idx)++;
+	} while (*idx < patlen &&
+			 raw_regex_ascii_is_digit((unsigned char) pattern[*idx]));
+
+	*value = n;
+	return true;
+}
+
+static bool
+raw_regex_bound_is_supported(const char *pattern, int patlen, int pos)
+{
+	int			idx = pos + 1;
+	int			lower;
+	int			upper;
+
+	if (idx >= patlen ||
+		!raw_regex_ascii_is_digit((unsigned char) pattern[idx]))
+		return true;
+
+	if (!raw_regex_parse_bound_number(pattern, patlen, &idx, &lower))
+		return false;
+
+	if (idx < patlen && pattern[idx] == ',')
+	{
+		idx++;
+		if (idx < patlen &&
+			raw_regex_ascii_is_digit((unsigned char) pattern[idx]))
+		{
+			if (!raw_regex_parse_bound_number(pattern, patlen, &idx, &upper))
+				return false;
+			if (lower > upper)
+				return false;
+		}
+	}
+
+	return idx < patlen && pattern[idx] == '}';
+}
+
+static bool
+raw_regex_starts_quantifier(const char *pattern, int patlen, int pos)
+{
+	unsigned char c;
+
+	if (pos >= patlen)
+		return false;
+
+	c = (unsigned char) pattern[pos];
+	if (c == '*' || c == '+' || c == '?')
+		return true;
+	if (c == '{' && pos + 1 < patlen &&
+		raw_regex_ascii_is_digit((unsigned char) pattern[pos + 1]))
+		return true;
+	return false;
+}
+
+static int
+raw_regex_hex_value(unsigned char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static bool
+raw_regex_append_codepoint(char *buf, Size cap, Size *pos, uint32 codepoint)
+{
+	char		tmp[16];
+	int			len;
+
+	if (codepoint > 0x10FFFF)
+		return false;
+
+	len = snprintf(tmp, sizeof(tmp), "\\x{%X}", codepoint);
+	if (len <= 0 || len >= (int) sizeof(tmp))
+		return false;
+	return pcre2_regex_append(buf, cap, pos, tmp);
+}
+
+static bool
+raw_regex_parse_fixed_hex_escape(const char *pattern, int patlen, int *idx,
+								 int digits, uint32 *codepoint)
+{
+	uint32		value = 0;
+
+	if (*idx + digits >= patlen)
+		return false;
+
+	for (int j = 1; j <= digits; j++)
+	{
+		int			hex = raw_regex_hex_value((unsigned char) pattern[*idx + j]);
+
+		if (hex < 0)
+			return false;
+		value = (value << 4) | (uint32) hex;
+	}
+
+	if (value > 0x10FFFF)
+		return false;
+
+	*idx += digits;
+	*codepoint = value;
+	return true;
+}
+
+static bool
+raw_regex_parse_variable_hex_escape(const char *pattern, int patlen, int *idx,
+									uint32 *codepoint)
+{
+	uint32		value = 0;
+	int			digits = 0;
+	int			pos = *idx + 1;
+
+	while (pos < patlen && digits < 255)
+	{
+		int			hex = raw_regex_hex_value((unsigned char) pattern[pos]);
+
+		if (hex < 0)
+			break;
+		if (value > (0x10FFFFU - (uint32) hex) / 16U)
+			return false;
+		value = value * 16U + (uint32) hex;
+		pos++;
+		digits++;
+	}
+
+	if (digits == 0 || value > 0x10FFFF)
+		return false;
+
+	*idx = pos - 1;
+	*codepoint = value;
+	return true;
+}
+
+static bool
+raw_regex_parse_octal_escape(const char *pattern, int patlen, int *idx,
+							 uint32 *codepoint)
+{
+	uint32		value = 0;
+	int			digits = 0;
+	int			pos = *idx;
+
+	while (pos < patlen && digits < 3 &&
+		   pattern[pos] >= '0' && pattern[pos] <= '7')
+	{
+		value = (value << 3) + (uint32) (pattern[pos] - '0');
+		pos++;
+		digits++;
+	}
+
+	if (digits == 0)
+		return false;
+
+	if (value > 0xFF && digits == 3)
+	{
+		value >>= 3;
+		pos--;
+		digits--;
+	}
+
+	if (value > 0xFF || digits == 0)
+		return false;
+
+	*idx = pos - 1;
+	*codepoint = value;
+	return true;
+}
+
+static bool
+raw_regex_append_plain_escape(char *buf, Size cap, Size *pos,
+							  const char *pattern, int patlen, int *idx,
+							  unsigned char escape)
+{
+	uint32		codepoint;
+
+	switch (escape)
+	{
+		case 'a':
+			return raw_regex_append_codepoint(buf, cap, pos, '\007');
+		case 'b':
+			return raw_regex_append_codepoint(buf, cap, pos, '\b');
+		case 'B':
+			return raw_regex_append_codepoint(buf, cap, pos, '\\');
+		case 'c':
+			if (*idx + 1 >= patlen)
+				return false;
+			(*idx)++;
+			return raw_regex_append_codepoint(buf, cap, pos,
+											  (unsigned char) pattern[*idx] & 037);
+		case 'e':
+			return raw_regex_append_codepoint(buf, cap, pos, '\033');
+		case 'f':
+			return raw_regex_append_codepoint(buf, cap, pos, '\f');
+		case 'n':
+			return raw_regex_append_codepoint(buf, cap, pos, '\n');
+		case 'r':
+			return raw_regex_append_codepoint(buf, cap, pos, '\r');
+		case 't':
+			return raw_regex_append_codepoint(buf, cap, pos, '\t');
+		case 'u':
+			if (!raw_regex_parse_fixed_hex_escape(pattern, patlen, idx, 4,
+												  &codepoint))
+				return false;
+			return raw_regex_append_codepoint(buf, cap, pos, codepoint);
+		case 'U':
+			if (!raw_regex_parse_fixed_hex_escape(pattern, patlen, idx, 8,
+												  &codepoint))
+				return false;
+			return raw_regex_append_codepoint(buf, cap, pos, codepoint);
+		case 'v':
+			return raw_regex_append_codepoint(buf, cap, pos, '\v');
+		case 'x':
+			if (!raw_regex_parse_variable_hex_escape(pattern, patlen, idx,
+													 &codepoint))
+				return false;
+			return raw_regex_append_codepoint(buf, cap, pos, codepoint);
+		case '0':
+			if (!raw_regex_parse_octal_escape(pattern, patlen, idx,
+											  &codepoint))
+				return false;
+			return raw_regex_append_codepoint(buf, cap, pos, codepoint);
+		default:
+			return false;
+	}
+}
+
+static bool
+raw_regex_supported_group_intro(const char *pattern, int patlen, int pos,
+								int *intro_len, bool *is_lookaround)
+{
+	if (pos + 2 >= patlen || pattern[pos] != '(' || pattern[pos + 1] != '?')
+		return false;
+
+	*is_lookaround = false;
+	switch (pattern[pos + 2])
+	{
+		case ':':
+			*intro_len = 3;
+			return true;
+		case '=':
+		case '!':
+			*intro_len = 3;
+			*is_lookaround = true;
+			return true;
+		case '<':
+			if (pos + 3 < patlen &&
+				(pattern[pos + 3] == '=' || pattern[pos + 3] == '!'))
+			{
+				*intro_len = 4;
+				*is_lookaround = true;
+				return true;
+			}
+			return false;
+		default:
+			return false;
+	}
 }
 
 static bool
@@ -301,13 +723,36 @@ raw_regex_class_start_is_unsupported(const char *pattern, int patlen, int pos)
 	return false;
 }
 
+static bool
+raw_regex_word_constraint(const char *pattern, int patlen, int pos,
+						  unsigned char *kind)
+{
+	if (pos + 6 >= patlen)
+		return false;
+	if (pattern[pos] != '[' || pattern[pos + 1] != '[' ||
+		pattern[pos + 2] != ':' ||
+		(pattern[pos + 3] != '<' && pattern[pos + 3] != '>') ||
+		pattern[pos + 4] != ':' ||
+		pattern[pos + 5] != ']' || pattern[pos + 6] != ']')
+		return false;
+
+	*kind = (unsigned char) pattern[pos + 3];
+	return true;
+}
+
 static char *
 raw_regex_to_pcre2(const char *pattern, int patlen, int *regex_len_out)
 {
 	char	   *buf;
+	bool	   *group_lookaround;
 	Size		cap;
 	Size		pos = 0;
 	bool		in_class = false;
+	bool		class_first = false;
+	bool		class_after_leading_caret = false;
+	bool		last_atom_was_constraint = false;
+	int			group_depth = 0;
+	int			lookaround_depth = 0;
 
 	if (patlen < 0 || patlen > PCRE2_MAX_PATTERN_BYTES)
 		return NULL;
@@ -315,8 +760,20 @@ raw_regex_to_pcre2(const char *pattern, int patlen, int *regex_len_out)
 	cap = (Size) patlen * 32 + 1;
 	if (cap > PCRE2_MAX_PATTERN_BYTES)
 		cap = PCRE2_MAX_PATTERN_BYTES;
-	buf = MemoryContextAlloc(TopMemoryContext, cap + 1);
+	buf = MemoryContextAllocExtended(TopMemoryContext, cap + 1,
+	                                 MCXT_ALLOC_NO_OOM);
+	if (buf == NULL)
+		return NULL;
 	buf[0] = '\0';
+	group_lookaround = MemoryContextAllocExtended(TopMemoryContext,
+												  (patlen > 0 ? (Size) patlen : 1) *
+												  sizeof(*group_lookaround),
+												  MCXT_ALLOC_NO_OOM);
+	if (group_lookaround == NULL)
+	{
+		pfree(buf);
+		return NULL;
+	}
 
 	for (int i = 0; i < patlen; i++)
 	{
@@ -324,44 +781,138 @@ raw_regex_to_pcre2(const char *pattern, int patlen, int *regex_len_out)
 
 		if (in_class)
 		{
+			bool		escaped = false;
+
 			if (c == '\\')
 			{
-				if (i + 1 >= patlen ||
-					!pcre2_regex_append_byte(buf, cap, &pos, c))
+				unsigned char e;
+
+				if (i + 1 >= patlen)
 					goto fallback;
-				i++;
-				c = (unsigned char) pattern[i];
+				e = (unsigned char) pattern[++i];
+				escaped = true;
+				switch (e)
+				{
+					case 'd':
+					case 'D':
+					case 's':
+					case 'S':
+					case 'w':
+					case 'W':
+						if (!pcre2_regex_append_byte(buf, cap, &pos, '\\') ||
+							!pcre2_regex_append_byte(buf, cap, &pos, e))
+							goto fallback;
+						break;
+					case 'a':
+					case 'b':
+					case 'B':
+					case 'c':
+					case 'e':
+					case 'f':
+					case 'n':
+					case 'r':
+					case 't':
+					case 'u':
+					case 'U':
+					case 'v':
+					case 'x':
+					case '0':
+						if (!raw_regex_append_plain_escape(buf, cap, &pos,
+														   pattern, patlen, &i,
+														   e))
+							goto fallback;
+						break;
+					default:
+						if (raw_regex_ascii_is_alnum(e))
+							goto fallback;
+						if (!raw_regex_append_codepoint(buf, cap, &pos, e))
+							goto fallback;
+						break;
+				}
+				c = e;
 			}
 			else if (c == '[' && raw_regex_class_start_is_unsupported(pattern,
 																	   patlen,
 																	   i))
 				goto fallback;
-			else if (c == ']')
+			else if (c == ']' && !class_first)
+			{
 				in_class = false;
-
-			if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+				if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+					goto fallback;
+			}
+			else if (!pcre2_regex_append_byte(buf, cap, &pos, c))
 				goto fallback;
+
+			if (!in_class)
+			{
+				class_first = false;
+				class_after_leading_caret = false;
+				last_atom_was_constraint = false;
+			}
+			else if (class_first)
+			{
+				if (!escaped && c == '^' && !class_after_leading_caret)
+					class_after_leading_caret = true;
+				else
+					class_first = false;
+			}
 			continue;
 		}
 
+		if (last_atom_was_constraint &&
+			raw_regex_starts_quantifier(pattern, patlen, i))
+			/*
+			 * PostgreSQL constraints are legal branch items, but cannot be
+			 * followed by a quantifier.  PCRE2 accepts some quantified
+			 * assertions, so reject before handing the pattern to PCRE2.
+			 */
+			goto fallback;
+
 		if (c == '[')
 		{
+			unsigned char kind;
+
+			if (raw_regex_word_constraint(pattern, patlen, i, &kind))
+			{
+				if (!pcre2_regex_append(buf, cap, &pos,
+											kind == '<' ?
+											"(?<![[:alnum:]_])(?=[[:alnum:]_])" :
+											"(?<=[[:alnum:]_])(?![[:alnum:]_])"))
+					goto fallback;
+				last_atom_was_constraint = true;
+				i += 6;
+				continue;
+			}
 			if (raw_regex_class_start_is_unsupported(pattern, patlen, i))
 				goto fallback;
 			in_class = true;
+			class_first = true;
+			class_after_leading_caret = false;
 			if (!pcre2_regex_append_byte(buf, cap, &pos, c))
 				goto fallback;
+			last_atom_was_constraint = false;
 			continue;
 		}
 
 		if (c == '$')
 		{
-			if (!raw_regex_dollar_is_constraint(pattern, patlen, i))
-				goto fallback;
 			if (!pcre2_regex_append(buf, cap, &pos, "\\z"))
 				goto fallback;
+			last_atom_was_constraint = true;
 			continue;
 		}
+
+		if (c == '^')
+		{
+			if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+				goto fallback;
+			last_atom_was_constraint = true;
+			continue;
+		}
+
+		if (c == '{' && !raw_regex_bound_is_supported(pattern, patlen, i))
+			goto fallback;
 
 		if (c == '\\')
 		{
@@ -372,34 +923,57 @@ raw_regex_to_pcre2(const char *pattern, int patlen, int *regex_len_out)
 			e = (unsigned char) pattern[++i];
 			switch (e)
 			{
-				case 'A':
-					if (!pcre2_regex_append(buf, cap, &pos, "\\A"))
-						goto fallback;
-					break;
-				case 'Z':
-					if (!pcre2_regex_append(buf, cap, &pos, "\\z"))
-						goto fallback;
-					break;
-				case 'y':
-					if (!pcre2_regex_append(buf, cap, &pos, "\\b"))
-						goto fallback;
-					break;
-				case 'Y':
-					if (!pcre2_regex_append(buf, cap, &pos, "\\B"))
-						goto fallback;
-					break;
-				case 'm':
-					if (!pcre2_regex_append(buf, cap, &pos,
-											"(?<![[:alnum:]_])(?=[[:alnum:]_])"))
-						goto fallback;
-					break;
-				case 'M':
-					if (!pcre2_regex_append(buf, cap, &pos,
-											"(?<=[[:alnum:]_])(?![[:alnum:]_])"))
-						goto fallback;
-					break;
-				case 'd':
-				case 'D':
+					case 'A':
+						if (!pcre2_regex_append(buf, cap, &pos, "\\A"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'Z':
+						if (!pcre2_regex_append(buf, cap, &pos, "\\z"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'y':
+						if (!pcre2_regex_append(buf, cap, &pos, "\\b"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'Y':
+						if (!pcre2_regex_append(buf, cap, &pos, "\\B"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'm':
+						if (!pcre2_regex_append(buf, cap, &pos,
+												"(?<![[:alnum:]_])(?=[[:alnum:]_])"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'M':
+						if (!pcre2_regex_append(buf, cap, &pos,
+												"(?<=[[:alnum:]_])(?![[:alnum:]_])"))
+							goto fallback;
+						last_atom_was_constraint = true;
+						break;
+					case 'a':
+					case 'b':
+				case 'B':
+				case 'c':
+				case 'e':
+				case 'f':
+				case 'u':
+				case 'U':
+				case 'v':
+				case 'x':
+				case '0':
+						if (!raw_regex_append_plain_escape(buf, cap, &pos,
+														   pattern, patlen, &i,
+														   e))
+							goto fallback;
+						last_atom_was_constraint = false;
+						break;
+					case 'd':
+					case 'D':
 				case 's':
 				case 'S':
 				case 'w':
@@ -416,43 +990,110 @@ raw_regex_to_pcre2(const char *pattern, int patlen, int *regex_len_out)
 				case '7':
 				case '8':
 				case '9':
+					/*
+					 * PostgreSQL's lookaround constraints do not allow back
+					 * references inside the constraint expression.
+					 */
+					if (e >= '1' && e <= '9' && lookaround_depth > 0)
+						goto fallback;
 					if (e >= '1' && e <= '9' && i + 1 < patlen &&
 						pattern[i + 1] >= '0' && pattern[i + 1] <= '9')
 						goto fallback;
-					if (!pcre2_regex_append_byte(buf, cap, &pos, '\\') ||
-						!pcre2_regex_append_byte(buf, cap, &pos, e))
-						goto fallback;
-					break;
-				default:
-					if ((e >= 'A' && e <= 'Z') ||
-						(e >= 'a' && e <= 'z') ||
-						(e >= '0' && e <= '9'))
-						goto fallback;
-					if (!pcre2_regex_append_byte(buf, cap, &pos, '\\') ||
-						!pcre2_regex_append_byte(buf, cap, &pos, e))
-						goto fallback;
-					break;
-			}
-			continue;
+						if (!pcre2_regex_append_byte(buf, cap, &pos, '\\') ||
+							!pcre2_regex_append_byte(buf, cap, &pos, e))
+							goto fallback;
+						last_atom_was_constraint = false;
+						break;
+					default:
+						if (raw_regex_ascii_is_alnum(e))
+							goto fallback;
+						if (!pcre2_regex_append_byte(buf, cap, &pos, '\\') ||
+							!pcre2_regex_append_byte(buf, cap, &pos, e))
+							goto fallback;
+						last_atom_was_constraint = false;
+						break;
+				}
+				continue;
 		}
 
-		if (c == '(' && i + 1 < patlen &&
-			(pattern[i + 1] == '?' || pattern[i + 1] == '*'))
-			goto fallback;
-		if ((c == '*' || c == '+' || c == '?' || c == '}') &&
-			i + 1 < patlen && pattern[i + 1] == '+')
-			goto fallback;
-		if (!pcre2_regex_append_byte(buf, cap, &pos, c))
-			goto fallback;
-	}
+		if (c == '(')
+		{
+			int			intro_len;
+			bool		is_lookaround;
+
+			if (group_depth >= patlen)
+				goto fallback;
+			if (i + 1 < patlen && pattern[i + 1] == '*')
+				goto fallback;
+			if (i + 1 < patlen && pattern[i + 1] == '?')
+			{
+				if (!raw_regex_supported_group_intro(pattern, patlen, i,
+													 &intro_len,
+													 &is_lookaround))
+					goto fallback;
+				for (int j = 0; j < intro_len; j++)
+				{
+					if (!pcre2_regex_append_byte(buf, cap, &pos,
+												 (unsigned char) pattern[i + j]))
+						goto fallback;
+				}
+					group_lookaround[group_depth++] = is_lookaround;
+					if (is_lookaround)
+						lookaround_depth++;
+					i += intro_len - 1;
+					last_atom_was_constraint = false;
+					continue;
+				}
+
+			group_lookaround[group_depth++] = false;
+			if (lookaround_depth > 0)
+			{
+				/*
+				 * PostgreSQL treats all parentheses inside lookaround
+				 * constraints as non-capturing, so keep external capture
+				 * numbering aligned before handing the pattern to PCRE2.
+				 */
+				if (!pcre2_regex_append(buf, cap, &pos, "(?:"))
+					goto fallback;
+			}
+				else if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+					goto fallback;
+				last_atom_was_constraint = false;
+				continue;
+			}
+
+		if (c == ')')
+		{
+			bool		closing_lookaround = false;
+
+			if (group_depth > 0)
+			{
+				closing_lookaround = group_lookaround[--group_depth];
+				if (closing_lookaround && lookaround_depth > 0)
+					lookaround_depth--;
+			}
+			if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+				goto fallback;
+			last_atom_was_constraint = closing_lookaround;
+			continue;
+		}
+			if ((c == '*' || c == '+' || c == '?' || c == '}') &&
+				i + 1 < patlen && pattern[i + 1] == '+')
+				goto fallback;
+			if (!pcre2_regex_append_byte(buf, cap, &pos, c))
+				goto fallback;
+			last_atom_was_constraint = false;
+		}
 
 	if (in_class || pos > PCRE2_MAX_PATTERN_BYTES)
 		goto fallback;
 
 	*regex_len_out = (int) pos;
+	pfree(group_lookaround);
 	return buf;
 
 fallback:
+	pfree(group_lookaround);
 	pfree(buf);
 	return NULL;
 }
@@ -465,15 +1106,90 @@ pcre2_match_result_is_match(int rc)
 	if (rc == PCRE2_ERROR_NOMATCH)
 		return false;
 
-	elog(ERROR, "PCRE2 JIT match failed with error code %d", rc);
+	elog(ERROR, "PCRE2 match failed with error code %d", rc);
 	return false;
+}
+
+static bool
+pg_jitter_pcre2_should_retry_without_jit(int rc)
+{
+#ifdef PCRE2_ERROR_JIT_STACKLIMIT
+	if (rc == PCRE2_ERROR_JIT_STACKLIMIT)
+		return true;
+#endif
+#ifdef PCRE2_ERROR_MATCHLIMIT
+	if (rc == PCRE2_ERROR_MATCHLIMIT)
+		return true;
+#endif
+#ifdef PCRE2_ERROR_DEPTHLIMIT
+	if (rc == PCRE2_ERROR_DEPTHLIMIT)
+		return true;
+#endif
+#ifdef PCRE2_ERROR_HEAPLIMIT
+	if (rc == PCRE2_ERROR_HEAPLIMIT)
+		return true;
+#endif
+
+	return false;
+}
+
+static uint32
+pg_jitter_pcre2_match_options(Pcre2CacheEntry *entry)
+{
+	uint32		options = 0;
+
+	if ((entry->flags & PCRE2_UTF) != 0)
+		options |= PCRE2_NO_UTF_CHECK;
+
+	return options;
+}
+
+static pcre2_match_context *
+pg_jitter_pcre2_create_match_context(pcre2_jit_stack *jit_stack)
+{
+	pcre2_match_context *match_context;
+
+	match_context = pcre2_match_context_create(NULL);
+	if (match_context == NULL)
+		return NULL;
+
+	if (pcre2_set_match_limit(match_context, PG_JITTER_PCRE2_MATCH_LIMIT) != 0 ||
+		pcre2_set_depth_limit(match_context, PG_JITTER_PCRE2_DEPTH_LIMIT) != 0 ||
+		pcre2_set_heap_limit(match_context, PG_JITTER_PCRE2_HEAP_LIMIT_KIB) != 0)
+	{
+		pcre2_match_context_free(match_context);
+		return NULL;
+	}
+
+	if (jit_stack != NULL)
+		pcre2_jit_stack_assign(match_context, NULL, jit_stack);
+
+	return match_context;
+}
+
+static int
+pg_jitter_pcre2_interpreter_match(Pcre2CacheEntry *entry,
+								  const uint8_t *data, int len)
+{
+	uint32		options = pg_jitter_pcre2_match_options(entry);
+
+#ifdef PCRE2_NO_JIT
+	options |= PCRE2_NO_JIT;
+#endif
+
+	return pcre2_match(entry->code,
+					   (PCRE2_SPTR) data, len,
+					   0, options,
+					   entry->match_data,
+					   entry->match_context);
 }
 
 /* ================================================================
  * Compile and cache a pattern
  * ================================================================ */
 Pcre2CacheEntry *
-pg_jitter_pcre2_compile(const char *pattern, int patlen,
+pg_jitter_pcre2_compile(PgJitterContext *ctx,
+                         const char *pattern, int patlen,
                          bool is_like, bool case_insensitive, Oid collid)
 {
 	uint32 pcre2_flags;
@@ -481,9 +1197,12 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 	int regex_len;
 	int errcode;
 	PCRE2_SIZE erroffset;
+	Pcre2CacheEntry *entry;
 	pcre2_code *code = NULL;
 	pcre2_match_data *match_data = NULL;
 
+	if (ctx == NULL)
+		return NULL;
 	if (!pg_jitter_pcre2_is_eligible(collid, is_like, case_insensitive))
 		return NULL;
 	if (patlen < 0 || patlen > PCRE2_MAX_PATTERN_BYTES)
@@ -511,29 +1230,27 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 		return NULL;
 	}
 
-	for (int i = 0; i < pcre2_cache_used; i++)
+	for (int i = 0; i < PCRE2_CACHE_SIZE; i++)
 	{
-		Pcre2CacheSlot *s = &pcre2_cache[i];
+		Pcre2CacheEntry *entry = pcre2_cache[i];
 
-		if (s->key.flags == pcre2_flags &&
-			s->key.patlen == regex_len &&
-			s->entry.pattern != NULL &&
-			memcmp(s->entry.pattern, regex_str, regex_len) == 0)
+		if (entry != NULL &&
+			entry->flags == pcre2_flags &&
+			entry->pattern_len == regex_len &&
+			entry->pattern != NULL &&
+			memcmp(entry->pattern, regex_str, regex_len) == 0)
 		{
-			/* Cache hit */
-			s->lru_counter = ++pcre2_lru_clock;
+			entry->lru_counter = ++pcre2_lru_clock;
 			pfree(regex_str);
-			return &s->entry;
+			if (!pg_jitter_pcre2_pin_entry(ctx, entry))
+				return NULL;
+			return entry;
 		}
 	}
 
-	/*
-	 * Generated code may embed Pcre2CacheEntry pointers, so entries in the fixed
-	 * cache cannot be evicted safely.  Once the cache is full, leave this pattern
-	 * on the regular PostgreSQL matcher instead of allocating backend-lifetime
-	 * overflow entries.
-	 */
-	if (pcre2_cache_used >= PCRE2_CACHE_SIZE)
+	entry = MemoryContextAllocExtended(TopMemoryContext, sizeof(Pcre2CacheEntry),
+	                                   MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (entry == NULL)
 	{
 		pfree(regex_str);
 		return NULL;
@@ -544,6 +1261,7 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 	                     pcre2_flags, &errcode, &erroffset, NULL);
 	if (!code)
 	{
+		pfree(entry);
 		pfree(regex_str);
 		return NULL;
 	}
@@ -552,6 +1270,7 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 	if (pcre2_jit_compile(code, PCRE2_JIT_COMPLETE) != 0)
 	{
 		pcre2_code_free(code);
+		pfree(entry);
 		pfree(regex_str);
 		return NULL;
 	}
@@ -564,65 +1283,61 @@ pg_jitter_pcre2_compile(const char *pattern, int patlen,
 	if (!match_data)
 	{
 		pcre2_code_free(code);
+		pfree(entry);
 		pfree(regex_str);
 		return NULL;
 	}
 
-	Pcre2CacheEntry *entry;
-	Pcre2CacheSlot *slot = &pcre2_cache[pcre2_cache_used++];
+	int slot = pg_jitter_pcre2_choose_slot();
 
-	entry = &slot->entry;
+	if (slot < 0)
+	{
+		pcre2_match_data_free(match_data);
+		pcre2_code_free(code);
+		pfree(entry);
+		pfree(regex_str);
+		return NULL;
+	}
 
-	int key_copy = regex_len < 256 ? regex_len : 256;
-	memcpy(slot->key.pattern, regex_str, key_copy);
-	if (key_copy < 256)
-		slot->key.pattern[key_copy] = '\0';
-	slot->key.patlen = regex_len;
-	slot->key.flags = pcre2_flags;
+	pg_jitter_pcre2_evict_slot(slot);
 
 	entry->pattern = regex_str; /* transfer ownership */
+	entry->pattern_len = regex_len;
 	entry->flags = pcre2_flags;
 	entry->code = code;
 	entry->match_data = match_data;
 	entry->match_context = NULL;
 	entry->jit_stack = pcre2_jit_stack_create(PJ_STACK_SIZE,
 	                                          PJ_STACK_SIZE * 4, NULL);
-#ifdef PCRE2_JIT_FAST_API
+#ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
 	entry->jit_fast = NULL;
 #endif
 
-	if (entry->jit_stack)
+	entry->match_context =
+		pg_jitter_pcre2_create_match_context(entry->jit_stack);
+	if (entry->match_context == NULL)
 	{
-#ifdef PCRE2_JIT_FAST_API
-		entry->jit_fast =
-			pcre2_jit_fast_context_create(code, PCRE2_JIT_COMPLETE,
-			                              match_data, entry->jit_stack);
-		if (!entry->jit_fast)
-		{
-			entry->match_context = pcre2_match_context_create(NULL);
-			if (entry->match_context)
-				pcre2_jit_stack_assign(entry->match_context, NULL,
-				                       entry->jit_stack);
-			else
-			{
-				pcre2_jit_stack_free(entry->jit_stack);
-				entry->jit_stack = NULL;
-			}
-		}
-#else
-		entry->match_context = pcre2_match_context_create(NULL);
-		if (entry->match_context)
-			pcre2_jit_stack_assign(entry->match_context, NULL,
-			                       entry->jit_stack);
-		else
+		if (entry->jit_stack)
 		{
 			pcre2_jit_stack_free(entry->jit_stack);
 			entry->jit_stack = NULL;
 		}
-#endif
+		pcre2_match_data_free(match_data);
+		pcre2_code_free(code);
+		pfree(entry);
+		pfree(regex_str);
+		return NULL;
 	}
 
-	slot->lru_counter = ++pcre2_lru_clock;
+#ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
+	if (entry->jit_stack)
+		entry->jit_fast =
+			pcre2_jit_fast_context_create(code, PCRE2_JIT_COMPLETE,
+		                                  match_data, entry->jit_stack);
+#endif
+
+	if (!pg_jitter_pcre2_publish_and_pin_entry(ctx, slot, entry))
+		return NULL;
 
 	return entry;
 }
@@ -634,17 +1349,24 @@ bool
 pg_jitter_pcre2_match(Pcre2CacheEntry *entry, const char *data, int len)
 {
 	int rc;
+	uint32		match_options;
 
-	if (entry == NULL || entry->code == NULL || len < 0 ||
+	if (entry == NULL || entry->code == NULL || entry->match_data == NULL ||
+	    len < 0 ||
 	    (data == NULL && len > 0))
 		return false;
 
+	match_options = pg_jitter_pcre2_match_options(entry);
 	rc = pcre2_jit_match(entry->code,
 	                     (PCRE2_SPTR)data, len,
 	                     0,        /* start_offset */
-	                     0,        /* options */
+	                     match_options,
 	                     entry->match_data,
 	                     entry->match_context);
+
+	if (pg_jitter_pcre2_should_retry_without_jit(rc))
+		rc = pg_jitter_pcre2_interpreter_match(entry,
+											   (const uint8_t *) data, len);
 
 	/*
 	 * rc > 0: match found (number of ovector pairs filled)
@@ -661,22 +1383,28 @@ pg_jitter_pcre2_match_raw(int64 entry_ptr, int64 data_ptr, int32 len)
 	Pcre2CacheEntry *entry = (Pcre2CacheEntry *)entry_ptr;
 	const uint8_t *data = (const uint8_t *)(uintptr_t)data_ptr;
 	int rc;
+	uint32		match_options;
 
-	if (entry == NULL || entry->code == NULL || len < 0 ||
+	if (entry == NULL || entry->code == NULL || entry->match_data == NULL ||
+	    len < 0 ||
 	    (data == NULL && len > 0))
 		return 0;
 
-#ifdef PCRE2_JIT_FAST_API
+	match_options = pg_jitter_pcre2_match_options(entry);
+#ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
 	if (entry->jit_fast)
 		rc = pcre2_jit_fast_match(entry->jit_fast, (PCRE2_SPTR)data,
-		                          len, 0, 0);
+		                          len, 0, match_options);
 	else
 #endif
 		rc = pcre2_jit_match(entry->code,
 		                     (PCRE2_SPTR)data, len,
-		                     0, 0,
+		                     0, match_options,
 		                     entry->match_data,
 		                     entry->match_context);
+
+	if (pg_jitter_pcre2_should_retry_without_jit(rc))
+		rc = pg_jitter_pcre2_interpreter_match(entry, data, len);
 
 	return pcre2_match_result_is_match(rc) ? 1 : 0;
 }
@@ -695,8 +1423,20 @@ pg_jitter_pcre2_match_text(int64 datum, int64 entry_ptr)
 	text *t = DatumGetTextPP(d);
 	int len = VARSIZE_ANY_EXHDR(t);
 	const uint8_t *data = (const uint8_t *)VARDATA_ANY(t);
-	int32 result = pg_jitter_pcre2_match_raw(entry_ptr, (int64)(uintptr_t)data,
-	                                         len);
+	int32 result;
+
+	PG_TRY();
+	{
+		result = pg_jitter_pcre2_match_raw(entry_ptr, (int64)(uintptr_t)data,
+										   len);
+	}
+	PG_CATCH();
+	{
+		if ((Pointer)t != DatumGetPointer(d))
+			pfree(t);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if ((Pointer)t != DatumGetPointer(d))
 		pfree(t);

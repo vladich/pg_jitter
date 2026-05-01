@@ -15,28 +15,38 @@
 #define PG_JITTER_PCRE2_H
 
 #include "postgres.h"
+#include "pg_jitter_common.h"
 
 #ifdef PG_JITTER_HAVE_PCRE2
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include "pcre2.h"
 
+#if defined(PCRE2_JIT_FAST_API) && defined(PG_JITTER_HAVE_PCRE2_JIT_FAST_CONTEXT_FREE)
+#define PG_JITTER_USE_PCRE2_JIT_FAST_API 1
+#endif
+
 /* ================================================================
  * Pattern cache entry
  * ================================================================ */
 typedef struct Pcre2CacheEntry {
 	char              *pattern;      /* regex string (palloc'd) */
+	int                pattern_len;  /* regex string length */
 	uint32             flags;        /* PCRE2 compile flags */
 	pcre2_code        *code;         /* compiled + JIT-compiled code */
 	pcre2_match_data  *match_data;   /* reusable match_data */
-	pcre2_match_context *match_context; /* fallback public JIT stack context */
+	pcre2_match_context *match_context; /* resource limits + public JIT stack */
 	pcre2_jit_stack   *jit_stack;    /* reusable public PCRE2 JIT stack */
+	int                refcount;     /* generated-code references */
+	bool               in_cache;     /* present in the process-local LRU */
+	uint64             lru_counter;  /* cache recency stamp */
 
 	/*
 	 * Opaque PCRE2 fast-JIT state.  Available with the bundled patched PCRE2
-	 * API; system PCRE2 builds use match_context + jit_stack above.
+	 * API only when it also exposes a matching destructor.  Other PCRE2 builds
+	 * use match_context + jit_stack above.
 	 */
-#ifdef PCRE2_JIT_FAST_API
+#ifdef PG_JITTER_USE_PCRE2_JIT_FAST_API
 	pcre2_jit_fast_context *jit_fast;
 #endif
 } Pcre2CacheEntry;
@@ -49,14 +59,15 @@ typedef struct Pcre2CacheEntry {
  * implementation converts the PostgreSQL ARE subset it can prove equivalent to
  * PCRE2 and returns NULL for PostgreSQL fallback otherwise.
  *
- * Returns a Pcre2CacheEntry pointer valid for the backend's lifetime, or NULL
- * if compilation/JIT fails.  Entries returned to generated code are never
- * invalidated by cache eviction.
+ * Returns a Pcre2CacheEntry pointer pinned to the owning JIT context, or NULL
+ * if compilation/JIT fails.  Cache eviction removes entries from future lookup,
+ * but pinned entries remain valid until that JIT context is released.
  */
 extern bool pg_jitter_pcre2_is_eligible(Oid collid, bool is_like,
                                          bool case_insensitive);
 
-extern Pcre2CacheEntry *pg_jitter_pcre2_compile(const char *pattern, int patlen,
+extern Pcre2CacheEntry *pg_jitter_pcre2_compile(PgJitterContext *ctx,
+                                                 const char *pattern, int patlen,
                                                  bool is_like,
                                                  bool case_insensitive,
                                                  Oid collid);

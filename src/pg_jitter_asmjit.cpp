@@ -39,6 +39,7 @@ extern "C" {
 #endif
 #include "commands/sequence.h"
 #include "funcapi.h"
+#include "utils/fmgroids.h"
 
 PG_MODULE_MAGIC_EXT(
 	.name = "pg_jitter_asmjit",
@@ -71,6 +72,8 @@ typedef struct
 #undef recv
 #undef send
 #endif
+
+#include <new>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <asmjit/a64.h>
@@ -107,6 +110,7 @@ static bool asmjit_compile_expr(ExprState *state);
 static bool asmjit_emit_all(CodeHolder &code, ExprState *state,
                             PgJitterContext *ctx,
                             ExprEvalStep *steps, int steps_len);
+static void asmjit_reset_after_error(void);
 
 static void
 asmjit_code_free(void *data)
@@ -126,10 +130,10 @@ asmjit_code_free(void *data)
 #if defined(_MSC_VER) && PG_VERSION_NUM < 160000
 #pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
 #endif
-extern "C" void
+extern "C" PG_JITTER_EXPORT void
 _PG_jit_provider_init(JitProviderCallbacks *cb)
 {
-	cb->reset_after_error = pg_jitter_reset_after_error;
+	cb->reset_after_error = asmjit_reset_after_error;
 	cb->release_context = pg_jitter_release_context;
 	cb->compile_expr = asmjit_compile_expr;
 
@@ -392,11 +396,17 @@ asmjit_expr_allows_shared_code(ExprState *state)
 			case EEOP_SBSREF_FETCH:
 			case EEOP_IOCOERCE:
 #ifdef HAVE_EEOP_IOCOERCE_SAFE
-			case EEOP_IOCOERCE_SAFE:
-#endif
-			case EEOP_AGG_DESERIALIZE:
-			case EEOP_AGG_STRICT_DESERIALIZE:
-			case EEOP_ROWCOMPARE_STEP:
+				case EEOP_IOCOERCE_SAFE:
+	#endif
+				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_BYVAL:
+				case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+				case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+				case EEOP_AGG_PLAIN_TRANS_BYREF:
+				case EEOP_AGG_DESERIALIZE:
+				case EEOP_AGG_STRICT_DESERIALIZE:
+				case EEOP_ROWCOMPARE_STEP:
 			case EEOP_ROWCOMPARE_FINAL:
 #ifdef HAVE_EEOP_RETURNINGEXPR
 			case EEOP_RETURNINGEXPR:
@@ -417,6 +427,12 @@ asmjit_expr_allows_shared_code(ExprState *state)
 #elif defined(__x86_64__) || defined(_M_X64)
 #include "pg_jitter_asmjit_x86.inc"
 #endif
+
+static void
+asmjit_reset_after_error(void)
+{
+	asmjit_shared_code_mode = false;
+}
 
 static bool
 asmjit_compile_expr(ExprState *state)
@@ -540,7 +556,7 @@ asmjit_compile_expr(ExprState *state)
 					 shared_node_id, shared_expr_idx, code_size,
 					 npatched);
 
-				pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+				pg_jitter_register_exec_handle(ctx, handle);
 
 				/* Register Windows x64 unwind metadata for SEH-safe longjmp */
 				pg_jitter_win64_register_unwind(code_ptr, code_size);
@@ -580,10 +596,21 @@ no_shared_code_reuse:
 	steps = state->steps;
 	steps_len = state->steps_len;
 
-	ac = new AsmjitCode();
+	ac = new (std::nothrow) AsmjitCode();
+	if (ac == nullptr)
+	{
+		asmjit_shared_code_mode = false;
+		return false;
+	}
 
 	CodeHolder code;
-	code.init(ac->rt.environment());
+	Error err = code.init(ac->rt.environment());
+	if (err != kErrorOk)
+	{
+		delete ac;
+		asmjit_shared_code_mode = false;
+		return false;
+	}
 
 	if (!asmjit_emit_all(code, state, ctx, steps, steps_len))
 	{
@@ -592,7 +619,7 @@ no_shared_code_reuse:
 		return false;
 	}
 
-	Error err = ac->rt.add(&ac->func, &code);
+	err = ac->rt.add(&ac->func, &code);
 	if (err != kErrorOk)
 	{
 		delete ac;
@@ -622,17 +649,21 @@ no_shared_code_reuse:
 									(uint64)(uintptr_t) pg_jitter_fallback_step);
 	}
 
+	/*
+	 * From this point onward the file-scoped compile mode is no longer needed.
+	 * Clear it before ownership transfer so a registration ERROR cannot leave
+	 * the next compilation in shared-code mode.
+	 */
+	asmjit_shared_code_mode = false;
+
 	/* Register for cleanup */
-	pg_jitter_register_compiled(ctx, asmjit_code_free, ac);
+	pg_jitter_register_compiled_or_free(ctx, asmjit_code_free, ac);
 
 	/* Register Windows x64 unwind metadata for SEH-safe longjmp */
 	pg_jitter_win64_register_unwind(ac->func, code.code_size());
 
 	/* Set the eval function (with validation wrapper on first call) */
 	pg_jitter_install_expr(state, (ExprStateEvalFunc) ac->func);
-
-	/* Reset shared code mode for next compilation */
-	asmjit_shared_code_mode = false;
 
 	INSTR_TIME_SET_CURRENT(endtime);
 	INSTR_TIME_ACCUM_DIFF(ctx->base.instr.generation_counter,

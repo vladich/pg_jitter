@@ -43,6 +43,7 @@
 #include "nodes/primnodes.h"
 #include "commands/sequence.h"
 #include "funcapi.h"
+#include "utils/fmgroids.h"
 
 /* Inline VARSIZE_ANY helper (defined in pg_jitter_deform_jit.c) */
 extern void sljit_emit_varsize_any_inline(struct sljit_compiler *C,
@@ -197,6 +198,7 @@ emit_x86_crc32c_u32_reg(struct sljit_compiler *C, sljit_s32 dst,
 /* Forward declarations */
 static bool sljit_compile_expr(ExprState *state);
 static void sljit_code_free(void *data);
+static void sljit_reset_after_error(void);
 
 /*
  * Provider entry point — called by PG when loading the JIT provider.
@@ -204,8 +206,9 @@ static void sljit_code_free(void *data);
 #if defined(_MSC_VER) && PG_VERSION_NUM < 160000
 #pragma comment(linker, "/EXPORT:_PG_jit_provider_init")
 #endif
-void _PG_jit_provider_init(JitProviderCallbacks *cb) {
-  cb->reset_after_error = pg_jitter_reset_after_error;
+PG_JITTER_EXPORT void
+_PG_jit_provider_init(JitProviderCallbacks *cb) {
+  cb->reset_after_error = sljit_reset_after_error;
   cb->release_context = pg_jitter_release_context;
   cb->compile_expr = sljit_compile_expr;
 
@@ -338,6 +341,11 @@ static void sljit_code_free(void *data) {
     pg_jitter_win64_deregister_unwind(data);
     sljit_free_code(data, NULL);
   }
+}
+
+static void sljit_reset_after_error(void) {
+  sljit_shared_code_mode = false;
+  sljit_inline_enabled = false;
 }
 
 /*
@@ -701,6 +709,12 @@ static bool sljit_expr_allows_shared_code(ExprState *state) {
 #ifdef HAVE_EEOP_IOCOERCE_SAFE
       case EEOP_IOCOERCE_SAFE:
 #endif
+      case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_BYVAL:
+      case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+      case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+      case EEOP_AGG_PLAIN_TRANS_BYREF:
       case EEOP_AGG_DESERIALIZE:
       case EEOP_AGG_STRICT_DESERIALIZE:
       case EEOP_ROWCOMPARE_STEP:
@@ -800,7 +814,7 @@ static void *find_or_compile_deform(PgJitterContext *ctx,
 
     if (code) {
       /* Register for cleanup */
-      pg_jitter_register_compiled(ctx, sljit_code_free, code);
+      pg_jitter_register_compiled_or_free(ctx, sljit_code_free, code);
       ctx->base.instr.created_functions++;
 
       cache[*ncache].desc = desc;
@@ -2591,13 +2605,11 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     struct sljit_jump *j_hi, *j_lo;
     j_hi = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, (sljit_sw)PG_INT32_MAX);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int4_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
     sljit_set_label(j_hi, sljit_emit_label(C));
     j_lo = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, (sljit_sw)PG_INT32_MIN);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int4_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int4_overflow);
     sljit_set_label(j_lo, sljit_emit_label(C));
     /* Truncate to 32-bit (sign-extend for ARM64 upper bits) */
     sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
@@ -2609,13 +2621,11 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     struct sljit_jump *j_hi, *j_lo;
     j_hi = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, PG_INT16_MAX);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int2_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int2_overflow);
     sljit_set_label(j_hi, sljit_emit_label(C));
     j_lo = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, PG_INT16_MIN);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int2_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int2_overflow);
     sljit_set_label(j_lo, sljit_emit_label(C));
     sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0, SLJIT_R0, 0);
     return true;
@@ -2625,13 +2635,11 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
     struct sljit_jump *j_hi, *j_lo;
     j_hi = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, PG_INT16_MAX);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int2_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int2_overflow);
     sljit_set_label(j_hi, sljit_emit_label(C));
     j_lo = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL, SLJIT_R0, 0,
                            SLJIT_IMM, PG_INT16_MIN);
-    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS0V(),
-                     SLJIT_IMM, SLJIT_FUNC_ADDR(jit_error_int2_overflow));
+    EMIT_JIT_ERROR(C, SLJIT_CALL, SLJIT_ARGS0V(), jit_error_int2_overflow);
     sljit_set_label(j_lo, sljit_emit_label(C));
     sljit_emit_op1(C, SLJIT_MOV_S16, SLJIT_R0, 0, SLJIT_R0, 0);
     return true;
@@ -2678,12 +2686,12 @@ static bool emit_inline_funcexpr(struct sljit_compiler *C, JitInlineOp op) {
 /*
  * emit_inline_text_cmp — fully inline text equality comparison.
  *
- * Fast path (zero function calls for short strings ≤ 7 data bytes):
+ * Fast path:
  *   1. Pointer equality → done
  *   2. Load 1-byte varlena headers, check both are short
  *   3. Compare headers (lengths equal?) → done if different
- *   4. data_len ≤ 7: 8-byte word load + shift-mask comparison
- *   5. data_len > 7: call memcmp
+ *   4. data_len == 0 → done
+ *   5. Non-empty short varlena: exact-length memcmp
  * Slow path (non-short varlena): call jit_text_datum_eq/ne
  */
 static void
@@ -2692,9 +2700,8 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
 {
   struct sljit_jump *j_ptr_eq;
   struct sljit_jump *j_slow1, *j_slow2, *j_slow3, *j_slow4;
-  struct sljit_jump *j_len_ne, *j_empty, *j_big, *j_small_eq;
-  struct sljit_jump *j_to_ne, *j_to_store, *j_to_store2;
-  struct sljit_jump *j_memcmp_eq = NULL;
+  struct sljit_jump *j_len_ne, *j_empty, *j_memcmp_eq;
+  struct sljit_jump *j_to_store, *j_to_store2;
   struct sljit_label *l_result_eq, *l_result_ne, *l_slow, *l_store;
 
   sljit_sw off0 = (sljit_sw)&fcinfo->args[0].value - (sljit_sw)fcinfo;
@@ -2734,92 +2741,19 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   /* 6. data_len == 0 → both empty → result_eq */
   j_empty = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 0);
 
-  /* 7. data_len > 7 → memcmp path */
-  j_big = sljit_emit_cmp(C, SLJIT_GREATER, SLJIT_R2, 0, SLJIT_IMM, 7);
-
   /*
-   * 8. Inline word comparison (data_len 1-7, zero function calls).
-   *    Load 8 bytes from each datum and shift away trailing garbage
-   *    according to the host byte order.
+   * Compare non-empty short payloads exactly. Short varlena datums may sit at
+   * tuple or palloc storage boundaries, so speculative word/SIMD loads can
+   * read beyond the datum.
    */
-  sljit_emit_op2(C, SLJIT_SUB, SLJIT_R2, 0, SLJIT_IMM, 7,
-                 SLJIT_R2, 0);                            /* 7 - data_len */
-  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R2, 0,
-                 SLJIT_R2, 0, SLJIT_IMM, 3);             /* × 8 bits */
-  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
-                 SLJIT_MEM1(SLJIT_R0), 0);               /* word_a */
-  sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                 SLJIT_MEM1(SLJIT_R1), 0);               /* word_b */
-#ifdef WORDS_BIGENDIAN
-  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R3, 0,
-                 SLJIT_R3, 0, SLJIT_R2, 0);              /* word_a >>= shift */
-  sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0,
-                 SLJIT_R0, 0, SLJIT_R2, 0);              /* word_b >>= shift */
-#else
-  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0,
-                 SLJIT_R3, 0, SLJIT_R2, 0);              /* word_a <<= shift */
-  sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0,
-                 SLJIT_R0, 0, SLJIT_R2, 0);              /* word_b <<= shift */
-#endif
-  j_small_eq = sljit_emit_cmp(C, SLJIT_EQUAL,
-                               SLJIT_R3, 0, SLJIT_R0, 0);
-  j_to_ne = sljit_emit_jump(C, SLJIT_JUMP);              /* not equal */
-
-  /* 9. data_len > 7: SIMD path for 8-16 bytes, memcmp for >16 */
-  sljit_set_label(j_big, sljit_emit_label(C));
-  {
-    struct sljit_jump *j_simd_ne = NULL, *j_memcmp_eq2;
-    int simd_type = SLJIT_SIMD_REG_128 | SLJIT_SIMD_ELEM_8;
-    bool has_simd_cmpeq =
-#ifdef WORDS_BIGENDIAN
-        false;
-#else
-        sljit_has_cpu_feature(SLJIT_HAS_SIMD) &&
-        (sljit_emit_simd_op2(C,
-            simd_type | SLJIT_SIMD_OP2_CMPEQ | SLJIT_SIMD_TEST,
-            SLJIT_FR0, SLJIT_FR0, SLJIT_FR1, 0) != SLJIT_ERR_UNSUPPORTED);
-#endif
-
-    /* If SIMD available: data_len > 16 → memcmp. Otherwise all > 7 → memcmp. */
-    struct sljit_jump *j_memcmp_path = sljit_emit_cmp(C, SLJIT_GREATER,
-        SLJIT_R2, 0, SLJIT_IMM, has_simd_cmpeq ? 16 : 0);
-
-    if (has_simd_cmpeq) {
-      /* SIMD 8-16 byte path: load 16 bytes, CMPEQ, sign, mask */
-      sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
-      sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
-      sljit_emit_simd_mov(C, simd_type | SLJIT_SIMD_LOAD, SLJIT_FR0,
-                           SLJIT_MEM1(SLJIT_R0), 0);
-      sljit_emit_simd_mov(C, simd_type | SLJIT_SIMD_LOAD, SLJIT_FR1,
-                           SLJIT_MEM1(SLJIT_R1), 0);
-      sljit_emit_simd_op2(C, simd_type | SLJIT_SIMD_OP2_CMPEQ, SLJIT_FR0,
-                           SLJIT_FR0, SLJIT_FR1, 0);
-      sljit_emit_simd_sign(C, simd_type | SLJIT_SIMD_STORE, SLJIT_FR0,
-                            SLJIT_R0, 0);
-      sljit_emit_op2(C, SLJIT_SHL, SLJIT_R3, 0, SLJIT_IMM, 1, SLJIT_R2, 0);
-      sljit_emit_op2(C, SLJIT_SUB, SLJIT_R3, 0, SLJIT_R3, 0, SLJIT_IMM, 1);
-      sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R3, 0);
-      j_memcmp_eq = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_R3, 0);
-      j_simd_ne = sljit_emit_jump(C, SLJIT_JUMP);
-    }
-
-    /* memcmp fallback (data_len > 16, or all > 7 if no SIMD) */
-    sljit_set_label(j_memcmp_path, sljit_emit_label(C));
-    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
-    sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
-    EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, W, W), memcmp);
-    j_memcmp_eq2 = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
-    /* fall through = not equal */
-    if (j_simd_ne)
-      sljit_set_label(j_simd_ne, sljit_emit_label(C));
-
-    j_big = j_memcmp_eq2; /* stash for result_eq wiring */
-  }
+  sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
+  sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
+  EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, W, W), memcmp);
+  j_memcmp_eq = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
 
   /* --- result_ne --- */
   l_result_ne = sljit_emit_label(C);
   sljit_set_label(j_len_ne, l_result_ne);
-  sljit_set_label(j_to_ne, l_result_ne);
   sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 0 : 1);
   j_to_store = sljit_emit_jump(C, SLJIT_JUMP);
 
@@ -2827,10 +2761,7 @@ emit_inline_text_cmp(struct sljit_compiler *C, ExprState *state, int opno,
   l_result_eq = sljit_emit_label(C);
   sljit_set_label(j_ptr_eq, l_result_eq);
   sljit_set_label(j_empty, l_result_eq);
-  sljit_set_label(j_small_eq, l_result_eq);
-  if (j_memcmp_eq)
-    sljit_set_label(j_memcmp_eq, l_result_eq);
-  sljit_set_label(j_big, l_result_eq);  /* memcmp_eq2 for >16 byte path */
+  sljit_set_label(j_memcmp_eq, l_result_eq);
   sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, is_eq ? 1 : 0);
   j_to_store2 = sljit_emit_jump(C, SLJIT_JUMP);
 
@@ -3089,7 +3020,7 @@ static bool sljit_compile_expr(ExprState *state) {
              "node=%d expr=%d (%zu bytes, patched=%d)",
              shared_node_id, shared_expr_idx, code_size, npatched);
 
-        pg_jitter_register_compiled(ctx, pg_jitter_exec_free, handle);
+        pg_jitter_register_exec_handle(ctx, handle);
 
         /* Worker: set up process-local data structures.
          * Leader stored pointers in step data; worker needs its own. */
@@ -4358,15 +4289,11 @@ no_shared_code_reuse:
                   }
                 }
 
-                /*
-                 * StringZilla LIKE uses byte-level matching and only needs a
-                 * deterministic collation.  PCRE2 applies a stricter
-                 * encoding/collation check inside pg_jitter_pcre2_compile().
-                 */
-                bool collation_ok =
-                    pg_jitter_collation_is_deterministic(fcinfo->fncollation);
+                bool like_byte_search_ok =
+                    simd_like_byte_search_is_eligible(fcinfo->fncollation);
 
-                if (pat_const && !fcinfo->args[1].isnull && collation_ok) {
+                if (pat_const && !fcinfo->args[1].isnull &&
+                    like_byte_search_ok) {
                   Datum pat_datum = fcinfo->args[1].value;
                   text *pat_text = DatumGetTextPP(pat_datum);
                   char *pat_str = VARDATA_ANY(pat_text);
@@ -4603,9 +4530,9 @@ no_shared_code_reuse:
                   if (!vs_handled && !use_v1) {
                     bool is_like = is_like_fn || is_ilike_fn;
                     bool case_insens = is_ilike_fn || is_iregex_fn;
-                    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
-                        pat_str, pat_len, is_like, case_insens,
-                        fcinfo->fncollation);
+	                    Pcre2CacheEntry *pe = pg_jitter_pcre2_compile(
+	                        ctx, pat_str, pat_len, is_like, case_insens,
+	                        fcinfo->fncollation);
 
                     if (pe) {
                       /* Inline fast path: extract short text and call raw
@@ -6959,12 +6886,9 @@ no_shared_code_reuse:
 
 	      /* R0 = cstring result; call input function (or yyjson wrapper) */
 #ifdef PG_JITTER_HAVE_YYJSON
-	      if (fcinfo_in->flinfo->fn_oid == 321 /* F_JSON_IN */ ||
-	          fcinfo_in->flinfo->fn_oid == 3806 /* F_JSONB_IN */) {
-	        /* yyjson fast path: pg_jitter_yj_json[b]_in(cstring, fcinfo_in) */
-	        void *yj_fn = (fcinfo_in->flinfo->fn_oid == 321)
-	                           ? (void *)pg_jitter_yj_json_in
-	                           : (void *)pg_jitter_yj_jsonb_in;
+	      if (fcinfo_in->flinfo->fn_oid == F_JSONB_IN) {
+	        /* yyjson fast path: pg_jitter_yj_jsonb_in(cstring, fcinfo_in) */
+	        void *yj_fn = (void *)pg_jitter_yj_jsonb_in;
         /* R0 = cstring Datum, R1 = fcinfo_in */
         emit_load_step_field(
             C, opno, offsetof(ExprEvalStep, d.iocoerce.fcinfo_data_in),
@@ -7670,60 +7594,21 @@ no_shared_code_reuse:
 
           if (!arrayconst_t->constisnull) {
             Datum array_datum_t = arrayconst_t->constvalue;
-            ArrayType *arr_t = DatumGetArrayTypeP(array_datum_t);
-            int nitems_t = ArrayGetNItems(ARR_NDIM(arr_t), ARR_DIMS(arr_t));
-            int16 typlen_t;
-            bool typbyval_t;
-            char typalign_t;
+            bool text_has_nulls = false;
 
-            get_typlenbyvalalign(ARR_ELEMTYPE(arr_t), &typlen_t,
-                                 &typbyval_t, &typalign_t);
-
-            if (!typbyval_t && ARR_ELEMTYPE(arr_t) == TEXTOID &&
-                nitems_t > 0 && nitems_t <= 16384 &&
-                pg_jitter_collation_is_deterministic(fcinfo->fncollation)) {
-              bits8 *bitmap_t = ARR_NULLBITMAP(arr_t);
-              char *s_t = (char *)ARR_DATA_PTR(arr_t);
-              int bitmask_t = 1;
-              Datum *text_vals = palloc(nitems_t * sizeof(Datum));
-              int text_nvals = 0;
-              bool text_has_nulls = false;
-
-              for (int k = 0; k < nitems_t; k++) {
-                if (bitmap_t && (*bitmap_t & bitmask_t) == 0) {
-                  text_has_nulls = true;
-                } else {
-                  text_vals[text_nvals++] = fetch_att(s_t, false, typlen_t);
-                  s_t = att_addlength_pointer(s_t, typlen_t, s_t);
-                  s_t = (char *)att_align_nominal(s_t, typalign_t);
-                }
-
-                if (bitmap_t) {
-                  bitmask_t <<= 1;
-                  if (bitmask_t == 0x100) {
-                    bitmap_t++;
-                    bitmask_t = 1;
-                  }
-                }
-              }
-
-              if (text_nvals > 0) {
-                text_ht = text_hash_build(text_vals, text_nvals,
-                                           text_has_nulls, ctx);
-                array_has_nulls = text_has_nulls;
-                /*
-                 * Store table pointer in fcinfo->args[1].value for
-                 * shared mode. Workers will rebuild the table and
-                 * store their own pointer here. In non-shared mode
-                 * this is harmless (overwritten const array datum
-                 * is no longer needed).
-                 */
-                fcinfo->args[1].value = PointerGetDatum(text_ht);
-              }
-              pfree(text_vals);
+            text_ht = text_hash_build_from_array(array_datum_t, op, fcinfo,
+                                                 &text_has_nulls, ctx);
+            if (text_ht != NULL) {
+              array_has_nulls = text_has_nulls;
+              /*
+               * Store table pointer in fcinfo->args[1].value for
+               * shared mode. Workers will rebuild the table and
+               * store their own pointer here. In non-shared mode
+               * this is harmless (overwritten const array datum
+               * is no longer needed).
+               */
+              fcinfo->args[1].value = PointerGetDatum(text_ht);
             }
-            if ((Pointer)arr_t != DatumGetPointer(array_datum_t))
-              pfree(arr_t);
           }
         }
       }
@@ -7745,7 +7630,8 @@ no_shared_code_reuse:
       if (simd_max_nvals > simd_hw_max_nvals)
         simd_max_nvals = simd_hw_max_nvals;
 
-      if (sorted_vals && nvals > 0 && nvals <= simd_max_nvals &&
+      if (sorted_vals && nvals > 0 && !sljit_shared_code_mode &&
+          nvals <= simd_max_nvals &&
           eq_dfn && eq_dfn->jit_fn &&
           (fcinfo->args[0].value == 0 || sizeof(int32) == 4) && /* int4 check */
           (op->d.hashedscalararrayop.finfo->fn_addr == int4eq) &&
@@ -8113,8 +7999,9 @@ no_shared_code_reuse:
          * ---- Inline CRC32 hash probe (above in_bsearch_max) ----
          *
          * Build CRC32 open-addressing hash table at compile time.
-         * AArch64 and SSE4.2-capable x86_64 emit the probe inline; other
-         * platforms call the C helper.
+         * SSE4.2-capable x86_64 emits the probe inline. Other platforms call
+         * the C helper, which uses runtime-gated CRC32C with a software
+         * fallback.
          *
          * Register usage:
          *   R0 = scalar value (preserved)
@@ -8160,13 +8047,7 @@ no_shared_code_reuse:
         sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0,
                        SLJIT_IMM, (sljit_sw)0xFFFFFFFF);
 
-#if defined(__aarch64__)
-        /* Emit CRC32CW W1, W1, W0 = 0x1AC05821 */
-        {
-          sljit_u8 crc_inst[4] = {0x21, 0x58, 0xC0, 0x1A};
-          sljit_emit_op_custom(C, crc_inst, 4);
-        }
-#elif defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64)
         if (!pg_jitter_cpu_has_sse42() ||
             !emit_x86_crc32c_u32_reg(C, SLJIT_R1, SLJIT_R0)) {
           sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
@@ -8235,9 +8116,7 @@ no_shared_code_reuse:
           sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, 1);
           sljit_set_label(j_to_result, sljit_emit_label(C));
         }
-#if defined(__x86_64__) || (!defined(__aarch64__))
         crc32_inline_skip:
-#endif
         ;  /* empty statement after label (C requires statement before declaration) */
 
         /* R0 = 1 (found) or 0 (not found). Branch on result. */
@@ -8993,44 +8872,38 @@ no_shared_code_reuse:
     }
 
     /*
-     * ---- IS_JSON (yyjson-accelerated for text input) ----
+     * ---- IS_JSON ----
      */
 #ifdef HAVE_EEOP_JSON_CONSTRUCTOR
     case EEOP_IS_JSON: {
 #ifdef PG_JITTER_HAVE_YYJSON
       JsonIsPredicate *pred = op->d.is_json.pred;
-      if (exprType(pred->expr) == TEXTOID && !pred->unique_keys) {
-        /* yyjson fast path: validate text datum directly */
+
+      if (exprType(pred->expr) == TEXTOID) {
         struct sljit_jump *j_null, *j_done;
 
-        /* if (*op->resnull) → jump to null path */
         emit_load_resnull(C, state, opno, op, SLJIT_R0);
         j_null =
             sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
 
-        /* R0 = *op->resvalue (text Datum) */
         emit_load_resvalue(C, state, opno, op, SLJIT_R0);
-        /* R1 = item_type (compile-time constant) */
         sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM,
                         (sljit_sw)pred->item_type);
-        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2(32, W, 32),
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM,
+                        pred->unique_keys ? 1 : 0);
+        EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS3(32, W, 32, 32),
                     pg_jitter_yj_is_json_datum);
 
-        /* *op->resvalue = BoolGetDatum(R0) */
-        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+        emit_store_res_pair_false(C, state, opno, op, SLJIT_R0);
         j_done = sljit_emit_jump(C, SLJIT_JUMP);
 
-        /* Null path: *op->resvalue = BoolGetDatum(false) = 0 */
         sljit_set_label(j_null, sljit_emit_label(C));
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 0);
-        emit_store_resvalue(C, state, opno, op, SLJIT_R0);
+        emit_store_res_pair_true_imm(C, state, opno, op, 0);
 
-        /* Done */
         sljit_set_label(j_done, sljit_emit_label(C));
         break;
       }
 #endif /* PG_JITTER_HAVE_YYJSON */
-      /* Fallback: generic 2-arg call */
       sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
       emit_load_step_addr(C, opno, SLJIT_R1);
       EMIT_ICALL(C, SLJIT_CALL, SLJIT_ARGS2V(P, P), ExecEvalJsonIsPredicate);
@@ -9637,6 +9510,7 @@ no_shared_code_reuse:
   {
     instr_time emit_start, emit_end;
     void *code;
+    Size gen_code_size;
 
     INSTR_TIME_SET_CURRENT(emit_start);
     code = sljit_generate_code(C, 0, NULL);
@@ -9646,8 +9520,11 @@ no_shared_code_reuse:
       pfree(step_labels);
       pfree(pending_jumps);
       sljit_shared_code_mode = false;
+      sljit_inline_enabled = false;
       return false;
     }
+
+    gen_code_size = sljit_get_generated_code_size(C);
 
     INSTR_TIME_SET_CURRENT(emit_end);
     INSTR_TIME_ACCUM_DIFF(ctx->base.instr.emission_counter, emit_end,
@@ -9661,8 +9538,6 @@ no_shared_code_reuse:
         !IsParallelWorker() &&
         (state->parent->state->es_jit_flags & PGJIT_EXPR) &&
         ctx->share_state.sjc) {
-      Size gen_code_size = sljit_get_generated_code_size(C);
-
       elog(DEBUG1,
            "pg_jitter: leader storing code "
            "node=%d expr=%d (%zu bytes) at %p fallback=%p "
@@ -9677,19 +9552,30 @@ no_shared_code_reuse:
     }
 
     /* Register Windows x64 unwind metadata for SEH-safe longjmp */
-    pg_jitter_win64_register_unwind(code, sljit_get_generated_code_size(C));
+    pg_jitter_win64_register_unwind(code, gen_code_size);
+
+    sljit_free_compiler(C);
+    C = NULL;
+    pfree(step_labels);
+    step_labels = NULL;
+    pfree(pending_jumps);
+    pending_jumps = NULL;
+
+    /* Reset per-compilation flags before ownership transfer can ERROR. */
+    sljit_shared_code_mode = false;
+    sljit_inline_enabled = false;
 
     /* Register for cleanup */
-    pg_jitter_register_compiled(ctx, sljit_code_free, code);
+    pg_jitter_register_compiled_or_free(ctx, sljit_code_free, code);
 
     /* Set the eval function (with validation wrapper on first call) */
     pg_jitter_install_expr(state, (ExprStateEvalFunc)code);
-
-    sljit_free_compiler(C);
   }
 
-  pfree(step_labels);
-  pfree(pending_jumps);
+  if (step_labels)
+    pfree(step_labels);
+  if (pending_jumps)
+    pfree(pending_jumps);
 
   /* Reset per-compilation flags for next compilation */
   sljit_shared_code_mode = false;

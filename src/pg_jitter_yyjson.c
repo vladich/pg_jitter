@@ -3,12 +3,10 @@
  */
 #include "postgres.h"
 
-#include "common/jsonapi.h"
 #include "fmgr.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
-#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/jsonfuncs.h"
 #include "utils/memutils.h"
@@ -42,44 +40,129 @@ typedef struct YjConvertedStrings
 
 static bool yj_encoding_checked = false;
 static bool yj_is_utf8 = false;
+static bool yj_is_sql_ascii = false;
+
+#if PG_VERSION_NUM < 160000
+static bool
+yj_unicode_escape_error_is_validation_failure(int sqlerrcode)
+{
+	switch (sqlerrcode)
+	{
+		case ERRCODE_UNTRANSLATABLE_CHARACTER:
+		case ERRCODE_CHARACTER_NOT_IN_REPERTOIRE:
+		case ERRCODE_FEATURE_NOT_SUPPORTED:
+		case ERRCODE_SYNTAX_ERROR:
+			return true;
+		default:
+			return false;
+	}
+}
+#endif
 
 static void
 yj_check_encoding(void)
 {
 	if (!yj_encoding_checked)
 	{
-		yj_is_utf8 = (GetDatabaseEncoding() == PG_UTF8);
+		int			encoding = GetDatabaseEncoding();
+
+		yj_is_utf8 = (encoding == PG_UTF8);
+		yj_is_sql_ascii = (encoding == PG_SQL_ASCII);
 		yj_encoding_checked = true;
 	}
+}
+
+static bool
+yj_validate_unicode_escape(void *ctx, uint32_t codepoint)
+{
+	unsigned char buf[MAX_UNICODE_EQUIVALENT_STRING + 1];
+
+	(void) ctx;
+
+#if PG_VERSION_NUM >= 160000
+	return pg_unicode_to_server_noerror((pg_wchar) codepoint, buf);
+#else
+	MemoryContext oldcontext = CurrentMemoryContext;
+	bool		ok = true;
+
+	PG_TRY();
+	{
+		pg_unicode_to_server((pg_wchar) codepoint, buf);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		if (yj_unicode_escape_error_is_validation_failure(edata->sqlerrcode))
+		{
+			FreeErrorData(edata);
+			ok = false;
+		}
+		else
+			ReThrowError(edata);
+	}
+	PG_END_TRY();
+
+	return ok;
+#endif
+}
+
+static bool
+yj_contains_unicode_escape(const char *data, size_t len)
+{
+	if (len < 2)
+		return false;
+
+	for (size_t i = 0; i + 1 < len; i++)
+	{
+		if (data[i] == '\\' && data[i + 1] == 'u')
+			return true;
+	}
+
+	return false;
 }
 
 static void *
 yj_pg_malloc(void *ctx, size_t size)
 {
 	MemoryContext mctx = ctx ? (MemoryContext) ctx : CurrentMemoryContext;
+	Size		alloc_size;
 
 	if (size > MaxAllocSize)
 		return NULL;
-	return MemoryContextAlloc(mctx, size == 0 ? 1 : size);
+	alloc_size = size == 0 ? 1 : (Size) size;
+	return MemoryContextAllocExtended(mctx, alloc_size, MCXT_ALLOC_NO_OOM);
 }
 
 static void *
 yj_pg_realloc(void *ctx, void *ptr, size_t old_size, size_t size)
 {
 	MemoryContext mctx = ctx ? (MemoryContext) ctx : CurrentMemoryContext;
-
-	(void) old_size;
+	void	   *newptr;
+	Size		copy_size;
 
 	if (size > MaxAllocSize)
 		return NULL;
 	if (ptr == NULL)
-		return MemoryContextAlloc(mctx, size == 0 ? 1 : size);
+		return yj_pg_malloc(ctx, size);
 	if (size == 0)
 	{
 		pfree(ptr);
 		return NULL;
 	}
-	return repalloc(ptr, size);
+
+	newptr = MemoryContextAllocExtended(mctx, (Size) size, MCXT_ALLOC_NO_OOM);
+	if (newptr == NULL)
+		return NULL;
+
+	copy_size = old_size < size ? (Size) old_size : (Size) size;
+	if (copy_size > 0)
+		memcpy(newptr, ptr, copy_size);
+	pfree(ptr);
+	return newptr;
 }
 
 static void
@@ -107,7 +190,7 @@ yj_prepare_input(YjInput *input, const char *data, size_t len)
 
 	yj_check_encoding();
 
-	if (!yj_is_utf8)
+	if (!yj_is_utf8 && !yj_is_sql_ascii)
 	{
 		char	   *maybe_converted;
 
@@ -144,21 +227,30 @@ yj_track_converted_string(YjConvertedStrings *strings, char *str)
 
 	if (strings->count == strings->capacity)
 	{
-		int			new_capacity = strings->capacity == 0 ? 16 :
-			strings->capacity * 2;
+		Size		max_capacity = MaxAllocSize / sizeof(char *);
+		Size		new_capacity;
 
-		if (new_capacity < strings->capacity ||
-			(Size) new_capacity > MaxAllocSize / sizeof(char *))
+		if (strings->capacity < 0 ||
+			(Size) strings->capacity >= max_capacity ||
+			(strings->capacity != 0 &&
+			 (Size) strings->capacity > (Size) INT_MAX / 2))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("JSON input contains too many strings")));
+
+		new_capacity = strings->capacity == 0 ? 16 :
+			(Size) strings->capacity * 2;
+		if (new_capacity > max_capacity || new_capacity > (Size) INT_MAX)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("JSON input contains too many strings")));
 
 		if (strings->items == NULL)
-			strings->items = palloc((Size) new_capacity * sizeof(char *));
+			strings->items = palloc(new_capacity * sizeof(char *));
 		else
 			strings->items = repalloc(strings->items,
-									  (Size) new_capacity * sizeof(char *));
-		strings->capacity = new_capacity;
+									  new_capacity * sizeof(char *));
+		strings->capacity = (int) new_capacity;
 	}
 
 	strings->items[strings->count++] = str;
@@ -181,16 +273,25 @@ static yyjson_doc *
 yj_parse_document(const char *data, size_t len, YjInput *input,
 				  yyjson_read_err *err)
 {
+	yyjson_read_flag flags = YYJSON_READ_NUMBER_AS_RAW;
+
 	yj_prepare_input(input, data, len);
 	memset(err, 0, sizeof(*err));
+	if (yj_is_sql_ascii)
+		flags |= YYJSON_READ_ALLOW_INVALID_UNICODE;
 	return yyjson_read_opts((char *) input->data, input->len,
-							YYJSON_READ_NUMBER_AS_RAW,
-							&yj_pg_allocator, err);
+							flags, &yj_pg_allocator, err);
 }
 
 static void
 yj_invalid_input_error(const char *type_name, const yyjson_read_err *err)
 {
+	if (err != NULL && err->code == YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory while parsing JSON input for type %s",
+						type_name)));
+
 	if (err != NULL && err->msg != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
@@ -247,7 +348,7 @@ yj_store_jsonb_string(JsonbValue *jbv, const char *str, size_t len,
 	jbv->val.string.val = (char *) str;
 	jbv->val.string.len = (int) len;
 
-	if (!yj_is_utf8)
+	if (!yj_is_utf8 && !yj_is_sql_ascii)
 	{
 		char	   *server_str;
 
@@ -421,8 +522,70 @@ yj_walk_scalar(yyjson_val *val, JsonbParseState **pstate,
 }
 
 #if PG_VERSION_NUM >= 160000
+static int32
+yj_is_json_item_type_from_yyjson(yyjson_val *root, int32 item_type)
+{
+	if (root == NULL)
+		return 0;
+	if (item_type == 0 /* JS_TYPE_ANY */)
+		return 1;
+	if (yyjson_is_obj(root))
+		return item_type == 1 /* JS_TYPE_OBJECT */;
+	if (yyjson_is_arr(root))
+		return item_type == 2 /* JS_TYPE_ARRAY */;
+	return item_type == 3 /* JS_TYPE_SCALAR */;
+}
+
+static int32
+yj_is_json_item_type_from_pg_text(yyjson_pg_text_type type, int32 item_type)
+{
+	if (type == YYJSON_PG_TEXT_INVALID)
+		return 0;
+	if (item_type == 0 /* JS_TYPE_ANY */)
+		return 1;
+
+	switch (type)
+	{
+		case YYJSON_PG_TEXT_OBJECT:
+			return item_type == 1 /* JS_TYPE_OBJECT */;
+		case YYJSON_PG_TEXT_ARRAY:
+			return item_type == 2 /* JS_TYPE_ARRAY */;
+		case YYJSON_PG_TEXT_SCALAR:
+			return item_type == 3 /* JS_TYPE_SCALAR */;
+		default:
+			return 0;
+	}
+}
+
+static int32
+yj_is_json_pg_text_syntax(const char *data, size_t len, int32 item_type,
+						  int32 unique_keys)
+{
+	yyjson_read_err err;
+	yyjson_pg_text_type type;
+
+	memset(&err, 0, sizeof(err));
+	/*
+	 * Plain json text validation is syntax-only in PostgreSQL: it checks
+	 * \uXXXX shape but does not reject decoded \u0000 or lone surrogates.
+	 * Unique-key validation decodes strings, so it must also apply the server
+	 * encoding validator just like PostgreSQL's need_escapes path.
+	 */
+	type = yyjson_read_pg_text_type_opts_err_ex(
+		data, len, unique_keys != 0,
+		unique_keys ? yj_validate_unicode_escape : NULL,
+		NULL, &yj_pg_allocator, &err);
+	if (type == YYJSON_PG_TEXT_INVALID &&
+		err.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory while validating JSON text")));
+
+	return yj_is_json_item_type_from_pg_text(type, item_type);
+}
+
 int32
-pg_jitter_yj_is_json_datum(Datum datum, int32 item_type)
+pg_jitter_yj_is_json_datum(Datum datum, int32 item_type, int32 unique_keys)
 {
 	text	   *json = DatumGetTextPP(datum);
 	char	   *data = VARDATA_ANY(json);
@@ -431,7 +594,6 @@ pg_jitter_yj_is_json_datum(Datum datum, int32 item_type)
 	yyjson_read_err err;
 	YjInput		input;
 	yyjson_doc *doc = NULL;
-	yyjson_val *root;
 
 	input.data = NULL;
 	input.len = 0;
@@ -439,60 +601,37 @@ pg_jitter_yj_is_json_datum(Datum datum, int32 item_type)
 
 	PG_TRY();
 	{
-		if (len < PG_JITTER_YYJSON_MIN_INPUT_LEN)
+		/*
+		 * The regular yyjson reader is the fast path, but it is stricter than
+		 * PostgreSQL json text syntax for some Unicode escapes.  On parse
+		 * rejection, retry with yyjson's PostgreSQL syntax classifier.  Unique
+		 * key checks go straight to that classifier because they need decoded
+		 * string comparison and Unicode validation.
+		 */
+		if (unique_keys || len < PG_JITTER_YYJSON_MIN_INPUT_LEN)
 		{
-			bool		valid;
-
-			valid = json_validate(json, false, false);
-			if (valid)
-			{
-				if (item_type == 0 /* JS_TYPE_ANY */)
-					result = 1;
-				else
-				{
-					JsonTokenType tok = json_get_first_token(json, false);
-
-					switch (tok)
-					{
-						case JSON_TOKEN_OBJECT_START:
-							result = (item_type == 1 /* JS_TYPE_OBJECT */) ? 1 : 0;
-							break;
-						case JSON_TOKEN_ARRAY_START:
-							result = (item_type == 2 /* JS_TYPE_ARRAY */) ? 1 : 0;
-							break;
-						case JSON_TOKEN_STRING:
-						case JSON_TOKEN_NUMBER:
-						case JSON_TOKEN_TRUE:
-						case JSON_TOKEN_FALSE:
-						case JSON_TOKEN_NULL:
-							result = (item_type == 3 /* JS_TYPE_SCALAR */) ? 1 : 0;
-							break;
-						default:
-							result = 0;
-							break;
-					}
-				}
-			}
+			yj_prepare_input(&input, data, (size_t) len);
+			result = yj_is_json_pg_text_syntax(input.data, input.len,
+											  item_type, unique_keys);
 		}
 		else
 		{
 			doc = yj_parse_document(data, (size_t) len, &input, &err);
 			if (doc != NULL)
 			{
-				root = yyjson_doc_get_root(doc);
-				if (root != NULL)
-				{
-					if (item_type == 0 /* JS_TYPE_ANY */)
-						result = 1;
-					else if (yyjson_is_obj(root))
-						result = (item_type == 1 /* JS_TYPE_OBJECT */) ? 1 : 0;
-					else if (yyjson_is_arr(root))
-						result = (item_type == 2 /* JS_TYPE_ARRAY */) ? 1 : 0;
-					else
-						result = (item_type == 3 /* JS_TYPE_SCALAR */) ? 1 : 0;
-				}
+				result = yj_is_json_item_type_from_yyjson(yyjson_doc_get_root(doc),
+														 item_type);
 				yyjson_doc_free(doc);
 				doc = NULL;
+			}
+			else
+			{
+				if (err.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+					ereport(ERROR,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							 errmsg("out of memory while validating JSON text")));
+				result = yj_is_json_pg_text_syntax(input.data, input.len,
+												  item_type, unique_keys);
 			}
 		}
 	}
@@ -508,61 +647,12 @@ pg_jitter_yj_is_json_datum(Datum datum, int32 item_type)
 	PG_END_TRY();
 
 	yj_release_input(&input);
-
 	if ((Pointer) json != DatumGetPointer(datum))
 		pfree(json);
+
 	return result;
 }
 #endif /* PG_VERSION_NUM >= 160000 */
-
-Datum
-pg_jitter_yj_json_in(Datum cstring_datum, FunctionCallInfo fcinfo)
-{
-	char	   *str = DatumGetCString(cstring_datum);
-	size_t		len = strlen(str);
-	yyjson_read_err err;
-	YjInput		input;
-	yyjson_doc *doc = NULL;
-
-	if (len > INT_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("JSON input is too large")));
-
-	if (len < PG_JITTER_YYJSON_MIN_INPUT_LEN)
-	{
-		fcinfo->args[0].value = cstring_datum;
-		fcinfo->args[0].isnull = false;
-		fcinfo->isnull = false;
-		return fcinfo->flinfo->fn_addr(fcinfo);
-	}
-
-	input.data = NULL;
-	input.len = 0;
-	input.converted = NULL;
-
-	PG_TRY();
-	{
-		doc = yj_parse_document(str, len, &input, &err);
-		if (doc == NULL)
-		{
-			yj_release_input(&input);
-			yj_invalid_input_error("json", &err);
-		}
-		yyjson_doc_free(doc);
-		doc = NULL;
-		yj_release_input(&input);
-	}
-	PG_CATCH();
-	{
-		if (doc != NULL)
-			yyjson_doc_free(doc);
-		yj_release_input(&input);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	return PointerGetDatum(cstring_to_text_with_len(str, (int) len));
-}
 
 Datum
 pg_jitter_yj_jsonb_in(Datum cstring_datum, FunctionCallInfo fcinfo)
@@ -583,14 +673,6 @@ pg_jitter_yj_jsonb_in(Datum cstring_datum, FunctionCallInfo fcinfo)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("JSON input is too large")));
 
-	if (len < PG_JITTER_YYJSON_MIN_INPUT_LEN)
-	{
-		fcinfo->args[0].value = cstring_datum;
-		fcinfo->args[0].isnull = false;
-		fcinfo->isnull = false;
-		return fcinfo->flinfo->fn_addr(fcinfo);
-	}
-
 	doc = NULL;
 	input.data = NULL;
 	input.len = 0;
@@ -598,6 +680,20 @@ pg_jitter_yj_jsonb_in(Datum cstring_datum, FunctionCallInfo fcinfo)
 
 	PG_TRY();
 	{
+		yj_check_encoding();
+		if (yj_is_sql_ascii && yj_contains_unicode_escape(str, len))
+		{
+			yyjson_read_err pg_err;
+			yyjson_pg_text_type type;
+
+			memset(&pg_err, 0, sizeof(pg_err));
+			type = yyjson_read_pg_text_type_opts_err_ex(
+				str, len, false, yj_validate_unicode_escape, NULL,
+				&yj_pg_allocator, &pg_err);
+			if (type == YYJSON_PG_TEXT_INVALID)
+				yj_invalid_input_error("jsonb", &pg_err);
+		}
+
 		doc = yj_parse_document(str, len, &input, &err);
 		if (doc == NULL)
 			yj_invalid_input_error("jsonb", &err);

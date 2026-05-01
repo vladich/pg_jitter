@@ -13,11 +13,10 @@
 #define PG_JITTER_YYJSON_MIN_INPUT_LEN 64
 
 #if PG_VERSION_NUM >= 160000
-extern int32 pg_jitter_yj_is_json_datum(Datum datum, int32 item_type);
+extern int32 pg_jitter_yj_is_json_datum(Datum datum, int32 item_type,
+										int32 unique_keys);
 #endif
 
-extern Datum pg_jitter_yj_json_in(Datum cstring_datum,
-								  FunctionCallInfo fcinfo);
 extern Datum pg_jitter_yj_jsonb_in(Datum cstring_datum,
 								   FunctionCallInfo fcinfo);
 

@@ -2945,9 +2945,9 @@ deform_code_gen:
 /* ================================================================
  * pg_jitter_compiled_deform_dispatch — dylib-resident deform wrapper
  *
- * Called from JIT-compiled expression code.  Being a dylib function,
- * its address is within +-512KB of pg_jitter_fallback_step and
- * therefore properly relocated between leader and worker processes.
+ * Called from JIT-compiled expression code.  The shared-code relocator treats
+ * it as an exact known helper address, so workers patch the leader's absolute
+ * call target to their own process-local function address.
  *
  * On first call for a given (table-type, natts, slot-ops) combination,
  * JIT-compiles the deform function (loop-based for wide tables, unrolled
@@ -3073,7 +3073,7 @@ static const TupleTableSlotOps *shared_deform_valid_ops = NULL;
 static void *shared_deform_page = NULL;		/* for munmap on cleanup */
 static Size  shared_deform_page_size = 0;
 
-void
+PG_JITTER_EXPORT void
 pg_jitter_deform_dispatch_reset_fastpath(void)
 {
 	n_dispatch_fast = 0;
