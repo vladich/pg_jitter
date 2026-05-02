@@ -36,6 +36,10 @@ Commands:
   run-regression-tests    Run pg_regress plus pg_jitter targeted checks
   all-unix                Run the Unix CI sequence above
 
+Environment:
+  GHA_BACKENDS            Space-separated backend list for regression tests
+  GHA_REGRESS_TIMEOUT     Per regression command timeout, default: 10m; 0 disables
+
 Options:
   --postgres-version N    PostgreSQL major version, 14..18
   --pg-config PATH        pg_config path/name
@@ -446,6 +450,42 @@ backends_for_version() {
     fi
 }
 
+run_with_regress_timeout() {
+    local label="$1"
+    local limit="${GHA_REGRESS_TIMEOUT:-10m}"
+    local timeout_bin=""
+    local rc
+
+    shift
+    echo "----- $label -----"
+    echo "Started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    if [ -n "$limit" ] && [ "$limit" != "0" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout_bin="timeout"
+        elif command -v gtimeout >/dev/null 2>&1; then
+            timeout_bin="gtimeout"
+        fi
+    fi
+
+    if [ -n "$timeout_bin" ]; then
+        "$timeout_bin" --kill-after=30s "$limit" "$@"
+        rc=$?
+    else
+        if [ -n "$limit" ] && [ "$limit" != "0" ]; then
+            echo "No timeout command available; running without timeout."
+        fi
+        "$@"
+        rc=$?
+    fi
+
+    echo "Finished: $(date -u '+%Y-%m-%dT%H:%M:%SZ') rc=$rc"
+    if [ "$rc" -eq 124 ]; then
+        echo "$label timed out after $limit" >&2
+    fi
+    return "$rc"
+}
+
 pg_port_from_connuri() {
     psql -t -A -c "SHOW port;" "$CONNURI" | tr -d '[:space:]'
 }
@@ -473,7 +513,7 @@ set_jit_backend() {
 }
 
 run_regression_tests() {
-    local version backends pgport pgdata outdir backend provider_rc surface_rc
+    local version backends pgport pgdata outdir backend pg_regress_rc provider_rc surface_rc
     local targeted_failed=0
 
     [ -n "$CONNURI" ] || { echo "CONNURI is required" >&2; exit 1; }
@@ -485,27 +525,45 @@ run_regression_tests() {
 
     export PGUSER="${PGUSER:-postgres}"
     export PGPASSWORD="${PGPASSWORD:-postgres}"
+    export PG_JITTER_REGRESS_STREAM_LOG="${PG_JITTER_REGRESS_STREAM_LOG:-1}"
 
     echo "Using pg_regress backends: $backends"
-    "$WORKSPACE/tests/run_pg_regress.sh" \
-        --pg-config "$PG_CONFIG_PATH" \
-        --pg-src "$PG_SRC" \
-        --port "$pgport" \
-        --host localhost \
-        --use-running-cluster \
-        --allow-destructive-cleanup \
-        --backends "$backends" \
-        --output-dir "$outdir"
-
-    echo "============================================"
-    echo "  pg_jitter targeted regression tests"
-    echo "============================================"
+    echo "Per regression command timeout: ${GHA_REGRESS_TIMEOUT:-10m}"
 
     for backend in $backends; do
+        echo "============================================"
+        echo "  pg_regress: $backend"
+        echo "============================================"
+
+        set +e
+        run_with_regress_timeout "pg_regress backend $backend" \
+            "$WORKSPACE/tests/run_pg_regress.sh" \
+            --pg-config "$PG_CONFIG_PATH" \
+            --pg-src "$PG_SRC" \
+            --port "$pgport" \
+            --host localhost \
+            --use-running-cluster \
+            --allow-destructive-cleanup \
+            --backends "$backend" \
+            --output-dir "$outdir/pg_regress_$backend"
+        pg_regress_rc=$?
+        set -e
+
+        if [ "$pg_regress_rc" -ne 0 ]; then
+            echo "$backend pg_regress: FAILED (rc=$pg_regress_rc)"
+            return "$pg_regress_rc"
+        fi
+        echo "$backend pg_regress: PASSED"
+
+        echo "============================================"
+        echo "  targeted regression tests: $backend"
+        echo "============================================"
+
         set_jit_backend "$pgdata" "$version" "$backend"
 
         set +e
-        "$WORKSPACE/tests/test_provider_regressions.sh" \
+        run_with_regress_timeout "targeted provider regressions backend $backend" \
+            "$WORKSPACE/tests/test_provider_regressions.sh" \
             --pg-config "$PG_CONFIG_PATH" \
             --host localhost \
             --port "$pgport" \
@@ -513,7 +571,8 @@ run_regression_tests() {
             --backend "$backend"
         provider_rc=$?
 
-        "$WORKSPACE/tests/test_function_surface.sh" \
+        run_with_regress_timeout "targeted function surface regressions backend $backend" \
+            "$WORKSPACE/tests/test_function_surface.sh" \
             --pg-config "$PG_CONFIG_PATH" \
             --host localhost \
             --port "$pgport" \

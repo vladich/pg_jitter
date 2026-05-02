@@ -548,22 +548,41 @@ run_backend() {
     fi
 
     set +e
-    (
-        cd "$REGRESS_DIR"
-        pg_env env PGPORT="$PGPORT" "$PG_REGRESS" \
-            --inputdir="$REGRESS_DIR" \
-            --outputdir="$outdir" \
-            --bindir="$PGBIN" \
-            --dlpath="$REGRESS_DIR" \
-            --max-concurrent-tests="$MAX_CONCURRENT_TESTS" \
-            --max-connections="$MAX_CONNECTIONS" \
-            --schedule="$SCHEDULE_PATH" \
-            --host="$PGHOST" \
-            --port="$PGPORT" \
-            --dbname=regression \
-            2>&1
-    ) | tee "$logfile" | tail -3
-    rc=${PIPESTATUS[0]}
+    if [ "${PG_JITTER_REGRESS_STREAM_LOG:-0}" = "1" ]; then
+        (
+            cd "$REGRESS_DIR"
+            pg_env env PGPORT="$PGPORT" "$PG_REGRESS" \
+                --inputdir="$REGRESS_DIR" \
+                --outputdir="$outdir" \
+                --bindir="$PGBIN" \
+                --dlpath="$REGRESS_DIR" \
+                --max-concurrent-tests="$MAX_CONCURRENT_TESTS" \
+                --max-connections="$MAX_CONNECTIONS" \
+                --schedule="$SCHEDULE_PATH" \
+                --host="$PGHOST" \
+                --port="$PGPORT" \
+                --dbname=regression \
+                2>&1
+        ) | tee "$logfile"
+        rc=${PIPESTATUS[0]}
+    else
+        (
+            cd "$REGRESS_DIR"
+            pg_env env PGPORT="$PGPORT" "$PG_REGRESS" \
+                --inputdir="$REGRESS_DIR" \
+                --outputdir="$outdir" \
+                --bindir="$PGBIN" \
+                --dlpath="$REGRESS_DIR" \
+                --max-concurrent-tests="$MAX_CONCURRENT_TESTS" \
+                --max-connections="$MAX_CONNECTIONS" \
+                --schedule="$SCHEDULE_PATH" \
+                --host="$PGHOST" \
+                --port="$PGPORT" \
+                --dbname=regression \
+                2>&1
+        ) | tee "$logfile" | tail -3
+        rc=${PIPESTATUS[0]}
+    fi
     set -e
 
     cp -f "$logfile" "$REGRESS_DIR/regression_${backend}.log" 2>/dev/null || true
