@@ -301,6 +301,12 @@ prepare_deps() {
     clone_repo vladich/sljit "$WORKSPACE/deps/sljit"
     clone_repo asmjit/asmjit "$WORKSPACE/deps/asmjit"
     clone_repo vladich/mir-patched "$WORKSPACE/deps/mir" "$MIR_REF"
+    if git -C "$WORKSPACE/deps/mir" grep -q \
+         "char ch, ch2, start_ch, d;" -- mir-gen-aarch64.c; then
+        git -C "$WORKSPACE/deps/mir" apply --whitespace=nowarn \
+            "$WORKSPACE/patches/mir-aarch64-hex-value-sentinel.patch"
+    fi
+    git -C "$WORKSPACE/deps/mir" diff --check
     clone_repo ashvardanian/StringZilla "$WORKSPACE/deps/stringzilla"
 
     if [ "$(runner_os)" != "Windows" ]; then
@@ -442,17 +448,8 @@ build_regress_libs() {
 
 backends_for_version() {
     local version="$1"
-    local machine
 
-    machine="$(uname -m)"
-    if [ "$(runner_os)" = "Linux" ] &&
-       { [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; }; then
-        if [ "$version" -lt 17 ]; then
-            printf 'sljit asmjit\n'
-        else
-            printf 'sljit asmjit auto\n'
-        fi
-    elif [ "$version" -lt 17 ]; then
+    if [ "$version" -lt 17 ]; then
         printf 'sljit asmjit mir\n'
     else
         printf 'sljit asmjit mir auto\n'

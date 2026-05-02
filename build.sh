@@ -65,28 +65,6 @@ case "$TARGET" in
     all)    BACKENDS_LIST="" ;;  # empty = use CMakeLists.txt default (auto-detect)
 esac
 
-has_explicit_backend_list() {
-    local arg
-
-    for arg in "${CMAKE_EXTRA_ARGS[@]}"; do
-        case "$arg" in
-            -DPG_JITTER_BACKENDS=*) return 0 ;;
-        esac
-    done
-    return 1
-}
-
-host_default_backend_list() {
-    local os machine
-
-    os="$(uname -s)"
-    machine="$(uname -m)"
-    if [ "$os" = "Linux" ] &&
-       { [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; }; then
-        echo "sljit;asmjit"
-    fi
-}
-
 # Determine PG version for per-version build directory
 PG_VERSION=$("$PG_CONFIG" --version | sed 's/[^0-9]*\([0-9]*\).*/\1/')
 BUILD_DIR="$SCRIPT_DIR/build/pg$PG_VERSION"
@@ -105,11 +83,6 @@ if [ "$TARGET" != "all" ] && [ "$TARGET" != "meta" ]; then
     CMAKE_ARGS+=(-DPG_JITTER_BACKENDS="$BACKENDS_LIST")
 elif [ "$TARGET" = "meta" ]; then
     CMAKE_ARGS+=(-DPG_JITTER_BACKENDS="")
-elif [ "$TARGET" = "all" ] && ! has_explicit_backend_list; then
-    HOST_BACKENDS="$(host_default_backend_list)"
-    if [ -n "$HOST_BACKENDS" ]; then
-        CMAKE_ARGS+=(-DPG_JITTER_BACKENDS="$HOST_BACKENDS")
-    fi
 fi
 
 cmake "$SCRIPT_DIR" "${CMAKE_ARGS[@]}" "${CMAKE_EXTRA_ARGS[@]}"
