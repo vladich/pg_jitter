@@ -318,6 +318,13 @@ function(pg_jitter_apply_exports TARGET_NAME)
         file(APPEND "${_export_file}" "  local:\n    *;\n};\n")
         target_link_options(${TARGET_NAME} PRIVATE
             "-Wl,--version-script=${_export_file}")
+    elseif(WIN32 AND PG_VERSION_NUM LESS 160000)
+        set(_export_file "${_export_dir}/${TARGET_NAME}.def")
+        file(WRITE "${_export_file}" "EXPORTS\n")
+        foreach(_sym IN LISTS _symbols)
+            file(APPEND "${_export_file}" "  ${_sym}\n")
+        endforeach()
+        target_sources(${TARGET_NAME} PRIVATE "${_export_file}")
     endif()
 endfunction()
 

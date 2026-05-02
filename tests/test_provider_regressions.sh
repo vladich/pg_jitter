@@ -81,11 +81,7 @@ detect_backends() {
     local found=()
     local ext
 
-    case "$(uname -s)" in
-        Darwin) ext=dylib ;;
-        MINGW*|MSYS*|CYGWIN*) ext=dll ;;
-        *) ext=so ;;
-    esac
+    ext="$(library_extension)"
 
     for b in sljit asmjit mir; do
         for dir in "${PKGLIB_CANDIDATES[@]}"; do
@@ -102,6 +98,39 @@ detect_backends() {
     fi
 
     printf '%s\n' "${found[@]}"
+}
+
+library_extension() {
+    local ext
+
+    case "$(uname -s)" in
+        Darwin) ext=dylib ;;
+        MINGW*|MSYS*|CYGWIN*) ext=dll ;;
+        *) ext=so ;;
+    esac
+
+    printf '%s\n' "$ext"
+}
+
+sql_literal() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+provider_library() {
+    local backend="$1"
+    local ext dir lib
+
+    ext="$(library_extension)"
+    lib="pg_jitter_${backend}.${ext}"
+
+    for dir in "${PKGLIB_CANDIDATES[@]}"; do
+        if [ -f "$dir/$lib" ]; then
+            printf '%s/%s\n' "$dir" "$lib"
+            return 0
+        fi
+    done
+
+    printf 'pg_jitter_%s\n' "$backend"
 }
 
 if [ "$BACKEND" = "all" ]; then
@@ -135,12 +164,6 @@ backend_settings() {
     fi
 }
 
-provider_library() {
-    local backend="$1"
-
-    printf 'pg_jitter_%s' "$backend"
-}
-
 counter_backends() {
     local backend="$1"
 
@@ -156,7 +179,7 @@ third_party_counter_functions() {
     local counter_backend provider_lib
 
     while IFS= read -r counter_backend; do
-        provider_lib="$(provider_library "$counter_backend")"
+        provider_lib="$(sql_literal "$(provider_library "$counter_backend")")"
         cat <<SQL
 CREATE OR REPLACE FUNCTION pg_temp.pg_jitter_reset_third_party_counters_${counter_backend}()
 RETURNS void AS '$provider_lib', 'pg_jitter_reset_third_party_counters'

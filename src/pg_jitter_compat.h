@@ -20,7 +20,15 @@
  * module symbols with a visibility attribute on Unix, so provide one here and
  * make PG's module/function macros use it.
  * ---------------------------------------------------------------- */
-#if defined(_WIN32)
+#if defined(_WIN32) && PG_VERSION_NUM < 160000
+/*
+ * PG14/15 Windows headers declare PG_FUNCTION_INFO_V1 functions and
+ * _PG_jit_provider_init without PGDLLEXPORT, so adding dllexport at the
+ * definition triggers MSVC C2375.  CMake exports these symbols explicitly
+ * for those versions.
+ */
+#define PG_JITTER_EXPORT
+#elif defined(_WIN32)
 #define PG_JITTER_EXPORT PGDLLEXPORT
 #elif defined(__GNUC__) || defined(__clang__)
 #define PG_JITTER_EXPORT __attribute__((visibility("default")))
