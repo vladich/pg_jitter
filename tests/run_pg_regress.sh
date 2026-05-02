@@ -161,6 +161,19 @@ log_summary() {
     printf '%s\n' "$*" | tee -a "$SUMMARY_FILE"
 }
 
+safe_remove_regress_path() {
+    local dir="$1"
+
+    case "$dir" in
+        ""|"/"|"/tmp"|"${HOME:-}"|"$REPO_DIR"|"$OUTPUT_DIR")
+            echo "ERROR: refusing to remove unsafe path: $dir" >&2
+            exit 1
+            ;;
+    esac
+
+    rm -rf "$dir"
+}
+
 # Auto-detect PostgreSQL source tree.
 if [ -z "$PG_SRC" ]; then
     PG_INSTALL_PREFIX="$("$PG_CONFIG" --prefix 2>/dev/null || echo "")"
@@ -190,20 +203,8 @@ REGRESS_DIR_ORIG="$PG_SRC/src/test/regress"
 REGRESS_DIR="/tmp/pg_jitter_regress_work_pg${PG_MAJOR}_${PGPORT}"
 
 refresh_regress_workdir() {
-    local needs_copy=0
-
-    if [ ! -d "$REGRESS_DIR" ]; then
-        needs_copy=1
-    elif [ "$REGRESS_DIR_ORIG/pg_regress" -nt "$REGRESS_DIR/pg_regress" ]; then
-        needs_copy=1
-    elif [ "$REGRESS_DIR_ORIG/parallel_schedule" -nt "$REGRESS_DIR/parallel_schedule" ]; then
-        needs_copy=1
-    fi
-
-    if [ "$needs_copy" -eq 1 ]; then
-        rm -rf "$REGRESS_DIR"
-        cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
-    fi
+    safe_remove_regress_path "$REGRESS_DIR"
+    cp -a "$REGRESS_DIR_ORIG" "$REGRESS_DIR"
 
     mkdir -p "$REGRESS_DIR/testtablespace"
 }
@@ -527,6 +528,15 @@ run_backend() {
     local logfile="$outdir/pg_regress.log"
     local rc fail_line
 
+    case "$backend" in
+        sljit|asmjit|mir|auto) ;;
+        *)
+            echo "ERROR: unsupported backend name: $backend" >&2
+            return 1
+            ;;
+    esac
+
+    safe_remove_regress_path "$outdir"
     mkdir -p "$outdir/testtablespace"
     log_summary "===== run: $backend ====="
 
