@@ -29,8 +29,13 @@ endif()
 #
 
 # ---------- Backend selection ----------
-# AsmJIT only supports arm64 and x86_64/amd64
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64|amd64")
+# AsmJIT only supports arm64 and x86_64/amd64.  MIR's Linux arm64
+# generator can hang during PostgreSQL expression compilation, so keep it
+# opt-in there until that third-party backend is reliable on this target.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(_default_backends "sljit;asmjit")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64|amd64")
     set(_default_backends "sljit;asmjit;mir")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
     set(_default_backends "sljit")

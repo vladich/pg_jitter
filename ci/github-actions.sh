@@ -442,8 +442,17 @@ build_regress_libs() {
 
 backends_for_version() {
     local version="$1"
+    local machine
 
-    if [ "$version" -lt 17 ]; then
+    machine="$(uname -m)"
+    if [ "$(runner_os)" = "Linux" ] &&
+       { [ "$machine" = "aarch64" ] || [ "$machine" = "arm64" ]; }; then
+        if [ "$version" -lt 17 ]; then
+            printf 'sljit asmjit\n'
+        else
+            printf 'sljit asmjit auto\n'
+        fi
+    elif [ "$version" -lt 17 ]; then
         printf 'sljit asmjit mir\n'
     else
         printf 'sljit asmjit mir auto\n'
