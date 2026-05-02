@@ -2012,6 +2012,7 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				Datum *sorted_vals = NULL;
 				int nvals = 0;
 				bool array_has_nulls = false;
+				int in_bsearch_max = pg_jitter_get_in_bsearch_max();
 
 				if (eq_dfn && eq_dfn->jit_fn &&
 					pg_jitter_in_raw_datum_bsearch_safe(
@@ -2039,7 +2040,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 												 &typlen, &typbyval,
 												 &typalign);
 
-							if (typbyval && nitems > 0 && nitems <= 128)
+							if (typbyval && nitems > 0 &&
+								nitems <= in_bsearch_max)
 							{
 								bits8 *bitmap = ARR_NULLBITMAP(arr);
 								char *s = (char *) ARR_DATA_PTR(arr);
@@ -2078,20 +2080,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 									}
 								}
 
-								for (int a = 1; a < nvals; a++)
-								{
-									Datum vtmp = sorted_vals[a];
-									int b = a - 1;
-									while (b >= 0 &&
-										   (int64) sorted_vals[b] >
-										   (int64) vtmp)
-									{
-										sorted_vals[b + 1] =
-											sorted_vals[b];
-										b--;
-									}
-									sorted_vals[b + 1] = vtmp;
-								}
+								pg_jitter_sort_raw_datums(sorted_vals,
+														 nvals);
 							}
 							if ((Pointer) arr != DatumGetPointer(array_datum))
 								pfree(arr);

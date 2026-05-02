@@ -3546,13 +3546,15 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 				 */
 				Datum *sorted_vals = NULL;
 				int nvals = 0;
-					bool array_has_nulls = false;
-					TextHashTable *text_ht = NULL;
+				bool array_has_nulls = false;
+				TextHashTable *text_ht = NULL;
+				int in_bsearch_max = pg_jitter_get_in_bsearch_max();
+				bool in_text_hash = pg_jitter_get_in_text_hash();
 
-					if (eq_dfn && eq_dfn->jit_fn &&
-						pg_jitter_in_raw_datum_bsearch_safe(
-							op->d.hashedscalararrayop.finfo->fn_addr))
-					{
+				if (eq_dfn && eq_dfn->jit_fn &&
+					pg_jitter_in_raw_datum_bsearch_safe(
+						op->d.hashedscalararrayop.finfo->fn_addr))
+				{
 						Expr *arrayarg = (Expr *) lsecond(saop->args);
 
 						if (IsA(arrayarg, Const))
@@ -3574,7 +3576,8 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 								get_typlenbyvalalign(ARR_ELEMTYPE(arr),
 									&typlen, &typbyval, &typalign);
 
-								if (typbyval && nitems > 0 && nitems <= 128)
+								if (typbyval && nitems > 0 &&
+									nitems <= in_bsearch_max)
 								{
 									bits8 *bitmap = ARR_NULLBITMAP(arr);
 									char *s = (char *) ARR_DATA_PTR(arr);
@@ -3613,38 +3616,26 @@ asmjit_emit_all(CodeHolder &code, ExprState *state,
 										}
 									}
 
-									for (int a = 1; a < nvals; a++)
-									{
-										Datum vtmp = sorted_vals[a];
-										int b = a - 1;
-										while (b >= 0 &&
-											   (int64) sorted_vals[b] >
-											   (int64) vtmp)
-										{
-											sorted_vals[b + 1] =
-												sorted_vals[b];
-											b--;
-										}
-										sorted_vals[b + 1] = vtmp;
-									}
+									pg_jitter_sort_raw_datums(sorted_vals,
+															 nvals);
 								}
 								if ((Pointer) arr != DatumGetPointer(array_datum))
 									pfree(arr);
 							}
 						}
-					}
+				}
 
-					/*
-					 * Text IN-list hash table (independent of eq_dfn).
-					 * For text arrays with deterministic collation, build an
-					 * open-addressing hash table at compile time and probe at runtime.
-					 *
-					 * In shared mode: store table pointer in fcinfo->args[1].value
-					 * (overwriting the const array datum). Workers rebuild the table
-					 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
-					 */
-					if (!sorted_vals)
-					{
+				/*
+				 * Text IN-list hash table (independent of eq_dfn).
+				 * For text arrays with deterministic collation, build an
+				 * open-addressing hash table at compile time and probe at runtime.
+				 *
+				 * In shared mode: store table pointer in fcinfo->args[1].value
+				 * (overwriting the const array datum). Workers rebuild the table
+				 * via pg_jitter_setup_shared_in_hash() after DSM attachment.
+				 */
+				if (!sorted_vals && in_text_hash)
+				{
 						Expr *arrayarg_t = (Expr *) lsecond(saop->args);
 
 						if (IsA(arrayarg_t, Const))

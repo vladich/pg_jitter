@@ -855,7 +855,7 @@ done:
 }
 
 /* ================================================================
- * CRC32 open-addressing hash table for large IN lists
+ * Experimental CRC32 open-addressing hash table for int4-compatible IN lists
  * ================================================================ */
 static inline uint32
 pg_jitter_crc32c_sw_raw(uint32 crc, const void *data, Size len)
@@ -973,7 +973,7 @@ crc32_hash_probe_int4(int32 val, int64 table_ptr)
 }
 
 /* ================================================================
- * Runtime binary search for large IN lists
+ * Runtime binary search helper for sorted int4 IN-list constants
  * ================================================================ */
 SortedInt32Array *
 sorted_array_build_int4(const int32 *vals, int nvals, bool has_nulls,
