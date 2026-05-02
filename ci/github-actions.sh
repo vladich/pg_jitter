@@ -527,7 +527,8 @@ run_regression_tests() {
     backends="${GHA_BACKENDS:-$(backends_for_version "$version")}"
     pgport="$(pg_port_from_connuri)"
     pgdata="$(psql -t -A -c "SHOW data_directory;" "$CONNURI")"
-    outdir="$WORKSPACE/regress-output"
+    outdir="$WORKSPACE/regress-output/pg${version}_${pgport}"
+    safe_remove_dir "$outdir"
 
     export PGUSER="${PGUSER:-postgres}"
     export PGPASSWORD="${PGPASSWORD:-postgres}"
