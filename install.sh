@@ -75,14 +75,6 @@ esac
 
 # Parse target
 TARGET="${1:-all}"
-case "$TARGET" in
-    sljit|asmjit|mir) BACKENDS=("$TARGET") ;;
-    all)              BACKENDS=(sljit asmjit mir) ;;
-    *)                echo "Usage: $0 [--pg-config PATH] [sljit|asmjit|mir|all]"; exit 1 ;;
-esac
-
-echo "=== pg_jitter install ($TARGET) ==="
-echo "  Targets: ${INSTALL_DIRS[*]}"
 
 # Find and copy dylibs (support both flat and per-backend build layouts)
 find_dylib() {
@@ -97,14 +89,56 @@ find_dylib() {
     return 1
 }
 
-missing=0
-for b in "${BACKENDS[@]}"; do
-    if ! find_dylib "$b" > /dev/null 2>&1; then
-        echo "ERROR: pg_jitter_$b.$EXT not found in build/ — run ./build.sh $b first"
-        missing=1
-    fi
-done
-[ "$missing" -eq 1 ] && exit 1
+case "$TARGET" in
+    sljit|asmjit|mir)
+        BACKENDS=("$TARGET")
+        missing=0
+        for b in "${BACKENDS[@]}"; do
+            if ! find_dylib "$b" > /dev/null 2>&1; then
+                echo "ERROR: pg_jitter_$b.$EXT not found in build/ — run ./build.sh $b first"
+                missing=1
+            fi
+        done
+        [ "$missing" -eq 1 ] && exit 1
+        ;;
+    all)
+        BACKENDS=()
+        BACKEND_MANIFEST="$SCRIPT_DIR/build/pg$PG_VERSION/pg_jitter_backends.txt"
+        if [ -f "$BACKEND_MANIFEST" ]; then
+            # install.sh all follows the backend manifest from the last
+            # build, avoiding stale dylibs from previous configurations.
+            for b in $(cat "$BACKEND_MANIFEST"); do
+                BACKENDS+=("$b")
+            done
+        else
+            for b in sljit asmjit mir; do
+                if find_dylib "$b" > /dev/null 2>&1; then
+                    BACKENDS+=("$b")
+                fi
+            done
+        fi
+        if [ "${#BACKENDS[@]}" -eq 0 ]; then
+            echo "ERROR: no pg_jitter backend libraries found in build/ — run ./build.sh first"
+            exit 1
+        fi
+        missing=0
+        for b in "${BACKENDS[@]}"; do
+            if ! find_dylib "$b" > /dev/null 2>&1; then
+                echo "ERROR: pg_jitter_$b.$EXT listed in build manifest but not found"
+                missing=1
+            fi
+        done
+        [ "$missing" -eq 1 ] && exit 1
+        ;;
+    *)
+        echo "Usage: $0 [--pg-config PATH] [sljit|asmjit|mir|all]"
+        exit 1
+        ;;
+esac
+
+echo "=== pg_jitter install ($TARGET) ==="
+echo "  Targets: ${INSTALL_DIRS[*]}"
+echo "  Backends: ${BACKENDS[*]}"
 
 for b in "${BACKENDS[@]}"; do
     src=$(find_dylib "$b")

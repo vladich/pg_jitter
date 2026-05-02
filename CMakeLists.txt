@@ -29,7 +29,7 @@ endif()
 #
 
 # ---------- Backend selection ----------
-# AsmJIT only supports arm64 and x86_64/amd64
+# AsmJIT only supports arm64 and x86_64/amd64.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|x86_64|AMD64|amd64")
     set(_default_backends "sljit;asmjit;mir")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
@@ -203,11 +203,15 @@ if(PG_JITTER_BUILD_MIR)
     if(NOT EXISTS "${MIR_DIR}/mir-gen-x86_64.c")
         message(FATAL_ERROR "MIR x86_64 generator source not found at ${MIR_DIR}/mir-gen-x86_64.c. Set -DMIR_DIR=/path/to/mir")
     endif()
+    if(NOT EXISTS "${MIR_DIR}/mir-gen-aarch64.c")
+        message(FATAL_ERROR "MIR AArch64 generator source not found at ${MIR_DIR}/mir-gen-aarch64.c. Set -DMIR_DIR=/path/to/mir")
+    endif()
     file(READ "${MIR_DIR}/mir.h" _pg_jitter_mir_header)
     file(READ "${MIR_DIR}/mir-gen.c" _pg_jitter_mir_gen)
     file(READ "${MIR_DIR}/mir-gen-x86_64.c" _pg_jitter_mir_gen_x86_64)
+    file(READ "${MIR_DIR}/mir-gen-aarch64.c" _pg_jitter_mir_gen_aarch64)
     set(_pg_jitter_mir_text
-        "${_pg_jitter_mir_header}\n${_pg_jitter_mir_gen}\n${_pg_jitter_mir_gen_x86_64}")
+        "${_pg_jitter_mir_header}\n${_pg_jitter_mir_gen}\n${_pg_jitter_mir_gen_x86_64}\n${_pg_jitter_mir_gen_aarch64}")
     if(NOT _pg_jitter_mir_text MATCHES "MIR_UEXT32")
         message(FATAL_ERROR
             "MIR at ${MIR_DIR} lacks patched unsigned-extension opcodes "
@@ -226,6 +230,14 @@ if(PG_JITTER_BUILD_MIR)
                 "required by pg_jitter. Use the patched MIR tree or set -DMIR_DIR.")
         endif()
         unset(_pg_jitter_mir_cmake)
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
+       AND _pg_jitter_mir_gen_aarch64 MATCHES "char[ \t]+ch,[ \t]+ch2,[ \t]+start_ch,[ \t]+d;")
+        message(FATAL_ERROR
+            "MIR at ${MIR_DIR} has the AArch64 unsigned-char pattern parser bug "
+            "that can hang or crash during code generation. Apply "
+            "patches/mir-aarch64-hex-value-sentinel.patch or set -DMIR_DIR to "
+            "a patched MIR tree.")
     endif()
     include(CheckCSourceCompiles)
     set(_pg_jitter_save_required_includes "${CMAKE_REQUIRED_INCLUDES}")
@@ -252,6 +264,7 @@ if(PG_JITTER_BUILD_MIR)
     unset(_pg_jitter_mir_header)
     unset(_pg_jitter_mir_gen)
     unset(_pg_jitter_mir_gen_x86_64)
+    unset(_pg_jitter_mir_gen_aarch64)
     unset(_pg_jitter_mir_text)
     message(STATUS "MIR directory:      ${MIR_DIR}")
 endif()
@@ -318,6 +331,13 @@ function(pg_jitter_apply_exports TARGET_NAME)
         file(APPEND "${_export_file}" "  local:\n    *;\n};\n")
         target_link_options(${TARGET_NAME} PRIVATE
             "-Wl,--version-script=${_export_file}")
+    elseif(WIN32 AND PG_VERSION_NUM LESS 160000)
+        set(_export_file "${_export_dir}/${TARGET_NAME}.def")
+        file(WRITE "${_export_file}" "EXPORTS\n")
+        foreach(_sym IN LISTS _symbols)
+            file(APPEND "${_export_file}" "  ${_sym}\n")
+        endforeach()
+        target_sources(${TARGET_NAME} PRIVATE "${_export_file}")
     endif()
 endfunction()
 

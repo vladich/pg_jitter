@@ -89,5 +89,8 @@ cmake "$SCRIPT_DIR" "${CMAKE_ARGS[@]}" "${CMAKE_EXTRA_ARGS[@]}"
 
 cmake --build . --parallel "$JOBS"
 
+sed -n 's/^PG_JITTER_BACKENDS:STRING=//p' CMakeCache.txt | tr ';' ' ' \
+    > pg_jitter_backends.txt
+
 echo ""
 echo "=== Done ==="

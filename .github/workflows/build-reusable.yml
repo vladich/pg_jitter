@@ -18,21 +18,23 @@ jobs:
       - uses: actions/checkout@v4
 
       # ---- PostgreSQL: running server + pg_config on PATH ----
-      - name: Setup PostgreSQL
+      - name: Setup PostgreSQL (Unix)
+        if: runner.os != 'Windows'
+        id: postgres_unix
+        shell: bash
+        run: ./ci/github-actions.sh setup-postgres --postgres-version "${{ inputs.postgres-version }}"
+
+      - name: Setup PostgreSQL (Windows)
+        if: runner.os == 'Windows'
         uses: ikalnytskyi/action-setup-postgres@v8
         with:
           postgres-version: "${{ inputs.postgres-version }}"
-        id: postgres
+        id: postgres_windows
 
-      # Ubuntu: action provides server but not dev headers
-      - name: Install PostgreSQL dev headers (Ubuntu)
-        if: startsWith(inputs.os, 'ubuntu')
+      - name: Export PostgreSQL connection
+        shell: bash
         run: |
-          sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-server-dev-${{ inputs.postgres-version }}
+          echo "CONNURI=${{ steps.postgres_unix.outputs.connection-uri }}${{ steps.postgres_windows.outputs.connection-uri }}" >> "$GITHUB_ENV"
 
       # macOS: PG headers include <libintl.h> which comes from gettext
       - name: Install gettext (macOS)
@@ -43,61 +45,12 @@ jobs:
 
       - name: Verify pg_config
         shell: bash
-        run: |
-          pg_config --version
-          echo "includedir-server: $(pg_config --includedir-server)"
-          echo "includedir:        $(pg_config --includedir)"
-          echo "pkglibdir:         $(pg_config --pkglibdir)"
+        run: ./ci/github-actions.sh verify-pg-config --postgres-version "${{ inputs.postgres-version }}"
 
       # ---- Clone dependencies ----
-      - name: Clone sljit
-        uses: actions/checkout@v4
-        with:
-          repository: vladich/sljit
-          path: deps/sljit
-
-      - name: Clone AsmJIT
-        uses: actions/checkout@v4
-        with:
-          repository: asmjit/asmjit
-          path: deps/asmjit
-
-      - name: Clone MIR
-        uses: actions/checkout@v4
-        with:
-          repository: vladich/mir-patched
-          path: deps/mir
-
-      - name: Clone StringZilla
-        uses: actions/checkout@v4
-        with:
-          repository: ashvardanian/StringZilla
-          path: deps/stringzilla
-
-      # ---- yyjson (PostgreSQL JSON syntax helpers) ----
-      - name: Clone yyjson
-        if: runner.os != 'Windows'
-        uses: actions/checkout@v4
-        with:
-          repository: ibireme/yyjson
-          ref: f0fbeae7cc40218fd1af310391cdf83cfc1abff1
-          path: deps/yyjson
-
-      - name: Patch yyjson
-        if: runner.os != 'Windows'
+      - name: Prepare dependencies
         shell: bash
-        run: |
-          git -C deps/yyjson apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/yyjson-pg-jitter.patch"
-          git -C deps/yyjson diff --check
-
-      # ---- PCRE2 (Unicode-aware regex/LIKE with JIT) ----
-      - name: Clone PCRE2
-        if: runner.os != 'Windows'
-        uses: actions/checkout@v4
-        with:
-          repository: PCRE2Project/pcre2
-          path: deps/pcre2
-          submodules: true
+        run: ./ci/github-actions.sh prepare-deps --postgres-version "${{ inputs.postgres-version }}"
 
       - name: Cache PCRE2 build
         if: runner.os != 'Windows'
@@ -110,44 +63,14 @@ jobs:
       - name: Build PCRE2
         if: runner.os != 'Windows' && steps.cache-pcre2.outputs.cache-hit != 'true'
         shell: bash
-        run: |
-          cd deps/pcre2
-          mkdir -p build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPCRE2_SUPPORT_JIT=ON \
-            -DPCRE2_SUPPORT_UNICODE=ON \
-            -DPCRE2_BUILD_PCRE2_8=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DPCRE2_BUILD_PCRE2GREP=OFF \
-            -DPCRE2_BUILD_TESTS=OFF \
-            -DPCRE2_STATIC_PIC=ON
-          cmake --build . --target pcre2-8-static -j 2
-          echo "PCRE2 library:"
-          ls -la libpcre2-8.a
+        run: ./ci/github-actions.sh build-pcre2 --postgres-version "${{ inputs.postgres-version }}"
 
       # ---- Clone PostgreSQL source for regression tests ----
       # Pin to the exact minor version to avoid test expectation mismatches
       # (e.g., Homebrew may ship 17.8 while REL_17_STABLE is already at 17.9)
-      - name: Determine PostgreSQL version tag
-        id: pg_version
+      - name: Prepare PostgreSQL source
         shell: bash
-        run: |
-          PG_FULL=$(pg_config --version)
-          # Extract e.g. "17.8" from "PostgreSQL 17.8 (Homebrew)"
-          PG_VER=$(echo "$PG_FULL" | sed -E 's/PostgreSQL ([0-9]+\.[0-9]+).*/\1/')
-          # Convert "17.8" → "REL_17_8"
-          PG_TAG="REL_$(echo "$PG_VER" | tr '.' '_')"
-          echo "pg_tag=$PG_TAG" >> "$GITHUB_OUTPUT"
-          echo "PostgreSQL version: $PG_FULL → tag: $PG_TAG"
-
-      - name: Clone PostgreSQL source
-        uses: actions/checkout@v4
-        with:
-          repository: postgres/postgres
-          ref: ${{ steps.pg_version.outputs.pg_tag }}
-          path: postgres-src
-          fetch-depth: 1
+        run: ./ci/github-actions.sh prepare-postgres-source --postgres-version "${{ inputs.postgres-version }}"
 
       # ---- MSVC environment (Windows) ----
       # Must come before build so cl.exe / link.exe are on PATH
@@ -159,17 +82,7 @@ jobs:
       - name: Build (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          EXTRA_ARGS="-DSLJIT_DIR=${{ github.workspace }}/deps/sljit"
-          EXTRA_ARGS="$EXTRA_ARGS -DASMJIT_DIR=${{ github.workspace }}/deps/asmjit"
-          EXTRA_ARGS="$EXTRA_ARGS -DMIR_DIR=${{ github.workspace }}/deps/mir"
-          EXTRA_ARGS="$EXTRA_ARGS -DSTRINGZILLA_DIR=${{ github.workspace }}/deps/stringzilla"
-          EXTRA_ARGS="$EXTRA_ARGS -DPCRE2_DIR=${{ github.workspace }}/deps/pcre2"
-          EXTRA_ARGS="$EXTRA_ARGS -DYYJSON_DIR=${{ github.workspace }}/deps/yyjson"
-          if [[ -n "${GETTEXT_INCLUDE:-}" ]]; then
-            EXTRA_ARGS="$EXTRA_ARGS -DCMAKE_C_FLAGS=$GETTEXT_INCLUDE -DCMAKE_CXX_FLAGS=$GETTEXT_INCLUDE"
-          fi
-          ./build.sh all $EXTRA_ARGS
+        run: ./ci/github-actions.sh build-unix --postgres-version "${{ inputs.postgres-version }}"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -180,7 +93,7 @@ jobs:
       - name: Install pg_jitter (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: sudo ./install.sh --pg-config "$(command -v pg_config)" all
+        run: ./ci/github-actions.sh install-unix --postgres-version "${{ inputs.postgres-version }}"
 
       - name: Install pg_jitter (Windows)
         if: runner.os == 'Windows'
@@ -191,10 +104,16 @@ jobs:
           call install.cmd --pg-config "%ProgramFiles%\PostgreSQL\${{ inputs.postgres-version }}\bin\pg_config.exe" asmjit
 
       # ---- Configure JIT and restart PostgreSQL ----
-      - name: Configure and restart PostgreSQL
+      - name: Configure and restart PostgreSQL (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./ci/github-actions.sh configure-postgres --postgres-version "${{ inputs.postgres-version }}"
+
+      - name: Configure and restart PostgreSQL (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
-          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          CONNURI="${CONNURI:?CONNURI not set}"
           PGDATA=$(psql -t -A -c "SHOW data_directory;" "$CONNURI")
           echo "PGDATA: $PGDATA"
           pg_ctl -D "$PGDATA" stop -m fast
@@ -210,34 +129,7 @@ jobs:
       - name: Build regression test libraries
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          PGSRC="${{ github.workspace }}/postgres-src"
-          DLPATH="$PGSRC/src/test/regress"
-          INCSERVER="$(pg_config --includedir-server)"
-          INC="$(pg_config --includedir)"
-
-          # Sources: core regress helper + contrib/spi libraries used by the triggers test
-          # refint.c needs -DREFINT_VERBOSE to emit NOTICE messages expected by triggers.out
-          SOURCES="src/test/regress/regress.c contrib/spi/autoinc.c contrib/spi/refint.c contrib/spi/insert_username.c contrib/spi/moddatetime.c"
-
-          cd "$PGSRC"
-          for src in $SOURCES; do
-            base=$(basename "$src" .c)
-            EXTRA_CFLAGS=""
-            if [[ "$base" == "refint" ]]; then
-              EXTRA_CFLAGS="-DREFINT_VERBOSE"
-            fi
-            cc -fPIC -I"$INCSERVER" -I"$INC" ${GETTEXT_INCLUDE:-} $EXTRA_CFLAGS -c "$src" -o "$base.o"
-            if [[ "$(uname)" == "Darwin" ]]; then
-              cc -bundle -undefined dynamic_lookup "$base.o" -o "$DLPATH/$base.dylib"
-              # Some PG versions on macOS use .so instead of .dylib
-              cp "$DLPATH/$base.dylib" "$DLPATH/$base.so"
-            else
-              cc -shared "$base.o" -o "$DLPATH/$base.so"
-            fi
-          done
-          echo "Built libraries:"
-          ls "$DLPATH"/*.so "$DLPATH"/*.dylib 2>/dev/null || true
+        run: ./ci/github-actions.sh build-regress-libs --postgres-version "${{ inputs.postgres-version }}"
 
       - name: Build regression test libraries (Windows)
         if: runner.os == 'Windows'
@@ -278,10 +170,16 @@ jobs:
           ls "$DLPATH"/*.dll 2>/dev/null || true
 
       # ---- Regression tests for each backend ----
-      - name: Run regression tests
+      - name: Run regression tests (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./ci/github-actions.sh run-regression-tests --postgres-version "${{ inputs.postgres-version }}"
+
+      - name: Run regression tests (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
-          CONNURI="${{ steps.postgres.outputs.connection-uri }}"
+          CONNURI="${CONNURI:?CONNURI not set}"
           PG_MAJOR="${{ inputs.postgres-version }}"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             # MIR backend has pre-existing code-gen bugs on Windows — skip it
