@@ -166,6 +166,30 @@ apt_retry() {
     return 1
 }
 
+free_tcp_port() {
+    local port
+
+    for port in 55432 55433 55434 55435 55436 55437 55438 55439 55440; do
+        if command -v ss >/dev/null 2>&1; then
+            if ! ss -ltn "sport = :$port" | grep -q ":$port"; then
+                printf '%s\n' "$port"
+                return 0
+            fi
+        elif command -v lsof >/dev/null 2>&1; then
+            if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+                printf '%s\n' "$port"
+                return 0
+            fi
+        else
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+
+    echo "No free PostgreSQL test port found" >&2
+    exit 1
+}
+
 safe_remove_dir() {
     local dir="$1"
 
@@ -183,7 +207,7 @@ setup_postgres() {
 
     version="$(pg_major)"
     os="$(runner_os)"
-    port="${PGPORT:-5432}"
+    port="${PGPORT:-$(free_tcp_port)}"
     pgdata="${GHA_PGDATA:-/tmp/pg_jitter_gha_pg${version}_${port}}"
 
     case "$os" in
@@ -196,7 +220,9 @@ setup_postgres() {
                 sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
             apt_retry update -qq
             apt_retry install -y -qq "postgresql-$version" "postgresql-server-dev-$version"
+            sudo pg_ctlcluster "$version" main stop >/dev/null 2>&1 || true
             sudo systemctl stop postgresql.service >/dev/null 2>&1 || true
+            sudo service postgresql stop >/dev/null 2>&1 || true
             pg_bindir="$(/usr/lib/postgresql/$version/bin/pg_config --bindir)"
             ;;
         macOS)
@@ -229,7 +255,11 @@ setup_postgres() {
         echo "port = $port"
     } >> "$pgdata/postgresql.conf"
 
-    "$pg_bindir/pg_ctl" -D "$pgdata" start -l "$pgdata/logfile" -w
+    if ! "$pg_bindir/pg_ctl" -D "$pgdata" start -l "$pgdata/logfile" -w; then
+        echo "PostgreSQL failed to start; log follows:" >&2
+        cat "$pgdata/logfile" >&2 || true
+        exit 1
+    fi
     connuri="postgresql://postgres:postgres@localhost:${port}/postgres"
 
     write_github_env CONNURI "$connuri"
