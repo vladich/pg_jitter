@@ -17,6 +17,7 @@ PG_CONFIG_PATH="${PG_CONFIG:-pg_config}"
 CONNURI="${CONNURI:-}"
 PG_SRC="${PG_SRC:-$WORKSPACE/postgres-src}"
 SKIP_SETUP=0
+MIR_REF="717efbd196c38d1680f7e4b06c976b08e0fc9271"
 
 usage() {
     cat <<EOF
@@ -84,6 +85,20 @@ elif command -v "$PG_CONFIG_PATH" >/dev/null 2>&1; then
 fi
 if [ -x "$PG_CONFIG_PATH" ]; then
     export PATH="$(dirname "$PG_CONFIG_PATH"):$PATH"
+    PG_LIBDIR="$("$PG_CONFIG_PATH" --libdir 2>/dev/null || true)"
+    if [ -n "$PG_LIBDIR" ]; then
+        case "$(uname -s)" in
+            Darwin)
+                export DYLD_LIBRARY_PATH="$PG_LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+                ;;
+            MINGW*|MSYS*|CYGWIN*)
+                export PATH="$PG_LIBDIR:$PATH"
+                ;;
+            *)
+                export LD_LIBRARY_PATH="$PG_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                ;;
+        esac
+    fi
 fi
 
 pg_major() {
@@ -250,7 +265,7 @@ prepare_deps() {
     mkdir -p "$WORKSPACE/deps"
     clone_repo vladich/sljit "$WORKSPACE/deps/sljit"
     clone_repo asmjit/asmjit "$WORKSPACE/deps/asmjit"
-    clone_repo vladich/mir-patched "$WORKSPACE/deps/mir"
+    clone_repo vladich/mir-patched "$WORKSPACE/deps/mir" "$MIR_REF"
     clone_repo ashvardanian/StringZilla "$WORKSPACE/deps/stringzilla"
 
     if [ "$(runner_os)" != "Windows" ]; then
