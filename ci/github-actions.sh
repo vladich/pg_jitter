@@ -253,6 +253,7 @@ setup_postgres() {
     {
         echo "listen_addresses = 'localhost'"
         echo "port = $port"
+        echo "unix_socket_directories = '$pgdata'"
     } >> "$pgdata/postgresql.conf"
 
     if ! "$pg_bindir/pg_ctl" -D "$pgdata" start -l "$pgdata/logfile" -w; then
