@@ -112,6 +112,13 @@ library_extension() {
     printf '%s\n' "$ext"
 }
 
+default_in_hash_expected() {
+    case "$(uname -m | tr '[:upper:]' '[:lower:]')" in
+        x86_64|amd64) printf 'crc32\n' ;;
+        *) printf 'pg\n' ;;
+    esac
+}
+
 sql_literal() {
     printf '%s' "$1" | sed "s/'/''/g"
 }
@@ -362,6 +369,36 @@ $JIT_SETTINGS
     simd_inlist_settings=""
     if [ "$backend" = "sljit" ]; then
         simd_inlist_settings="SET pg_jitter.in_simd_max = 64;"
+    fi
+    crc32_inlist_settings=""
+    if [ "$backend" = "sljit" ]; then
+        crc32_inlist_settings="SET pg_jitter.in_hash = 'crc32';"
+    fi
+
+    if [ "$backend" = "sljit" ]; then
+        expected_in_hash="$(default_in_hash_expected)"
+        set +e
+        default_in_hash_out="$(printf '%s\nSELECT count(*) FROM generate_series(1, 8) AS g WHERE g + 0 > 0;\nSHOW pg_jitter.in_hash;\n' "$backend_jit_settings" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+        default_in_hash_rc=$?
+        set -e
+
+        if ! server_ready; then
+            echo "FAIL: default IN-list hash policy crashed or wedged the server"
+            printf '%s\n' "$default_in_hash_out" | sed -n '1,80p'
+            FAIL=$((FAIL + 1))
+        elif [ "$default_in_hash_rc" -ne 0 ]; then
+            echo "FAIL: default IN-list hash policy could not be read"
+            printf '%s\n' "$default_in_hash_out" | sed -n '1,80p'
+            FAIL=$((FAIL + 1))
+        else
+            default_in_hash_out="$(printf '%s\n' "$default_in_hash_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+            if [ "$default_in_hash_out" != "$expected_in_hash" ]; then
+                echo "FAIL: default pg_jitter.in_hash expected $expected_in_hash, got $default_in_hash_out"
+                FAIL=$((FAIL + 1))
+            else
+                echo "PASS: default IN-list hash policy is $expected_in_hash"
+            fi
+        fi
     fi
 
     overflow_sql="$backend_jit_settings
@@ -688,6 +725,7 @@ $third_party_counter_sql
 	  ('sword'),
 	  ('words'),
 	  ('Alpha123omega'),
+	  ('alpha_123omega'),
 	  (repeat('x', 260) || 'alpha123omega' || repeat('y', 260)),
 	  ('abb'),
 	  ('aba'),
@@ -699,6 +737,7 @@ $third_party_counter_sql
 	       v LIKE 'a_c' AS like_single,
 	       v LIKE 'abc%' AS like_prefix,
 	       v LIKE '%bc' AS like_suffix,
+	       v LIKE '%alpha\_123%' AS like_escaped_floating,
 	       v ILIKE 'alpha123%' AS ilike_prefix,
 	       v ~ '^a.c$' AS regex_dot,
 	       v ~ 'a$' AS regex_hard_end,
@@ -714,6 +753,7 @@ $third_party_counter_reset_sql
 	       v LIKE 'a_c' AS like_single,
 	       v LIKE 'abc%' AS like_prefix,
 	       v LIKE '%bc' AS like_suffix,
+	       v LIKE '%alpha\_123%' AS like_escaped_floating,
 	       v ILIKE 'alpha123%' AS ilike_prefix,
 	       v ~ '^a.c$' AS regex_dot,
 	       v ~ 'a$' AS regex_hard_end,
@@ -1085,6 +1125,117 @@ FROM checks;"
 	            echo "PASS: integer IN-list edge cases match PostgreSQL"
 	        fi
 	    fi
+
+    inlist_policy_sql="$backend_jit_settings
+SET pg_jitter.in_hash = 'pg';
+SET pg_jitter.in_bsearch_max = 128;
+SET pg_jitter.in_text_hash = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_inlist_policy_vals(v int4);
+INSERT INTO pg_jitter_inlist_policy_vals
+SELECT g::int4 FROM generate_series(-5, 6000) AS g;
+INSERT INTO pg_jitter_inlist_policy_vals VALUES (NULL), (-2147483648);
+WITH checks(name, ok) AS (
+  VALUES
+    ('pg_fallback_129',
+     (SELECT count(*) = 129
+      FROM pg_jitter_inlist_policy_vals
+      WHERE v + 0 = ANY ($(int4_array_1_to_n 129)))),
+    ('pg_fallback_4096',
+     (SELECT count(*) = 4096
+      FROM pg_jitter_inlist_policy_vals
+      WHERE v + 0 = ANY ($(int4_array_1_to_n 4096)))),
+    ('pg_fallback_4097',
+     (SELECT count(*) = 4097
+      FROM pg_jitter_inlist_policy_vals
+      WHERE v + 0 = ANY ($(int4_array_1_to_n 4097)))),
+    ('pg_fallback_int32_min',
+     (SELECT count(*) = 5001
+      FROM pg_jitter_inlist_policy_vals
+      WHERE v + 0 = ANY ($(int4_array_min_and_1_to_n 5000)))),
+    ('pg_fallback_not_in',
+     (SELECT count(*) = 1910
+      FROM pg_jitter_inlist_policy_vals
+      WHERE v + 0 <> ALL ($(int4_array_1_to_n 4097))))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+    set +e
+    inlist_policy_out="$(printf '%s\n' "$inlist_policy_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+    inlist_policy_rc=$?
+    set -e
+
+    if ! server_ready; then
+        echo "FAIL: PostgreSQL fallback IN-list policy crashed or wedged the server"
+        printf '%s\n' "$inlist_policy_out" | sed -n '1,80p'
+        FAIL=$((FAIL + 1))
+    elif [ "$inlist_policy_rc" -ne 0 ]; then
+        echo "FAIL: PostgreSQL fallback IN-list policy raised an unexpected SQL error"
+        printf '%s\n' "$inlist_policy_out" | sed -n '1,120p'
+        FAIL=$((FAIL + 1))
+    else
+        inlist_policy_out="$(printf '%s\n' "$inlist_policy_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+        if [ "$inlist_policy_out" != "ok" ]; then
+            echo "FAIL: PostgreSQL fallback IN-list policy checks failed: $inlist_policy_out"
+            FAIL=$((FAIL + 1))
+        else
+            echo "PASS: PostgreSQL fallback IN-list policy matches PostgreSQL"
+        fi
+    fi
+
+    if [ -n "$crc32_inlist_settings" ]; then
+        inlist_crc32_sql="$backend_jit_settings
+$crc32_inlist_settings
+SET pg_jitter.in_bsearch_max = 128;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pg_jitter_inlist_crc32_vals(v int4);
+INSERT INTO pg_jitter_inlist_crc32_vals
+SELECT g::int4 FROM generate_series(-5, 6000) AS g;
+INSERT INTO pg_jitter_inlist_crc32_vals VALUES (NULL), (-2147483648);
+WITH checks(name, ok) AS (
+  VALUES
+    ('crc32_4097',
+     (SELECT count(*) = 4097
+      FROM pg_jitter_inlist_crc32_vals
+      WHERE v + 0 = ANY ($(int4_array_1_to_n 4097)))),
+    ('crc32_int32_min',
+     (SELECT count(*) = 5001
+      FROM pg_jitter_inlist_crc32_vals
+      WHERE v + 0 = ANY ($(int4_array_min_and_1_to_n 5000)))),
+    ('crc32_not_in',
+     (SELECT count(*) = 1910
+      FROM pg_jitter_inlist_crc32_vals
+      WHERE v + 0 <> ALL ($(int4_array_1_to_n 4097))))
+)
+SELECT COALESCE(string_agg(name, ', ' ORDER BY name) FILTER (WHERE NOT ok), 'ok')
+FROM checks;"
+
+        set +e
+        inlist_crc32_out="$(printf '%s\n' "$inlist_crc32_sql" | psql_cmd -q -t -A -v ON_ERROR_STOP=1 2>&1)"
+        inlist_crc32_rc=$?
+        set -e
+
+        if ! server_ready; then
+            echo "FAIL: SLJIT CRC32 IN-list policy crashed or wedged the server"
+            printf '%s\n' "$inlist_crc32_out" | sed -n '1,80p'
+            FAIL=$((FAIL + 1))
+        elif [ "$inlist_crc32_rc" -ne 0 ]; then
+            echo "FAIL: SLJIT CRC32 IN-list policy raised an unexpected SQL error"
+            printf '%s\n' "$inlist_crc32_out" | sed -n '1,120p'
+            FAIL=$((FAIL + 1))
+        else
+            inlist_crc32_out="$(printf '%s\n' "$inlist_crc32_out" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+            if [ "$inlist_crc32_out" != "ok" ]; then
+                echo "FAIL: SLJIT CRC32 IN-list policy checks failed: $inlist_crc32_out"
+                FAIL=$((FAIL + 1))
+            else
+                echo "PASS: SLJIT CRC32 IN-list opt-in matches PostgreSQL"
+            fi
+        fi
+    fi
 
 	    partial_bitmap_sql="$backend_jit_settings
 	SET enable_indexscan = off;

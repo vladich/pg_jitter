@@ -79,14 +79,17 @@ int pg_jitter_deform_avx512_min_cols = DEFORM_AVX512_MIN_COLS_DEFAULT;
 /* GUC: pg_jitter.min_expr_steps — skip JIT for expressions with fewer steps */
 int pg_jitter_min_expr_steps = 4;
 
-/* GUC: pg_jitter.in_hash — hash table strategy for large IN lists */
-int pg_jitter_in_hash_strategy = IN_HASH_CRC32;
+/* GUC: pg_jitter.in_hash — strategy for IN lists above in_bsearch_max */
+int pg_jitter_in_hash_strategy = IN_HASH_DEFAULT;
 
 /* GUC: pg_jitter.in_bsearch_max — max IN list size for inline bsearch tree */
 int pg_jitter_in_bsearch_max = IN_BSEARCH_MAX_DEFAULT;
 
 /* GUC: pg_jitter.in_simd_max — max IN list size for SIMD linear scan */
 int pg_jitter_in_simd_max = IN_SIMD_MAX_DEFAULT;
+
+/* GUC: pg_jitter.in_text_hash — opt-in text IN-list hash table */
+bool pg_jitter_in_text_hash = false;
 
 PG_FUNCTION_INFO_V1(pg_jitter_reset_third_party_counters);
 
@@ -456,6 +459,54 @@ int pg_jitter_get_min_expr_steps(void) {
   return pg_jitter_min_expr_steps;
 }
 
+int pg_jitter_get_in_hash_strategy(void) {
+  const char *val = GetConfigOption("pg_jitter.in_hash", true, false);
+
+  if (val != NULL) {
+    if (strcmp(val, "pg") == 0)
+      return IN_HASH_PG;
+    if (strcmp(val, "crc32") == 0)
+      return IN_HASH_CRC32;
+  }
+
+  return pg_jitter_in_hash_strategy;
+}
+
+int pg_jitter_get_in_bsearch_max(void) {
+  const char *val = GetConfigOption("pg_jitter.in_bsearch_max", true, false);
+
+  if (val != NULL) {
+    long parsed = strtol(val, NULL, 10);
+
+    if (parsed < 0)
+      return 0;
+    if (parsed > IN_BSEARCH_MAX_DEFAULT)
+      return IN_BSEARCH_MAX_DEFAULT;
+    return (int)parsed;
+  }
+
+  return pg_jitter_in_bsearch_max;
+}
+
+bool pg_jitter_get_in_text_hash(void) {
+  const char *val = GetConfigOption("pg_jitter.in_text_hash", true, false);
+
+  if (val != NULL) {
+    if (pg_strcasecmp(val, "on") == 0 ||
+        pg_strcasecmp(val, "true") == 0 ||
+        pg_strcasecmp(val, "yes") == 0 ||
+        strcmp(val, "1") == 0)
+      return true;
+    if (pg_strcasecmp(val, "off") == 0 ||
+        pg_strcasecmp(val, "false") == 0 ||
+        pg_strcasecmp(val, "no") == 0 ||
+        strcmp(val, "0") == 0)
+      return false;
+  }
+
+  return pg_jitter_in_text_hash;
+}
+
 bool pg_jitter_in_raw_datum_bsearch_safe(PGFunction fn) {
   /*
    * The generated IN-list bsearch compares the Datum bit pattern directly and
@@ -477,6 +528,18 @@ bool pg_jitter_in_int32_hash_safe(PGFunction fn) {
    */
   return fn == int2eq || fn == int4eq || fn == date_eq ||
          fn == chareq || fn == oideq;
+}
+
+static int pg_jitter_raw_datum_cmp(const void *a, const void *b) {
+  int64 av = (int64)*(const Datum *)a;
+  int64 bv = (int64)*(const Datum *)b;
+
+  return (av > bv) - (av < bv);
+}
+
+void pg_jitter_sort_raw_datums(Datum *vals, int nvals) {
+  if (vals != NULL && nvals > 1)
+    qsort(vals, nvals, sizeof(Datum), pg_jitter_raw_datum_cmp);
 }
 
 bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
@@ -5913,6 +5976,9 @@ pg_jitter_setup_shared_in_hash(ExprState *state,
 {
 #if PG_VERSION_NUM >= 150000
   PgJitterContext *ctx = NULL;
+
+  if (!pg_jitter_get_in_text_hash())
+    return;
 
   if (state && state->parent && state->parent->state->es_jit)
     ctx = (PgJitterContext *)state->parent->state->es_jit;

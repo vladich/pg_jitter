@@ -323,10 +323,12 @@ _PG_jit_provider_init(JitProviderCallbacks *cb) {
         {"crc32", IN_HASH_CRC32, false},
         {NULL, 0, false}};
     DefineCustomEnumVariable("pg_jitter.in_hash",
-                             "Hash table strategy for large IN lists (> 128 elements): "
-                             "pg (built-in Jenkins), crc32 (CRC32C open-addressing)",
+                             "SLJIT strategy hint for integer IN lists larger "
+                             "than pg_jitter.in_bsearch_max: pg (PostgreSQL "
+                             "hashed scalar-array op), crc32 (CRC32C "
+                             "open-addressing; default on x86_64)",
                              NULL, &pg_jitter_in_hash_strategy,
-                             IN_HASH_CRC32, in_hash_options,
+                             IN_HASH_DEFAULT, in_hash_options,
                              PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
                              NULL, NULL, NULL);
   }
@@ -335,7 +337,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb) {
     DefineCustomIntVariable(
         "pg_jitter.in_bsearch_max",
         "Max IN list elements for inline binary search tree. "
-        "Larger lists use CRC32 hash probe. 0 disables inline bsearch.",
+        "Larger lists use pg_jitter.in_hash. 0 disables inline bsearch.",
         NULL, &pg_jitter_in_bsearch_max,
         IN_BSEARCH_MAX_DEFAULT,
         0,    /* minimum: 0 = disable */
@@ -352,6 +354,17 @@ _PG_jit_provider_init(JitProviderCallbacks *cb) {
         NULL, &pg_jitter_in_simd_max,
         IN_SIMD_MAX_DEFAULT,
         0, 64,
+        PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
+        NULL, NULL, NULL);
+  }
+
+  if (!GetConfigOption("pg_jitter.in_text_hash", true, false)) {
+    DefineCustomBoolVariable(
+        "pg_jitter.in_text_hash",
+        "Use pg_jitter's experimental text IN-list hash table. "
+        "When off, text HASHED_SCALARARRAYOP uses PostgreSQL's native path.",
+        NULL, &pg_jitter_in_text_hash,
+        false,
         PGC_USERSET, GUC_ALLOW_IN_PARALLEL,
         NULL, NULL, NULL);
   }
@@ -7546,6 +7559,15 @@ no_shared_code_reuse:
       int nvals = 0;
       bool array_has_nulls = false;
       TextHashTable *text_ht = NULL;
+      int in_hash_strategy = pg_jitter_get_in_hash_strategy();
+      int in_bsearch_max = pg_jitter_get_in_bsearch_max();
+      bool in_text_hash = pg_jitter_get_in_text_hash();
+      bool crc32_hash_enabled =
+          !sljit_shared_code_mode &&
+          in_hash_strategy == IN_HASH_CRC32 &&
+          pg_jitter_in_int32_hash_safe(
+              op->d.hashedscalararrayop.finfo->fn_addr);
+      int in_extract_max = crc32_hash_enabled ? 16384 : in_bsearch_max;
 
       if (eq_dfn && eq_dfn->jit_fn &&
           pg_jitter_in_raw_datum_bsearch_safe(
@@ -7571,7 +7593,7 @@ no_shared_code_reuse:
             get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval,
                                  &typalign);
 
-            if (typbyval && nitems > 0 && nitems <= 16384) {
+            if (typbyval && nitems > 0 && nitems <= in_extract_max) {
               /*
                * Extract all values. Check for NULLs.
                */
@@ -7601,20 +7623,7 @@ no_shared_code_reuse:
                 }
               }
 
-              /*
-               * Sort values for binary search.
-               * Simple insertion sort — at most 64
-               * elements at compile time.
-               */
-              for (int a = 1; a < nvals; a++) {
-                Datum tmp = sorted_vals[a];
-                int b = a - 1;
-                while (b >= 0 && (int64)sorted_vals[b] > (int64)tmp) {
-                  sorted_vals[b + 1] = sorted_vals[b];
-                  b--;
-                }
-                sorted_vals[b + 1] = tmp;
-              }
+              pg_jitter_sort_raw_datums(sorted_vals, nvals);
             }
             if ((Pointer)arr != DatumGetPointer(array_datum))
               pfree(arr);
@@ -7631,7 +7640,7 @@ no_shared_code_reuse:
        * (overwriting the const array datum). Workers rebuild the table
        * via pg_jitter_setup_shared_in_hash() after DSM attachment.
        */
-      if (!sorted_vals) {
+      if (!sorted_vals && in_text_hash) {
         Expr *arrayarg_t = (Expr *)lsecond(saop->args);
 
         if (IsA(arrayarg_t, Const)) {
@@ -7815,9 +7824,9 @@ no_shared_code_reuse:
 
         pfree(found_jumps);
         pfree(sorted_vals);
-      } else if (sorted_vals && nvals > 0 && nvals <= pg_jitter_in_bsearch_max) {
+      } else if (sorted_vals && nvals > 0 && nvals <= in_bsearch_max) {
         /*
-         * ---- Inline binary search path (up to 256 elements) ----
+         * ---- Inline binary search path (up to pg_jitter.in_bsearch_max) ----
          *
          * Emit a balanced binary search tree as inline
          * CMP + conditional branch instructions.
@@ -7879,7 +7888,7 @@ no_shared_code_reuse:
          * "not found" to patch at the end.
          */
         {
-          /* Max depth for 256 elements = 9 levels.
+          /* Max depth for 4096 elements = 13 levels.
            * Work stack needs at most 2*depth entries. */
           struct {
             int lo, hi;
@@ -8036,8 +8045,7 @@ no_shared_code_reuse:
 
         pfree(sorted_vals);
       } else if (sorted_vals && nvals > 0 && !sljit_shared_code_mode &&
-                 pg_jitter_in_int32_hash_safe(
-                     op->d.hashedscalararrayop.finfo->fn_addr)) {
+                 crc32_hash_enabled) {
         /* sorted_vals is only set for typbyval int4/int8 types.
          * Skip in shared mode: ht_table pointer is process-local. */
         /*

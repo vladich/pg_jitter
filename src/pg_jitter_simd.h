@@ -77,11 +77,13 @@ extern int32 simd_int4_array_eq(int32 val, const int32 *data, int nitems);
 extern int32 simd_int8_array_eq(int64 val, const int64 *data, int nitems);
 
 /* ================================================================
- * CRC32 open-addressing hash table for large IN lists (> 128 elements)
+ * Experimental CRC32 open-addressing hash table for int4-compatible IN lists.
  *
  * Built at JIT compile time from constant array values.
  * At runtime: crc32(val) & mask → linear probe.
- * ~3 cycles per lookup vs PG's ~30 cycles (Jenkins + chained buckets).
+ * Default on x86_64 SLJIT and opt-in elsewhere via
+ * pg_jitter.in_hash = 'crc32'. PostgreSQL's native hash path remains
+ * available via pg_jitter.in_hash = 'pg'.
  * ================================================================ */
 typedef struct Crc32HashSlot {
 	int32 value;
@@ -110,7 +112,7 @@ extern Crc32HashTable *crc32_hash_build_int4(const int32 *vals, int nvals,
 extern int32 crc32_hash_probe_int4(int32 val, int64 table_ptr);
 
 /* ================================================================
- * Runtime binary search for large IN lists (> 256 elements)
+ * Runtime binary search helper for sorted int4 IN-list constants.
  *
  * Sorted int32 array built at JIT compile time, searched at runtime.
  * O(log n) comparisons, ~15 instructions, zero code bloat.

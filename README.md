@@ -152,8 +152,9 @@ All parameters are user-settable (`SET` in session, `ALTER SYSTEM` for persisten
 |-----------|------|---------|-------------|
 | `pg_jitter.min_expr_steps` | integer | `4` | Minimum expression step count for JIT compilation. Expressions with fewer steps skip JIT and use the interpreter. Range: 0–1000. |
 | `pg_jitter.deform_cache` | boolean | `on` | Cache compiled deform functions across queries within a backend process. When off, deform is recompiled each query. |
-| `pg_jitter.in_bsearch_max` | integer | `4096` | Maximum IN-list elements for inline binary search tree. Larger integer IN-lists use CRC32 hash probe. 0 disables inline binary search. Range: 0–8192. |
-| `pg_jitter.in_hash` | enum | `crc32` | Hash table strategy for large integer IN-lists: `pg` (PG's built-in Jenkins hash), `crc32` (hardware CRC32C open-addressing). |
+| `pg_jitter.in_bsearch_max` | integer | `4096` | Maximum IN-list elements for inline binary search tree. Larger integer IN-lists use `pg_jitter.in_hash`. 0 disables inline binary search. Range: 0–4096. |
+| `pg_jitter.in_hash` | enum | `crc32` on x86_64, `pg` elsewhere | SLJIT strategy for integer IN-lists larger than `pg_jitter.in_bsearch_max`: `pg` (PostgreSQL's native hashed scalar-array path), `crc32` (hardware/software CRC32C open-addressing). Other backends use PostgreSQL's native path above the binary-search threshold. |
+| `pg_jitter.in_text_hash` | boolean | `off` | Use pg_jitter's experimental text IN-list hash table. When off, text hashed scalar-array operations use PostgreSQL's native path. |
 
 ### Adaptive Backend Selection (experimental)
 

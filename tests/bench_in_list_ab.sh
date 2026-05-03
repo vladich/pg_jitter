@@ -42,7 +42,7 @@ get_median() {
     printf '%s\n' "$@" | sort -n | sed -n "$((${#@}/2))p"
 }
 
-echo "IN_size  CRC32_ms  Bsearch_ms  Interp_ms  CRC32_spd  Bsrch_spd"
+echo "IN_size  CRC32_ms  Native_ms  Interp_ms  CRC32_spd  Native_spd"
 echo "-------  --------  ----------  ---------  ---------  ---------"
 
 for N in $SIZES; do
@@ -50,29 +50,29 @@ for N in $SIZES; do
     Q="SELECT COUNT(*) FROM bench_inlist WHERE val2 IN ($IN_LIST)"
 
     CRC="SET jit_above_cost=0; SET pg_jitter.backend='sljit'; SET pg_jitter.in_hash='crc32';"
-    BSR="SET jit_above_cost=0; SET pg_jitter.backend='sljit'; SET pg_jitter.in_hash='pg';"
+    NAT="SET jit_above_cost=0; SET pg_jitter.backend='sljit'; SET pg_jitter.in_hash='pg';"
     INT="SET jit_above_cost=1000000;"
 
     # Warmup all 3
     get_exec_time "$CRC" "$Q" > /dev/null
-    get_exec_time "$BSR" "$Q" > /dev/null
+    get_exec_time "$NAT" "$Q" > /dev/null
     get_exec_time "$INT" "$Q" > /dev/null
 
-    ct=(); bt=(); it=()
+    ct=(); nt=(); it=()
     for r in $(seq 1 $RUNS); do
         t=$(get_exec_time "$CRC" "$Q"); [ -n "$t" ] && ct+=($t)
-        t=$(get_exec_time "$BSR" "$Q"); [ -n "$t" ] && bt+=($t)
+        t=$(get_exec_time "$NAT" "$Q"); [ -n "$t" ] && nt+=($t)
         t=$(get_exec_time "$INT" "$Q"); [ -n "$t" ] && it+=($t)
     done
 
     cm=$(printf '%s\n' "${ct[@]}" | sort -n | sed -n "$((RUNS/2))p")
-    bm=$(printf '%s\n' "${bt[@]}" | sort -n | sed -n "$((RUNS/2))p")
+    nm=$(printf '%s\n' "${nt[@]}" | sort -n | sed -n "$((RUNS/2))p")
     im=$(printf '%s\n' "${it[@]}" | sort -n | sed -n "$((RUNS/2))p")
 
-    if [ -n "$cm" ] && [ -n "$bm" ] && [ -n "$im" ]; then
+    if [ -n "$cm" ] && [ -n "$nm" ] && [ -n "$im" ]; then
         cs=$(python3 -c "print(f'{float(\"$im\")/float(\"$cm\"):.2f}')")
-        bs=$(python3 -c "print(f'{float(\"$im\")/float(\"$bm\"):.2f}')")
-        printf "%-7s  %8s  %10s  %9s  %8sx  %8sx\n" "$N" "$cm" "$bm" "$im" "$cs" "$bs"
+        ns=$(python3 -c "print(f'{float(\"$im\")/float(\"$nm\"):.2f}')")
+        printf "%-7s  %8s  %9s  %9s  %8sx  %9sx\n" "$N" "$cm" "$nm" "$im" "$cs" "$ns"
     else
         printf "%-7s  FAILED\n" "$N"
     fi

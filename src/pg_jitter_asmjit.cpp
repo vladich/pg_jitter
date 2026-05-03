@@ -216,6 +216,56 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 			1000,		/* maximum */
 			PGC_USERSET,
 			GUC_ALLOW_IN_PARALLEL,
+				NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter.in_hash", true, false))
+	{
+		static const struct config_enum_entry in_hash_options[] = {
+			{"pg", IN_HASH_PG, false},
+			{"crc32", IN_HASH_CRC32, false},
+			{NULL, 0, false}};
+		DefineCustomEnumVariable(
+			"pg_jitter.in_hash",
+			"SLJIT strategy hint for integer IN lists larger than "
+			"pg_jitter.in_bsearch_max: pg (PostgreSQL hashed scalar-array op), "
+			"crc32 (CRC32C open-addressing; default on x86_64)",
+			NULL,
+			&pg_jitter_in_hash_strategy,
+			IN_HASH_DEFAULT,
+			in_hash_options,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter.in_bsearch_max", true, false))
+	{
+		DefineCustomIntVariable(
+			"pg_jitter.in_bsearch_max",
+			"Max IN list elements for inline binary search tree. "
+			"Larger lists use pg_jitter.in_hash. 0 disables inline bsearch.",
+			NULL,
+			&pg_jitter_in_bsearch_max,
+			IN_BSEARCH_MAX_DEFAULT,
+			0,
+			IN_BSEARCH_MAX_DEFAULT,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
+			NULL, NULL, NULL);
+	}
+
+	if (!GetConfigOption("pg_jitter.in_text_hash", true, false))
+	{
+		DefineCustomBoolVariable(
+			"pg_jitter.in_text_hash",
+			"Use pg_jitter's experimental text IN-list hash table. "
+			"When off, text HASHED_SCALARARRAYOP uses PostgreSQL's native path.",
+			NULL,
+			&pg_jitter_in_text_hash,
+			false,
+			PGC_USERSET,
+			GUC_ALLOW_IN_PARALLEL,
 			NULL, NULL, NULL);
 	}
 

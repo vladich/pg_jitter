@@ -295,11 +295,19 @@ extern void pg_jitter_cleanup_shared_dsm(PgJitterContext *ctx);
 #define PARALLEL_JIT_SHARED     2
 
 /* IN-list strategy for HASHED_SCALARARRAYOP */
-#define IN_HASH_PG       0  /* PG's built-in Jenkins hash probe */
+#define IN_HASH_PG       0  /* PostgreSQL native hashed scalar-array path */
 #define IN_HASH_CRC32    1  /* CRC32C open-addressing */
 
+#if defined(__x86_64__) || defined(_M_X64)
+#define IN_HASH_DEFAULT  IN_HASH_CRC32
+#else
+#define IN_HASH_DEFAULT  IN_HASH_PG
+#endif
+
 /*
- * Default threshold: ≤ this → inline bsearch tree, > this → CRC32 hash.
+ * Default threshold: <= this -> inline bsearch tree. Larger lists use
+ * pg_jitter.in_hash: CRC32 on x86_64, PostgreSQL native fallback elsewhere
+ * unless explicitly overridden.
  *
  * The hashed scalar-array SIMD linear scan is opt-in only.  PostgreSQL starts
  * using HASHED_SCALARARRAYOP for lists large enough that a linear scan loses on
@@ -319,6 +327,7 @@ extern int pg_jitter_min_expr_steps;
 extern int pg_jitter_in_hash_strategy;
 extern int pg_jitter_in_bsearch_max;
 extern int pg_jitter_in_simd_max;
+extern bool pg_jitter_in_text_hash;
 
 /*
  * x86 CPU feature checks with OS XSAVE/XCR0 validation.
@@ -345,8 +354,12 @@ extern int pg_jitter_get_parallel_mode(void);
 extern int pg_jitter_get_min_expr_steps(void);
 extern bool pg_jitter_get_deform_avx512(void);
 extern int pg_jitter_get_deform_avx512_min_cols(void);
+extern int pg_jitter_get_in_hash_strategy(void);
+extern int pg_jitter_get_in_bsearch_max(void);
+extern bool pg_jitter_get_in_text_hash(void);
 extern bool pg_jitter_in_raw_datum_bsearch_safe(PGFunction fn);
 extern bool pg_jitter_in_int32_hash_safe(PGFunction fn);
+extern void pg_jitter_sort_raw_datums(Datum *vals, int nvals);
 extern bool pg_jitter_text_hash_saop_eligible(ExprEvalStep *op,
 											  FunctionCallInfo fcinfo);
 
