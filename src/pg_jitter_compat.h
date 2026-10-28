@@ -235,4 +235,10 @@ pg_file_exists(const char *name)
 #define HAVE_EEOP_AGG_PRESORTED_DISTINCT		/* EEOP_AGG_PRESORTED_DISTINCT_SINGLE/MULTI */
 #endif
 
+#if PG_VERSION_NUM >= 190000
+#include "catalog/pg_type.h"
+#include "access/tupmacs.h"
+typedef uint8 bits8;
+#endif
+
 #endif /* PG_JITTER_COMPAT_H */

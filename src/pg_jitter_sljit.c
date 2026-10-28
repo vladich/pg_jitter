@@ -1375,6 +1375,7 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
     sljit_emit_op1(C, SLJIT_MOV_U32, SLJIT_MEM1(SLJIT_R0), slot_off, SLJIT_R3,
                    0);
 
+#if PG_VERSION_NUM < 190000
     /* tts_flags |= TTS_FLAG_SLOW */
     sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0, SLJIT_MEM1(SLJIT_R0),
                    offsetof(TupleTableSlot, tts_flags));
@@ -1382,6 +1383,7 @@ static bool sljit_emit_deform_inline(struct sljit_compiler *C, TupleDesc desc,
                    TTS_FLAG_SLOW);
     sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_MEM1(SLJIT_R0),
                    offsetof(TupleTableSlot, tts_flags), SLJIT_R1, 0);
+#endif
 
     /*
      * Write S4/S5 (tts_values/tts_isnull) to the slot cache area

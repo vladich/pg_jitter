@@ -1,0 +1,11 @@
+name: "PG 19 \xB7 Linux x86_64"
+on:
+  push:
+    branches: [master, pg19]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore', 'img/**', 'bench/**']
+jobs:
+  build:
+    uses: ./.github/workflows/build-reusable.yml
+    with:
+      postgres-version: "19"
+      os: ubuntu-24.04

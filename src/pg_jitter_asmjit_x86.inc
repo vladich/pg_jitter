@@ -468,10 +468,12 @@ asmjit_emit_deform_inline(x86::Compiler &cc,
     /* slot->off = (uint32) off */
     cc.mov(x86::dword_ptr(slot_reg, (int32_t) slot_off), v_off.r32());
 
+#if PG_VERSION_NUM < 190000
     /* tts_flags |= TTS_FLAG_SLOW */
     cc.movzx(dtmp1.r32(), x86::word_ptr(slot_reg, offsetof(TupleTableSlot, tts_flags)));
     cc.or_(dtmp1, Imm(TTS_FLAG_SLOW));
     cc.mov(x86::word_ptr(slot_reg, offsetof(TupleTableSlot, tts_flags)), dtmp1.r16());
+#endif
 
     pfree(nvalid_labels);
     pfree(att_labels);

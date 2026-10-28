@@ -549,6 +549,7 @@ pg_jitter_compile_deform(TupleDesc desc,
 					   SLJIT_MEM1(SLJIT_S0), slot_off,
 					   SLJIT_R1, 0);
 
+#if PG_VERSION_NUM < 190000
 		/* tts_flags |= TTS_FLAG_SLOW */
 		sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0,
 					   SLJIT_MEM1(SLJIT_S0),
@@ -559,6 +560,7 @@ pg_jitter_compile_deform(TupleDesc desc,
 					   SLJIT_MEM1(SLJIT_S0),
 					   offsetof(TupleTableSlot, tts_flags),
 					   SLJIT_R1, 0);
+#endif
 	}
 
 	/* Return void */
@@ -1179,7 +1181,9 @@ deform_sparse_dispatch(TupleTableSlot *slot, int natts,
         ((MinimalTupleTableSlot *)slot)->off = off;
     else
         ((HeapTupleTableSlot *)slot)->off = off;
+#if PG_VERSION_NUM < 190000
     slot->tts_flags |= TTS_FLAG_SLOW;
+#endif
 }
 
 void *
@@ -2899,6 +2903,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				   SLJIT_S4, 0);
 
 	/* tts_flags |= TTS_FLAG_SLOW */
+#if PG_VERSION_NUM < 190000
 	sljit_emit_op1(C, SLJIT_MOV_U16, SLJIT_R1, 0,
 				   SLJIT_MEM1(SLJIT_S0),
 				   offsetof(TupleTableSlot, tts_flags));
@@ -2908,6 +2913,7 @@ pg_jitter_compile_deform_loop(TupleDesc desc,
 				   SLJIT_MEM1(SLJIT_S0),
 				   offsetof(TupleTableSlot, tts_flags),
 				   SLJIT_R1, 0);
+#endif
 
 	sljit_emit_return_void(C);
 
